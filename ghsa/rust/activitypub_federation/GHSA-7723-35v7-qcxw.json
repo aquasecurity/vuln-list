@@ -1,0 +1,53 @@
+{
+  "Severity": "MODERATE",
+  "UpdatedAt": "2025-02-10T20:25:38Z",
+  "Package": {
+    "Ecosystem": "RUST",
+    "Name": "activitypub_federation"
+  },
+  "Advisory": {
+    "DatabaseId": 279601,
+    "Id": "GSA_kwCzR0hTQS03NzIzLTM1djctcWN4d84ABEQx",
+    "GhsaId": "GHSA-7723-35v7-qcxw",
+    "References": [
+      {
+        "Url": "https://github.com/LemmyNet/lemmy/security/advisories/GHSA-7723-35v7-qcxw"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-25194"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-7723-35v7-qcxw"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-7723-35v7-qcxw"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-25194"
+      }
+    ],
+    "Description": "### Summary\nThis vulnerability allows a user to bypass any predefined hardcoded URL path or security anti-Localhost mechanism and perform an arbitrary GET request to any Host, Port and URL using a Webfinger Request.\n\n### Details\nThe Webfinger endpoint takes a remote domain for checking accounts as a feature, however, as per the ActivityPub spec (https://www.w3.org/TR/activitypub/#security-considerations), on the security considerations section at B.3, access to Localhost services should be prevented while running in production.\nThe library attempts to prevent Localhost access using the following mechanism (/src/config.rs):\n```rust\npub(crate) async fn verify_url_valid(\u0026self, url: \u0026Url) -\u003e Result\u003c(), Error\u003e {\n        match url.scheme() {\n            \"https\" =\u003e {}\n            \"http\" =\u003e {\n                if !self.allow_http_urls {\n                    return Err(Error::UrlVerificationError(\n                        \"Http urls are only allowed in debug mode\",\n                    ));\n                }\n            }\n            _ =\u003e return Err(Error::UrlVerificationError(\"Invalid url scheme\")),\n        };\n\n        // Urls which use our local domain are not a security risk, no further verification needed\n        if self.is_local_url(url) {\n            return Ok(());\n        }\n\n        if url.domain().is_none() {\n            return Err(Error::UrlVerificationError(\"Url must have a domain\"));\n        }\n\n        if url.domain() == Some(\"localhost\") \u0026\u0026 !self.debug {\n            return Err(Error::UrlVerificationError(\n                \"Localhost is only allowed in debug mode\",\n            ));\n        }\n\n        self.url_verifier.verify(url).await?;\n\n        Ok(())\n    }\n```\nThere are multiple issues with the current anti-Localhost implementation: \n\n1. It does not resolve the domain address supplied by the user.\n2. The Localhost check is using only a simple comparison method while ignoring more complex malicious tampering attempts.\n3. It filters only localhost domains, without any regard for alternative local IP domains or other sensitive domains, such internal network or cloud metadata domains.\n\nWe can reach the verify_url_valid function while sending a Webfinger request to lookup a user’s account (/src/fetch/webfinger.rs):\n\n```rust\npub async fn webfinger_resolve_actor\u003cT: Clone, Kind\u003e(\n    identifier: \u0026str,\n    data: \u0026Data\u003cT\u003e,\n) -\u003e Result\u003cKind, \u003cKind as Object\u003e::Error\u003e\nwhere\n    Kind: Object + Actor + Send + 'static + Object\u003cDataType = T\u003e,\n    for\u003c'de2\u003e \u003cKind as Object\u003e::Kind: serde::Deserialize\u003c'de2\u003e,\n    \u003cKind as Object\u003e::Error: From\u003ccrate::error::Error\u003e + Send + Sync + Display,\n{\n    let (_, domain) = identifier\n        .splitn(2, '@')\n        .collect_tuple()\n        .ok_or(WebFingerError::WrongFormat.into_crate_error())?;\n    let protocol = if data.config.debug { \"http\" } else { \"https\" };\n    let fetch_url =\n        format!(\"{protocol}://{domain}/.well-known/webfinger?resource=acct:{identifier}\");\n    debug!(\"Fetching webfinger url: {}\", \u0026fetch_url);\n\n    let res: Webfinger = fetch_object_http_with_accept(\n        \u0026Url::parse(\u0026fetch_url).map_err(Error::UrlParse)?,\n        data,\n        \u0026WEBFINGER_CONTENT_TYPE,\n    )\n    .await?\n    .object;\n\n    debug_assert_eq!(res.subject, format!(\"acct:{identifier}\"));\n    let links: Vec\u003cUrl\u003e = res\n        .links\n        .iter()\n        .filter(|link| {\n            if let Some(type_) = \u0026link.kind {\n                type_.starts_with(\"application/\")\n            } else {\n                false\n            }\n        })\n        .filter_map(|l| l.href.clone())\n        .collect();\n\n    for l in links {\n        let object = ObjectId::\u003cKind\u003e::from(l).dereference(data).await;\n        match object {\n            Ok(obj) =\u003e return Ok(obj),\n            Err(error) =\u003e debug!(%error, \"Failed to dereference link\"),\n        }\n    }\n    Err(WebFingerError::NoValidLink.into_crate_error().into())\n}\n```\n\nThe Webfinger logic takes the user account from the GET parameter “resource” and sinks the domain directly into the hardcoded Webfinger URL (“{protocol}://{domain}/.well-known/webfinger?resource=acct:{identifier}”) without any additional checks.\nAfterwards the user domain input will pass into the “fetch_object_http_with_accept” function and finally into the security check on “verify_url_valid” function, again, without any form of sanitizing or input validation.\nAn adversary can cause unwanted behaviours using multiple techniques:\n\n1. **_Gaining control over the query’s path:_**\nAn adversary can manipulate the Webfinger hard-coded URL, gaining full control over the GET request domain, path and port by submitting malicious input like: hacker@hacker_host:1337/hacker_path?hacker_param#, which in turn will result in the following string:\nhttp[s]://hacker_host:1337/hacker_path?hacker_param#/.well-known/webfinger?resource=acct:{identifier}, directing the URL into another domain and path without any issues as the hash character renders the rest of the URL path unrecognized by the webserver.\n\n2. **_Bypassing the domain’s restriction using DNS resolving mechanism:_**\nAn adversary can manipulate the security check and force it to look for internal services regardless the Localhost check by using a domain name that resolves into a local IP (such as: localh.st, for example), as the security check does not verify the resolved IP at all - any service under the Localhost domain can be reached.\n\n3. _**Bypassing the domain’s restriction using official Fully Qualified Domain Names (FQDNs):**_\nIn the official DNS specifications, a fully qualified domain name actually should end with a dot.\nWhile most of the time a domain name is presented without any trailing dot, the resolver will assume it exists, however - it is still possible to use a domain name with a trailing dot which will resolve correctly.\nAs the Localhost check is mainly a simple comparison check - if we register a “hacker@localhost.” domain it will pass the test as “localhost” is not equal to “localhost.”, however the domain will be valid (Using this mechanism it is also possible to bypass any domain blocklist mechanism).\n\n\n### PoC\n\n1. Activate a local HTTP server listening to port 1234 with a “secret.txt” file:\n`python3 -m http.server 1234`\n2. Open the “main.rs” file inside the “example” folder on the activitypub-federated-rust project, and modify the “beta@localhost” string into “hacker@localh.st:1234/secret.txt?something=1#”.\n3. Run the example using the following command:\n`cargo run --example local_federation axum`\n4. View the console of the Python’s HTTP server and see that a request for a “secret.txt” file was performed.\n\nThis proves that we can redirect the URL to any domain and path we choose.\nNow on the next steps we will prove that the security checks of Localhost and blocked domains can be easily bypassed (both checks use the same comparison mechanism).\n\n1. Now open the “instance.rs” file inside the “example” folder and view that the domain “malicious.com” is blocked (you can switch it to any desired domain address).\n2. Change the same “beta@localhost” string into “hacker@malicious.com” and run the example command to see that the malicious domain blocking mechanism is working as expected.\n3. Now change the “hacker@malicious.com” string into  “hacker@malicious.com.” string and re-initiate the example, view now that the check passed successfully.\n4. You can combine both methods on “localhost.” domain (or any other domain) to verify that the FQDNs resolving is indeed successful.\n\n\n### Impact\nDue to this issue, any user can cause the server to send GET requests with controlled path and port in an attempt to query services running on the instance’s host, and attempt to execute a Blind-SSRF gadget in hope of targeting a known vulnerable local service running on the victim’s machine.\n\n### Fix Suggestion\nModify the domain validation mechanism and implement the following checks:\n\n1. Resolve the domain and validate it is not using any invalid IP address (internal, or cloud metadata IPs) using regexes of both IPv4 and IPv6 addresses.\nFor Implementation example of a good SSRF prevention practice you can review a similiar project such as “Fedify” (https://github.com/dahlia/fedify/blob/main/src/runtime/url.ts) which handles external URL resource correctly.\nNote that it is still needed to remove unwanted characters from the URL. \n2. Filter the user’s input for any unwanted characters that should not be present on a domain name, such as #,?,/, etc.\n3. Perform checks that make sure the desired request path is the executed path with the same port.\n4. Disable automatic HTTP redirect follows on the implemented client, as redirects can be used for security mechanisms circumvention.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-02-10T20:25:37Z",
+    "Severity": "MODERATE",
+    "Summary": "Server-Side Request Forgery (SSRF) in activitypub_federation",
+    "UpdatedAt": "2025-02-11T00:33:49Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 4,
+      "VectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:L/I:N/A:N"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": ""
+      },
+      "VulnerableVersionRange": "\u003c= 0.6.2"
+    }
+  ]
+}

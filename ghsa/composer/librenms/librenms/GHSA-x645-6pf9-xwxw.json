@@ -1,0 +1,50 @@
+{
+  "Severity": "CRITICAL",
+  "UpdatedAt": "2024-11-15T15:54:19Z",
+  "Package": {
+    "Ecosystem": "COMPOSER",
+    "Name": "librenms/librenms"
+  },
+  "Advisory": {
+    "DatabaseId": 267850,
+    "Id": "GSA_kwCzR0hTQS14NjQ1LTZwZjkteHd4d84ABBZK",
+    "GhsaId": "GHSA-x645-6pf9-xwxw",
+    "References": [
+      {
+        "Url": "https://github.com/librenms/librenms/security/advisories/GHSA-x645-6pf9-xwxw"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-x645-6pf9-xwxw"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-x645-6pf9-xwxw"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2024-51092"
+      }
+    ],
+    "Description": "### Summary\nAn authenticated attacker can create dangerous directory names on the system and alter sensitive configuration parameters through the web portal. Those two defects combined then allows to inject arbitrary OS commands inside `shell_exec()` calls, thus achieving arbitrary code execution.\n\n### Details\n#### OS Command Injection\nWe start by inspecting the file `app/Http/Controllers/AboutController.php`, more particularly the index() method which is executed upon simply visiting the /about page:\n```php\npublic function index(Request $request)\n    {\n        $version = Version::get();\n\n        return view('about.index', [\n            \u003cTRUNCATED\u003e\n\n            'version_webserver' =\u003e $request-\u003eserver('SERVER_SOFTWARE'),\n            'version_rrdtool' =\u003e Rrd::version(),\n            'version_netsnmp' =\u003e str_replace('version: ', '', rtrim(shell_exec(Config::get('snmpget', 'snmpget') . ' -V 2\u003e\u00261'))),\n\n           \u003cTRUNCATED\u003e\n        ]);\n    }\n```\n\nWe can see that the `version_netsnmp` key receives a value direclty dependent of a `shell_exec()` call. The argument to this call reflects a configuration parameter with no sanitization. Should an attacker identify a way to alter this parameter, the server is at risk of being compromised.\n\n#### Configuration parameters poisoning\nWe now focus on the `update()` method of the `SettingsController.php` script. This method is called when the user visits the route `/settings/{key}` via HTTP PUT. The key parameter here is simply the name of the configuration key the user wishes to modify.\n```php\npublic function update(DynamicConfig $config, Request $request, $id)\n{\n    $value = $request-\u003eget('value');\n\n    if (! $config-\u003eisValidSetting($id)) {\n        return $this-\u003ejsonResponse($id, ':id is not a valid setting', null, 400);\n    }\n\n    $current = \\LibreNMS\\Config::get($id);\n    $config_item = $config-\u003eget($id);\n\n    if (! $config_item-\u003echeckValue($value)) {\n        return $this-\u003ejsonResponse($id, $config_item-\u003egetValidationMessage($value), $current, 400);\n    }\n\n    if (\\LibreNMS\\Config::persist($id, $value)) {\n        return $this-\u003ejsonResponse($id, \"Successfully set $id\", $value);\n    }\n\n    return $this-\u003ejsonResponse($id, 'Failed to update :id', $current, 400);\n}\n```\n\nWe can see that some protections are implemented around the configuration parameters by `$config_item-\u003echeckValue($value)`, with a format of data being expected depending on the data type of the variable the user wants to modify.\nSpecifically, the `snmpget` configuration variable expects a valid path to an existing binary on the system.\nTo summarize : if an attacker finds a valid full-path to a system binary, while that full-path also holds shell metacharacters, then those characters would be interpreted by the `shell_exec()` call defined above and allow for arbitrary command execution.\n\n#### Arbitrary directory creation\nWhen creating a new Device through the \"Add Device\" page, the server allows the user to send malformed or impossible hostnames and force the data to be stored, with no sanitization being performed on this field.\n\nIn the file `app/Jobs/PollDevice.php`, the `initRrdDirectory()` method is responsible for creating a directory named after the Device's hostname. We can see the `mkdir()` call inside the try block:\n```php\nprivate function initRrdDirectory(): void\n{\n    $host_rrd = \\Rrd::name($this-\u003edevice-\u003ehostname, '', '');\n    if (Config::get('rrd.enable', true) \u0026\u0026 ! is_dir($host_rrd)) {\n        try {\n            mkdir($host_rrd);\n            Log::info(\"Created directory : $host_rrd\");\n        } catch (\\ErrorException $e) {\n            Eventlog::log(\"Failed to create rrd directory: $host_rrd\", $this-\u003edevice);\n            Log::info($e);\n        }\n    }\n}\n```\n\nThis method is called by `initDevice()`, which is itself called by the `handle()` method (executed when the job starts).\n`\\Rrd::name()` simply concatenates a string following the format `\u003cLIBRENMS_INSTALL_DIR\u003e/rrd/\u003cDEVICE_HOSTNAME\u003e`.\n\n#### Summary\nWith all this, an authenticated attacker can:\n- Create a malicious Device with shell metacharacters inside its hostname\n- Force the creation of directory containing shell metacharacters through the PollDevice job\n- Modify the `snmpget` configuration variable to point to a valid system binary, while also using the directory created in the previous step via a path traversal (i.e: `/path/to/install/dir/rrd/\u003cDEVICE_HOSTNAME\u003e/../../../../../../../bin/ls`)\n- Trigger a code execution via the `shell_exec()` call contained in the `AboutController.php` script\n\n#### \n\n### PoC\nFor proof of concept, we will create a file located at `/tmp/rce-proof` on the server's filesystem.\n\nConsider the following command : `/usr/bin/touch /tmp/rce-proof`, encoded in base64 (`L3Vzci9iaW4vdG91Y2ggL3RtcC9yY2UtcHJvb2Y=`). This encoding is necesary whenever the command contains '/' characters, as this would otherwise generate invalid directory paths.\nCreate a new Device with a name that contains the command you wish to execute enclosed in semi-colons, ending with a '3' character:\n![librenms-1](https://github.com/user-attachments/assets/a242fc1a-f04a-4df9-901e-abcc5f14af14)\n\nBe careful to tick the \"Force Add\" option, otherwise the request will be rejected. Click add:\n![librenms-2](https://github.com/user-attachments/assets/84e0d853-1418-44aa-870b-4259adba27f8)\n\nA directory matching the hostname of the Device will be created whenever a PollDevice job is launched. For the purpose of the demonstration, we will be triggering this manually with artisan:\n![librenms-4](https://github.com/user-attachments/assets/ce4061ef-6cb6-4847-a229-1417091048f5)\n\nWe can confirm that this directory indeed exists on the system:\n![librenms-5](https://github.com/user-attachments/assets/79f912c6-f200-47d2-b950-d46636dc30ef)\n\nWe can now update the `snmpget` parameter value to point to any binary on the system, making sure that the specified path includes the directory that was just created:\n![librenms-13](https://github.com/user-attachments/assets/4b49c2db-c716-41ae-b668-ff6bf3d5d8de)\n\nVisiting the `/about` page will trigger the payload, then we can check that our code was indeed executed:\n![librenms-10](https://github.com/user-attachments/assets/8fcf0838-50b5-47e0-85d5-0892d9909c76)\n\n\n### Impact\nServer takeover",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2024-11-15T15:54:18Z",
+    "Severity": "CRITICAL",
+    "Summary": "LibreNMS has an Authenticated OS Command Injection",
+    "UpdatedAt": "2024-11-15T15:54:19Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 9.1,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:L"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "24.10.0"
+      },
+      "VulnerableVersionRange": "\u003c= 24.9.1"
+    }
+  ]
+}

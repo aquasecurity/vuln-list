@@ -1,0 +1,49 @@
+{
+  "Severity": "LOW",
+  "UpdatedAt": "2025-01-14T22:04:01Z",
+  "Package": {
+    "Ecosystem": "NPM",
+    "Name": "@lodestar/reqresp"
+  },
+  "Advisory": {
+    "DatabaseId": 275942,
+    "Id": "GSA_kwCzR0hTQS01M3J2LWhjdm0tcnBwOc4ABDXm",
+    "GhsaId": "GHSA-53rv-hcvm-rpp9",
+    "References": [
+      {
+        "Url": "https://github.com/ChainSafe/lodestar/security/advisories/GHSA-53rv-hcvm-rpp9"
+      },
+      {
+        "Url": "https://github.com/ChainSafe/lodestar/commit/18a0d681dbcc51fb2ac9456f31e91f4e31a18300"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-53rv-hcvm-rpp9"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-53rv-hcvm-rpp9"
+      }
+    ],
+    "Description": "### Impact\nUnintended permanent chain split affecting greater than or equal to 25% of the network, requiring hard fork (network partition requiring hard fork)\n\n### Description\nLodestar client may fail to decode snappy framing compressed messages.\n\n### Vulnerability Details\nIn Req/Resp protocol the message are encoded by using ssz_snappy encoding, which is basically snappy framing compression over ssz encoded message.\n\nIt's mentioned here - https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md\n\n```\nThe token of the negotiated protocol ID specifies the type of encoding to be used for the req/resp interaction. Only one value is possible at this time:\n\nssz_snappy: The contents are first SSZ-encoded and then compressed with Snappy frames compression. For objects containing a single field, only the field is SSZ-encoded not a container with a single field. For example, the BeaconBlocksByRoot request is an SSZ-encoded list of Root's. This encoding type MUST be supported by all clients.\n```\n\nIn snappy framing format there a few types of chunks.\nWe are interested in so called reserved skippable chunks. These are chunks with chunk type in range [0x80, 0xfd]\nLet's see how rust snappy handles them https://github.com/BurntSushi/rust-snappy/blob/master/src/read.rs#L137\n\n```\nimpl\u003cR: io::Read\u003e io::Read for FrameDecoder\u003cR\u003e {\n    fn read(\u0026mut self, buf: \u0026mut [u8]) -\u003e io::Result\u003cusize\u003e {\n \t\t   ... \n           ...\n  \t\t    let len = len64 as usize;\n            match ty {\n                Err(b) if 0x02 \u003c= b \u0026\u0026 b \u003c= 0x7F =\u003e {\n                    // Spec says that chunk types 0x02-0x7F are reserved and\n                    // conformant decoders must return an error.\n                    fail!(Error::UnsupportedChunkType { byte: b });\n                }\n                Err(b) if 0x80 \u003c= b \u0026\u0026 b \u003c= 0xFD =\u003e {\n                    // Spec says that chunk types 0x80-0xFD are reserved but\n                    // skippable.\n                    self.r.read_exact(\u0026mut self.src[0..len])?;\n                }\n```\n\nSimilar code can be found in golang implementation - https://github.com/golang/snappy/blob/master/decode.go#L221\n\n```\nfunc (r *Reader) fill() error {\n\t...\n\tif chunkType \u003c= 0x7f {\n\t\t\t// Section 4.5. Reserved unskippable chunks (chunk types 0x02-0x7f).\n\t\t\tr.err = ErrUnsupported\n\t\t\treturn r.err\n\t\t}\n\t\t// Section 4.4 Padding (chunk type 0xfe).\n\t\t// Section 4.6. Reserved skippable chunks (chunk types 0x80-0xfd).\n\t\tif !r.readFull(r.buf[:chunkLen], false) {\n\t\t\treturn r.err\n\t\t}\n```\n\nNow let's see how lodestar handles such chunks https://github.com/ChainSafe/lodestar/blob/unstable/packages/reqresp/src/encodingStrategies/sszSnappy/snappyFrames/uncompress.ts#L17\n\n```\nuncompress(chunk: Uint8ArrayList): Uint8ArrayList | null {\n    this.buffer.append(chunk);\n    const result = new Uint8ArrayList();\n    while (this.buffer.length \u003e 0) {\n      if (this.buffer.length \u003c 4) break;\n\n      const type = getChunkType(this.buffer.get(0));\n      const frameSize = getFrameSize(this.buffer, 1);\n\n      if (this.buffer.length - 4 \u003c frameSize) {\n        break;\n      }\n\n      const data = this.buffer.subarray(4, 4 + frameSize);\n      this.buffer.consume(4 + frameSize);\n\n      if (!this.state.foundIdentifier \u0026\u0026 type !== ChunkType.IDENTIFIER) {\n        throw \"malformed input: must begin with an identifier\";\n      }\n\n      if (type === ChunkType.IDENTIFIER) {\n        if (!Buffer.prototype.equals.call(data, IDENTIFIER)) {\n          throw \"malformed input: bad identifier\";\n        }\n        this.state.foundIdentifier = true;\n        continue;\n      }\n\n      if (type === ChunkType.COMPRESSED) {\n        result.append(uncompress(data.subarray(4)));\n      }\n      if (type === ChunkType.UNCOMPRESSED) {\n        result.append(data.subarray(4));\n      }\n    }\n    if (result.length === 0) {\n      return null;\n    }\n    return result;\n  }\n\n function getChunkType(value: number): ChunkType {\n  switch (value) {\n    case ChunkType.IDENTIFIER:\n      return ChunkType.IDENTIFIER;\n    case ChunkType.COMPRESSED:\n      return ChunkType.COMPRESSED;\n    case ChunkType.UNCOMPRESSED:\n      return ChunkType.UNCOMPRESSED;\n    case ChunkType.PADDING:\n      return ChunkType.PADDING;\n    default:\n      throw new Error(\"Unsupported snappy chunk type\");\n  }\n```\n\nAs you can see, lodestar does not recognize such chunks.\n\nIf it sees such chunk, function getChunkType() throws an exception and decoding fails.\n\n### Impact Details\n\nFaulty nodes may trigger chain stall by sending messages which lodestar fails to parse, while other clients will be able to handle.\n\n### Proof of Concept\n\nHow to reproduce:\n\n1. get archive (via provided [gist link](https://gist.github.com/gln7/bdde7f4e0bdf9d47bf810a015796867a)), decode and unpack it:\n```\n$ base64 -d poc.txt \u003e poc.tgz\n$ tar zxf poc.tgz\n```\n\n2. run dec1.go to verify that our snappy file decompressed successfully\n```\n$ go run dec1.go\n\nreading 1.snappy...\nread 124 bytes, err \u003cnil\u003e\n```\n\n3. run dec1.mjs to verify that lodestar fails to decode such file\n```\nchecking chunk type=255\nchecking chunk type=1\ngot uncompressed chunk..\nchecking chunk type=129\nfile:///../poc/dec1.mjs:74\n            throw new Error(\"Unsupported snappy chunk type\");\n```\n",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-01-14T22:03:59Z",
+    "Severity": "LOW",
+    "Summary": "Lodestar snappy decompression issue",
+    "UpdatedAt": "2025-01-14T22:04:01Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.25.0"
+      },
+      "VulnerableVersionRange": "\u003c 1.25.0"
+    }
+  ]
+}

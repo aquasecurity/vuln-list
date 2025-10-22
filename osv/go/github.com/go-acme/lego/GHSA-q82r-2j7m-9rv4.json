@@ -1,0 +1,111 @@
+{
+  "id": "GHSA-q82r-2j7m-9rv4",
+  "modified": "2025-08-11T18:14:48.847361Z",
+  "published": "2025-08-06T17:08:52Z",
+  "aliases": [
+    "CVE-2025-54799",
+    "GO-2025-3847"
+  ],
+  "related": [
+    "CGA-3fgc-5q79-6hm2",
+    "CGA-4p4m-vqcv-jrww",
+    "CGA-98g5-525p-f4qh",
+    "CGA-mwvc-qqxv-pv9h",
+    "CGA-pmxx-pv94-8cpv",
+    "CGA-q59p-m734-55f4",
+    "CGA-w547-862g-4qhh",
+    "CGA-wv85-r9xj-8mrh"
+  ],
+  "summary": "github.com/go-acme/lego/v4/acme/api does not enforce HTTPS",
+  "details": "## Summary\n\nIt was discovered that the github.com/go-acme/lego/v4/acme/api package (thus the lego library and the lego cli as well) don't enforce HTTPS when talking to CAs as an ACME client.\n\n## Details\n\nUnlike the http-01 challenge which solves an ACME challenge over unencrypted HTTP, the ACME protocol requires HTTPS when a client communicates with the CA to performs ACME functions. This is stated in 6.1 of RFC 8555: [https://datatracker.ietf.org/doc/html/rfc8555#section-6.1](https://datatracker.ietf.org/doc/html/rfc8555#section-6.1)\n\n\u003e Each ACME function is accomplished by the client sending a sequence\n\u003e of HTTPS requests to the server [[RFC2818](https://datatracker.ietf.org/doc/html/rfc2818)], carrying JSON messages\n\u003e [[RFC8259](https://datatracker.ietf.org/doc/html/rfc8259)].  Use of HTTPS is REQUIRED.  Each subsection of [Section 7](https://datatracker.ietf.org/doc/html/rfc8555#section-7)\n\u003e below describes the message formats used by the function and the\n\u003e order in which messages are sent.\n\nHowever, the library fails to enforce HTTPS both in the original discover URL (configured by the library user) and in the subsequent addresses returned by the CAs in the directory and order objects.\n\nIf the library user accidentally inputs an HTTP URL, or the CA similarly misconfigures its endpoints, this will cause the relevant parts of the protocol to be performed over HTTP. This can result, at the very least, in a lost of privacy of the request/response details, such as account and request identifiers (which could be intercepted by an attacker in a privileged network position). We did not investigate whether other more serious threats could result from the ability to impersonate a CA for some of the protocol requests, but enforcing HTTPS usage is definitely the safe choice.\n\n## Reproducing\n\nThis is illustrated in the attached http_acme_test.go. Since it uses private field Core.directory, this test must be placed inside the source directory of https://github.com/go-acme/lego/v4/acme/api to run.\n\nPlease note that this only checks getting the directory and creating a new account, but other ACME functions are likely impacted as well, such as creating orders, getting and checking order authorizations.\n\n\u003cdetails\u003e\n\n```go\npackage api\n\nimport (\n\t\"crypto/ecdsa\"\n\t\"crypto/elliptic\"\n\t\"crypto/rand\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/go-acme/lego/v4/acme\"\n)\n\nconst letsEncryptURLHTTP = \"http://acme-v02.api.letsencrypt.org/directory\"\nconst letsEncryptURLHTTPS = \"https://acme-v02.api.letsencrypt.org/directory\"\n\nfunc changeToHTTP(url *string) {\n\tif strings.HasPrefix(*url, \"https:\") {\n\t\t*url = \"http\" + (*url)[len(\"https\"):]\n\t}\n}\n\nfunc changeToHTTPS(url *string) {\n\tif strings.HasPrefix(*url, \"http:\") {\n\t\t*url = \"https\" + (*url)[len(\"http\"):]\n\t}\n}\n\nfunc TestHTTPURLs(t *testing.T) {\n\tprivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)\n\tif err != nil {\n\t\tt.Fatalf(\"error generating a private key: %v\", err)\n\t}\n\n\tfunc() {\n\t\tt.Log(\"testing that Discover enforces https\")\n\t\t_, err := New(\u0026http.Client{\n\t\t\tTransport: \u0026httpsOnlyRoundTripper{inner: http.DefaultTransport},\n\t\t\tTimeout:   20 * time.Second,\n\t\t}, \"\", letsEncryptURLHTTP, \"\", privateKey)\n\t\tif err != nil {\n\t\t\tt.Errorf(\"New error: %v\", err)\n\t\t}\n\t}()\n\n\tcore, err := New(\u0026http.Client{\n\t\tTransport: \u0026httpsOnlyRoundTripper{inner: http.DefaultTransport},\n\t\tTimeout:   20 * time.Second,\n\t}, \"\", letsEncryptURLHTTPS, \"\", privateKey)\n\tif err != nil {\n\t\tt.Fatalf(\"New error: %v\", err)\n\t}\n\n\tfunc() {\n\t\tt.Log(\"testing that account creation enforces https\")\n\n\t\t// Simulate a misconfigured CA that gives out HTTP directory URLs and when\n\t\t// we're done change it back to HTTPS to test the rest.\n\t\tchangeToHTTP(\u0026core.directory.NewAccountURL)\n\t\tdefer changeToHTTPS(\u0026core.directory.NewAccountURL)\n\n\t\t_, err := core.Accounts.New(acme.Account{\n\t\t\tTermsOfServiceAgreed: true,\n\t\t\tContact:              []string{},\n\t\t})\n\t\tif err != nil {\n\t\t\tt.Errorf(\"core.Accounts.New error: %v\", err)\n\t\t}\n\t}()\n\n\t_, err = core.Accounts.New(acme.Account{\n\t\tTermsOfServiceAgreed: true,\n\t\tContact:              []string{},\n\t})\n\tif err != nil {\n\t\tt.Fatalf(\"core.Accounts.New error: %v\", err)\n\t}\n}\n\ntype httpsOnlyRoundTripper struct {\n\tinner http.RoundTripper\n}\n\nfunc (r *httpsOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {\n\tif req.URL.Scheme != \"https\" {\n\t\treturn nil, fmt.Errorf(\"non-https request is being sent\")\n\t}\n\treturn r.inner.RoundTrip(req)\n}\n```\n\n\u003c/details\u003e\n\n_",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-acme/lego",
+        "purl": "pkg:golang/github.com/go-acme/lego"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "4.25.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/08/GHSA-q82r-2j7m-9rv4/GHSA-q82r-2j7m-9rv4.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-acme/lego/v3",
+        "purl": "pkg:golang/github.com/go-acme/lego/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "4.25.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/08/GHSA-q82r-2j7m-9rv4/GHSA-q82r-2j7m-9rv4.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-acme/lego/v4",
+        "purl": "pkg:golang/github.com/go-acme/lego/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.25.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.25.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/08/GHSA-q82r-2j7m-9rv4/GHSA-q82r-2j7m-9rv4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-acme/lego/security/advisories/GHSA-q82r-2j7m-9rv4"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-54799"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-acme/lego/commit/238454b5f74f3cfcbb244ff0d0dc914a4ad44b96"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-acme/lego"
+    }
+  ]
+}

