@@ -1,0 +1,56 @@
+{
+  "Severity": "CRITICAL",
+  "UpdatedAt": "2025-11-20T17:36:15Z",
+  "Package": {
+    "Ecosystem": "NPM",
+    "Name": "@hpke/core"
+  },
+  "Advisory": {
+    "DatabaseId": 322385,
+    "Id": "GSA_kwCzR0hTQS03M2c4LTVoNzMtMjZoNM4ABOtR",
+    "GhsaId": "GHSA-73g8-5h73-26h4",
+    "References": [
+      {
+        "Url": "https://github.com/dajiaji/hpke-js/security/advisories/GHSA-73g8-5h73-26h4"
+      },
+      {
+        "Url": "https://github.com/dajiaji/hpke-js/commit/94a767c9b9f37ce48d5cd86f7017d8cacd294aaf"
+      },
+      {
+        "Url": "https://github.com/dajiaji/hpke-js/blob/b7fd3592c7c08660c98289d67c6bb7f891af75c4/packages/core/src/senderContext.ts#L22-L34"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-73g8-5h73-26h4"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-73g8-5h73-26h4"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-64767"
+      }
+    ],
+    "Description": "### Summary\n\nThe public SenderContext Seal() API has a race condition which allows for the same AEAD nonce to be re-used for multiple Seal() calls. This can lead to complete loss of Confidentiality and Integrity of the produced messages.\n\n### Details\n\nThe SenderContext Seal() [implementation](https://github.com/dajiaji/hpke-js/blob/b7fd3592c7c08660c98289d67c6bb7f891af75c4/packages/core/src/senderContext.ts#L22-L34) allows for concurrent executions to trigger `computeNonce()` with the same sequence number. This results in the same nonce being used in the suite's AEAD.\n\n### PoC\n\nThis code reproduces the issue (and also checks for more things that could be wrong with the implementation).\n\n```js\nimport { CipherSuite, KdfId, AeadId, KemId } from \"hpke-js\";\n\nconst suite = new CipherSuite({\n  kem: KemId.DhkemP256HkdfSha256,\n  kdf: KdfId.HkdfSha256,\n  aead: AeadId.Aes128Gcm,\n});\n\nconst keypair = await suite.kem.generateKeyPair();\nconst skR = keypair.privateKey;\nconst pkR = keypair.publicKey;\n\nconst sender = await suite.createSenderContext({\n  recipientPublicKey: pkR,\n});\n\nconst [message0, message1] = await Promise.all([\n  sender.seal(\n    new TextEncoder().encode(\"Secret message 1: Attack at dawn\").buffer\n  ),\n  sender.seal(\n    new TextEncoder().encode(\"Secret message 2: Withdraw troops\").buffer\n  ),\n]);\n\nconst recipient = await suite.createRecipientContext({\n  recipientKey: skR,\n  enc: sender.enc,\n});\n\nconst plaintext0 = await recipient.open(message0);\nconsole.log(\"✓ Decrypted message seq=0\", new TextDecoder().decode(plaintext0));\n\ntry {\n  console.log(\n    \"✓ Decrypted message seq=1\",\n    new TextDecoder().decode(await recipient.open(message1))\n  );\n  console.log(\"\\n✓ nonce-reuse reproduction completed, code is NOT vulnerable\");\n} catch (error) {\n  // re-sequence the recipient to verify same nonce was used for two messages\n  recipient._ctx.seq = 0;\n  console.log(\n    \"❌ Decrypted a different message with seq=0\",\n    new TextDecoder().decode(await recipient.open(message1))\n  );\n\n  console.log(\n    \"\\n✓ nonce-reuse reproduction completed, code is vulnerable, nonces are reused when concurrent calls to .seal() are used\"\n  );\n}\n\n// Test that failed Open() doesn't increment sequence\nconst recipient2 = await suite.createRecipientContext({\n  recipientKey: skR,\n  enc: sender.enc,\n});\n\nconst invalidMessage = new Uint8Array(message0.byteLength);\ninvalidMessage.set(new Uint8Array(message0));\ninvalidMessage[0] ^= 0xff; // Corrupt the first byte\n\ntry {\n  await recipient2.open(invalidMessage.buffer);\n} catch {}\n\n// Now try to open the first valid message - should still work with seq=0\ntry {\n  await recipient2.open(message0);\n  console.log(\"✓ Successfully decrypted message with seq=0 after failed open()\");\n  console.log(\"✓ Failed open() did NOT increment sequence\");\n} catch (error) {\n  console.log(\"❌ Failed to decrypt message - sequence was incorrectly incremented\");\n}\n\n// Test that same message produces same ciphertext due to nonce reuse\nconst sender2 = await suite.createSenderContext({\n  recipientPublicKey: pkR,\n});\n\nconst sameMessage = new TextEncoder().encode(\"Identical message\").buffer;\nconst [cipher0, cipher1] = await Promise.all([\n  sender2.seal(sameMessage),\n  sender2.seal(sameMessage),\n]);\n\nconst cipher0Array = new Uint8Array(cipher0);\nconst cipher1Array = new Uint8Array(cipher1);\n\nlet identical = true;\nif (cipher0Array.length !== cipher1Array.length) {\n  identical = false;\n} else {\n  for (let i = 0; i \u003c cipher0Array.length; i++) {\n    if (cipher0Array[i] !== cipher1Array[i]) {\n      identical = false;\n      break;\n    }\n  }\n}\n\nif (identical) {\n  console.log(\"\\n❌ Same message produced IDENTICAL ciphertext (nonce reuse confirmed)\");\n} else {\n  console.log(\"\\n✓ Same message produced different ciphertext (nonces are unique)\");\n}\n```\n\n### Recommendation\n\nImplement a synchronization mechanism such that only one seal()/open() per context can be executed at a time.\n\n### Notes\n\nRefs: https://github.com/hpkewg/hpke/issues/38\n\n\u003e https://www.rfc-editor.org/rfc/rfc9180.html#section-9.7.5\n\u003e The AEADs specified in this document are not secure in case of nonce reuse.\n\n\u003e https://www.rfc-editor.org/rfc/rfc9180.html#section-5-6\n\u003e A context is an implementation-specific structure that encodes the AEAD algorithm and key in use, and manages the nonces used so that the same nonce is not used with multiple plaintexts.\n\nThe context implementation in @hpke/core is not correct given its AEAD Seal() is awaited/asynchronous.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-11-20T17:36:13Z",
+    "Severity": "CRITICAL",
+    "Summary": "@hpke/core reuses AEAD nonces",
+    "UpdatedAt": "2025-11-20T17:36:15Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 9.1,
+      "VectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.7.5"
+      },
+      "VulnerableVersionRange": "\u003c= 1.7.4"
+    }
+  ]
+}

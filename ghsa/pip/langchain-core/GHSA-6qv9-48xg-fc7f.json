@@ -1,0 +1,62 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2025-11-20T17:42:13Z",
+  "Package": {
+    "Ecosystem": "PIP",
+    "Name": "langchain-core"
+  },
+  "Advisory": {
+    "DatabaseId": 322386,
+    "Id": "GSA_kwCzR0hTQS02cXY5LTQ4eGctZmM3Zs4ABOtS",
+    "GhsaId": "GHSA-6qv9-48xg-fc7f",
+    "References": [
+      {
+        "Url": "https://github.com/langchain-ai/langchain/security/advisories/GHSA-6qv9-48xg-fc7f"
+      },
+      {
+        "Url": "https://github.com/langchain-ai/langchain/commit/c4b6ba254e1a49ed91f2e268e6484011c540542a"
+      },
+      {
+        "Url": "https://github.com/langchain-ai/langchain/commit/fa7789d6c21222b85211755d822ef698d3b34e00"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-6qv9-48xg-fc7f"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-6qv9-48xg-fc7f"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-65106"
+      }
+    ],
+    "Description": "## Context\n\nA template injection vulnerability exists in LangChain's prompt template system that allows attackers to access Python object internals through template syntax. This vulnerability affects applications that accept **untrusted template strings** (not just template variables) in `ChatPromptTemplate` and related prompt template classes.\n\nTemplates allow attribute access (`.`) and indexing (`[]`) but not method invocation (`()`).\n\nThe combination of attribute access and indexing may enable exploitation depending on which objects are passed to templates. When template variables are simple strings (the common case), the impact is limited. However, when using `MessagesPlaceholder` with chat message objects, attackers can traverse through object attributes and dictionary lookups (e.g., `__globals__`) to reach sensitive data such as environment variables.\n\nThe vulnerability specifically requires that applications accept **template strings** (the structure) from untrusted sources, not just **template variables** (the data). Most applications either do not use templates or else use hardcoded templates and are not vulnerable.\n\n## Affected Components\n\n- `langchain-core` package\n- Template formats:\n  - F-string templates (`template_format=\"f-string\"`) - **Vulnerability fixed**\n  - Mustache templates (`template_format=\"mustache\"`) - **Defensive hardening**\n  - Jinja2 templates (`template_format=\"jinja2\"`) - **Defensive hardening**\n\n### Impact\nAttackers who can control template strings (not just template variables) can:\n- Access Python object attributes and internal properties via attribute traversal\n- Extract sensitive information from object internals (e.g., `__class__`, `__globals__`)\n- Potentially escalate to more severe attacks depending on the objects passed to templates\n\n### Attack Vectors\n\n#### 1. F-string Template Injection\n**Before Fix:**\n```python\nfrom langchain_core.prompts import ChatPromptTemplate\n\nmalicious_template = ChatPromptTemplate.from_messages(\n    [(\"human\", \"{msg.__class__.__name__}\")],\n    template_format=\"f-string\"\n)\n\n# Note that this requires passing a placeholder variable for \"msg.__class__.__name__\".\nresult = malicious_template.invoke({\"msg\": \"foo\", \"msg.__class__.__name__\": \"safe_placeholder\"})\n# Previously returned\n# \u003e\u003e\u003e result.messages[0].content\n# \u003e\u003e\u003e 'str'\n```\n\n#### 2. Mustache Template Injection\n**Before Fix:**\n```python\nfrom langchain_core.prompts import ChatPromptTemplate\nfrom langchain_core.messages import HumanMessage\n\nmsg = HumanMessage(\"Hello\")\n\n# Attacker controls the template string\nmalicious_template = ChatPromptTemplate.from_messages(\n    [(\"human\", \"{{question.__class__.__name__}}\")],\n    template_format=\"mustache\"\n)\n\nresult = malicious_template.invoke({\"question\": msg})\n# Previously returned: \"HumanMessage\" (getattr() exposed internals)\n```\n\n#### 3. Jinja2 Template Injection\n**Before Fix:**\n```python\nfrom langchain_core.prompts import ChatPromptTemplate\nfrom langchain_core.messages import HumanMessage\n\nmsg = HumanMessage(\"Hello\")\n\n# Attacker controls the template string\nmalicious_template = ChatPromptTemplate.from_messages(\n    [(\"human\", \"{{question.parse_raw}}\")],\n    template_format=\"jinja2\"\n)\n\nresult = malicious_template.invoke({\"question\": msg})\n# Could access non-dunder attributes/methods on objects\n```\n\n### Root Cause\n\n1. **F-string templates**: The implementation used Python's `string.Formatter().parse()` to extract variable names from template strings. This method returns the complete field expression, including attribute access syntax:\n     ```python\n     from string import Formatter\n\n     template = \"{msg.__class__} and {x}\"\n     print([var_name for (_, var_name, _, _) in Formatter().parse(template)])\n     # Returns: ['msg.__class__', 'x']\n    ```\n     The extracted names were not validated to ensure they were simple identifiers. As a result, template strings containing attribute traversal and indexing expressions (e.g., `{obj.__class__.__name__}` or `{obj.method.__globals__[os]}`) were accepted and subsequently evaluated during formatting. While f-string templates do not support method calls with `()`, they do support `[]` indexing, which could allow traversal through dictionaries like `__globals__` to reach sensitive objects.\n2. **Mustache templates**: By design, used `getattr()` as a fallback to support accessing attributes on objects (e.g., `{{user.name}}` on a User object). However, we decided to restrict this to simpler primitives that subclass dict, list, and tuple types as defensive hardening, since untrusted templates could exploit attribute access to reach internal properties like class on arbitrary objects\n3. **Jinja2 templates**: Jinja2's default `SandboxedEnvironment` blocks dunder attributes (e.g., `__class__`) but permits access to other attributes and methods on objects. While Jinja2 templates in LangChain are typically used with trusted template strings, as a defense-in-depth measure, we've restricted the environment to block all attribute and method access on objects\n   passed to templates.\n\n\n## Who Is Affected?\n\n### High Risk Scenarios\nYou are affected if your application:\n- Accepts template strings from untrusted sources (user input, external APIs, databases)\n- Dynamically constructs prompt templates based on user-provided patterns\n- Allows users to customize or create prompt templates\n\n**Example vulnerable code:**\n```python\n# User controls the template string itself\nuser_template_string = request.json.get(\"template\")  # DANGEROUS\n\nprompt = ChatPromptTemplate.from_messages(\n    [(\"human\", user_template_string)],\n    template_format=\"mustache\"\n)\n\nresult = prompt.invoke({\"data\": sensitive_object})\n```\n\n### Low/No Risk Scenarios\nYou are **NOT** affected if:\n- Template strings are hardcoded in your application code\n- Template strings come only from trusted, controlled sources\n- Users can only provide **values** for template variables, not the template structure itself\n\n**Example safe code:**\n```python\n# Template is hardcoded - users only control variables\nprompt = ChatPromptTemplate.from_messages(\n    [(\"human\", \"User question: {question}\")],  # SAFE\n    template_format=\"f-string\"\n)\n\n# User input only fills the 'question' variable\nresult = prompt.invoke({\"question\": user_input})\n```\n\n## The Fix\n\n### F-string Templates\nF-string templates had a clear vulnerability where attribute access syntax was exploitable. We've added strict validation to prevent this:\n\n- Added validation to enforce that variable names must be valid Python identifiers\n- Rejects syntax like `{obj.attr}`, `{obj[0]}`, or `{obj.__class__}`\n- Only allows simple variable names: `{variable_name}`\n\n```python\n# After fix - these are rejected at template creation time\nChatPromptTemplate.from_messages(\n    [(\"human\", \"{msg.__class__}\")],  # ValueError: Invalid variable name\n    template_format=\"f-string\"\n)\n```\n\n### Mustache Templates (Defensive Hardening)\nAs defensive hardening, we've restricted what Mustache templates support to reduce the attack surface:\n\n- Replaced `getattr()` fallback with strict type checking\n- Only allows traversal into `dict`, `list`, and `tuple` types\n- Blocks attribute access on arbitrary Python objects\n\n```python\n# After hardening - attribute access returns empty string\nprompt = ChatPromptTemplate.from_messages(\n    [(\"human\", \"{{msg.__class__}}\")],\n    template_format=\"mustache\"\n)\nresult = prompt.invoke({\"msg\": HumanMessage(\"test\")})\n# Returns: \"\" (access blocked)\n```\n\n### Jinja2 Templates (Defensive Hardening)\nAs defensive hardening, we've significantly restricted Jinja2 template capabilities:\n\n- Introduced `_RestrictedSandboxedEnvironment` that blocks **ALL** attribute/method access\n- Only allows simple variable lookups from the context dictionary\n- Raises `SecurityError` on any attribute access attempt\n\n```python\n# After hardening - all attribute access is blocked\nprompt = ChatPromptTemplate.from_messages(\n    [(\"human\", \"{{msg.content}}\")],\n    template_format=\"jinja2\"\n)\n# Raises SecurityError: Access to attributes is not allowed\n```\n\n**Important Recommendation**: Due to the expressiveness of Jinja2 and the difficulty of fully sandboxing it, **we recommend reserving Jinja2 templates for trusted sources only**. If you need to accept template strings from untrusted users, use f-string or mustache templates with the new restrictions instead.\n\nWhile we've hardened the Jinja2 implementation, the nature of templating engines makes comprehensive sandboxing challenging. The safest approach is to only use Jinja2 templates when you control the template source.\n\n**Important Reminder**: Many applications do not need prompt templates. Templates are useful for variable substitution and dynamic logic (if statements, loops, conditionals). However, if you're building a chatbot or conversational application, you can often work directly with message objects (e.g., `HumanMessage`, `AIMessage`, `ToolMessage`) without templates. Direct message construction avoids template-related security concerns entirely.\n\n## Remediation\n\n### Immediate Actions\n\n1. **Audit your code** for any locations where template strings come from untrusted sources\n2. **Update to the patched version** of `langchain-core`\n3. **Review template usage** to ensure separation between template structure and user data\n\n### Best Practices\n\n- **Consider if you need templates at all** - Many applications can work directly with message objects (`HumanMessage`, `AIMessage`, etc.) without templates\n- **Reserve Jinja2 for trusted sources** - Only use Jinja2 templates when you fully control the template content",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-11-20T17:42:12Z",
+    "Severity": "HIGH",
+    "Summary": "LangChain Vulnerable to Template Injection via Attribute Access in Prompt Templates",
+    "UpdatedAt": "2025-11-20T18:25:34Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "0.3.80"
+      },
+      "VulnerableVersionRange": "\u003c= 0.3.79"
+    },
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.0.7"
+      },
+      "VulnerableVersionRange": "\u003e= 1.0.0, \u003c= 1.0.6"
+    }
+  ]
+}
