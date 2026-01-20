@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-54wq-72mp-cq7c",
+  "modified": "2026-01-20T18:07:05.462418Z",
+  "published": "2026-01-20T17:54:55Z",
+  "aliases": [
+    "CVE-2026-23829"
+  ],
+  "summary": "Mailpit has an SMTP Header Injection via Regex Bypass",
+  "details": "# Vulnerability Report: SMTP Header Injection via Regex Bypass\n\n**Vulnerable Code:** `mailpit/internal/smtpd/smtpd.go`\n\n## Executive Summary\nMailpit's SMTP server is vulnerable to **Header Injection** due to an insufficient Regular Expression used to validate `RCPT TO` and `MAIL FROM` addresses. An attacker can inject arbitrary SMTP headers (or corrupt existing ones) by including carriage return characters (`\\r`) in the email address. This header injection occurs because the regex intended to filter control characters fails to exclude `\\r` and `\\n` when used inside a character class.\n\n## RFC Compliance \u0026 Design Analysis\n**\"Is this behavior intentional for a testing tool?\"**\nNo. While testing tools are often permissive, this specific behavior violates the core SMTP protocol and fails the developer's own intent.\n\n1.  **RFC 5321 Violation:** The SMTP protocol strictly forbids Control Characters (CR, LF, Null) in the envelope address (`Mailbox`).\n    *   *RFC 5321 Section 4.1.2:* A `Mailbox` consists of an `Atom` or `Quoted-string`. An `Atom` explicitly excludes \"specials, SPACE and CTLs\" (Control Characters).\n2.  **Failed Intent:** The existence of `\\v` in the regex `[^\u003c\u003e\\v]` proves the developer **intended** to block vertical whitespace. The vulnerability is that `\\v` in Go regex (`re2`) inside brackets `[]` matches *only* Vertical Tab, not CR/LF. If the design were to allow everything, the `\\v` exclusion wouldn't exist.\n3.  **Data Corruption:** Allowing `\\r` results in the generation of malformed `.eml` files where the `Received` header is broken. This is not a feature; it's a bug that creates invalid email files.\n4. RFC 5321 also enforces address lengths which are not applied in Mailpit.\n\n## Technical Analysis\n\n### The Flaw\nThe vulnerability exists in the regex definitions used to parse SMTP commands:\n\n```go\n// internal/smtpd/smtpd.go:32-33\nrcptToRE   = regexp.MustCompile(`(?i)TO: ?\u003c([^\u003c\u003e\\v]+)\u003e( |$)(.*)?`)\nmailFromRE = regexp.MustCompile(`(?i)FROM: ?\u003c(|[^\u003c\u003e\\v]+)\u003e( |$)(.*)?`)\n```\n\nThe developer likely intended `[^\u003c\u003e\\v]` to mean \"Match anything that is NOT a `\u003c` OR `\u003e` OR `Vertical Whitespace`\".\n\nHowever, in Go's `regexp` (RE2) syntax, the behavior of `\\v` changes depending on context:\n- **Outside** brackets: `\\v` matches all vertical whitespace: `[\\n\\v\\f\\r\\x85\\u2028\\u2029]`.\n- **Inside** brackets (`[...]`): `\\v` matches **only** the Vertical Tab character (`\\x0B`).\n\n**Result:** The regex `[^\u003c\u003e\\v]` **allows** Carriage Return (`\\r`) and Line Feed (`\\n`) characters to pass through, as they are not `\u003c` or `\u003e` or `\\x0B`.\n\n### Exploit Scenario\n### Exploit Scenario\nWhen Mailpit constructs the `Received` header, it uses the validated recipient address directly:\n\n```go\n// internal/smtpd/smtpd.go:865\nbuffer.WriteString(fmt.Sprintf(\"        for \u003c%s\u003e; %s\\r\\n\", to[0], now))\n```\n\nIf `to[0]` contains `victim\\rINJECTED-HEADER: YES`, the resulting string in memory becomes:\n\n```text\n        for \u003cvictim\\rINJECTED-HEADER: YES\u003e; ...\n```\n\nWhile `bufio.ReadString` prevents injecting immediate `\\n` (newlines), `\\r` (Carriage Return) bypasses this check. \n\n**The Result:** The stored EML file contains a \"Bare CR\".\n- **RFC Violation:** RFC 5321 strictly forbids Bare CR. Lines must end in CRLF.\n- **UI Behavior:** Browsers typically render Bare CR as a space, so it may look like `victim INJECTED` in the Mailpit UI.\n- **Real Impact:** The raw email is corrupted. If this email is exported or relayed, downstream systems (Outlook, older MTAs) may interpret the Bare CR as a line break, triggering a full **Header Injection**. Furthermore, Mailpit failing to reject this gives developers a **false sense of security**, as their code might be generating malformed emails that work in Mailpit but fail in production (e.g., with Gmail or Exchange).\n\n### Raw EML Verification\nThe following screenshot of the raw `.eml` file confirms that the `\\r` character successfully broke the `Received` header structure in the stored file, effectively creating a new line for the injected content.\n\n\u003cimg width=\"621\" height=\"230\" alt=\"image\" src=\"https://github.com/user-attachments/assets/1611f07e-316d-436a-95d6-9b14c9a8ecc6\" /\u003e\n\n\u003cimg width=\"1058\" height=\"441\" alt=\"image\" src=\"https://github.com/user-attachments/assets/9543d904-6e0a-4c8b-b283-abbe05b752d0\" /\u003e\n\n\u003cimg width=\"668\" height=\"196\" alt=\"image\" src=\"https://github.com/user-attachments/assets/907e4467-aab6-4bb4-83ce-743af4f6ba8d\" /\u003e\n\n\n\nAs seen in lines  of the screenshot:\n```text\n        for \u003cvictim\nINJECTED_VIA_CR:YES\u003e; Tue, 13 Jan ...\n```\nThe `INJECTED_VIA_CR:YES` payload is treated as a start of a new line by the text editor (VS Code), which honors `\\r` as a line break. This proves the injection matches the \"Bare CR\" attack vector.\n\n## Additional Proof of Concepts\n\n### 1. Null Byte Injection (`\\x00`)\nThe regex `[^\u003c\u003e\\v]+` also allows the Null Byte (`\\x00`).\n**Test:** `test_null_byte.py` sent `RCPT TO:\u003cvictim\\x00-NULL-BYTE-HERE\u003e`.\n**Result:** Server accepted the message (`250 OK`).\n**Impact:** The API returns an empty `[]` for the To field in the message summary, indicating the parser failure in the UI/API layer. The raw message content confirms the Null Byte is stored in the database.\n\n### 3. Detailed Character Compatibility\nTests (0-127 ASCII) confirm that the regex `[^\u003c\u003e\\v]` blocks **only** the following:\n- `\u003c` (Less Than)\n- `\u003e` (Greater Than)\n- `\\x0B` (Vertical Tab)\n\n**Crucially, it ALLOWS:**\n| Character | Hex | Regex Status | Network Status | Impact |\n| :--- | :--- | :--- | :--- | :--- |\n| **Carriage Return** | `\\r` (`0x0D`) | **ALLOWED** | **Passed** | **Header Injection** |\n| **Line Feed** | `\\n` (`0x0A`) | **ALLOWED** | Blocked* | *Blocked by `bufio.ReadString`, not regex. |\n| **Null Byte** | `\\x00` (`0x00`) | **ALLOWED** | **Passed** | API DoS / Corrupt Data |\n| **Tab** | `\\t` (`0x09`) | **ALLOWED** | **Passed** | Formatting issues |\n| **Delete** | `\\x7F` (`0x7F`) | **ALLOWED** | **Passed** | Potential obfuscation |\n| **Controls** | `0x01`-`0x1F` | **ALLOWED** | **Passed** | (Except `0x0A`, `0x0B`, `0x0D`) |\n\n*This confirms that the regex fails to implement a proper \"Safe Text\" allowlist, defaulting instead to a flawed denylist.*\n\n## Proof of Concept\nThe following Python script demonstrates the injection of a \"bare CR\" into the headers, which is successfully accepted by the server.\n\n```python\nimport socket\n\ndef exploit():\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.connect((\"127.0.0.1\", 1025))\n    s.recv(1024)\n    s.send(b\"EHLO test.com\\r\\n\")\n    s.recv(1024)\n    s.send(b\"MAIL FROM:\u003cattacker@evil.com\u003e\\r\\n\")\n    s.recv(1024)\n    \n    # Injecting \\r \n    payload = b\"RCPT TO:\u003cvictim\\rX-Injected: Yes\u003e\\r\\n\"\n    s.send(payload)\n    resp = s.recv(1024)\n    print(f\"Server Response: {resp.decode()}\") # Expect 250 OK\n    \n    s.send(b\"DATA\\r\\n\")\n    s.recv(1024)\n    s.send(b\"Subject: Test\\r\\n\\r\\nBody\\r\\n.\\r\\n\")\n    s.recv(1024)\n    s.close()\n    \nexploit()\n```\n\n## Remediation\nUpdate the regex to explicitly exclude `\\r` and `\\n`, or use the correct character class escape for control characters.\n\n**Recommended Fix:**\nUse `\\x00-\\x1F` to exclude all ASCII control characters.\n\n```go\n// Fix: Exclude all control characters explicitly\nrcptToRE   = regexp.MustCompile(`(?i)TO: ?\u003c([^\u003c\u003e\\x00-\\x1f]+)\u003e( |$)(.*)?`)\nmailFromRE = regexp.MustCompile(`(?i)FROM: ?\u003c(|[^\u003c\u003e\\x00-\\x1f]+)\u003e( |$)(.*)?`)\n```\n\nAlternatively, strictly exclude CR and LF:\n```go\nrcptToRE   = regexp.MustCompile(`(?i)TO: ?\u003c([^\u003c\u003e\\r\\n]+)\u003e( |$)(.*)?`)\n```\n## Classification \u0026 References\n- **OWASP:** [Injection Flaws](https://owasp.org/www-community/attacks/Injection_Flaws)\n- **CAPEC-106:** [Command Injection](https://capec.mitre.org/data/definitions/106.html) (Related usage pattern)\n- [[RFC 5321 Section 4.5.3.1 - Size Limits](https://datatracker.ietf.org/doc/html/rfc5321#section-4.5.3.1)](https://datatracker.ietf.org/doc/html/rfc5321#section-4.5.3.1)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/axllent/mailpit",
+        "purl": "pkg:golang/github.com/axllent/mailpit"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.28.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.28.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-54wq-72mp-cq7c/GHSA-54wq-72mp-cq7c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/security/advisories/GHSA-54wq-72mp-cq7c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-23829"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/commit/36cc06c125954dec6673219dafa084e13cc14534"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/axllent/mailpit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/releases/tag/v1.28.3"
+    }
+  ]
+}
