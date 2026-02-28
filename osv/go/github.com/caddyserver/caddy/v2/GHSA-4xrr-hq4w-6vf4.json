@@ -1,0 +1,71 @@
+{
+  "id": "GHSA-4xrr-hq4w-6vf4",
+  "modified": "2026-02-28T00:52:59.733182Z",
+  "published": "2026-02-24T20:16:55Z",
+  "aliases": [
+    "CVE-2026-27585",
+    "GO-2026-4535"
+  ],
+  "summary": "Caddy: Improper sanitization of glob characters in file matcher may lead to bypassing security protections",
+  "details": "### Summary\n\nThe path sanitization in [file matcher](https://github.com/caddyserver/caddy/blob/68d50020eef0d4c3398b878f17c8092ca5b58ca0/modules/caddyhttp/fileserver/matcher.go#L361) doesn't sanitize backslashes which can lead to bypassing path related security protections.\n\n### Details\n\nThe [try_files](https://caddyserver.com/docs/caddyfile/directives/try_files) directive is used to rewrite the request uri. It accepts a list of patterns and checks if any files exist in the root that match the provided patterns. It's commonly used in Caddy configs. For example, it's used in SPA applications to rewrite every route that doesn't exist as a file to `index.html`. \n \n```caddy\nexample.com {\n\troot * /srv\n\tencode\n\ttry_files {path} /index.html\n\tfile_server\n}\n```\n\n`try_files` patterns are actually glob patterns and file matcher expands them. The `{path}` in the pattern is replaced with\nthe request path and then [is expanded by `fs.Glob`](https://github.com/caddyserver/caddy/blob/68d50020eef0d4c3398b878f17c8092ca5b58ca0/modules/caddyhttp/fileserver/matcher.go#L398). The request path is sanitized before being placed inside the pattern and the special chars are escaped . [The following code](https://github.com/caddyserver/caddy/blob/68d50020eef0d4c3398b878f17c8092ca5b58ca0/modules/caddyhttp/fileserver/matcher.go#L361) is the sanitization part.   \n\n```go\nvar globSafeRepl = strings.NewReplacer(\n\t\"*\", \"\\\\*\",\n\t\"[\", \"\\\\[\",\n\t\"?\", \"\\\\?\",\n)\n\nexpandedFile, err := repl.ReplaceFunc(file, func(variable string, val any) (any, error) {\n    if runtime.GOOS == \"windows\" {\n        return val, nil\n    }\n    switch v := val.(type) {\n    case string:\n        return globSafeRepl.Replace(v), nil\n    case fmt.Stringer:\n        return globSafeRepl.Replace(v.String()), nil\n    }\n    return val, nil\n})\n```\n\nThe problem here is that it does not escape backslashes. `/something-\\*/` can match a file named `something-\\-anything.txt`, but it should not. The primitive that this vulnerability provides is not very useful, as it only allows an attacker to guess filenames that contain a backslash and they should also know the characters before that backslash.\n\nThe backslash is mainly used to escape special characters in glob patterns, but when it appears before non special characters, it is ignored. This means that `h\\ello*` matches `hello world` even though `e` is not a special character. This behavior can be abused to bypass path protections that might be in place. For example, if there is a reverse proxy that only allows `/documents/*` to the internal network and its upstream is a Caddy server that uses `try_files`, the reverse proxy's protection can be bypassed by requesting the path `/do%5ccuments/`.\n\nSome configurations that implement blacklisting and serving together in Caddy are also vulnerable but there's a condition that the `try_files` directive and the filtering `route`/`handle` must not be in a same block because `try_files` directive [executes before `route` and `handle` directives](https://caddyserver.com/docs/caddyfile/directives#directive-order). \n\nFor example the following config isn't vulnerable.\n\n```caddy\n:80 {\n    root * /srv\n\n    route /documents/* {\n        respond \"Access denied\" 403\n    }\n\n    try_files {path} /index.html\n    file_server\n}\n```\n\nBut this one is vulnerable.\n\n```caddy\n:80 {\n    root * /srv\n\n    route /documents/* {\n        respond \"Access denied\" 403\n    }\n\n    route /* {\n        try_files {path} /index.html\n    }\n    file_server\n}\n```\n\nThis config is also vulnerable because `Header` directives executes before `try_files`. \n\n```caddy\n:80 {\n    root * /srv \n    header /uploads/* {\n        X-Content-Type-Options \"nosniff\"\n        Content-Security-Policy \"default-src 'none';\"\n    }\n    try_files {path} /index.html\n    file_server\n}\n```\n\n### PoC\n\nPaste this script somewhere and run it. It should print \"some content\" which means that the nginx protection has failed.\n\n```bash\n#!/bin/bash\n\nmkdir secret\necho 'some content' \u003e secret/secret.txt\n\ncat \u003e Caddyfile \u003c\u003c'EOF'\n:80 {\n    root * /srv\n\n    try_files {path} /index.html\n    file_server\n}\nEOF\n\ncat \u003e nginx.conf \u003c\u003c'EOF'\nevents {}\n\nhttp {\n    server {\n        listen 80;\n        \n        location /secret {\n            return 403;\n        }\n\n        location / {\n            proxy_pass http://caddy;\n            proxy_set_header Host $host;\n        }\n    }\n}\nEOF\n\ncat \u003e docker-compose.yml \u003c\u003c'EOF'\nservices:\n  caddy:\n    # caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb\n    image: caddy:latest\n    volumes:\n      - ./Caddyfile:/etc/caddy/Caddyfile:ro\n      - ./secret:/srv/secret:ro\n  nginx:\n    # nginx@sha256:341bf0f3ce6c5277d6002cf6e1fb0319fa4252add24ab6a0e262e0056d313208\n    image: nginx:latest\n    volumes:\n      - ./nginx.conf:/etc/nginx/nginx.conf:ro\n    ports:\n      - \"8000:80\" \nEOF\n\ndocker compose up -d\ncurl 'localhost:8000/secre%5ct/secret.txt'\n```\n\n### Impact\n\nThis vulnerability may allow an attacker to bypass security protections. It affects users with specific Caddy and environment configurations.\n\n### AI Usage\n\nAn LLM was used to polish this report.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy/v2",
+        "purl": "pkg:golang/github.com/caddyserver/caddy/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 2.11.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/02/GHSA-4xrr-hq4w-6vf4/GHSA-4xrr-hq4w-6vf4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/security/advisories/GHSA-4xrr-hq4w-6vf4"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-27585"
+    },
+    {
+      "type": "WEB",
+      "url": "https://caddyserver.com/docs/caddyfile/directives#directive-order"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/blob/68d50020eef0d4c3398b878f17c8092ca5b58ca0/modules/caddyhttp/fileserver/matcher.go#L361"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/blob/68d50020eef0d4c3398b878f17c8092ca5b58ca0/modules/caddyhttp/fileserver/matcher.go#L398"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/releases/tag/v2.11.1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://pkg.go.dev/vuln/GO-2026-4535"
+    }
+  ]
+}
