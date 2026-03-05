@@ -1,0 +1,51 @@
+{
+  "id": "GHSA-5wp8-q9mx-8jx8",
+  "modified": "2026-03-05T00:46:15.237135Z",
+  "published": "2026-03-05T00:38:14Z",
+  "summary": "zeptoclaw has Shell allowlist-blocklist bypass via command/argument injection and file name wildcards",
+  "details": "### Summary\n[zeptoclaw](https://github.com/qhkm/zeptoclaw) implements a allowlist combined with a blocklist to prevent malicious shell commands in [src/security/shell.rs](https://github.com/qhkm/zeptoclaw/blob/v0.5.8/src/security/shell.rs). However, even in the `Strict` mode, attackers can completely bypass all the guards from allowlist and blocklist:\n\n- to bypass the `allowlist`, command injection is enough, such as `;`, `$()` etc.\n- to bypass the `REGEX_BLOCKED_PATTERNS`, argument injection is enough, such as the `python3 -P -c \"...\"`\n- to bypass the `LITERAL_BLOCKED_PATTERNS`, file name wildcards can do the work, such as `cat /etc/pass[w]d`\n\n### Details\nIn code [src/security/shell.rs#L218-L243](https://github.com/qhkm/zeptoclaw/blob/fe2ef07cfec5bb46b42cdd65f52b9230c03e9270/src/security/shell.rs#L218-L243), one can see the allowlist only checks the first token and thus makes command injection possible. \n```rust\n        // Allowlist check (runs after blocklist)\n        if self.allowlist_mode != ShellAllowlistMode::Off \u0026\u0026 !self.allowlist.is_empty() {\n            let first_token = command\n                .split_whitespace()\n                .next()\n                .unwrap_or(\"\")\n                .to_lowercase();\n            // Strip path prefix (e.g. /usr/bin/git -\u003e git)\n            let executable = first_token.rsplit('/').next().unwrap_or(\u0026first_token);\n            if !self.allowlist.iter().any(|a| a == executable) {\n                match self.allowlist_mode {\n                    ShellAllowlistMode::Strict =\u003e {\n                        return Err(ZeptoError::SecurityViolation(format!(\n                            \"Command '{}' not in allowlist\",\n                            executable\n                        )));\n                    }\n                    ShellAllowlistMode::Warn =\u003e {\n                        tracing::warn!(\n                            command = %command,\n                            executable = %executable,\n                            \"Command not in allowlist\"\n                        );\n                    }\n                    ShellAllowlistMode::Off =\u003e {} // unreachable\n                }\n```\n `!self.allowlist.is_empty()` makes the empty allowlist overlook the allowlist check, if it is in `ShellAllowlistMode::Strict` mode, empty allowlist should direct reject all the commands.\n\nAs the code in [src/security/shell.rs#L18-L70](https://github.com/qhkm/zeptoclaw/blob/fe2ef07cfec5bb46b42cdd65f52b9230c03e9270/src/security/shell.rs#L18-L70), we can find the `REGEX_BLOCKED_PATTERNS` only apply `\\s+` in between the command and arguments, making argument injection possible, and the `LITERAL_BLOCKED_PATTERNS` just uses specific file name, totally overlooking the file name wildcards:\n```rust\nconst REGEX_BLOCKED_PATTERNS: \u0026[\u0026str] = \u0026[\n    // Piped shell execution (curl/wget to sh/bash)\n    r\"curl\\s+.*\\|\\s*(sh|bash|zsh)\",\n    r\"wget\\s+.*\\|\\s*(sh|bash|zsh)\",\n    r\"\\|\\s*(sh|bash|zsh)\\s*$\",\n    // Reverse shells\n    r\"bash\\s+-i\\s+\u003e\u0026\\s*/dev/tcp\",\n    r\"nc\\s+.*-e\\s+(sh|bash|/bin)\",\n    r\"/dev/tcp/\",\n    r\"/dev/udp/\",\n    // Destructive root operations (various flag orderings)\n    r\"rm\\s+(-[rf]{1,2}\\s+)*(-[rf]{1,2}\\s+)*/\\s*($|;|\\||\u0026)\",\n    r\"rm\\s+(-[rf]{1,2}\\s+)*(-[rf]{1,2}\\s+)*/\\*\\s*($|;|\\||\u0026)\",\n    // Format/overwrite disk\n    r\"mkfs(\\.[a-z0-9]+)?\\s\",\n    r\"dd\\s+.*if=/dev/(zero|random|urandom).*of=/dev/[sh]d\",\n    r\"\u003e\\s*/dev/[sh]d[a-z]\",\n    // System-wide permission changes\n    r\"chmod\\s+(-R\\s+)?777\\s+/\\s*$\",\n    r\"chmod\\s+(-R\\s+)?777\\s+/[a-z]\",\n    // Fork bombs\n    r\":\\(\\)\\s*\\{\\s*:\\|:\u0026\\s*\\}\\s*;:\",\n    r\"fork\\s*\\(\\s*\\)\",\n    // Encoded/indirect execution (common blocklist bypasses)\n    r\"base64\\s+(-d|--decode)\",\n    r\"python[23]?\\s+-c\\s+\",\n    r\"perl\\s+-e\\s+\",\n    r\"ruby\\s+-e\\s+\",\n    r\"node\\s+-e\\s+\",\n    r\"\\beval\\s+\",\n    r\"xargs\\s+.*sh\\b\",\n    r\"xargs\\s+.*bash\\b\",\n    // Environment variable exfiltration\n    r\"\\benv\\b.*\u003e\\s*/\",\n    r\"\\bprintenv\\b.*\u003e\\s*/\",\n];\n\n/// Literal substring patterns (credentials, sensitive paths)\nconst LITERAL_BLOCKED_PATTERNS: \u0026[\u0026str] = \u0026[\n    \"/etc/shadow\",\n    \"/etc/passwd\",\n    \"~/.ssh/\",\n    \".ssh/id_rsa\",\n    \".ssh/id_ed25519\",\n    \".ssh/id_ecdsa\",\n    \".ssh/id_dsa\",\n    \".ssh/authorized_keys\",\n    \".aws/credentials\",\n    \".kube/config\",\n    // ZeptoClaw's own config (contains API keys and channel tokens)\n    \".zeptoclaw/config.json\",\n    \".zeptoclaw/config.yaml\",\n];\n```\n\n### PoC\n```rust\n    #[test]\n    fn test_allowlist_bypass() {\n        let config =\n            ShellSecurityConfig::new().with_allowlist(vec![\"git\"], ShellAllowlistMode::Strict);\n        assert!(config.validate_command(\"/usr/bin/git status; python -P -c 'import os; os.system(\\\"rm -rf /\\\")'; cat /etc/pass[w]d\").is_ok());\n    }\n```\n\n### Impact\nUnauthorized command execution.\n\n### Credit\n[@zpbrent](https://github.com/zpbrent)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zeptoclaw",
+        "purl": "pkg:cargo/zeptoclaw"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.6.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.6.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-5wp8-q9mx-8jx8/GHSA-5wp8-q9mx-8jx8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/qhkm/zeptoclaw/security/advisories/GHSA-5wp8-q9mx-8jx8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qhkm/zeptoclaw/commit/68916c3e4f3af107f11940b27854fc7ef517058b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/qhkm/zeptoclaw"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qhkm/zeptoclaw/blob/fe2ef07cfec5bb46b42cdd65f52b9230c03e9270/src/security/shell.rs#L218-L243"
+    }
+  ]
+}
