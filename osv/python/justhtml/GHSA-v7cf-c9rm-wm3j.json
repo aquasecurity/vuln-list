@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-v7cf-c9rm-wm3j",
+  "modified": "2026-03-17T14:16:29.177781Z",
+  "published": "2026-03-17T14:07:38Z",
+  "summary": "Uncontrolled recursion DoS in JustHTML() via deeply nested HTML",
+  "details": "### Summary\n\njusthtml through 1.9.1 allows denial of service via deeply nested HTML. During parsing, `JustHTML.__init__()` always reaches `TreeBuilder.finish()`, which unconditionally calls `_populate_selectedcontent()`. That function recursively traverses the DOM via `_find_elements()` / `_find_element()` without a depth bound, allowing attacker-controlled deeply nested input to trigger an unhandled `RecursionError` on CPython. Depending on the host application's exception handling, this can abort parsing, fail requests, or terminate a worker/process.\n\n### Details\n\n`TreeBuilder.finish()` ([`treebuilder.py#L476`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/treebuilder.py#L476)) unconditionally calls `_populate_selectedcontent(self.document)` at [line 494](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/treebuilder.py#L494). `_populate_selectedcontent()` ([`treebuilder.py#L1243`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/treebuilder.py#L1243)) calls `_find_elements()` ([`treebuilder.py#L1280`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/treebuilder.py#L1280)) to recursively search the DOM tree for `\u003cselect\u003e` elements:\n\n```python\ndef _find_elements(self, node: Any, name: str, result: list[Any]) -\u003e None:\n    \"\"\"Recursively find all elements with given name.\"\"\"\n    if node.name == name:\n        result.append(node)\n    if node.has_child_nodes():\n        for child in node.children:\n            self._find_elements(child, name, result)  # recursive call\n```\n\nWhen the DOM tree depth exceeds CPython's default recursion limit (1000), this raises an unhandled `RecursionError`. The full call path is:\n\n`JustHTML(html)` → `tokenizer.run()` → `tree_builder.finish()` → `_populate_selectedcontent(document)` → `_find_elements(root, \"select\", selects)` (recursive)\n\nDeeply nested DOM trees can be produced by nesting `\u003cdiv\u003e` tags ~1000 levels deep. On CPython with the default recursion limit, approximately 11 KB of `\u003cdiv\u003e` nesting is sufficient to trigger the error. The exact depth threshold is environment-dependent (CPython version, recursion limit setting, call stack depth at invocation).\n\nAdditional recursive functions are affected on already-parsed deep trees:\n- `Node.clone_node(deep=True)` ([`node.py#L523`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/node.py#L523)) — called during sanitization\n- `_node_to_html()` ([`serialize.py#L580`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/serialize.py#L580)) — used by `to_html(pretty=True)`\n- `_to_markdown_walk()` ([`node.py#L817`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/node.py#L817)) — used by `to_markdown()`\n\nNote: the library already uses iterative traversal in several comparable functions (e.g., `_node_to_html_compact` at [`serialize.py#L197`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/serialize.py#L197), `_to_text_collect` at [`node.py#L161`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/node.py#L161), `_is_blocky_element` at [`serialize.py#L405`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/serialize.py#L405), `apply_to_children` at [`transforms.py#L1642`](https://github.com/EmilStenstrom/justhtml/blob/a866b6077770d9ec4cb6b6f9bfe7c918f98455e4/src/justhtml/transforms.py#L1642)), demonstrating the correct pattern.\n\n### PoC\n\n```python\nfrom justhtml import JustHTML\n\nhtml = \"\u003cdiv\u003e\" * 1000 + \"x\" + \"\u003c/div\u003e\" * 1000\ndoc = JustHTML(html)  # raises RecursionError\n```\n\nTest environment: CPython 3.14.3, macOS ARM64 (Apple Silicon), justhtml 1.9.1, default recursion limit (1000)\n\n| Input | Size | Result |\n|-------|------|--------|\n| `\u003cdiv\u003e` × 500 | 5,501 bytes | OK |\n| `\u003cdiv\u003e` × 800 | 8,801 bytes | OK |\n| `\u003cdiv\u003e` × 1000 | 11,001 bytes | RecursionError |\n\nThe error occurs with both `sanitize=True` (default) and `sanitize=False`.\n\n### Impact\n\nAn attacker who can supply HTML for parsing can trigger an unhandled `RecursionError` during `JustHTML()` construction. The error is triggered during construction and is not avoided by `justhtml` configuration alone; mitigating it requires host-application exception handling or input constraints. Depending on the host application's exception handling, this can abort parsing, fail requests, or terminate a worker/process.\n\n### Suggested Fix\n\nConvert the recursive tree traversal functions to iterative implementations using an explicit stack. Example for `_find_elements`:\n\n```python\ndef _find_elements(self, node: Any, name: str, result: list[Any]) -\u003e None:\n    stack = [node]\n    while stack:\n        current = stack.pop()\n        if current.name == name:\n            result.append(current)\n        if current.has_child_nodes():\n            stack.extend(reversed(current.children))\n```\n\nThe same conversion should be applied to `_find_element`, `clone_node(deep=True)`, `_node_to_html()`, and `_to_markdown_walk()`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "justhtml",
+        "purl": "pkg:pypi/justhtml"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.10.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.19.0",
+        "0.2.0",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.26.0",
+        "0.27.0",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.38.0",
+        "0.39.0",
+        "0.4.0",
+        "0.40.0",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.6.0",
+        "0.7.0",
+        "0.8.0",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.9.0",
+        "1.9.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-v7cf-c9rm-wm3j/GHSA-v7cf-c9rm-wm3j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/EmilStenstrom/justhtml/security/advisories/GHSA-v7cf-c9rm-wm3j"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/EmilStenstrom/justhtml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/EmilStenstrom/justhtml/releases/tag/v1.10.0"
+    }
+  ]
+}
