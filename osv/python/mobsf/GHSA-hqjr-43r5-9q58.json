@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-hqjr-43r5-9q58",
+  "modified": "2026-03-27T21:33:43.127711Z",
+  "published": "2026-03-24T19:23:52Z",
+  "aliases": [
+    "CVE-2026-33545"
+  ],
+  "summary": "MobSF has SQL Injection in its SQLite Database Viewer Utils",
+  "details": "## Description\n\nMobSF's `read_sqlite()` function in `mobsf/MobSF/utils.py` (lines 542-566) uses Python string formatting (`%`) to construct SQL queries with table names read from a SQLite database's `sqlite_master` table. When a security analyst uses MobSF to analyze a malicious mobile application containing a crafted SQLite database, attacker-controlled table names are interpolated directly into SQL queries without parameterization or escaping.\n\nThis allows an attacker to:\n\n1. **Cause Denial of Service** -- A malicious table name causes the database viewer to crash, preventing the analyst from viewing ANY data in the SQLite database. A malicious app can use this to hide sensitive data (C2 server URLs, stolen credentials, API keys) from MobSF's analysis.\n\n2. **Achieve SQL Injection** -- The `SELECT * FROM` query on line 557 is provably injectable via `UNION SELECT`, allowing attacker-controlled data to be returned in query results. The current code structure (a `PRAGMA` statement that runs first on line 553) limits the full exploitation chain, but the underlying code is verifiably injectable.\n\n## Root Cause\n\nThe vulnerable code in `mobsf/MobSF/utils.py:542-566`:\n\n```python\ndef read_sqlite(sqlite_file):\n    \"\"\"Sqlite Dump - Readable Text.\"\"\"\n    table_dict = {}\n    try:\n        con = sqlite3.connect(sqlite_file)\n        cur = con.cursor()\n        cur.execute('SELECT name FROM sqlite_master WHERE type=\\'table\\';')\n        tables = cur.fetchall()\n        for table in tables:\n            table_dict[table[0]] = {'head': [], 'data': []}\n            cur.execute('PRAGMA table_info(\\'%s\\')' % table)    # \u003c-- INJECTION POINT 1\n            rows = cur.fetchall()\n            for sq_row in rows:\n                table_dict[table[0]]['head'].append(sq_row[1])\n            cur.execute('SELECT * FROM \\'%s\\'' % table)         # \u003c-- INJECTION POINT 2\n            rows = cur.fetchall()\n            for sq_row in rows:\n                tmp_row = []\n                for each_row in sq_row:\n                    tmp_row.append(str(each_row))\n                table_dict[table[0]]['data'].append(tmp_row)\n    except Exception:\n        logger.exception('Reading SQLite db')\n    return table_dict\n```\n\n**Lines 553 and 557** use `%` string formatting to interpolate `table` (a tuple from `sqlite_master`) directly into SQL strings. The `table` value is attacker-controlled when the SQLite database originates from a malicious application being analyzed.\n\n## Attack Vector\n\nThe `read_sqlite()` function is called from two locations:\n\n1. **Dynamic Analysis File Viewer** (`mobsf/DynamicAnalyzer/views/common/device.py:64`):\n   - Triggered when an analyst clicks to view a `.db` file in device data\n   - Applies to both Android and iOS dynamic analysis\n\n2. **iOS Static Analysis File Viewer** (`mobsf/StaticAnalyzer/views/ios/views/view_source.py:123`):\n   - Triggered when an analyst clicks to view a `.db` file during iOS static analysis\n\n### Attack Scenario\n\n1. Attacker creates a malicious Android APK (or iOS IPA) containing a SQLite database with a crafted table name in the `assets/` directory\n2. The SQLite database contains a table created with:\n   ```sql\n   CREATE TABLE \"x' UNION SELECT 'SQL_INJECTION_PROOF'--\" (id INTEGER);\n   ```\n3. Security analyst uploads the application to MobSF for analysis\n4. Analyst browses the extracted files and clicks to view the SQLite database\n5. MobSF's `read_sqlite()` reads table names from `sqlite_master`, including the malicious name `x' UNION SELECT 'SQL_INJECTION_PROOF'--`\n6. The table name is interpolated into SQL queries via string formatting:\n   - `PRAGMA table_info('x' UNION SELECT 'SQL_INJECTION_PROOF'--')` -- causes syntax error (DoS)\n   - `SELECT * FROM 'x' UNION SELECT 'SQL_INJECTION_PROOF'--'` -- SQL injection (UNION SELECT returns attacker data)\n\n## Impact\n\n### Denial of Service (Confirmed)\n\nWhen the malicious table name is the first table in `sqlite_master` (i.e., created first in the database), the `PRAGMA` statement on line 553 raises a `sqlite3.OperationalError`, which is caught by the outer `try/except`. This causes `read_sqlite()` to return an empty or partial result, preventing the analyst from viewing **any** database content.\n\n**Security impact:** A malicious app author can use this technique to **hide incriminating data** stored in SQLite databases from MobSF's analysis. This directly undermines MobSF's core purpose as a security analysis tool.\n\n### SQL Injection (Confirmed in Isolation)\n\nThe `SELECT * FROM` query on line 557 is demonstrably injectable. When the malicious table name `x' UNION SELECT 'SQL_INJECTION_PROOF'--` is interpolated, the resulting query:\n\n```sql\nSELECT * FROM 'x' UNION SELECT 'SQL_INJECTION_PROOF'--'\n```\n\nSuccessfully executes and returns attacker-controlled data via `UNION SELECT`. The `--` comments out the trailing single quote. This is verified by the PoC script.\n\n**Note:** In the current code structure, the `PRAGMA table_info()` statement on line 553 runs before the `SELECT * FROM` on line 557. The PRAGMA fails with a syntax error for injected payloads, which triggers the exception handler before the SELECT can execute. This limits the full exploitation chain. However, the code flaw is real and any future refactoring that changes the execution order or removes the PRAGMA would immediately expose the full SQL injection.\n\n## Proof of Concept\n\n### Files Provided(Gdrive)\n\n| File | Description |\n|------|-------------|\n| `poc_sqlite_injection.py` | Standalone PoC demonstrating the vulnerability |\n| `malicious.db` | Crafted SQLite database (generated by PoC) |\n| `create_malicious_apk.sh` | Script to package the malicious DB into an APK |\n| `malicious_sqli.apk` | Pre-built APK for testing against MobSF |\n\nhttps://drive.google.com/drive/folders/1mNGkFfNowkaZ5J018HFi4IQcnjKaWCym?usp=sharing\n\n\n### Running the PoC\n\n```bash\n# Run the standalone PoC (no MobSF required)\npython3 poc_sqlite_injection.py\n\n# Build the malicious APK (requires Android SDK)\n./create_malicious_apk.sh\n\n# Test against MobSF\n# 1. Start MobSF\n# 2. Upload malicious_sqli.apk\n# 3. Browse extracted files -\u003e click app_data.db\n# 4. Observe: database viewer fails (DoS)\n```\n\n### PoC Output (Abbreviated)\n\n```\n[STEP 2] Running MobSF's read_sqlite() against malicious database...\n    [!] EXCEPTION CAUGHT: OperationalError: near \"UNION\": syntax error\n    [!] DoS CONFIRMED: read_sqlite() crashed\n\n[STEP 3] Demonstrating SELECT * FROM injection in isolation...\n    Query: SELECT * FROM 'x' UNION SELECT 'SQL_INJECTION_PROOF'--'\n    [+] Query executed successfully!\n    [+] Results: [('SQL_INJECTION_PROOF',), ('normal_data',)]\n    [+] SQL INJECTION CONFIRMED\n\n[STEP 4] Complete DoS (malicious table created first):\n    Tables with data: NONE\n    [!] COMPLETE DoS CONFIRMED\n```\n\n## Suggested Fix\n\nReplace string formatting with properly quoted identifiers. SQLite uses double quotes for identifiers:\n\n```python\ndef read_sqlite(sqlite_file):\n    \"\"\"Sqlite Dump - Readable Text.\"\"\"\n    table_dict = {}\n    try:\n        con = sqlite3.connect(sqlite_file)\n        cur = con.cursor()\n        cur.execute('SELECT name FROM sqlite_master WHERE type=\\'table\\';')\n        tables = cur.fetchall()\n        for table in tables:\n            table_name = table[0]\n            # Properly escape table name as a double-quoted identifier\n            safe_name = table_name.replace('\"', '\"\"')\n            table_dict[table_name] = {'head': [], 'data': []}\n            cur.execute(f'PRAGMA table_info(\"{safe_name}\")')\n            rows = cur.fetchall()\n            for sq_row in rows:\n                table_dict[table_name]['head'].append(sq_row[1])\n            cur.execute(f'SELECT * FROM \"{safe_name}\"')\n            rows = cur.fetchall()\n            for sq_row in rows:\n                tmp_row = []\n                for each_row in sq_row:\n                    tmp_row.append(str(each_row))\n                table_dict[table_name]['data'].append(tmp_row)\n    except Exception:\n        logger.exception('Reading SQLite db')\n    return table_dict\n```\n\nThis escapes any double quotes within table names by doubling them (`\"` → `\"\"`), which is the standard SQL mechanism for identifier quoting. This prevents breakout from the double-quoted identifier context.\n\n## Resources\n\n- **CWE-89**: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')\n- **OWASP SQL Injection**: https://owasp.org/www-community/attacks/SQL_Injection\n- **Affected File**: `mobsf/MobSF/utils.py`, lines 542-566",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mobsf",
+        "purl": "pkg:pypi/mobsf"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.4.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.2.6",
+        "3.2.7",
+        "3.2.8",
+        "3.2.9",
+        "3.3.3",
+        "3.3.5",
+        "3.4.0",
+        "3.4.3",
+        "3.4.6",
+        "3.5.0",
+        "3.6.0",
+        "3.6.9",
+        "3.7.6",
+        "3.9.7",
+        "4.1.3",
+        "4.3.0",
+        "4.3.2",
+        "4.4.0",
+        "4.4.2",
+        "4.4.5"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.4.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-hqjr-43r5-9q58/GHSA-hqjr-43r5-9q58.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MobSF/Mobile-Security-Framework-MobSF/security/advisories/GHSA-hqjr-43r5-9q58"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33545"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MobSF/Mobile-Security-Framework-MobSF/commit/6f8a43c1b78d21cfbd7186aaafa7f622d990e0f1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MobSF/Mobile-Security-Framework-MobSF"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MobSF/Mobile-Security-Framework-MobSF/releases/tag/v4.4.6"
+    }
+  ]
+}

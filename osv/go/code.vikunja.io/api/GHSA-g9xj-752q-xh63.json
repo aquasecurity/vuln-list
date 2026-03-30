@@ -1,0 +1,59 @@
+{
+  "id": "GHSA-g9xj-752q-xh63",
+  "modified": "2026-03-26T21:11:29.463337Z",
+  "published": "2026-03-25T21:17:56Z",
+  "aliases": [
+    "CVE-2026-33679",
+    "GO-2026-4852"
+  ],
+  "summary": "Vikjuna Bypasses Webhook SSRF Protections During OpenID Connect Avatar Download ",
+  "details": "## Summary\n\nThe `DownloadImage` function in `pkg/utils/avatar.go` uses a bare `http.Client{}` with no SSRF protection when downloading user avatar images from the OpenID Connect `picture` claim URL. An attacker who controls their OIDC profile picture URL can force the Vikunja server to make HTTP GET requests to arbitrary internal or cloud metadata endpoints. This bypasses the SSRF protections that are correctly applied to the webhook system.\n\n## Details\n\nWhen a user authenticates via OpenID Connect, Vikunja extracts the `picture` claim from the ID token or UserInfo endpoint and passes it to `syncUserAvatarFromOpenID`, which calls `utils.DownloadImage` with the attacker-controlled URL:\n\n**Claim extraction** (`pkg/modules/auth/openid/openid.go:70-78`):\n```go\ntype claims struct {\n\tEmail              string                   `json:\"email\"`\n\tName               string                   `json:\"name\"`\n\tPreferredUsername   string                   `json:\"preferred_username\"`\n\tNickname           string                   `json:\"nickname\"`\n\tVikunjaGroups      []map[string]interface{} `json:\"vikunja_groups\"`\n\tPicture            string                   `json:\"picture\"`\n\t// ...\n}\n```\n\n**Avatar sync trigger** (`pkg/modules/auth/openid/openid.go:348-352`):\n```go\n// Try sync avatar if available\nerr = syncUserAvatarFromOpenID(s, u, cl.Picture)\nif err != nil {\n\tlog.Errorf(\"Error syncing avatar for user %s: %v\", u.Username, err)\n}\n```\n\n**Vulnerable download** (`pkg/utils/avatar.go:94-115`):\n```go\nfunc DownloadImage(url string) ([]byte, error) {\n\tctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)\n\tdefer cancel()\n\n\treq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to create HTTP request: %w\", err)\n\t}\n\n\tresp, err := (\u0026http.Client{}).Do(req)  // No SSRF protection\n\t// ...\n\treturn io.ReadAll(resp.Body)  // No size limit\n}\n```\n\nIn contrast, the webhook system correctly applies SSRF protection (`pkg/models/webhooks.go:306-310`):\n```go\nif !config.WebhooksAllowNonRoutableIPs.GetBool() {\n\tguardian := ssrf.New(ssrf.WithAnyPort())\n\ttransport.DialContext = (\u0026net.Dialer{\n\t\tControl: guardian.Safe,\n\t}).DialContext\n}\n```\n\nThe avatar download path has none of this protection. There is no URL scheme validation, no IP address filtering, and no response body size limit.\n\n## PoC\n\n**Prerequisites:** A Vikunja instance with OpenID Connect configured (e.g., Keycloak, Authentik). Attacker has an account on the OIDC provider.\n\n**Step 1:** Set up a listener to observe incoming requests:\n```bash\n# On attacker-controlled server or internal service\nnc -lvp 8888\n```\n\n**Step 2:** In the OIDC provider (e.g., Keycloak admin), update the attacker's user profile picture URL to an internal address:\n```\nhttp://169.254.169.254/latest/meta-data/iam/security-credentials/\n```\nOr to probe internal services:\n```\nhttp://internal-service:8888/admin\n```\n\n**Step 3:** Log in to Vikunja via the OIDC provider. After the callback completes, the Vikunja server will make a GET request from its own network context to the URL set in the picture claim.\n\n**Step 4:** Observe the request arriving at the internal endpoint or listener. The request originates from the Vikunja server's IP, bypassing any network-level access controls that allow Vikunja server traffic.\n\n**Cloud metadata example (AWS):**\n```\n# Set picture URL to:\nhttp://169.254.169.254/latest/meta-data/iam/security-credentials/\n\n# Vikunja server makes GET to this URL from its own network context\n# The response is read into memory (io.ReadAll) before image.Decode fails\n# The HTTP request itself reaches the metadata service\n```\n\n## Impact\n\n- **Cloud metadata access:** Attacker can reach cloud instance metadata services (AWS IMDSv1 at `169.254.169.254`, GCP, Azure equivalents) from the Vikunja server's network position, potentially leaking IAM credentials, instance identity tokens, and configuration data.\n- **Internal network reconnaissance:** Port scanning and service discovery of internal hosts reachable from the Vikunja server by observing response timing and error messages.\n- **Internal service interaction:** Any internal service that acts on GET requests (cache purges, status endpoints, admin panels) can be triggered.\n- **Memory pressure:** The `io.ReadAll` call with no size limit means pointing the URL at a large resource could cause memory exhaustion on the Vikunja server, though the 3-second timeout partially mitigates this.\n- **Repeated exploitation:** The SSRF triggers on every OIDC login, allowing the attacker to iterate through different internal URLs by updating their OIDC profile between logins.\n\n## Recommended Fix\n\nApply the same SSRF protection used in webhooks to `DownloadImage`, and add a response body size limit:\n\n```go\n// pkg/utils/avatar.go\nimport (\n\t\"net\"\n\t\"code.dny.dev/ssrf\"\n)\n\nfunc DownloadImage(url string) ([]byte, error) {\n\tctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)\n\tdefer cancel()\n\n\treq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to create HTTP request: %w\", err)\n\t}\n\n\t// SSRF protection: block requests to non-globally-routable IPs\n\tguardian := ssrf.New(ssrf.WithAnyPort())\n\tclient := \u0026http.Client{\n\t\tTransport: \u0026http.Transport{\n\t\t\tDialContext: (\u0026net.Dialer{\n\t\t\t\tControl: guardian.Safe,\n\t\t\t}).DialContext,\n\t\t},\n\t}\n\n\tresp, err := client.Do(req)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to download image: %w\", err)\n\t}\n\tdefer resp.Body.Close()\n\n\tif resp.StatusCode != http.StatusOK {\n\t\treturn nil, fmt.Errorf(\"failed to download image, status code: %d\", resp.StatusCode)\n\t}\n\n\t// Limit response body to 10MB to prevent memory exhaustion\n\tconst maxAvatarSize = 10 * 1024 * 1024\n\treturn io.ReadAll(io.LimitReader(resp.Body, maxAvatarSize))\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-g9xj-752q-xh63/GHSA-g9xj-752q-xh63.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-g9xj-752q-xh63"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33679"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/363aa6642352b08fc8bc6aaff2f3a550393af1cf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

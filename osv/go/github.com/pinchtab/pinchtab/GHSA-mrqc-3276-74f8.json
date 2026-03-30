@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-mrqc-3276-74f8",
+  "modified": "2026-03-27T21:32:45.020832Z",
+  "published": "2026-03-24T19:33:23Z",
+  "aliases": [
+    "CVE-2026-33620",
+    "GO-2026-4822"
+  ],
+  "summary": "PinchTab: API Bearer Token Exposed in URL Query Parameter via Server Logs and Intermediary Systems",
+  "details": "### Summary\nPinchTab `v0.7.8` through `v0.8.3` accepted the API token from a `token` URL query parameter in addition to the `Authorization` header. When a valid API credential is sent in the URL, it can be exposed through request URIs recorded by intermediaries or client-side tooling, such as reverse proxy access logs, browser history, shell history, clipboard history, and tracing systems that capture full URLs.\n\nThis issue is an unsafe credential transport pattern rather than a direct authentication bypass. It only affects deployments where a token is configured and a client actually uses the query-parameter form. PinchTab's security guidance already recommended `Authorization: Bearer \u003ctoken\u003e`, but `v0.8.3` still accepted `?token=` and included first-party flows that generated and consumed URLs containing the token.\n\nThis was addressed in v0.8.4 by removing query-string token authentication and requiring safer header- or session-based authentication flows.\n\n### Details\n**Issue 1 — Query-string token accepted in `v0.7.8` through `v0.8.3` (`internal/handlers/middleware.go`):**\nThe `v0.8.3` authentication middleware accepted credentials from the URL query string:\n\n```\n// internal/handlers/middleware.go — v0.8.3\nauth := r.Header.Get(\"Authorization\")\nqToken := r.URL.Query().Get(\"token\")\n\nif auth == \"\" \u0026\u0026 qToken == \"\" {\n    web.ErrorCode(w, 401, \"missing_token\", \"unauthorized\", false, nil)\n    return\n}\n\nprovided := strings.TrimPrefix(auth, \"Bearer \")\nif provided == auth {\n    if qToken != \"\" {\n        provided = qToken\n    } else {\n        provided = auth\n    }\n}\n\nif subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.Token)) != 1 {\n    web.ErrorCode(w, 401, \"bad_token\", \"unauthorized\", false, nil)\n    return\n}\n```\n\nThis means any client sending `GET /health?token=\u003csecret\u003e` in `v0.8.3` would authenticate successfully without using the `Authorization` header. I verified the same query-token auth pattern is present in the historical tag range starting at `v0.7.8`, and it is removed in `v0.8.4`.\n\n**Issue 2 — First-party setup and dashboard flows in `v0.8.3` generated and consumed `?token=` URLs:**\nThe `v0.8.3` setup flow generated dashboard URLs containing the token in the query string:\n\n```\n// cmd/pinchtab/cmd_wizard.go — v0.8.3\nfunc dashboardURL(cfg *config.FileConfig, path string) string {\n    host := orDefault(cfg.Server.Bind, \"127.0.0.1\")\n    port := orDefault(cfg.Server.Port, \"9867\")\n    url := fmt.Sprintf(\"http://%s:%s%s\", host, port, path)\n    if cfg.Server.Token != \"\" {\n        url += \"?token=\" + cfg.Server.Token\n    }\n    return url\n}\n```\n\nThe `v0.8.3` dashboard frontend also supported one-click login from that same query-string token:\n\n```\n// dashboard/src/App.tsx — v0.8.3\nconst params = new URLSearchParams(window.location.search);\nconst urlToken = params.get(\"token\");\nif (urlToken) {\n    setStoredAuthToken(urlToken);\n    clean.searchParams.delete(\"token\");\n    window.history.replaceState({}, \"\", clean.pathname + clean.hash);\n    window.location.reload();\n}\n```\n\nThat combination materially increased the chance that users would open, copy, paste, bookmark, or log URLs containing live credentials before the token was scrubbed from the visible address bar.\n\n**Issue 3 — Exposure depends on surrounding systems recording the URL:**\nPinchTab's own request logger records `r.URL.Path`, not the full raw query string, so the leak is not primarily through PinchTab's structured application log. The risk comes from surrounding systems or client tooling that record the full request URI, such as:\n\n1. reverse proxies and load balancers\n2. browser history or bookmarks\n3. shell history containing full `curl` commands\n4. clipboard or terminal history when the wizard prints and copies a tokenized URL\n5. tracing or monitoring systems that capture full request URLs\n\n### PoC\n**Step 1 — Confirm auth is required**\n\n```bash\ncurl -i http://localhost:9867/health\n```\n\nExpected in token-protected affected deployments:\n\n```http\nHTTP/1.1 401 Unauthorized\n```\n\n**Step 2 — Authenticate using the vulnerable query-parameter pattern**\n\n```bash\ncurl -i \"http://localhost:9867/health?token=supersecrettoken\"\n```\n\nExpected:\n\n```http\nHTTP/1.1 200 OK\n```\n\nThis demonstrates that the token is accepted from the URL.\n\n**Step 3 — Observe the exposure vector**\nIf the request traverses a system that records the full URI, the token may appear in logs or local history, for example:\n\n```text\nGET /health?token=supersecrettoken HTTP/1.1\n```\n\nIn `v0.8.3`, a first-party reproduction path also exists without any external proxy: run the setup wizard, copy the printed dashboard URL containing `?token=...`, and note that the live credential is now present in clipboard history and any place that URL is pasted.\n\n### Impact\n1. Exposure of a valid API token through unsafe URL-based transport when a client uses the `?token=` authentication form.\n2. Lower barrier for credential compromise where reverse proxies, browser history, shell history, clipboard history, or tracing systems retain full request URIs.\n3. The `v0.8.3` wizard/dashboard flow increased the practical likelihood of this exposure by generating and consuming tokenized URLs as a first-party login pattern.\n4. Practical risk depends on actual use of the query-token pattern; deployments that use only `Authorization: Bearer \u003ctoken\u003e` are not affected by this issue in practice.\n5. This is not a direct authentication bypass. An attacker still needs access to a secondary source that captured the URL containing the token.\n\n### Suggested Remediation\n1. Reject query-string token authentication and accept credentials only through the `Authorization` header or controlled session mechanisms.\n2. Avoid generating user-facing URLs that contain live credentials.\n3. Document header-based auth as the only supported non-browser API authentication pattern.\n4. Recommend token rotation for users who may previously have used query-parameter authentication.\n\n**Screenshot Capture**\n\u003cimg width=\"1162\" height=\"164\" alt=\"ภาพถ่ายหน้าจอ 2569-03-18 เวลา 12 46 08\" src=\"https://github.com/user-attachments/assets/e68b4469-dafd-400d-a6e1-f74d368cc8ac\" /\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pinchtab/pinchtab",
+        "purl": "pkg:golang/github.com/pinchtab/pinchtab"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.7.8"
+            },
+            {
+              "fixed": "0.8.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-mrqc-3276-74f8/GHSA-mrqc-3276-74f8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/security/advisories/GHSA-mrqc-3276-74f8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33620"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pinchtab/pinchtab"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pinchtab/pinchtab/releases/tag/v0.8.4"
+    }
+  ]
+}

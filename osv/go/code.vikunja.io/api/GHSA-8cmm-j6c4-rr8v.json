@@ -1,0 +1,63 @@
+{
+  "id": "GHSA-8cmm-j6c4-rr8v",
+  "modified": "2026-03-26T21:11:11.623327Z",
+  "published": "2026-03-25T21:17:12Z",
+  "aliases": [
+    "CVE-2026-33676",
+    "GO-2026-4847"
+  ],
+  "summary": "Vikunja has Cross-Project Information Disclosure via Task Relations — Missing Authorization Check on Related Task Read",
+  "details": "## Summary\n\nWhen the Vikunja API returns tasks, it populates the `related_tasks` field with full task objects for all related tasks without checking whether the requesting user has read permission on those tasks' projects. An authenticated user who can read a task that has cross-project relations will receive full details (title, description, due dates, priority, percent completion, project ID, etc.) of tasks in projects they have no access to.\n\n## Details\n\nThe vulnerability is in `addRelatedTasksToTasks()` at `pkg/models/tasks.go:496-548`. This function is called by `addMoreInfoToTasks()` (line 773) during every task read operation — both project task listings (`GET /api/v1/projects/{id}/views/{id}/tasks`) and single task reads (`GET /api/v1/tasks/{id}`).\n\nThe function fetches all related tasks directly from the database without any permission filtering:\n\n```go\n// pkg/models/tasks.go:496-548\nfunc addRelatedTasksToTasks(s *xorm.Session, taskIDs []int64, taskMap map[int64]*Task, a web.Auth) (err error) {\n    relatedTasks := []*TaskRelation{}\n    err = s.In(\"task_id\", taskIDs).Find(\u0026relatedTasks)\n    // ...\n    fullRelatedTasks := make(map[int64]*Task)\n    err = s.In(\"id\", relatedTaskIDs).Find(\u0026fullRelatedTasks)  // Line 514: NO permission check\n    // ...\n    for _, rt := range relatedTasks {\n        // Directly adds to response without checking if user can read the related task\n        taskMap[rt.TaskID].RelatedTasks[rt.RelationKind] = append(\n            taskMap[rt.TaskID].RelatedTasks[rt.RelationKind], otherTask)\n    }\n}\n```\n\nThe `a web.Auth` parameter is received but only used for determining favorites (line 519), never for access control on the related tasks themselves.\n\nIn contrast, `addBucketsToTasks()` (line 550+) in the same file correctly filters enrichment data by calling `getAllRawProjects(s, a, ...)` to scope results to projects the requesting user can access.\n\nWhile task relation **creation** properly enforces authorization (`task_relation_permissions.go:32-52` checks write access on the base task and read access on the other task), the relation **display** path does not re-check permissions for the current reader. This means a privileged user can create a relation that then leaks data to all other users who can read the base task.\n\n## PoC\n\n**Setup:** Two users (User A, User B), two projects (Project-Shared, Project-Private).\n- User A has access to both projects.\n- User B has access only to Project-Shared.\n- Task 1 exists in Project-Shared, Task 2 exists in Project-Private.\n\n**Step 1: User A creates a relation between the two tasks**\n\n```bash\n# As User A (who has access to both projects)\ncurl -X PUT \"http://localhost:3456/api/v1/tasks/TASK1_ID/relations\" \\\n  -H \"Authorization: Bearer USER_A_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"other_task_id\": TASK2_ID, \"relation_kind\": \"related\"}'\n```\n\nExpected: 201 Created (User A has write on Task 1, read on Task 2).\n\n**Step 2: User B reads tasks from the shared project**\n\n```bash\n# As User B (who has NO access to Project-Private)\ncurl \"http://localhost:3456/api/v1/projects/PROJECT_SHARED_ID/views/VIEW_ID/tasks\" \\\n  -H \"Authorization: Bearer USER_B_TOKEN\"\n```\n\nExpected: Task 1 should be returned, but related_tasks should NOT include Task 2.\n\n**Actual result:** The response includes Task 1 with the `related_tasks` field containing the full Task 2 object, including its `title`, `description`, `due_date`, `priority`, `percent_done`, `project_id`, and other metadata — despite User B having no access to Project-Private.\n\n## Impact\n\n- **Information disclosure**: Any authenticated user can read the full metadata of tasks in projects they do not have access to, as long as a relation exists from a task they can read.\n- **Leaked fields include**: title, description, due dates, start dates, priority, percent completion, project ID, hex color, task index, done status, repeat configuration, cover image attachment ID, and creation/update timestamps.\n- **Project structure disclosure**: The `project_id` field reveals the existence and IDs of private projects.\n- **No user interaction required**: Once a privileged user creates a cross-project relation (which is intentionally allowed), the data leak is automatic for all readers of the base task.\n- **Blast radius**: Affects all Vikunja instances with cross-project task relations. In multi-tenant or team environments where projects have different access scopes, this undermines project-level access control.\n\n## Recommended Fix\n\nFilter related tasks by the requesting user's read permissions before adding them to the response. In `addRelatedTasksToTasks()`, after fetching full task objects, check that the user can read each related task's project:\n\n```go\nfunc addRelatedTasksToTasks(s *xorm.Session, taskIDs []int64, taskMap map[int64]*Task, a web.Auth) (err error) {\n    relatedTasks := []*TaskRelation{}\n    err = s.In(\"task_id\", taskIDs).Find(\u0026relatedTasks)\n    if err != nil {\n        return\n    }\n\n    var relatedTaskIDs []int64\n    for _, rt := range relatedTasks {\n        relatedTaskIDs = append(relatedTaskIDs, rt.OtherTaskID)\n    }\n\n    if len(relatedTaskIDs) == 0 {\n        return\n    }\n\n    fullRelatedTasks := make(map[int64]*Task)\n    err = s.In(\"id\", relatedTaskIDs).Find(\u0026fullRelatedTasks)\n    if err != nil {\n        return\n    }\n\n    // Filter related tasks by user's read permission\n    allowedProjectIDs := make(map[int64]bool)\n    checkedProjectIDs := make(map[int64]bool)\n    for _, t := range fullRelatedTasks {\n        if checkedProjectIDs[t.ProjectID] {\n            continue\n        }\n        checkedProjectIDs[t.ProjectID] = true\n        p := \u0026Project{ID: t.ProjectID}\n        canRead, _, err := p.CanRead(s, a)\n        if err != nil {\n            log.Errorf(\"Could not check project read permission: %v\", err)\n            continue\n        }\n        if canRead {\n            allowedProjectIDs[t.ProjectID] = true\n        }\n    }\n\n    taskFavorites, err := getFavorites(s, relatedTaskIDs, a, FavoriteKindTask)\n    if err != nil {\n        return err\n    }\n\n    for _, rt := range relatedTasks {\n        task, has := fullRelatedTasks[rt.OtherTaskID]\n        if !has {\n            continue\n        }\n        // Skip related tasks the user cannot access\n        if !allowedProjectIDs[task.ProjectID] {\n            continue\n        }\n        fullRelatedTasks[rt.OtherTaskID].IsFavorite = taskFavorites[rt.OtherTaskID]\n        otherTask := \u0026Task{}\n        err = copier.Copy(otherTask, fullRelatedTasks[rt.OtherTaskID])\n        if err != nil {\n            log.Errorf(\"Could not duplicate task object: %v\", err)\n            continue\n        }\n        otherTask.RelatedTasks = nil\n        taskMap[rt.TaskID].RelatedTasks[rt.RelationKind] = append(\n            taskMap[rt.TaskID].RelatedTasks[rt.RelationKind], otherTask)\n    }\n\n    return\n}\n```\n\nThis checks project-level read permission once per unique project ID (cached in `allowedProjectIDs`) and skips related tasks from projects the user cannot access.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-8cmm-j6c4-rr8v/GHSA-8cmm-j6c4-rr8v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8cmm-j6c4-rr8v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33676"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/2449"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/833f2aec006ac0f6643c41872e45dd79220b9174"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.2-was-released"
+    }
+  ]
+}

