@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-9q5m-jfc4-wc92",
+  "modified": "2026-04-01T20:01:23.089558Z",
+  "published": "2026-04-01T19:52:04Z",
+  "aliases": [
+    "CVE-2026-33544"
+  ],
+  "summary": "Tinyauth has OAuth account confusion via shared mutable state on singleton service instances",
+  "details": "### Summary\n\nAll three OAuth service implementations (`GenericOAuthService`, `GithubOAuthService`, `GoogleOAuthService`) store PKCE verifiers and access tokens as mutable struct fields on singleton instances shared across all concurrent requests. When two users initiate OAuth login for the same provider concurrently, a race condition between `VerifyCode()` and `Userinfo()` causes one user to receive a session with the other user's identity.\n\n### Details\n\nThe [`OAuthBrokerService.GetService()`](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/oauth_broker_service.go#L70-L72) returns a single shared instance per provider for every request. The OAuth flow stores intermediate state as struct fields on this singleton:\n\n**Token storage** — [`generic_oauth_service.go` line 96](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/generic_oauth_service.go#L96):\n```go\ngeneric.token = token  // Shared mutable field on singleton\n```\n\n**Verifier storage** — [`generic_oauth_service.go` line 81](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/generic_oauth_service.go#L81):\n```go\ngeneric.verifier = verifier  // Shared mutable field on singleton\n```\n\nIn the callback handler [`oauth_controller.go` lines 136–143](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/controller/oauth_controller.go#L136-L143), the code calls:\n```go\nerr = service.VerifyCode(code)                       // line 136 — stores token on singleton\n// ... race window ...\nuser, err := controller.broker.GetUser(req.Provider)  // line 143 — reads token from singleton\n```\n\nBetween these two calls, a concurrent request's `VerifyCode()` can overwrite the `token` field, causing `GetUser()` → `Userinfo()` to fetch the **wrong user's** identity claims.\n\nThe same pattern exists in all three implementations:\n- [`github_oauth_service.go` lines 34–39, 77, 86–99](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/github_oauth_service.go#L34-L39)\n- [`google_oauth_service.go` lines 22–27, 65, 73–87](https://github.com/steveiliop56/tinyauth/blob/592b7ded24959013f8af63ab9930254c752c8c8e/internal/service/google_oauth_service.go#L22-L27)\n\n### PoC\n\n**Race scenario** (two concurrent OAuth callbacks):\n\n1. User A and User B both click \"Login with GitHub\" on the same tinyauth instance\n2. Both are redirected to GitHub, authorize, and GitHub redirects both back with authorization codes\n3. Both callbacks arrive at tinyauth nearly simultaneously:\n\n```\nTimeline:\n  t0: Request A → service.VerifyCode(codeA) → singleton.token = tokenA\n  t1: Request B → service.VerifyCode(codeB) → singleton.token = tokenB  (overwrites tokenA)\n  t2: Request A → broker.GetUser(\"github\")  → Userinfo() reads singleton.token = tokenB\n  t3: Request A receives User B's identity (email, name, groups)\n```\n\nUser A now has a tinyauth session with User B's email, gaining access to all resources User B is authorized for via tinyauth's ACL.\n\n**PKCE verifier DoS variant**: Even with PKCE, concurrent `oauthURLHandler` calls overwrite the `verifier` field, causing `VerifyCode()` to send the wrong verifier to the OAuth provider, which rejects the exchange.\n\n**Static verification**: Run Go's race detector on a test that calls `VerifyCode` and `Userinfo` concurrently on the same service instance — the `-race` flag will flag data races on the `token` and `verifier` fields.\n\n**Go race detector confirmation**: Running a concurrent test with `go test -race` on the singleton service detects **4 data races** on the `token` and `verifier` fields. Without the race detector, measured token overwrite rate is 99.9% (9,985/10,000 iterations).\n\n**Test environment**: tinyauth v5.0.4, commit `592b7ded`, Go race detector + source code analysis\n\n### Impact\n\nAn attacker who times their OAuth callback to race with a victim's callback can obtain a tinyauth session with the victim's identity. This grants unauthorized access to all resources the victim is permitted to access through tinyauth's ACL system. The probability of collision increases with concurrent OAuth traffic.\n\nThe PKCE verifier overwrite additionally causes a denial-of-service: concurrent OAuth logins for the same provider reliably fail.\n\n### Suggested Fix\n\nPass verifier and token through method parameters or return values instead of storing them on the singleton:\n\n```go\nfunc (generic *GenericOAuthService) VerifyCode(code string, verifier string) (*oauth2.Token, error) {\n    return generic.config.Exchange(generic.context, code, oauth2.VerifierOption(verifier))\n}\n\nfunc (generic *GenericOAuthService) Userinfo(token *oauth2.Token) (config.Claims, error) {\n    client := generic.config.Client(generic.context, token)\n    // ...\n}\n```\n\nStore the PKCE verifier in the session/cookie associated with the OAuth `state` parameter, not on the service struct.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/steveiliop56/tinyauth",
+        "purl": "pkg:golang/github.com/steveiliop56/tinyauth"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.0.1-0.20260401140714-fc1d4f2082a5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-9q5m-jfc4-wc92/GHSA-9q5m-jfc4-wc92.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/steveiliop56/tinyauth/security/advisories/GHSA-9q5m-jfc4-wc92"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/steveiliop56/tinyauth"
+    }
+  ]
+}
