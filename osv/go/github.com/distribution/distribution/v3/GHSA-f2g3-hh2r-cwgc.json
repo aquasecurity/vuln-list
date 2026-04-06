@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-f2g3-hh2r-cwgc",
+  "modified": "2026-04-06T18:02:03.217900Z",
+  "published": "2026-04-06T17:53:40Z",
+  "aliases": [
+    "CVE-2026-35172"
+  ],
+  "summary": "Distribution: stale blob access resurrection via repo-scoped redis descriptor cache invalidation",
+  "details": "## summary:\ndistribution can restore read access in `repo a` after an explicit delete when `storage.cache.blobdescriptor: redis` and `storage.delete.enabled: true` are both enabled. the delete path clears the shared digest descriptor but leaves stale repo-scoped membership behind, so a later `Stat` or `Get` from `repo b` repopulates the shared descriptor and makes the deleted blob readable from `repo a` again.\n\n## Severity\n\nHIGH\n\njustification: this is a repo-local authorization bypass after explicit delete, with concrete confidentiality impact and no requirement for write access after the delete event. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N (7.5). CWE-284.\n\n# affected version\n\n- repository: https://github.com/distribution/distribution\n- commit: ab67ffa0bda3712991194841d0fde727464feeb9\n- affected versions: \\\u003c= 3.0.x, \\\u003c= 2.8.x when redis blob descriptor cache and delete are both enabled\n- affected file:\n  - https://github.com/distribution/distribution/blob/ab67ffa0bda3712991194841d0fde727464feeb9/registry/storage/cache/redis/redis.go#L212-L226\n- related callsites:\n  - https://github.com/distribution/distribution/blob/ab67ffa0bda3712991194841d0fde727464feeb9/registry/storage/cache/cachedblobdescriptorstore.go#L66-L76\n  - https://github.com/distribution/distribution/blob/ab67ffa0bda3712991194841d0fde727464feeb9/registry/storage/linkedblobstore.go#L218-L224\n  - https://github.com/distribution/distribution/blob/ab67ffa0bda3712991194841d0fde727464feeb9/registry/storage/linkedblobstore.go#L396-L403\n\n# details\n\nthe backend access model is repository-link based: once `repo a` deletes its blob link, later reads from `repo a` should continue returning `ErrBlobUnknown` even if the same digest remains linked in `repo b`.\n\nthe issue is the split invalidation path in the redis cache backend:\n\n1. `linkedBlobStore.Delete` calls `blobAccessController.Clear` during repository delete handling.\n2. `cachedBlobStatter.Clear` forwards that invalidation into the cache layer.\n3. `repositoryScopedRedisBlobDescriptorService.Clear` checks that the digest is a member of `repo a`, but then only calls `upstream.Clear`.\n4. `upstream.Clear` deletes the shared digest descriptor and does not remove the digest from the repository membership set for `repo a`.\n5. when `repo b` later stats or gets the same digest, the shared descriptor is recreated.\n6. `repositoryScopedRedisBlobDescriptorService.Stat` for `repo a` accepts the stale membership and now trusts the repopulated shared descriptor, restoring access in the repository that already deleted its link.\n\nthis creates a revocation gap at the repository boundary. the blob is briefly inaccessible from `repo a` right after delete, which confirms the backend link was removed, and then becomes accessible again only because stale redis membership survived while a peer repository repopulated the shared descriptor.\n\n# attack scenario\n\n1. an operator runs distribution with `storage.cache.blobdescriptor: redis` and `storage.delete.enabled: true`.\n2. the same digest exists in both `repo a` and `repo b`.\n3. the operator deletes the blob from `repo a` and expects repository-local access to be revoked.\n4. `repo a` correctly returns `blob unknown` immediately after the delete.\n5. an anonymous or unprivileged user requests the same digest from `repo b`, which still legitimately owns it and repopulates the shared descriptor.\n6. a later request for the digest from `repo a` succeeds again because stale repo-a membership was never revoked from redis.\n\n# PoC\n\nattachment: `poc.zip`\n\nthe attached PoC is a deterministic integration harness using `miniredis` and the pinned distribution source tree.\n\n## steps to reproduce\n\ncanonical:\n\n```bash\nunzip -q -o poc.zip -d poc\ncd poc\nmake canonical\n```\n\nexpected output:\n\n```text\n[CALLSITE_HIT]: repositoryScopedRedisBlobDescriptorService.Clear-\u003eupstream.Clear-\u003erepositoryScopedRedisBlobDescriptorService.Stat\n[PROOF_MARKER]: repo_a_access_restored=true repo_a_delete_miss=true repo_b_peer_warm=true\n[IMPACT_MARKER]: repo_a_post_delete_read=true confidentiality_boundary_broken=true\n```\n\ncontrol:\n\n```bash\nunzip -q -o poc.zip -d poc\ncd poc\nmake control\n```\n\nexpected control output:\n\n```text\n[CALLSITE_HIT]: repositoryScopedRedisBlobDescriptorService.Clear-\u003erepositoryScopedRedisBlobDescriptorService.Stat\n[NC_MARKER]: repo_a_access_restored=false repo_b_peer_warm=true\n```\n\n# expected vs actual\n\n- expected: after `repo a` deletes its blob link, later reads from `repo a` should keep returning `blob unknown` even if `repo b` still references the same digest and warms cache state.\n- actual: `repo a` first returns `blob unknown`, then `repo b` repopulates the shared descriptor, and `repo a` serves the deleted digest again through stale repo-scoped redis membership.\n\n# impact\n\nthe confirmed impact is repository-local confidentiality failure after explicit delete. an operator can remove sensitive content from `repo a`, observe revocation working immediately after the delete, and still have the same content become readable from `repo a` again as soon as `repo b` refreshes the shared descriptor for that digest.\n\nthis is not a claim about global blob deletion. the bounded claim is that repository-local revocation fails, which breaks the expectation that deleting a blob link from one repository prevents further reads from that repository.\n\n# remediation\n\nthe safest fix is to make redis invalidation revoke repo-scoped state together with the backend link deletion. in practice that means removing the digest from the repository membership set, deleting the repo-scoped descriptor hash, and keeping that cleanup atomic enough that peer-repository warming cannot restore access in the repository that already deleted its link.\n\n[poc.zip](https://github.com/user-attachments/files/25813827/poc.zip)\n[PR_DESCRIPTION.md](https://github.com/user-attachments/files/25813828/PR_DESCRIPTION.md)\n[attack_scenario.md](https://github.com/user-attachments/files/25813829/attack_scenario.md)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/distribution/distribution/v3",
+        "purl": "pkg:golang/github.com/distribution/distribution/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-f2g3-hh2r-cwgc/GHSA-f2g3-hh2r-cwgc.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/distribution/distribution",
+        "purl": "pkg:golang/github.com/distribution/distribution"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.8.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-f2g3-hh2r-cwgc/GHSA-f2g3-hh2r-cwgc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/security/advisories/GHSA-f2g3-hh2r-cwgc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/commit/078b0783f239b4115d1a979e66f08832084e9d1d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/distribution/distribution"
+    }
+  ]
+}
