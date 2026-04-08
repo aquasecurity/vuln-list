@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-mx42-j6wv-px98",
+  "modified": "2026-04-08T00:42:40.124247Z",
+  "published": "2026-04-08T00:15:50Z",
+  "aliases": [
+    "CVE-2026-39360"
+  ],
+  "summary": "RustFS has an authorization bypass in multipart UploadPartCopy enables cross-bucket object exfiltration",
+  "details": "RustFS contains a missing authorization check in the multipart copy path (`UploadPartCopy`). A low-privileged user who cannot read objects from a victim bucket can still exfiltrate victim objects by copying them into an attacker-controlled multipart upload and completing the upload.\n\nThis breaks tenant isolation in multi-user / multi-tenant deployments.\n\n## Impact\n**Unauthorized cross-bucket / cross-tenant data exfiltration (Confidentiality: High).**\n\nAn attacker with only minimal permissions on their own bucket (multipart upload + Put/Get on destination objects) can copy and retrieve objects from a victim bucket **without** having `s3:GetObject` (or equivalent) permission on the source.\n\nIn the attached PoC, the attacker successfully exfiltrates a 5MB private object and proves integrity via matching SHA256 and size.\n\n## Threat Model (Realistic)\n- **Victim tenant/user** owns a bucket (e.g., `victim-bucket-*`) and stores private objects (e.g., `private/finance_dump.bin`).\n- **Attacker tenant/user** has **no permissions** on the victim bucket:\n  - cannot `ListObjects`, `HeadObject`, `GetObject`, or `CopyObject` from the victim bucket.\n- Attacker has **minimal permissions only on attacker bucket**:\n  - `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload`,\n  - and `PutObject`/`GetObject` for objects in attacker bucket.\n- Despite this, attacker can exfiltrate victim objects via multipart copy.\n\n## Root Cause Analysis\nThe access control layer fails open for multipart copy-related operations:\n\nFile: `rustfs/src/storage/access.rs`\n- `abort_multipart_upload()` returns `Ok(())` without authorization (L435–437)\n- `complete_multipart_upload()` returns `Ok(())` without authorization (L442–444)\n- `upload_part_copy()` returns `Ok(())` without authorization (L1446–1448)\n\nIn contrast, `copy_object()` correctly enforces authorization:\n- source `GetObject` authorization (L469)\n- destination `PutObject` authorization (L478)\n\nThe multipart copy implementation reads the source object directly:\n\nFile: `rustfs/src/app/multipart_usecase.rs`\n- `store.get_object_reader(\u0026src_bucket, \u0026src_key, ...)` (L959–962)\n\nBecause `upload_part_copy()` does not enforce source `GetObject` authorization, the server reads and copies victim data even when the requester lacks permission.\n\n## Affected Versions\n- **Tested vulnerable on:** `main` @ `c1d5106acc3480c275a52344df84633bb6dcd8f0`\n- **Git describe:** `1.0.0-alpha.86-3-gc1d5106a`\n\nThe fail-open authorization behavior for `UploadPartCopy` was introduced in:\n- **Commit:** `09ea11c13` (per `git blame` on `rustfs/src/storage/access.rs:1443-1448`)\n\n**Affected range (recommended wording):**\n- All versions **from** commit `09ea11c13` **through** `c1d5106acc3480c275a52344df84633bb6dcd8f0` (and likely any releases containing those commits) until a fix is applied.\n\n### Package version (Cargo metadata)\n- `rustfs` crate version in this tree: **0.0.5** (`cargo metadata`)\n\n## Proof of Concept (PoC) – Real Commands + Verified Results\n\n### Files\nPlace the PoC script at the repository root:\n\n- **PoC script:** [`poc_uploadpartcopy_exfil_v3.sh`](https://github.com/user-attachments/files/26006935/poc_uploadpartcopy_exfil_v3.sh)\n- **Captured output:** [`poc_v3_output.txt`](https://github.com/user-attachments/files/26006938/poc_v3_output.txt)\n- *(Optional)* **Redacted debug log:** `upload_part_copy_debug_redacted.log` (Authorization/signature redacted)\n\n### Environment \nRustFS running locally (Docker is simplest), listening on:\n\n- `http://127.0.0.1:9000`\n\nTools:\n- `awscli`, `jq`, `awscurl`\n\n### Steps to Reproduce\n1) Start RustFS (example):\n\n```bash\ndocker compose -f docker-compose-simple.yml up -d\n````\n\n2. Run the PoC and save output:\n\n```bash\nchmod +x poc_uploadpartcopy_exfil_v3.sh\n./poc_uploadpartcopy_exfil_v3.sh | tee poc_v3_output.txt\n```\n\n### Attachments\n\n* [`poc_uploadpartcopy_exfil_v3.sh`](https://github.com/user-attachments/files/26006950/poc_uploadpartcopy_exfil_v3.sh)\n* [`poc_v3_output.txt`](https://github.com/user-attachments/files/26006953/poc_v3_output.txt)\n\n\n### Expected Behavior\n\n* Attacker operations against victim bucket should be denied:\n\n  * `ListObjects` -\u003e AccessDenied\n  * `HeadObject` -\u003e AccessDenied\n  * `GetObject` -\u003e AccessDenied\n  * `CopyObject` -\u003e AccessDenied\n* `UploadPartCopy` from victim -\u003e attacker multipart should also be denied.\n\n### Actual Behavior\n\n* All direct operations against victim are denied (as expected),\n* but **`UploadPartCopy` succeeds**, and attacker retrieves the copied object from attacker bucket.\n\n### Observed PoC Output \n\nVictim uploads a private object:\n\n* size: `5,242,880` bytes\n* sha256: `fda018db1da9d8f4c1b287c75943384a3b4ede391ec156039b6d94e17d6ad68f`\n\nAttacker exfiltrates it via multipart copy:\n\n* stolen size: `5,242,880` bytes\n* stolen sha256: `fda018db1da9d8f4c1b287c75943384a3b4ede391ec156039b6d94e17d6ad68f`\n\nProof:\n\n* hashes and sizes match (victim == stolen) -\u003e unauthorized cross-bucket read confirmed.\n\n## Network Evidence (Redacted)\n\nThe debug log shows a successful request with:\n\n* HTTP method: `PUT`\n* destination: `/\u003cattacker-bucket\u003e/\u003cdst-key\u003e?partNumber=1\u0026uploadId=...`\n* header: `x-amz-copy-source: \u003cvictim-bucket\u003e/private/finance_dump.bin`\n* response: `HTTP/1.1 200` with `\u003cCopyPartResult\u003e\u003cETag\u003e...\u003c/ETag\u003e...\u003c/CopyPartResult\u003e`\n\n\n## Fix\n\nImplement authorization checks equivalent to `copy_object()` for multipart copy paths:\n\n* `upload_part_copy`:\n\n  * enforce **source** `GetObject` authorization on `x-amz-copy-source`\n  * enforce **destination** `PutObject` authorization on the target object\n  * (recommended) apply the same tag-condition enforcement used by `copy_object()` on the source.\n\n* `complete_multipart_upload`:\n\n  * enforce destination `PutObject` authorization\n\n* `abort_multipart_upload`:\n\n  * enforce appropriate multipart permission (or destination `PutObject` as a safe boundary)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "rustfs",
+        "purl": "pkg:cargo/rustfs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.0.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-mx42-j6wv-px98/GHSA-mx42-j6wv-px98.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rustfs/rustfs/security/advisories/GHSA-mx42-j6wv-px98"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-39360"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rustfs/rustfs"
+    }
+  ]
+}

