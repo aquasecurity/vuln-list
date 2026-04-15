@@ -1,0 +1,43 @@
+{
+  "id": "GHSA-vw86-c94w-v3x4",
+  "modified": "2026-04-10T19:49:50.148112Z",
+  "published": "2026-04-10T19:32:12Z",
+  "summary": "SiYuan: Publish Reader Path Traversal Delete via `removeUnusedAttributeView`",
+  "details": "SiYuan's publish/read-only boundary can be broken through `/api/av/removeUnusedAttributeView`.\n\nA publish-service Reader context can call this endpoint because it is protected only by `CheckAuth`, and publish requests are forwarded upstream with a valid `RoleReader` JWT. The handler accepts attacker-controlled `id` input and passes it directly into a filesystem delete sink:\n\n- no admin check\n- no readonly check\n- no node-ID validation\n- no subpath enforcement\n- no verification that the target AV is actually unused\n\nBecause the sink builds the file path with:\n\n```go\nfilepath.Join(util.DataDir, \"storage\", \"av\", id+\".json\")\n```\n\nan attacker can supply `../` path traversal sequences and delete arbitrary `.json` files reachable from the workspace, rather than only `data/storage/av/\u003cid\u003e.json`.\n\nThis is a real write/destructive authorization bug, not a `visible=false` listing issue.\n\n## Impact\n\nAn attacker with publish-reader access can delete arbitrary `.json` files under the workspace path reachable from `data/storage/av/` using traversal payloads.\n\nExamples of realistic targets:\n\n- `../local` -\u003e `data/storage/local.json`\n- `../../storage/recent-doc` -\u003e `data/storage/recent-doc.json`\n- `../../storage/outline` -\u003e `data/storage/outline.json`\n- `../../storage/criteria` -\u003e `data/storage/criteria.json`\n- `../../../conf/conf` -\u003e `conf/conf.json`\n\nPractical impact includes:\n\n- persistent destruction of Attribute View definitions\n- deletion of global workspace configuration\n- deletion of local storage and outline state\n- corruption of user state that survives reload\n- forced reset/recovery flows or broken UI behavior\n\nEven if some files can be regenerated, this is still a publish-reader to persistent server-side delete primitive against workspace data.\n\n## Source to Sink\n\n### Source 1: publish service issues Reader-role JWTs\n\n`kernel/server/proxy/publish.go`\n\nThe publish reverse proxy forwards requests to the kernel and injects `X-Auth-Token`.\n\n### Source 2: publish accounts are Reader-role accounts\n\n`kernel/model/auth.go`\n\nPublish accounts are created with `RoleReader`.\n\n### Source 3: generic auth accepts Reader role\n\n`kernel/model/session.go`\n\n`CheckAuth` allows:\n\n- `RoleAdministrator`\n- `RoleEditor`\n- `RoleReader`\n\n### Source 4: dangerous route is only guarded by `CheckAuth`\n\n[`kernel/api/router.go#L507`](/root/audit/siyuan/kernel/api/router.go#L507)\n\n```go\nginServer.Handle(\"POST\", \"/api/av/removeUnusedAttributeView\", model.CheckAuth, removeUnusedAttributeView)\n```\n\n### Source 5: attacker-controlled `id` is passed straight to model\n\n[`kernel/api/av.go#L32-L45`](/root/audit/siyuan/kernel/api/av.go#L32)\n\n```go\navID := arg[\"id\"].(string)\nmodel.RemoveUnusedAttributeView(avID)\n```\n\nThere is no:\n\n- `util.InvalidIDPattern(...)`\n- allowlist\n- normalization check\n- verification that the caller should modify this object\n\n### Sink: path traversal reaches filesystem delete\n\n[`kernel/model/attribute_view.go#L49-L76`](/root/audit/siyuan/kernel/model/attribute_view.go#L49)\n\n```go\nabsPath := filepath.Join(util.DataDir, \"storage\", \"av\", id+\".json\")\n...\nif err = filelock.RemoveWithoutFatal(absPath); err != nil {\n```\n\nBecause `id` is not validated, inputs like `../../../conf/conf` resolve outside `data/storage/av/`.\n\nExamples:\n\n```text\n../../../conf/conf              -\u003e \u003cworkspace\u003e/conf/conf.json\n../local                        -\u003e \u003cworkspace\u003e/data/storage/local.json\n../../storage/recent-doc        -\u003e \u003cworkspace\u003e/data/storage/recent-doc.json\n../../storage/outline           -\u003e \u003cworkspace\u003e/data/storage/outline.json\n../../storage/criteria          -\u003e \u003cworkspace\u003e/data/storage/criteria.json\n```\n\n## Proof of Concept\n\nPrerequisite:\n\n- publish service enabled\n- attacker has publish-reader access, or anonymous publish access if publish auth is disabled\n\nRequest:\n\n```http\nPOST /api/av/removeUnusedAttributeView HTTP/1.1\nHost: \u003cpublish-host\u003e:6808\nContent-Type: application/json\n\n{\n  \"id\": \"../../../conf/conf\"\n}\n```\n\nExpected result:\n\n- request is accepted from publish context\n- backend resolves target to `\u003cworkspace\u003e/conf/conf.json`\n- target file is removed\n\nSafer validation targets for testing:\n\n```json\n{\"id\":\"../local\"}\n{\"id\":\"../../storage/recent-doc\"}\n{\"id\":\"../../storage/outline\"}\n```\n\nThese demonstrate traversal without immediately targeting the main config file.\n\n\n## Root Cause\n\nTwo separate authorization/design failures combine here:\n\n1. publish Reader contexts are treated as fully authenticated for `CheckAuth` routes\n2. a destructive internal endpoint trusts raw `id` input as a filesystem path component\n\nEither issue would be dangerous; together they produce a high-impact delete primitive.\n\n## Remediation\n\n### 1. Lock the endpoint down properly\n\n`/api/av/removeUnusedAttributeView` should require:\n\n- `CheckAdminRole`\n- `CheckReadonly`\n\n### 2. Validate the identifier\n\nReject anything that is not a valid AV/node ID. For example, enforce `util.InvalidIDPattern(...)` or an equivalent strict allowlist.\n\n### 3. Enforce subpath safety\n\nAfter path construction, verify the resolved path remains under the intended directory:\n\n```go\nbase := filepath.Join(util.DataDir, \"storage\", \"av\")\nabsPath := filepath.Join(base, id+\".json\")\nif !util.IsSubPath(base, absPath) {\n    return error\n}\n```\n\n### 4. Actually verify \"unused\"\n\nBefore deletion, confirm that the requested AV is in the computed unused set. The current single-delete API does not do that at all.\n\n### 5. Add regression tests\n\nAdd negative tests proving a publish-reader context cannot:\n\n- call this endpoint successfully\n- delete a valid AV directly\n- pass traversal strings such as `../local`\n- escape `data/storage/av/`\n\n## Key References\n\n- Route exposure: [`kernel/api/router.go#L507`](/root/audit/siyuan/kernel/api/router.go#L507)\n- Handler: [`kernel/api/av.go#L32`](/root/audit/siyuan/kernel/api/av.go#L32)\n- Delete sink: [`kernel/model/attribute_view.go#L49`](/root/audit/siyuan/kernel/model/attribute_view.go#L49)\n- Publish proxy token forwarding: [`kernel/server/proxy/publish.go`](/root/audit/siyuan/kernel/server/proxy/publish.go)\n- Reader JWT issuance: [`kernel/model/auth.go`](/root/audit/siyuan/kernel/model/auth.go)\n- `CheckAuth` accepting `RoleReader`: [`kernel/model/session.go#L201`](/root/audit/siyuan/kernel/model/session.go#L201)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.40.0.0-20260407035653-2f416e5253f1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 0.0.0-20260407035653-2f416e5253f1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-vw86-c94w-v3x4/GHSA-vw86-c94w-v3x4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-vw86-c94w-v3x4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    }
+  ]
+}

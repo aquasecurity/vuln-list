@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-7m5h-w69j-qggg",
+  "modified": "2026-04-10T21:32:45Z",
+  "published": "2026-04-10T19:32:07Z",
+  "aliases": [
+    "CVE-2026-40259"
+  ],
+  "summary": "SiYuan: Publish Reader Can Arbitrarily Delete Attribute View Files via `/api/av/removeUnusedAttributeView`",
+  "details": "## Summary\n\nAn authenticated publish-service reader can invoke `/api/av/removeUnusedAttributeView` and cause persistent deletion of arbitrary attribute view (`AV`) definition files from the workspace.\n\nThe route is protected only by generic `CheckAuth`, which accepts publish `RoleReader` requests. The handler forwards a caller-controlled `id` directly into a model function that deletes `data/storage/av/\u003cid\u003e.json` without verifying either:\n\n- that the caller is allowed to perform write/destructive actions; or\n- that the target AV is actually unused.\n\nThis is a persistent integrity and availability issue reachable from the publish surface.\n\n## Root Cause\n\n### 1. Publish users are issued a `RoleReader` JWT\n\n- [kernel/model/auth.go](/root/audit/siyuan/kernel/model/auth.go#L105)\n\n```go\nClaimsKeyRole: RoleReader,\n```\n\n### 2. The publish reverse proxy forwards that token upstream\n\n- [kernel/server/proxy/publish.go](/root/audit/siyuan/kernel/server/proxy/publish.go#L131)\n- [kernel/server/proxy/publish.go](/root/audit/siyuan/kernel/server/proxy/publish.go#L186)\n\n### 3. `CheckAuth` accepts `RoleReader`\n\n- [kernel/model/session.go](/root/audit/siyuan/kernel/model/session.go#L201)\n\n```go\nif role := GetGinContextRole(c); IsValidRole(role, []Role{\n    RoleAdministrator,\n    RoleEditor,\n    RoleReader,\n}) {\n    c.Next()\n    return\n}\n```\n\n### 4. The route is exposed with `CheckAuth` only\n\n- [kernel/api/router.go](/root/audit/siyuan/kernel/api/router.go#L507)\n\n```go\nginServer.Handle(\"POST\", \"/api/av/removeUnusedAttributeView\", model.CheckAuth, removeUnusedAttributeView)\n```\n\nThere is no `CheckAdminRole` and no `CheckReadonly`.\n\n### 5. The handler forwards attacker-controlled `id` directly to the delete sink\n\n- [kernel/api/av.go](/root/audit/siyuan/kernel/api/av.go#L32)\n\n```go\navID := arg[\"id\"].(string)\nmodel.RemoveUnusedAttributeView(avID)\n```\n\n### 6. The model deletes the AV file unconditionally\n\n- [kernel/model/attribute_view.go](/root/audit/siyuan/kernel/model/attribute_view.go#L49)\n\n```go\nfunc RemoveUnusedAttributeView(id string) {\n    absPath := filepath.Join(util.DataDir, \"storage\", \"av\", id+\".json\")\n    if !filelock.IsExist(absPath) {\n        return\n    }\n    ...\n    if err = filelock.RemoveWithoutFatal(absPath); err != nil {\n        ...\n        return\n    }\n    IncSync()\n}\n```\n\nCrucially, this function does **not** verify that the supplied AV is actually unused. The name of the function suggests a cleanup helper, but the implementation is really \"delete AV file by id if it exists\".\n\n## Attack Prerequisites\n\n- Publish service enabled\n- Attacker can access the publish service\n- If publish auth is enabled, attacker has valid publish-reader credentials\n- Attacker knows an `avID`\n\n## Obtaining `avID`\n\n`avID` is not secret. It is exposed extensively in frontend markup as `data-av-id`.\n\nExamples:\n\n- [app/src/protyle/render/av/render.ts](/root/audit/siyuan/app/src/protyle/render/av/render.ts#L117)\n- [app/src/protyle/render/av/layout.ts](/root/audit/siyuan/app/src/protyle/render/av/layout.ts#L120)\n- [app/src/protyle/render/av/groups.ts](/root/audit/siyuan/app/src/protyle/render/av/groups.ts#L52)\n\nAny publish-visible database/attribute view can therefore disclose a valid `avID` to the attacker.\n\n## Exploit Path\n\n1. Attacker browses published content containing an attribute view.\n2. Attacker extracts the `data-av-id` value from the page/DOM.\n3. Attacker sends a POST request to `/api/av/removeUnusedAttributeView` through the publish service.\n4. Publish proxy injects a valid `RoleReader` token.\n5. `CheckAuth` accepts the request.\n6. The handler passes the attacker-controlled `avID` to `model.RemoveUnusedAttributeView`.\n7. The backend deletes `data/storage/av/\u003cavID\u003e.json`.\n\n## Proof of Concept\n\nRequest:\n\n```http\nPOST /api/av/removeUnusedAttributeView HTTP/1.1\nHost: \u003cpublish-host\u003e:\u003cpublish-port\u003e\nContent-Type: application/json\nAuthorization: Basic \u003cpublish-account-creds-if-enabled\u003e\n\n{\n  \"id\": \"\u003cexposed-data-av-id\u003e\"\n}\n```\n\nExpected result:\n\n- HTTP 200\n- backend increments sync state\n- the target attribute view file is removed from `data/storage/av/`\n- published and local workspace behavior for that AV becomes broken until restored from history or recreated\n\n## Impact\n\nThis gives a low-privileged publish reader a destructive persistent write primitive against workspace data.\n\nPractical consequences include:\n\n- deletion of live attribute view definitions\n- corruption/breakage of published database views\n- breakage of local workspace rendering and AV-backed relationships\n- operational disruption until restore or manual repair\n\nThe bug affects integrity and availability, not merely UI state.\n\n## Recommended Fix\n\nAt minimum:\n\n1. Block publish/read-only users from this route.\n2. Require admin/write authorization.\n3. Re-validate that the target AV is actually unused before deletion.\n\nSafe router fix:\n\n```go\nginServer.Handle(\"POST\", \"/api/av/removeUnusedAttributeView\",\n    model.CheckAuth,\n    model.CheckAdminRole,\n    model.CheckReadonly,\n    removeUnusedAttributeView,\n)\n```\n\nAnd inside the model or handler, reject deletion unless the target `id` is present in `UnusedAttributeViews(...)`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260407035653-2f416e5253f1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-7m5h-w69j-qggg/GHSA-7m5h-w69j-qggg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-7m5h-w69j-qggg"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+{
+  "id": "GHSA-66hx-chf7-3332",
+  "modified": "2026-04-14T23:49:43.665134Z",
+  "published": "2026-04-14T23:38:35Z",
+  "summary": "pyLoad has Stale Session Privilege After Role/Permission Change (Privilege Revocation Bypass)",
+  "details": "### Summary\npyLoad caches `role` and `permission` in the session at login and continues to authorize requests using these cached values, even after an admin changes the user's role/permissions in the database.\n\nAs a result, an already logged-in user can keep old (revoked) privileges until logout/session expiry, enabling continued privileged actions.\n\nThis is a core authorization/session-consistency issue and is not resolved by toggling an optional security feature.\n\n### Details\nThe WebUI auth flow stores authorization state in session:\n\n- `src/pyload/webui/app/helpers.py:187-200`\n  - `set_session(...)` writes:\n    - `\"role\": user_info[\"role\"]`\n    - `\"perms\": user_info[\"permission\"]`\n\nAuthorization checks later trust cached session values:\n\n- `src/pyload/webui/app/helpers.py:134-151`\n  - `parse_permissions(...)` reads `session.get(\"role\")` / `session.get(\"perms\")`\n- `src/pyload/webui/app/helpers.py:225-230`\n  - `is_authenticated(...)` only verifies `authenticated` and `api.user_exists(user)` (existence), not fresh role/permission\n- `src/pyload/webui/app/helpers.py:267-275`\n  - `login_required(...)` uses `parse_permissions(s)` for allow/deny decisions\n- `src/pyload/webui/app/helpers.py:356-365`\n  - API session auth path also trusts `s[\"role\"]` and `s[\"perms\"]`\n\nRole/permission updates are written to DB but active sessions are not invalidated/refreshed:\n\n- `src/pyload/webui/app/blueprints/json_blueprint.py:389-434`\n  - `update_users(...)` calls `api.set_user_permission(...)` and returns\n- `src/pyload/core/api/__init__.py:1643-1645`\n  - `set_user_permission(...)` updates DB role/permission only\n\nDefault exposure window is long:\n\n- `src/pyload/core/config/default.cfg:47`\n  - `session_lifetime = 44640` minutes (~31 days)\n\nTherefore, privilege revocation is not enforced immediately for active sessions.\n\nNote on duplicates:\n- This appears distinct from CVE-2023-0227 (session validity after **user deletion**) because this report is about stale authorization after **role/permission changes** while the user still exists.\n\n### PoC\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nRepro: stale session privilege after role/permission changes.\n\nThis PoC is source-based and leaves no persistent state.\nIt validates that:\n1) Role/permission are cached into session at login.\n2) Authorization checks read role/permission from session, not fresh DB values.\n3) User updates write DB permission/role without invalidating active sessions.\n4) Default session lifetime is long, increasing stale-privilege exposure window.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport pathlib\nimport re\nfrom typing import Iterable\n\n\nROOT = pathlib.Path(__file__).resolve().parent / \"pyload\" / \"src\" / \"pyload\"\n\n\ndef read(rel: str) -\u003e str:\n    return (ROOT / rel).read_text(encoding=\"utf-8\")\n\n\ndef has_any(text: str, patterns: Iterable[str]) -\u003e bool:\n    return all(re.search(p, text, re.MULTILINE) for p in patterns)\n\n\ndef main() -\u003e None:\n    helpers = read(\"webui/app/helpers.py\")\n    json_blueprint = read(\"webui/app/blueprints/json_blueprint.py\")\n    api_init = read(\"core/api/__init__.py\")\n    default_cfg = (ROOT / \"core/config/default.cfg\").read_text(encoding=\"utf-8\")\n\n    checks = {\n        \"set_session_caches_role_perms\": has_any(\n            helpers,\n            [\n                r'def\\\\s+set_session\\\\(',\n                r'\"role\"\\\\s*:\\\\s*user_info\\\\[\"role\"\\\\]',\n                r'\"perms\"\\\\s*:\\\\s*user_info\\\\[\"permission\"\\\\]',\n            ],\n        ),\n        \"is_authenticated_only_checks_user_exists\": has_any(\n            helpers,\n            [\n                r'def\\\\s+is_authenticated\\\\(',\n                r'api\\\\s*=\\\\s*flask\\\\.current_app\\\\.config\\\\[\"PYLOAD_API\"\\\\]',\n                r'return\\\\s+authenticated\\\\s+and\\\\s+api\\\\.user_exists\\\\(user\\\\)',\n            ],\n        ),\n        \"parse_permissions_reads_session_cache\": has_any(\n            helpers,\n            [\n                r'def\\\\s+parse_permissions\\\\(',\n                r'session\\\\.get\\\\(\"role\"\\\\)\\\\s*==\\\\s*Role\\\\.ADMIN',\n                r'session\\\\.get\\\\(\"perms\"\\\\)',\n            ],\n        ),\n        \"login_required_uses_parse_permissions_session\": has_any(\n            helpers,\n            [\n                r'def\\\\s+login_required\\\\(',\n                r'if\\\\s+is_authenticated\\\\(s\\\\):',\n                r'perms\\\\s*=\\\\s*parse_permissions\\\\(s\\\\)',\n            ],\n        ),\n        \"api_session_auth_uses_cached_role_perms\": has_any(\n            helpers,\n            [\n                r'if\\\\s+is_authenticated\\\\(s\\\\):',\n                r'\"role\"\\\\s*:\\\\s*s\\\\[\"role\"\\\\]',\n                r'\"permission\"\\\\s*:\\\\s*s\\\\[\"perms\"\\\\]',\n            ],\n        ),\n        \"update_users_changes_db_without_session_invalidation\": has_any(\n            json_blueprint,\n            [\n                r'def\\\\s+update_users\\\\(',\n                r'api\\\\.set_user_permission\\\\(name,\\\\s*data\\\\[\"permission\"\\\\],\\\\s*data\\\\[\"role\"\\\\]\\\\)',\n                r'return\\\\s+jsonify\\\\(True\\\\)',\n            ],\n        ),\n        \"set_user_permission_only_updates_db\": has_any(\n            api_init,\n            [\n                r'def\\\\s+set_user_permission\\\\(',\n                r'self\\\\.pyload\\\\.db\\\\.set_permission\\\\(user,\\\\s*permission\\\\)',\n                r'self\\\\.pyload\\\\.db\\\\.set_role\\\\(user,\\\\s*role\\\\)',\n            ],\n        ),\n        \"default_session_lifetime_long\": re.search(\n            r'session_lifetime\\\\s*:\\\\s*\"Session lifetime \\\\(minutes\\\\)\"\\\\s*=\\\\s*44640',\n            default_cfg,\n            re.MULTILINE,\n        )\n        is not None,\n    }\n\n    for name, ok in checks.items():\n        print(f\"{name}={ok}\")\n\n    stale_privilege_repro_success = all(checks.values())\n    print(f\"stale_privilege_repro_success={stale_privilege_repro_success}\")\n\n    # Cleanup: this PoC creates/modifies no runtime/data files.\n    print(\"cleanup_done=True\")\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n```text\nset_session_caches_role_perms=True\nis_authenticated_only_checks_user_exists=True\nparse_permissions_reads_session_cache=True\nlogin_required_uses_parse_permissions_session=True\napi_session_auth_uses_cached_role_perms=True\nupdate_users_changes_db_without_session_invalidation=True\nset_user_permission_only_updates_db=True\ndefault_session_lifetime_long=True\nstale_privilege_repro_success=True\ncleanup_done=True\n```\n\n### Impact\n- Privilege revocation is not immediate for active sessions.\n- A user can continue using stale, previously granted privileges (including admin) after downgrade/restriction.\n- This can allow continued access to privileged WebUI/API actions until session expiry or manual logout/session reset.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.5.0b3.dev97"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96",
+        "0.5.0b3.dev97"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-66hx-chf7-3332/GHSA-66hx-chf7-3332.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-66hx-chf7-3332"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/commit/e95804fb0d06cbb07d2ba380fc494d9ff89b68c1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

