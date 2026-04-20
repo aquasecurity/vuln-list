@@ -1,0 +1,150 @@
+{
+  "id": "GHSA-mp82-fmj6-f22v",
+  "modified": "2026-04-16T01:31:38.057913Z",
+  "published": "2026-04-16T01:20:49Z",
+  "aliases": [
+    "CVE-2026-40594"
+  ],
+  "summary": "pyLoad has a Session Cookie Security Downgrade via Untrusted X-Forwarded-Proto Header Spoofing (Global State Race Condition)",
+  "details": "## Summary\n\nThe `set_session_cookie_secure` `before_request` handler in `src/pyload/webui/app/__init__.py` reads the `X-Forwarded-Proto` header from any HTTP request without validating that the request originates from a trusted proxy, then mutates the **global** Flask configuration `SESSION_COOKIE_SECURE` on every request. Because pyLoad uses the multi-threaded Cheroot WSGI server (`request_queue_size=512`), this creates a race condition where an attacker's request can influence the `Secure` flag on other users' session cookies — either downgrading cookie security behind a TLS proxy or causing a session denial-of-service on plain HTTP deployments.\n\n## Details\n\nThe vulnerable code is in `src/pyload/webui/app/__init__.py:75-84`:\n\n```python\n# Dynamically set SESSION_COOKIE_SECURE according to the value of X-Forwarded-Proto\n# TODO: Add trusted proxy check\n@app.before_request\ndef set_session_cookie_secure():\n    x_forwarded_proto = flask.request.headers.get(\"X-Forwarded-Proto\", \"\")\n    is_secure = (\n        x_forwarded_proto.split(',')[0].strip() == \"https\" or\n        app.config[\"PYLOAD_API\"].get_config_value(\"webui\", \"use_ssl\")\n    )\n    flask.current_app.config['SESSION_COOKIE_SECURE'] = is_secure\n```\n\nThe root cause has two components:\n\n1. **No origin validation (CWE-346):** The `X-Forwarded-Proto` header is read from any client request. This header is only trustworthy when set by a known reverse proxy. Without `ProxyFix` middleware or a trusted proxy allowlist, any client can spoof it. The code itself acknowledges this with the TODO on line 76.\n\n2. **Global state mutation in a multi-threaded server:** `flask.current_app.config['SESSION_COOKIE_SECURE']` is application-wide shared state. When Thread A (attacker) writes `False` to this config, Thread B (victim) may read `False` when Flask's `save_session()` runs in the after_request phase, producing a `Set-Cookie` response without the `Secure` flag.\n\nThe Cheroot WSGI server is configured with `request_queue_size=512` in `src/pyload/webui/webserver_thread.py:46`, confirming concurrent multi-threaded request processing.\n\nNo `ProxyFix` or equivalent middleware is configured anywhere in the codebase (confirmed via codebase-wide search).\n\n## PoC\n\n**Attack Path 1 — Cookie Security Downgrade (behind TLS-terminating proxy, `use_ssl=False`):**\n\nAn attacker with direct access to the backend (e.g., in a containerized/Kubernetes deployment) sends concurrent requests to keep `SESSION_COOKIE_SECURE` set to `False`:\n\n```bash\n# Attacker floods backend directly, bypassing TLS proxy\nfor i in $(seq 1 200); do\n  curl -s -H 'X-Forwarded-Proto: http' http://pyload-backend:8000/ \u0026\ndone\n\n# Meanwhile, a legitimate user behind the TLS proxy receives a session cookie\n# During the race window, their Set-Cookie header lacks the Secure flag\n# The cookie is then vulnerable to interception over plain HTTP\n```\n\n**Attack Path 2 — Session Denial of Service (default plain HTTP deployment):**\n\n```bash\n# Attacker causes SESSION_COOKIE_SECURE=True on a plain HTTP server\nfor i in $(seq 1 200); do\n  curl -s -H 'X-Forwarded-Proto: https' http://localhost:8000/ \u0026\ndone\n\n# Concurrent legitimate users receive Set-Cookie with Secure flag\n# Browser refuses to send Secure cookies over HTTP\n# Users' sessions silently break — they appear logged out\n```\n\nThe second attack path works against the default configuration (`use_ssl=False`) and requires no special network position.\n\n## Impact\n\n- **Session cookie exposure (Attack Path 1):** When deployed behind a TLS-terminating proxy, an attacker can cause session cookies to be issued without the `Secure` flag. If the victim's browser subsequently makes an HTTP request (e.g., via a mixed-content link or downgrade attack), the session cookie is transmitted in cleartext, enabling session hijacking.\n\n- **Session denial of service (Attack Path 2):** On default plain HTTP deployments, an attacker can continuously set `SESSION_COOKIE_SECURE=True`, causing browsers to refuse sending session cookies back to the server. This silently breaks all concurrent users' sessions with no user-visible error message, only a redirect to login.\n\n- **No authentication required:** Both attack paths are fully unauthenticated — the `before_request` handler fires before any auth checks.\n\n## Recommended Fix\n\nReplace the global config mutation with per-response cookie handling, and add proxy validation:\n\n```python\n# Option A: Set Secure flag per-response instead of mutating global config\n@app.after_request\ndef set_session_cookie_secure(response):\n    # Only trust X-Forwarded-Proto if ProxyFix is configured\n    is_secure = app.config[\"PYLOAD_API\"].get_config_value(\"webui\", \"use_ssl\")\n    if 'Set-Cookie' in response.headers:\n        # Modify cookie flags per-response, not global config\n        cookies = response.headers.getlist('Set-Cookie')\n        response.headers.remove('Set-Cookie')\n        for cookie in cookies:\n            if is_secure and 'Secure' not in cookie:\n                cookie += '; Secure'\n            response.headers.add('Set-Cookie', cookie)\n    return response\n\n# Option B (preferred): Use Werkzeug's ProxyFix with explicit trust\nfrom werkzeug.middleware.proxy_fix import ProxyFix\n\n# In App.__new__, before returning:\nif trusted_proxy_count:  # from config\n    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=trusted_proxy_count)\n# Then set SESSION_COOKIE_SECURE once at startup based on use_ssl config,\n# and let ProxyFix handle X-Forwarded-Proto transparently\n```\n\nAt minimum, remove the `before_request` handler entirely and set `SESSION_COOKIE_SECURE` once at startup (line 130 already does this in `_configure_session`). The dynamic per-request adjustment is the root cause of both the spoofing and the race condition.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.5.0b3.dev98"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96",
+        "0.5.0b3.dev97"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.5.0b3.dev97",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-mp82-fmj6-f22v/GHSA-mp82-fmj6-f22v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-mp82-fmj6-f22v"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

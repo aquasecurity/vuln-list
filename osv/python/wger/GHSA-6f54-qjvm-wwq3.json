@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-6f54-qjvm-wwq3",
+  "modified": "2026-04-16T01:47:34.620174Z",
+  "published": "2026-04-16T01:37:21Z",
+  "aliases": [
+    "CVE-2026-40353"
+  ],
+  "summary": "wger has Stored XSS via Unescaped License Attribution Fields",
+  "details": "# Stored XSS via Unescaped License Attribution Fields\n\n## Summary\n\nThe `AbstractLicenseModel.attribution_link` property in `wger/utils/models.py` constructs HTML strings by directly interpolating user-controlled fields (`license_author`, `license_title`, `license_object_url`, `license_author_url`, `license_derivative_source_url`) without any escaping. The resulting HTML is rendered in the ingredient view template using Django's `|safe` filter, which disables auto-escaping. An authenticated user can create an ingredient with a malicious `license_author` value containing JavaScript, which executes when any user (including unauthenticated visitors) views the ingredient page.\n\n## Severity\n\n**High** (CVSS 3.1: ~7.6)\n\n- Low-privilege attacker (any authenticated non-temporary user)\n- Stored XSS — persists in database\n- Triggers on a public page (no authentication needed to view)\n- Can steal session cookies, perform actions as other users, redirect to phishing\n\n## CWE\n\nCWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')\n\n## Affected Components\n\n### Vulnerable Property\n**File:** `wger/utils/models.py:88-110`\n\n```python\n@property\ndef attribution_link(self):\n    out = ''\n    if self.license_object_url:\n        out += f'\u003ca href=\"{self.license_object_url}\"\u003e{self.license_title}\u003c/a\u003e'\n    else:\n        out += self.license_title  # NO ESCAPING\n    out += ' by '\n    if self.license_author_url:\n        out += f'\u003ca href=\"{self.license_author_url}\"\u003e{self.license_author}\u003c/a\u003e'\n    else:\n        out += self.license_author  # NO ESCAPING\n    out += f' is licensed under \u003ca href=\"{self.license.url}\"\u003e{self.license.short_name}\u003c/a\u003e'\n    if self.license_derivative_source_url:\n        out += (\n            f'/ A derivative work from \u003ca href=\"{self.license_derivative_source_url}\"\u003ethe '\n            f'original work\u003c/a\u003e'\n        )\n    return out\n```\n\n### Unsafe Template Rendering\n**File:** `wger/nutrition/templates/ingredient/view.html`\n\n- **Line 171:** `{{ ingredient.attribution_link|safe }}`\n- **Line 226:** `{{ image.attribution_link|safe }}`\n\n### Writable Entry Point\n**File:** `wger/nutrition/views/ingredient.py:154-175`\n\n```python\nclass IngredientCreateView(WgerFormMixin, CreateView):\n    model = Ingredient\n    form_class = IngredientForm  # includes license_author field\n```\n\n**URL:** `login_required(ingredient.IngredientCreateView.as_view())` — any authenticated non-temporary user.\n\n**Form fields (from `wger/nutrition/forms.py:295-313`):** includes `license_author` (TextField, max_length=3500) — no sanitization.\n\n### Models Affected\n\n6 models inherit from `AbstractLicenseModel`:\n- `Exercise`, `ExerciseImage`, `ExerciseVideo`, `Translation` (exercises module)\n- `Ingredient`, `Image` (nutrition module)\n\nOnly the **Ingredient** and nutrition **Image** models' attribution links are currently rendered with `|safe` in templates.\n\n## Root Cause\n\n1. `attribution_link` constructs raw HTML by string interpolation of user-controlled fields without calling `django.utils.html.escape()` or `django.utils.html.format_html()`\n2. The template renders the result with `|safe`, bypassing Django's auto-escaping\n3. The `license_author` field in `IngredientForm` has no input sanitization\n4. The `set_author()` method only sets a default value if the field is empty — it does not sanitize user-provided values\n\n## Reproduction Steps (Verified)\n\n### Prerequisites\n- A wger instance with user registration enabled (default)\n- An authenticated user account (non-temporary)\n\n### Steps\n\n1. **Register/login** to a wger instance\n\n2. **Create a malicious ingredient** via the web form at `/en/nutrition/ingredient/add/`:\n   - Set `Name` to any valid name (e.g., \"XSS Form Verified\")\n   - Set `Energy` to `125`, `Protein` to `10`, `Carbohydrates` to `10`, `Fat` to `5` (energy must approximately match macros)\n   - Set `Author(s)` (license_author) to:\n     ```\n     \u003cimg src=x onerror=\"alert(document.cookie)\"\u003e\n     ```\n   - Submit the form — **the form validates and saves successfully with no sanitization**\n\n3. **View the ingredient page** (public URL, no auth needed):\n   - Navigate to the newly created ingredient's detail page\n   - The XSS payload executes in the browser\n\n### Verified PoC Output\n\nThe rendered HTML in the ingredient detail page (line 171 of `ingredient/view.html`) contains:\n\n```html\n\u003csmall\u003e\n     by \u003cimg src=x onerror=alert(1)\u003e is licensed under \u003ca href=\"https://creativecommons.org/licenses/by-sa/3.0/deed.en\"\u003eCC-BY-SA 3\u003c/a\u003e\n\u003c/small\u003e\n```\n\nThe `\u003cimg\u003e` tag with `onerror` handler is injected directly into the page DOM and executes JavaScript when the browser attempts to load the non-existent image.\n\n### Alternative API Path (ExerciseImage)\n\nFor users who are \"trustworthy\" (account \u003e3 weeks old + verified email):\n\n```bash\n# Upload exercise image with XSS in license_author\ncurl -X POST https://wger.example.com/api/v2/exerciseimage/ \\\n  -H \"Authorization: Token \u003ctoken\u003e\" \\\n  -F \"exercise=1\" \\\n  -F \"image=@photo.jpg\" \\\n  -F 'license_author=\u003cimg src=x onerror=\"alert(document.cookie)\"\u003e' \\\n  -F \"license=2\"\n```\n\nNote: ExerciseImage's `attribution_link` is not currently rendered with `|safe` in exercise templates, but the data is stored with XSS payloads and would execute if any template renders it with `|safe` in the future. The API serializer also returns the unescaped `attribution_link` data, which could cause XSS in API consumers (mobile apps, SPAs).\n\n## Impact\n\n- **Session hijacking**: Steal admin session cookies to gain full control\n- **Account takeover**: Modify other users' passwords or email addresses\n- **Data theft**: Access other users' workout plans, nutrition data, and personal measurements\n- **Worm-like propagation**: Malicious ingredient could inject XSS that creates more malicious ingredients\n- **Phishing**: Redirect users to fake login pages\n\n## Suggested Fix\n\nReplace the `attribution_link` property with properly escaped HTML using Django's `format_html()`:\n\n```python\nfrom django.utils.html import format_html, escape\n\n@property\ndef attribution_link(self):\n    parts = []\n\n    if self.license_object_url:\n        parts.append(format_html('\u003ca href=\"{}\"\u003e{}\u003c/a\u003e', self.license_object_url, self.license_title))\n    else:\n        parts.append(escape(self.license_title))\n\n    parts.append(' by ')\n\n    if self.license_author_url:\n        parts.append(format_html('\u003ca href=\"{}\"\u003e{}\u003c/a\u003e', self.license_author_url, self.license_author))\n    else:\n        parts.append(escape(self.license_author))\n\n    parts.append(format_html(\n        ' is licensed under \u003ca href=\"{}\"\u003e{}\u003c/a\u003e',\n        self.license.url, self.license.short_name\n    ))\n\n    if self.license_derivative_source_url:\n        parts.append(format_html(\n            '/ A derivative work from \u003ca href=\"{}\"\u003ethe original work\u003c/a\u003e',\n            self.license_derivative_source_url\n        ))\n\n    return mark_safe(''.join(str(p) for p in parts))\n```\n\nAlternatively, remove the `|safe` filter from the templates and escape in the property, though this would break the anchor tags.\n\n## References\n\n- [Django Security: Cross Site Scripting (XSS) protection](https://docs.djangoproject.com/en/5.0/topics/security/#cross-site-scripting-xss-protection)\n- [Django `format_html()` documentation](https://docs.djangoproject.com/en/5.0/ref/utils/#django.utils.html.format_html)\n- [OWASP: Stored Cross-Site Scripting](https://owasp.org/www-community/attacks/xss/#stored-xss-attacks)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-6f54-qjvm-wwq3/GHSA-6f54-qjvm-wwq3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-6f54-qjvm-wwq3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    }
+  ]
+}

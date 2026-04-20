@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-xppv-4jrx-qf8m",
+  "modified": "2026-04-16T01:50:37.463230Z",
+  "published": "2026-04-16T01:35:16Z",
+  "aliases": [
+    "CVE-2026-40474"
+  ],
+  "summary": "wger has Broken Access Control in Global Gym Configuration Update Endpoint",
+  "details": "## Summary\n\nwger exposes a global configuration edit endpoint at `/config/gym-config/edit` implemented by `GymConfigUpdateView`. The view declares `permission_required = 'config.change_gymconfig'` but does not enforce it because it inherits `WgerFormMixin` (ownership-only checks) instead of the project’s permission-enforcing mixin (`WgerPermissionMixin`) .\n\nThe edited object is a singleton (`GymConfig(pk=1)`) and the model does not implement `get_owner_object()`, so `WgerFormMixin` skips ownership enforcement. As a result, a low-privileged authenticated user can modify installation-wide configuration and trigger server-side side effects in `GymConfig.save()`.\n\nThis is a vertical privilege escalation from a regular user to privileged global configuration control.\nThe application explicitly declares permission_required = 'config.change_gymconfig', demonstrating that the action is intended to be restricted; however, this requirement is never enforced at runtime.\n\n## Affected endpoint\n\nThe config URLs map as follows.\n\nFile: `wger/config/urls.py`\n\n```python\npatterns_gym_config = [\n    path('edit', gym_config.GymConfigUpdateView.as_view(), name='edit'),\n]\n\nurlpatterns = [\n    path(\n        'gym-config/',\n        include((patterns_gym_config, 'gym_config'), namespace='gym_config'),\n    ),\n]\n```\n\nThis resolves to:\n\n`/config/gym-config/edit`\n\n## Root cause\n\n### The view declares a permission but does not enforce it\n\nFile: `wger/config/views/gym_config.py`\n\n```python\nclass GymConfigUpdateView(WgerFormMixin, UpdateView):\n    model = GymConfig\n    fields = ('default_gym',)\n    permission_required = 'config.change_gymconfig'\n    success_url = reverse_lazy('gym:gym:list')\n    title = gettext_lazy('Edit')\n\n    def get_object(self):\n        return GymConfig.objects.get(pk=1)\n```\n\nThe permission string exists, but `WgerFormMixin` does not check `permission_required`.\n\n### The project’s permission mixin exists but is not used\n\nFile: `wger/utils/generic_views.py`\n\n```python\nclass WgerPermissionMixin:\n    permission_required = False\n    login_required = False\n\n    def dispatch(self, request, *args, **kwargs):\n        if self.login_required or self.permission_required:\n            if not request.user.is_authenticated:\n                return HttpResponseRedirect(\n                    reverse_lazy('core:user:login') + f'?next={request.path}'\n                )\n\n            if self.permission_required:\n                has_permission = False\n                if isinstance(self.permission_required, tuple):\n                    for permission in self.permission_required:\n                        if request.user.has_perm(permission):\n                            has_permission = True\n                elif request.user.has_perm(self.permission_required):\n                    has_permission = True\n\n                if not has_permission:\n                    return HttpResponseForbidden('You are not allowed to access this object')\n\n        return super(WgerPermissionMixin, self).dispatch(request, *args, **kwargs)\n```\n\n`GymConfigUpdateView` does not inherit this mixin, so none of the login/permission logic runs.\n\n### The mixin that *is* used performs only ownership checks, and `GymConfig` has no owner\n\nFile: `wger/utils/generic_views.py`\n\n```python\nclass WgerFormMixin(ModelFormMixin):\n    def dispatch(self, request, *args, **kwargs):\n        self.kwargs = kwargs\n        self.request = request\n\n        if self.owner_object:\n            owner_object = self.owner_object['class'].objects.get(pk=kwargs[self.owner_object['pk']])\n        else:\n            try:\n                owner_object = self.get_object().get_owner_object()\n            except AttributeError:\n                owner_object = False\n\n        if owner_object and owner_object.user != self.request.user:\n            return HttpResponseForbidden('You are not allowed to access this object')\n\n        return super(WgerFormMixin, self).dispatch(request, *args, **kwargs)\n```\n\nFile: `wger/config/models/gym_config.py`\n\n```python\nclass GymConfig(models.Model):\n    default_gym = models.ForeignKey(\n        Gym,\n        verbose_name=_('Default gym'),\n        # ...\n        null=True,\n        blank=True,\n        on_delete=models.CASCADE,\n    )\n    # No get_owner_object() method\n```\n\nBecause `GymConfig` does not implement `get_owner_object()`, `WgerFormMixin` catches `AttributeError` and sets `owner_object = False`, skipping any access restriction.\n\n## Security impact\n\nThis is not a cosmetic setting: `GymConfig.save()` performs installation-wide side effects.\n\nFile: `wger/config/models/gym_config.py`\n\n```python\ndef save(self, *args, **kwargs):\n    if self.default_gym:\n        UserProfile.objects.filter(gym=None).update(gym=self.default_gym)\n\n        for profile in UserProfile.objects.filter(gym=self.default_gym):\n            user = profile.user\n            if not is_any_gym_admin(user):\n                try:\n                    user.gymuserconfig\n                except GymUserConfig.DoesNotExist:\n                    config = GymUserConfig()\n                    config.gym = self.default_gym\n                    config.user = user\n                    config.save()\n\n    return super(GymConfig, self).save(*args, **kwargs)\n```\n\nOn deployments with multiple gyms, this allows a low-privileged user to tamper with tenant assignment defaults, affecting new registrations and bulk-updating existing users lacking a gym. This permits unauthorized modification of installation-wide state and bulk updates to other users’ records, violating the intended administrative trust boundary.\n\n## Proof of concept (local verification)\n\nEnvironment: local docker compose stack, accessed via `http://127.0.0.1:8088/en/`.\n\n### Observed behavior\n\nAn unauthenticated user can reach the endpoint via GET; POST requires authentication and redirects to login.\nAn authenticated low-privileged user can submit the form and change the global singleton. After the save, the application redirects to `success_url = reverse_lazy('gym:gym:list')` (e.g. `/en/gym/list`), which is permission-protected; therefore the browser may display a “Forbidden” page even though the global update already succeeded.\n\n### DB evidence (before/after)\n\nBefore submission:\n\n```bash\ndefault_gym_id= None\nprofiles_gym_null= 1\n```\n\nAfter a low-privileged user submitted the form setting `default_gym` to gym id `1`:\n\n```bash\ndefault_gym_id= 1\nprofiles_gym_null= 0\n```\n\n## Recommended fix\n\nEnsure permission enforcement runs before the form dispatch.\n\nUsing the project mixin (order matters):\n\n```python\nclass GymConfigUpdateView(WgerPermissionMixin, WgerFormMixin, UpdateView):\n    permission_required = 'config.change_gymconfig'\n    login_required = True\n```\n\nAlternatively, use Django’s `PermissionRequiredMixin` (and `LoginRequiredMixin`) directly.\n\n## Conclusion \n\nThe view explicitly declares permission_required = 'config.change_gymconfig', which demonstrates developer intent that this action be restricted. The fact that it is not enforced constitutes improper access control regardless of perceived business impact.\n\n\u003cimg width=\"1912\" height=\"578\" alt=\"Screenshot 2026-02-27 230752\" src=\"https://github.com/user-attachments/assets/c627b404-6d9c-4477-88bd-f867d0fa09d2\" /\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-xppv-4jrx-qf8m/GHSA-xppv-4jrx-qf8m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-xppv-4jrx-qf8m"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    }
+  ]
+}
