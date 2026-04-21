@@ -1,0 +1,112 @@
+{
+  "id": "GHSA-mf9w-mj56-hr94",
+  "modified": "2026-04-21T14:50:24.036382Z",
+  "published": "2026-04-21T14:38:57Z",
+  "aliases": [
+    "CVE-2026-28684"
+  ],
+  "summary": "python-dotenv: Symlink following in set_key allows arbitrary file overwrite via cross-device rename fallback",
+  "details": "### Summary\n\n`set_key()` and `unset_key()` in python-dotenv follow symbolic links when rewriting `.env` files, allowing a local attacker to overwrite arbitrary files via a crafted symlink when a cross-device rename fallback is triggered.\n\n\n### Details\n\nThe `rewrite()` context manager in `dotenv/main.py` is used by both `set_key()` and `unset_key()` to safely modify `.env` files. It works by writing to a temporary file (created in the system's default temp directory, typically `/tmp`) and then using `shutil.move()` to replace the original file.\n\nWhen the `.env` path is a symbolic link and the temp directory resides on a different filesystem than the target (a common configuration on Linux systems using tmpfs for `/tmp`), the following sequence occurs:\n\n1. `shutil.move()` first attempts `os.rename()`, which fails with an `OSError` because atomic renames cannot cross device boundaries.\n2. On failure, `shutil.move()` falls back to `shutil.copy2()` followed by `os.unlink()`.\n3. `shutil.copy2()` calls `shutil.copyfile()` with `follow_symlinks=True` by default.\n4. This causes the content to be written to the **symlink target** rather than replacing the symlink itself.\n\nAn attacker who has write access to the directory containing a `.env` file can pre-place a symlink pointing to any file that the application process has write access to. When the application (or a privileged process such as a deploy script, Docker entrypoint, or CI pipeline) calls `set_key()` or `unset_key()`, the symlink target is overwritten with the new `.env` content.\n\nThis vulnerability does not require a race condition and is fully deterministic once the preconditions are met.\n\n### Impact\nThe primary impacts are to **integrity** and **availability**:\n\n- **File overwrite / destruction (DoS):** An attacker can cause an application or privileged process to corrupt or destroy configuration files, database configs, or other sensitive files it would not normally have access to modify.\n- **Integrity violation:** The target file's original content is replaced with `.env`-formatted content controlled by the attacker.\n- **Potential privilege escalation:** In scenarios where a privileged process (running as root or a service account) calls `set_key()`, the attacker can leverage this to write to files beyond their own access level.\n\nThe scope of impact depends on the application using python-dotenv and the privileges under which it runs.\n\n\n### Proof of Concept\n\nThe following script demonstrates the vulnerability. It requires `/tmp` and the user's home directory to reside on different devices (common on systemd-based Linux systems with tmpfs).\n\n```python\nimport os\nimport sys\nimport tempfile\nfrom dotenv import set_key\n\n# Pre-condition: /tmp must be on a different device than the target directory.\ntmp_dev = os.stat(\"/tmp\").st_dev\nhome_dev = os.stat(os.path.expanduser(\"~\")).st_dev\nassert tmp_dev != home_dev, \"Skipped: /tmp and ~ are on the same device (no cross-device move)\"\n\nwith tempfile.TemporaryDirectory(dir=os.path.expanduser(\"~\")) as workdir:\n    # File an attacker wants to overwrite\n    target = os.path.join(workdir, \"victim_config.txt\")\n    with open(target, \"w\") as f:\n        f.write(\"DB_PASSWORD=supersecret\\n\")\n\n    # Attacker pre-places a symlink at the path the application will use as .env\n    env_symlink = os.path.join(workdir, \".env\")\n    os.symlink(target, env_symlink)\n\n    before = open(target).read()\n\n    # Application writes a new key -- triggers the cross-device fallback\n    set_key(env_symlink, \"INJECTED\", \"attacker_value\")\n\n    after = open(target).read()\n\n    print(\"Before:\", repr(before))\n    print(\"After: \", repr(after))\n    print(\"Symlink target overwritten:\", target)\n```\n\n**Expected output:**\n```\nBefore: 'DB_PASSWORD=supersecret\\n'\nAfter:  \"DB_PASSWORD=supersecret\\nINJECTED='attacker_value'\\n\"\nSymlink target overwritten: /home/user/tmp806nut2g/victim_config.txt\n```\n\n### Remediation\n\nThe fix changes the `rewrite()` context manager in the following ways:\n\n1. **Symlinks are no longer followed by default.** When the `.env` path is a symlink, `rewrite()` now resolves it to the real path before proceeding, or (by default) operates on the symlink entry itself rather than the target.\n2. **A `follow_symlinks: bool = False` parameter** is added to `set_key()` and `unset_key()` for users who explicitly need the old behavior.\n3. **Temp files are written in the same directory** as the target `.env` file (instead of the system temp directory), eliminating the cross-device rename condition entirely.\n4. **`os.replace()` is used instead of `shutil.move()`**, providing atomic replacement without symlink-following fallback behavior.\n\nUsers are advised to upgrade to the patched version as soon as it is available on PyPI.\n\n### Timeline\n\n| Date             | Event                                                                                                                                                                 |\n| ------------ | ---------------------------------------------------------------------------------------------------- |\n| 2026-01-09  | Initial report received from Giorgos Tsigourakos regarding a separate, unrelated issue also located in `rewrite()` |\n| 2026-01-10   | Co-maintainer acknowledged report, requested clarification                                                         |\n| 2026-01-11    | Initial report assessed as not exploitable and closed                                                              |\n| 2026-02-24  | Reporter identified new, distinct cross-device symlink attack vector with deterministic exploitation               |\n| 2026-02-26  | Co-maintainer confirmed vulnerability and shared draft patch                                                       |\n| 2026-02-26  | Reporter validated fix with monkeypatched PoC, proposed CVSS                                                       |\n| 2026-03-01   | Patch merged to main                                                                                               |\n| 2026-03-01   | Patched version released to PyPI                                                                                   |\n| 2026-04-20   | Advisory published                                                                                                 |\n\n### Patches\n\nUpgrade to v.1.2.2 or use the patch from https://github.com/theskumar/python-dotenv/commit/790c5c02991100aa1bf41ee5330aca75edc51311.patch",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "python-dotenv",
+        "purl": "pkg:pypi/python-dotenv"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.2.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.2",
+        "0.1.3",
+        "0.1.5",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.19.0",
+        "0.19.1",
+        "0.19.2",
+        "0.2.0",
+        "0.20.0",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.4.0",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.1.1",
+        "1.2.0",
+        "1.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-mf9w-mj56-hr94/GHSA-mf9w-mj56-hr94.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/theskumar/python-dotenv/security/advisories/GHSA-mf9w-mj56-hr94"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-28684"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theskumar/python-dotenv/commit/790c5c02991100aa1bf41ee5330aca75edc51311"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theskumar/python-dotenv/commit/790c5c02991100aa1bf41ee5330aca75edc51311.patch"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/theskumar/python-dotenv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theskumar/python-dotenv/releases/tag/v1.2.2"
+    }
+  ]
+}
