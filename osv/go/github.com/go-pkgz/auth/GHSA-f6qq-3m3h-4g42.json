@@ -1,0 +1,82 @@
+{
+  "id": "GHSA-f6qq-3m3h-4g42",
+  "modified": "2026-05-05T16:06:04.231068Z",
+  "published": "2026-04-30T20:47:24Z",
+  "aliases": [
+    "CVE-2026-42560"
+  ],
+  "summary": "auth: Patreon provider assigns the same local user ID to every authenticated Patreon account, enabling cross‑user impersonation",
+  "details": "### Summary\nThe Patreon OAuth provider maps every authenticated Patreon account to the same local `user.ID`, instead of deriving a unique ID from the Patreon account returned by Patreon.\n\nIn practice, this means all Patreon-authenticated users of an application using this library are collapsed into a single local identity. Any application that trusts `token.User.ID` as the stable account key can end up mixing or fully merging unrelated Patreon users, which can lead to cross-account access, privilege confusion, and subscription-state leakage.\n\n### Details\nThe bug is in the Patreon provider's user-mapping logic.\n\nBoth the root module and the `v2` module create a fresh empty `token.User{}` and then derive the Patreon ID from `userInfo.ID` before that field has been populated:\n\n```go\nmapUser: func(data UserData, bdata []byte) token.User {\n    userInfo := token.User{}\n\n    uinfoJSON := uinfo{}\n    if err := json.Unmarshal(bdata, \u0026uinfoJSON); err == nil {\n        userInfo.ID = \"patreon_\" + token.HashID(sha1.New(), userInfo.ID)\n        userInfo.Name = uinfoJSON.Data.Attributes.FullName\n        userInfo.Picture = uinfoJSON.Data.Attributes.ImageURL\n        ...\n    }\n    return userInfo\n}\n```\n\nAffected locations:\n\n- `provider/providers.go:257`\n- `v2/provider/providers.go:257`\n\nAt that point, `userInfo.ID` is still the empty string, so the effective result is always:\n\n```text\npatreon_ + sha1(\"\")\n```\n\nwhich is:\n\n```text\npatreon_da39a3ee5e6b4b0d3255bfef95601890afd80709\n```\n\nfor every Patreon user.\n\nThe code appears to have intended to hash the Patreon user ID returned by Patreon, i.e. `uinfoJSON.Data.ID`, but instead hashes the uninitialized destination field.\n\nWhy this matters:\n\n1. Patreon is a documented, supported provider.\n2. The library documents `token.User.ID` as the hashed user ID exposed to consumers.\n3. The OAuth flow stores the mapped user object in JWT claims, and middleware later injects that object into the request context verbatim, consuming handlers receive the provider's wrong user.ID as authoritative identity.\n\nRelevant flow in `v2`:\n\n- `v2/provider/oauth2.go:207` calls `u := p.mapUser(...)`\n- `v2/provider/oauth2.go:223` stores `u` in token claims\n- `v2/middleware/auth.go:154` copies `*claims.User` into request context\n\nThe existing tests already encode the broken behavior:\n\n- `provider/providers_test.go:179`\n- `provider/providers_test.go:204`\n- `v2/provider/providers_test.go:179`\n- `v2/provider/providers_test.go:204`\n\nThose tests assert the constant empty-string hash value for Patreon users.\n\n### PoC\nThis can be reproduced locally without contacting Patreon by exercising the provider's `mapUser` logic with two different Patreon payloads.\n\nFrom the repository root, create a temporary test file:\n\n`v2/provider/patreon_repro_test.go`\n\n```go\npackage provider\n\nimport \"testing\"\n\nfunc TestPatreonSharedIdentity(t *testing.T) {\n    r := NewPatreon(Params{\n        URL:     \"http://example.com\",\n        Cid:     \"cid\",\n        Csecret: \"secret\",\n    })\n\n    a := r.mapUser(UserData{}, []byte(`{\n        \"data\": {\n            \"attributes\": {\n                \"full_name\": \"Alice\",\n                \"image_url\": \"https://example.com/alice.png\"\n            },\n            \"id\": \"1111111\"\n        }\n    }`))\n\n    b := r.mapUser(UserData{}, []byte(`{\n        \"data\": {\n            \"attributes\": {\n                \"full_name\": \"Bob\",\n                \"image_url\": \"https://example.com/bob.png\"\n            },\n            \"id\": \"9999999\"\n        }\n    }`))\n\n    if a.ID != b.ID {\n        t.Fatalf(\"expected IDs to collide, got %q and %q\", a.ID, b.ID)\n    }\n\n    t.Logf(\"Alice -\u003e %s\", a.ID)\n    t.Logf(\"Bob   -\u003e %s\", b.ID)\n}\n```\n\nThen run:\n\n```bash\ncd v2\ngo test ./provider -run TestPatreonSharedIdentity -v\n```\n\nExpected result:\n\n```text\nAlice -\u003e patreon_da39a3ee5e6b4b0d3255bfef95601890afd80709\nBob   -\u003e patreon_da39a3ee5e6b4b0d3255bfef95601890afd80709\n```\n\nThis was confirmed locally with three distinct Patreon `data.id` values; all of them produced the same `patreon_da39...` identity.\n\nThe same issue is reflected in the existing built-in tests, which already assert this constant Patreon ID.\n\n### Impact\nThis is an authentication/identity-collision vulnerability in the Patreon provider.\n\nImpacted users:\n\n- applications using `github.com/go-pkgz/auth/provider.NewPatreon`\n- applications using `github.com/go-pkgz/auth/v2/provider.NewPatreon`\n- applications that rely on `token.User.ID` as the stable local account identifier, or use it to key roles, profiles, entitlements, subscription state, or other authorization-relevant records\n\nPractical impact:\n\n- all Patreon-authenticated users in the same application can collapse into the same local account\n- data associated with one Patreon user may be exposed to or overwritten by another Patreon user\n- Patreon-specific attributes such as `is_paid_sub` can leak across unrelated users\n- if a target application grants any elevated privileges to the local account keyed by this shared Patreon ID, those privileges can effectively apply to every Patreon login\n\n\n### Suggested Fix\nThe Patreon provider should derive the user ID from the Patreon account ID returned by Patreon, not from the uninitialized destination struct.\n\nIn both of these files:\n\n- `provider/providers.go`\n- `v2/provider/providers.go`\n\nchange:\n\n```go\nuserInfo.ID = \"patreon_\" + token.HashID(sha1.New(), userInfo.ID)\n```\n\nto:\n\n```go\nuserInfo.ID = \"patreon_\" + token.HashID(sha1.New(), uinfoJSON.Data.ID)\n```\n\nThe addition of regression testing with at least two different Patreon `data.id` values and asserting that they produce different local IDs is recommended.\n\nBecause the current bug causes all Patreon users to share a single local ID, maintainers may also want to consider migration guidance for consumers who already have Patreon-linked local accounts created under the broken identifier.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-pkgz/auth",
+        "purl": "pkg:golang/github.com/go-pkgz/auth"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.18.0"
+            },
+            {
+              "fixed": "1.25.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.25.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-f6qq-3m3h-4g42/GHSA-f6qq-3m3h-4g42.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-pkgz/auth/v2",
+        "purl": "pkg:golang/github.com/go-pkgz/auth/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "fixed": "2.1.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.1.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-f6qq-3m3h-4g42/GHSA-f6qq-3m3h-4g42.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-pkgz/auth/security/advisories/GHSA-f6qq-3m3h-4g42"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-pkgz/auth/commit/c0b15ee72a8401da83c01781c16636c521f42698"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-pkgz/auth"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-pkgz/auth/releases/tag/v1.25.2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-pkgz/auth/releases/tag/v2.1.2"
+    }
+  ]
+}

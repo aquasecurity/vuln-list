@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-x5r6-jr56-89pv",
+  "modified": "2026-05-05T16:14:33.762790Z",
+  "published": "2026-05-04T19:45:23Z",
+  "aliases": [
+    "CVE-2026-41684"
+  ],
+  "summary": "Incus has Nil Dereferences on Restore via Malformed YAML",
+  "details": "### Summary\n\n### Details\nIt was found that backup.GetInfo() trusts the inline backup/index.yaml config when present and only falls back to parsing the legacy backup/container/backup.yaml file if result.Config == nil. As a result, an archive can carry a valid inline config that passes the initial import preflight while also carrying a malformed legacy backup/container/backup.yaml file that is reparsed later from the restored file system.\n\nParseConfigYamlFile() accepts YAML documents with no container section, and multiple downstream consumers then dereference .Container without checking for nil. Confirmed examples in the instance restore and import flow include backup.UpdateInstanceConfig() and internalImportFromBackup().\n\nAn authenticated user with permission to import instance backups may be able to crash the Incus daemon with a crafted backup archive whose inline backup/index.yaml is valid but whose extracted legacy backup.yaml omits container. The crash occurs in the restore path after archive extraction has begun.\n\nThe flow is as follows:\nA crafted backup archive contains a valid backup/index.yaml file together with a malformed backup/container/backup.yaml file that omits the container section.\nbackup.GetInfo() parses backup/index.yaml successfully, so bInfo.Config is populated from the inline config.\nBecause result.Config != nil, GetInfo() does not fall back to backup/container/backup.yaml.\ninstances_post.go then builds the request from bInfo.Config.Container, which succeeds because the inline config is valid.\nLater, storage unpack extracts backup/container/backup.yaml into the instance volume as \u003cmountPath\u003e/backup.yaml.\nbackend.go then calls backup.UpdateInstanceConfig(..., mountPath), which reparses \u003cmountPath\u003e/backup.yaml through ParseConfigYamlFile().\nBecause ParseConfigYamlFile() accepts YAML with no container section, backup.Container == nil, and later access to backup.Container.Devices or backup.Container.ExpandedDevices can trigger a nil-pointer dereference.\n\n\nAffected Files:\n - https://github.com/lxc/incus/blob/v6.22.0/internal/server/backup/backup_info.go#L87\n - https://github.com/lxc/incus/blob/v6.22.0/internal/server/backup/backup_info.go#L115\n - https://github.com/lxc/incus/blob/v6.22.0/internal/server/backup/backup_config_utils.go#L85\n - https://github.com/lxc/incus/blob/v6.22.0/internal/server/backup/backup_config_utils.go#L159\n - https://github.com/lxc/incus/blob/v6.22.0/internal/server/storage/backend.go#L809\n - https://github.com/lxc/incus/blob/v6.22.0/cmd/incusd/api_internal.go#L749\n\nThe initial backup-metadata parser prefers inline backup/index.yaml content:\n\nAffected Code:\n```\nif hdr.Name == backupIndexPath {\n    err = yaml.NewDecoder(tr).Decode(\u0026result)\n```\n\nThe legacy backup/container/backup.yaml file is only parsed if the inline config is absent:\n\nAffected Code:\n```\nif result.Config == nil \u0026\u0026 hdr.Name == \"backup/container/backup.yaml\" {\n    err = yaml.NewDecoder(tr).Decode(\u0026result.Config)\n```\n\nParseConfigYamlFile() accepts an empty YAML document, or one with no container section, without validation:\n\nAffected Code:\n```\nfunc ParseConfigYamlFile(path string) (*config.Config, error) {\n    data, err := os.ReadFile(path)\n    ...\n    backupConf := config.Config{}\n    err = yaml.Unmarshal(data, \u0026backupConf)\n```\n\nUpdateInstanceConfig() conditionally uses backup.Container at first but later dereferences it unconditionally:\n\nAffected Code:\n```\nif backup.Container != nil {\n    backup.Container.Name = b.Name\n    backup.Container.Project = b.Project\n}\n\nif updateRootDevicePool(backup.Container.Devices, pool.Name) {\n    rootDiskDeviceFound = true\n}\n\nif updateRootDevicePool(backup.Container.ExpandedDevices, pool.Name) {\n    rootDiskDeviceFound = true\n}\n```\n\nAnother confirmed sink is present in internalImportFromBackup():\n\nAffected Code:\n```\nif allowNameOverride {\n    backupConf.Container.Name = instName\n}\n\nif instName != backupConf.Container.Name {\n    return fmt.Errorf(\"Instance name requested %q doesn't match instance name in backup config %q\", instName, backupConf.Container.Name)\n}\n```\n\nThis was confirmed as follows:\n\nCommand:\n```\ngo test ./test/fuzz -run='TestExtractedBackupYAMLMissingContainerNilDereference' -count=1 -v\n```\n\nOutput:\n\n```\n=== RUN   TestExtractedBackupYAMLMissingContainerNilDereference\n=== RUN   TestExtractedBackupYAMLMissingContainerNilDereference/legacy_backup_empty\n   extracted_backup_yaml_poc_test.go:70: UpdateInstanceConfig panicked on malformed extracted\n       backup.yaml (container is nil): runtime error: invalid memory address or nil pointer\n       dereference\n=== RUN   TestExtractedBackupYAMLMissingContainerNilDereference/legacy_backup_pool_only\n   extracted_backup_yaml_poc_test.go:70: UpdateInstanceConfig panicked on malformed extracted\n       backup.yaml (container is nil): runtime error: invalid memory address or nil pointer\n       dereference\n=== RUN   TestExtractedBackupYAMLMissingContainerNilDereference/legacy_backup_volume_only\n   extracted_backup_yaml_poc_test.go:70: UpdateInstanceConfig panicked on malformed extracted\n       backup.yaml (container is nil): runtime error: invalid memory address or nil pointer\n       dereference\n--- FAIL: TestExtractedBackupYAMLMissingContainerNilDereference (0.21s)\nFAIL\n```\n\nIt is recommended to validate the parsed legacy backup.yaml structure before any dereference and to fail with a standard error if Container is missing:\n\nProposed Fix:\n```\nif backup.Container == nil {\n    return errors.New(\"No container struct in the backup file found\")\n}\n```\n\nThat validation should be added at minimum in: backup.UpdateInstanceConfig() and internalImportFromBackup() before any backupConf.Container.* access\n\nMore broadly, it is recommended to centralize backup-config validation so that both inline backup/index.yaml and extracted legacy backup.yaml files are checked against the same structural requirements before any restore or import consumer uses them.\n\nA patch is available at https://github.com/lxc/incus/releases/tag/v7.0.0.\n\n### Credit\nThis issue was discovered and reported by the team at 7asecurity (https://7asecurity.com/)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lxc/incus/v6/cmd/incusd",
+        "purl": "pkg:golang/github.com/lxc/incus/v6/cmd/incusd"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "6.23.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-x5r6-jr56-89pv/GHSA-x5r6-jr56-89pv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/security/advisories/GHSA-x5r6-jr56-89pv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lxc/incus"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/releases/tag/v7.0.0"
+    }
+  ]
+}

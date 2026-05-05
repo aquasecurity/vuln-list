@@ -1,0 +1,52 @@
+{
+  "id": "GHSA-vp29-5652-4fw9",
+  "modified": "2026-05-05T16:11:45.894966Z",
+  "published": "2026-04-28T22:54:32Z",
+  "aliases": [
+    "CVE-2026-35579"
+  ],
+  "related": [
+    "CGA-mj76-j6gj-3wqh"
+  ],
+  "summary": "CoreDNS has TSIG authentication bypass on gRPC and QUIC transports",
+  "details": "### Summary\n\nThe gRPC, QUIC, DoH, and DoH3 transports in CoreDNS incorrectly handle TSIG authentication.\n\nFor gRPC and QUIC, CoreDNS checks whether the TSIG key name exists in the config, but does not actually verify the TSIG HMAC. If the key name matches, `tsigStatus` remains nil and the tsig plugin treats the request as \"verified\".\n\nFor DoH and DoH3, the issue is worse: TSIG is not verified at all. The DoH response writer has `TsigStatus()` hardcoded to return nil, so any request containing a TSIG record is treated as authenticated, even if the key name is invalid and the MAC is garbage.\n\nAs a result, attackers may bypass TSIG authentication on affected transports and access TSIG-protected functionality such as AXFR/IXFR zone transfers, dynamic updates, or other TSIG-gated plugin behavior.\n\n### Details\n\nIn `server_grpc.go` and `server_quic.go`, the TSIG handling checks whether the TSIG key name exists, but does not call `dns.TsigVerify()`.\n\nRelevant code before fix:\n\n```go\nif tsig := msg.IsTsig(); tsig != nil {\n    if s.tsigSecret == nil {\n        w.tsigStatus = dns.ErrSecret\n    } else if _, ok := s.tsigSecret[tsig.Hdr.Name]; !ok {\n        w.tsigStatus = dns.ErrSecret\n    }\n    // key found -\u003e nothing happens -\u003e tsigStatus stays nil -\u003e \"verified\"\n}\n```\n\nThis means that for gRPC and QUIC, a request with a known TSIG key name but an invalid MAC is accepted as authenticated.\n\nPRs #7943 and #7947 partially addressed this area by adding key name checks for gRPC and QUIC, but did not add HMAC verification.\n\nThe DoH and DoH3 paths have an even weaker failure mode. In `https.go`, `DoHWriter.TsigStatus()` returned nil unconditionally:\n\n```go\nfunc (d *DoHWriter) TsigStatus() error {\n    return nil\n}\n```\n\nIn `server_https.go`, the incoming DNS message is unpacked from the HTTP request and passed directly into `ServeDNS()` without checking `msg.IsTsig()`, without looking up the TSIG key name, and without calling `dns.TsigVerify()`.\n\nThe same pattern exists in the DoH3 path in `server_https3.go`.\n\nThe effective DoH/DoH3 flow before the fix was:\n\n1. HTTP or HTTP/3 request arrives.\n2. DNS message is unpacked from the request.\n3. A `DoHWriter` is created.\n4. The message is passed to `ServeDNS()`.\n5. The tsig plugin checks `w.TsigStatus()`.\n6. `TsigStatus()` returns nil.\n7. nil is interpreted as successful TSIG verification.\n\nThis means that for DoH and DoH3, CoreDNS did not even require a valid TSIG key name. Any TSIG record was enough to satisfy the tsig plugin, regardless of key name or MAC contents.\n\n### PoC\n\nSetup: built CoreDNS from master at commit `12d9457` and also verified against the v1.14.2 release binary. Configured a single test zone with 9 records and `tsig { require all }`.\n\nListeners used the same TSIG configuration and key:\n\n- TCP on port 1053, using the normal `dns.Server` path where TSIG HMAC verification works correctly\n- gRPC on port 1443, using manual TSIG handling\n- DoH on port 8443\n- DoH3 with the same TSIG configuration\n\n#### gRPC / QUIC behavior\n\nA test client sent AXFR requests over gRPC with a valid TSIG key name but forged MAC values. The same requests were sent over TCP for comparison.\n\n| MAC used | gRPC | TCP |\n|----------|------|-----|\n| 32 zero bytes | BYPASS, 9 records returned | BADSIG |\n| 32 random bytes | BYPASS, 9 records returned | BADSIG |\n| HMAC computed with wrong secret | BYPASS, 9 records returned | BADSIG |\n| truncated to 16 bytes | BYPASS, 9 records returned | BADSIG |\n| single byte `0x41` | BYPASS, 9 records returned | BADSIG |\n| empty MAC | BYPASS, 9 records returned | BADSIG |\n| wrong key name + zero MAC | REJECTED, NOTAUTH/BADKEY | REJECTED, NOTAUTH/BADKEY |\n\n6 out of 7 forged TSIG requests bypassed authentication over gRPC and returned a full zone transfer. The only rejected case was the wrong key name, because the gRPC path checked whether the key name existed.\n\nThe same class applied to QUIC.\n\n#### DoH / DoH3 behavior\n\nFor DoH, a test client sent DNS queries over HTTPS POST to `/dns-query` with forged TSIG records. These requests were also compared against TCP.\n\n| TSIG variant | DoH result | TCP result |\n|-------------|------------|------------|\n| 32 zero bytes | BYPASS, NOERROR | BADSIG |\n| 32 random bytes | BYPASS, NOERROR | BADSIG |\n| HMAC computed with wrong secret | BYPASS, NOERROR | BADSIG |\n| truncated to 16 bytes | BYPASS, NOERROR | BADSIG |\n| single byte `0x41` | BYPASS, NOERROR | BADSIG |\n| empty MAC | BYPASS, NOERROR | BADSIG |\n| bad key name | BYPASS, NOERROR | NOTAUTH/BADKEY |\n| no TSIG record | REJECTED, REFUSED | REJECTED, REFUSED |\n\n7 out of 8 cases bypassed authentication over DoH. Every request containing a TSIG record was accepted, including requests with an invalid key name.\n\nAn AXFR request over DoH with a forged TSIG record using a zero-byte MAC returned the full test zone.\n\nThe same pattern applies to DoH3 because it used the same `DoHWriter` TSIG behavior and did not verify TSIG before passing the message into the plugin chain.\n\nTo confirm that the tsig plugin itself was enforcing policy, requests with no TSIG record were rejected with `REFUSED`. The bypass happens because the transport layer reports successful TSIG verification when verification either did not happen or only checked the key name.\n\n### Impact\n\nAn unauthenticated network attacker may bypass TSIG authentication on affected CoreDNS transports.\n\nDepending on configuration, this may allow an attacker to:\n\n- perform AXFR or IXFR zone transfers over affected transports\n- dump TSIG-protected zone data\n- submit dynamic DNS updates if enabled\n- bypass other TSIG-gated plugin behavior\n- authenticate over DoH or DoH3 without knowing a valid TSIG key name\n\nThe DoH and DoH3 variants have a lower exploitation bar than gRPC and QUIC because the attacker does not need to know a configured TSIG key name. Any TSIG record is treated as valid.\n\n### Affected transports\n\n- gRPC\n- QUIC\n- DoH\n- DoH3\n\n### Workarounds\n\nIf upgrading is not immediately possible:\n\n- Disable gRPC, QUIC, DoH, and DoH3 listeners where TSIG authentication is required.\n- Restrict network-level access to affected transport ports to trusted sources only.\n- Avoid exposing TSIG-protected functionality such as AXFR, IXFR, or dynamic updates over affected transports.\n\n### Fix\n\nAffected transports must verify TSIG before passing the DNS message into the plugin chain.\n\nFor requests containing a TSIG record, the transport should:\n\n1. check whether TSIG secrets are configured\n2. verify that the TSIG key name exists\n3. call `dns.TsigVerify()` against the original wire-format message\n4. store the resulting status in the response writer\n5. return that status from `TsigStatus()`\n\nA successful key name lookup alone is not sufficient. A nil TSIG status must only be returned after successful HMAC verification.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/coredns/coredns",
+        "purl": "pkg:golang/github.com/coredns/coredns"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.14.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-vp29-5652-4fw9/GHSA-vp29-5652-4fw9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/coredns/coredns/security/advisories/GHSA-vp29-5652-4fw9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/coredns/coredns"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/coredns/coredns/releases/tag/v1.14.3"
+    }
+  ]
+}

