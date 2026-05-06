@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-q4w7-56hr-83rm",
+  "modified": "2026-05-06T17:18:51.108578Z",
+  "published": "2026-05-06T17:01:04Z",
+  "aliases": [
+    "CVE-2026-42223"
+  ],
+  "summary": "Nginx-UI Settings API Exposes Protected Secrets",
+  "details": "### Summary\nThe `GetSettings` API handler (`api/settings/settings.go:24-65`) serializes all settings structs to JSON and returns them to authenticated users. Many sensitive fields are tagged with `protected:\"true\"` - however, this tag is only enforced during writes (via `ProtectedFill` in `SaveSettings`) and is completely ignored during reads. This exposes 40+ protected fields including `JwtSecret` (enabling auth token forgery), `NodeSecret` (enabling cluster node impersonation), OIDC `ClientSecret` (enabling OAuth account takeover), and the IP whitelist configuration.\n\n### Details\n#### Vulnerable Code\n\n**`api/settings/settings.go:49-64` - GetSettings serializes all fields**\n\n```go\nc.JSON(http.StatusOK, gin.H{\n    \"app\":       cSettings.AppSettings,\n    \"server\":    cSettings.ServerSettings,\n    \"database\":  settings.DatabaseSettings,\n    \"auth\":      settings.AuthSettings,\n    \"casdoor\":   settings.CasdoorSettings,\n    \"oidc\":      settings.OIDCSettings,\n    \"cert\":      settings.CertSettings,\n    \"http\":      settings.HTTPSettings,\n    \"logrotate\": settings.LogrotateSettings,\n    \"nginx\":     settings.NginxSettings,\n    \"node\":      settings.NodeSettings,\n    \"openai\":    settings.OpenAISettings,\n    \"terminal\":  settings.TerminalSettings,\n    \"webauthn\":  settings.WebAuthnSettings,\n})\n```\n\nGo's `json.Marshal` serializes all exported fields with `json:` tags. The `protected:\"true\"` struct tag is a custom tag - it has no effect on JSON serialization.\n\n#### Protection is Write-Only\n\n**`api/settings/settings.go:126-135` - ProtectedFill only used during saves**\n\n```go\ncSettings.ProtectedFill(cSettings.AppSettings, \u0026json.App)\ncSettings.ProtectedFill(cSettings.ServerSettings, \u0026json.Server)\ncSettings.ProtectedFill(settings.AuthSettings, \u0026json.Auth)\n// ... etc\n```\n\n`ProtectedFill` prevents overwriting protected fields during `SaveSettings`, but `GetSettings` has no corresponding filter. The protection is asymmetric - secrets can be read but not overwritten.\n\n#### Exposed Protected Fields\n\n**`settings/node.go`:**\n- `Secret` (protected) - used for cluster node authentication\n- `SkipInstallation` (protected), `Demo` (protected)\n\n**`settings/oidc.go` (all protected):**\n- `ClientId`, `ClientSecret`, `Endpoint`, `RedirectUri`, `Scopes`, `Identifier`\n\n**`settings/casdoor.go` (all protected):**\n- `Endpoint`, `ExternalUrl`, `ClientId`, `ClientSecret`, `CertificatePath`, `Organization`, `Application`, `RedirectUri`\n\n**`settings/auth.go`:**\n- `IPWhiteList` (protected) - exposes security configuration\n\n#### Attack Scenario\n\n1. Low-privilege authenticated user calls `GET /api/settings`\n2. Response includes `NodeSecret` - attacker can impersonate cluster nodes\n3. Response includes OIDC `ClientSecret` - attacker can perform OAuth flows as the application\n4. Response includes `IPWhiteList` - attacker learns network security configuration\n5. If `JwtSecret` is in app settings (via cosy framework), attacker can forge authentication tokens for any user\n\n### PoC\n**1. `GetSettings` serializes all fields** without filtering `protected:\"true\"` tags. From `api/settings/settings.go:49-64`:\n\n```go\nc.JSON(http.StatusOK, gin.H{\n    \"app\":       cSettings.AppSettings,\n    \"server\":    cSettings.ServerSettings,\n    \"database\":  settings.DatabaseSettings,\n    \"auth\":      settings.AuthSettings,\n    \"casdoor\":   settings.CasdoorSettings,\n    \"oidc\":      settings.OIDCSettings,\n    \"cert\":      settings.CertSettings,\n    \"http\":      settings.HTTPSettings,\n    \"logrotate\": settings.LogrotateSettings,\n    \"nginx\":     settings.NginxSettings,\n    \"node\":      settings.NodeSettings,\n    \"openai\":    settings.OpenAISettings,\n    \"terminal\":  settings.TerminalSettings,\n    \"webauthn\":  settings.WebAuthnSettings,\n})\n```\n\nGo's `json.Marshal` serializes all exported fields. The custom `protected:\"true\"` tag has no effect on serialization.\n\n**2. Protected secrets are defined** across `settings/*.go`. High-impact examples:\n\n```go\n// settings/server_v1.go:19\nJwtSecret string `json:\"jwt_secret\" protected:\"true\"`\n\n// settings/node.go:5\nSecret string `json:\"secret\" protected:\"true\"`\n\n// settings/oidc.go\nClientSecret string `json:\"client_secret\" protected:\"true\"`\n\n// settings/auth.go\nIPWhiteList []string `json:\"ip_white_list\" protected:\"true\"`\n```\n\n**3. `ProtectedFill` is write-only.** It appears 10 times in `SaveSettings` (lines 126-135) but 0 times in `GetSettings`:\n\n```go\n// api/settings/settings.go:126-135 - Only used during writes\ncSettings.ProtectedFill(cSettings.AppSettings, \u0026json.App)\ncSettings.ProtectedFill(cSettings.ServerSettings, \u0026json.Server)\ncSettings.ProtectedFill(settings.AuthSettings, \u0026json.Auth)\n// ... 7 more calls\n```\n\n**4. Exploit request.** Any authenticated user can retrieve all secrets:\n\n```http\nGET /api/settings HTTP/1.1\nAuthorization: Bearer \u003cany-valid-jwt\u003e\n```\n\nResponse includes (among 45 protected fields):\n```json\n{\n  \"app\": {\"jwt_secret\": \"\u003cthe-actual-jwt-signing-key\u003e\", ...},\n  \"node\": {\"secret\": \"\u003cnode-authentication-secret\u003e\", ...},\n  \"oidc\": {\"client_secret\": \"\u003coidc-client-secret\u003e\", ...},\n  \"casdoor\": {\"client_secret\": \"\u003ccasdoor-client-secret\u003e\", ...},\n  \"auth\": {\"ip_white_list\": [\"10.0.0.1\", ...], ...},\n  \"nginx\": {\"reload_cmd\": \"nginx -s reload\", \"restart_cmd\": \"...\", ...}\n}\n```\n\n\n### Impact\n- **Authentication bypass via JwtSecret**: An attacker who obtains the `JwtSecret` can forge valid JWT tokens for any user, including admin accounts. This provides permanent, independent access that survives password changes and session revocations.\n- **Cluster compromise via NodeSecret**: The `NodeSecret` is used for inter-node authentication in nginx-ui clusters. An attacker can impersonate any cluster node, push malicious configurations to all nodes, and intercept cluster synchronization traffic.\n- **Third-party OAuth takeover**: Leaked OIDC `ClientSecret` and Casdoor `ClientSecret` allow the attacker to perform OAuth flows as the nginx-ui application, potentially gaining access to user accounts on the identity provider.\n- **Security configuration disclosure**: The `IPWhiteList`, `ReloadCmd`, `RestartCmd`, `ConfigDir`, `SbinPath`, and other protected fields reveal the security posture and infrastructure layout, enabling more targeted attacks.\n- **Low barrier to exploitation**: Any authenticated user (not just admins) can access `GET /api/settings`. In multi-user deployments, a low-privilege operator can escalate to full admin access.\n\n### Remediation\n\nFilter out `protected:\"true\"` fields before serialization.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/nginx-ui",
+        "purl": "pkg:golang/github.com/0xJacky/nginx-ui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.3.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.3.7",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-q4w7-56hr-83rm/GHSA-q4w7-56hr-83rm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-q4w7-56hr-83rm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-42223"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.3.8"
+    }
+  ]
+}

