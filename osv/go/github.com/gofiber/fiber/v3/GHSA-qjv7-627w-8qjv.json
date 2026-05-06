@@ -1,0 +1,70 @@
+{
+  "id": "GHSA-qjv7-627w-8qjv",
+  "modified": "2026-05-05T20:18:50.735879Z",
+  "published": "2026-05-05T20:13:23Z",
+  "aliases": [
+    "CVE-2026-42554"
+  ],
+  "summary": "Fiber vulnerable to XSS in AutoFormat Content Negotiation",
+  "details": "## Summary\n\n**Description**\n\nA Cross-Site Scripting (CWE-79) vulnerability in Go Fiber allows a remote attacker to inject arbitrary HTML/JavaScript by supplying `Accept: text/html` on any request whose handler passes attacker-influenced data to the AutoFormat() feature. This affects `github.com/gofiber/fiber/v3` (`DefaultRes.AutoFormat`) through version 3.1.0 and `github.com/gofiber/fiber/v2` (`Ctx.Format`) through version 2.52.12. \n\nThe developer opts into content negotiation by calling AutoFormat(), but does not opt into raw HTML emission for a particular request; Fiber chooses that branch from attacker-controlled Accept. Five of the six branches of the same method already escape. `JSON`, `XML`, `MsgPack`, and `CBOR` all route through encoders that neutralize markup; the txt branch emits `text/plain` and cannot execute. The html branch is the sole outlier in a method whose name (`AutoFormat`) and symmetrical structure actively telegraph \"safe, format-agnostic reply.\"\n\n## Details\nThe issue resides in `res.go` within `(*DefaultRes).AutoFormat()`. The method negotiates against the request Accept header, selects one of `html | json | txt | xml | msgpack | cbor`, and serializes the caller-supplied body accordingly.\n\nThe \"html\" branch concatenates the stringified body directly into HTML markup with no output encoding:\n- `accept` comes from `r.c.Accepts(...)`, i.e. is fully attacker-controlled. An attacker can force the \"html\" branch on any `AutoFormat()` call regardless of which format the developer tested against.\n- `b` is produced from `body` via direct assignment (`string` / `[]byte`) or `fmt.Sprintf(\"%v\", body)`. No `html.EscapeString` is applied.\n- The resulting string is sent as `text/html; charset=utf-8`, so browsers render it as active HTML.\n\n```go\n// res.go\nfunc (r *DefaultRes) AutoFormat(body any) error {\n\n    accept := r.c.DefaultReq.Accepts(\"html\", \"json\", \"txt\", \"xml\", \"msgpack\", \"cbor\")\n\n    r.Type(accept)\n    var b string\n    switch val := body.(type) {\n    case string:\n        b = val\n    case []byte:\n        b = r.c.app.toString(val)\n    default:\n        b = fmt.Sprintf(\"%v\", val)\n    }\n\n    switch accept {\n    case \"txt\":\n        return r.SendString(b)\n    case \"json\":\n        return r.JSON(body)\n    case \"xml\":\n        return r.XML(body)\n    case \"html\":\n        return r.SendString(\"\u003cp\u003e\" + b + \"\u003c/p\u003e\")\n    case \"msgpack\":\n        return r.MsgPack(body)\n    case \"cbor\":\n        return r.CBOR(body)\n    }\n    return r.SendString(b)\n}\n```\n## Impact\n\nThis impacts all current v3 releases ≤ 3.1.0 containing `DefaultRes.AutoFormat`, and all current v2 releases ≤ 2.52.12 where the identical `\"\u003cp\u003e\" + b + \"\u003c/p\u003e\"` construction exists in `(*Ctx).Format()`. Exploitation requires that an application call `c.AutoFormat(v)` where `v` (or a field stringified by `%v`) contains request-influenced data.\n\nA handler that uses `AutoFormat()` to serve multiple representations of the same data can be turned into an HTML XSS sink when the client sends `Accept: text/html`, even if the developer only tested the JSON path.\n\nThis may result in:\n- **Reflected XSS** in the application's origin via any request-derived value reaching `AutoFormat`.\n- **Stored XSS** where the reflected value originates from persisted input later passed to `AutoFormat`.\n\n## Proposed Patch\n\nThe injection surface is `r.Type(\"html\")` followed by `r.SendString(b)` with unescaped caller data, where it constructs markup on the caller's behalf around a value whose HTML-ness the caller did not declare. A few options:\n- `AutoFormat()` should treat `body` as data, not markup, in the `\"html\"` branch and escape it before concatenating it into the framework-generated `\u003cp\u003e` wrapper. Callers that need raw negotiated HTML should use `Format()` with an explicit HTML handler.\n- Introduce a sibling method that escapes, leave `AutoFormat` alone for backward compatibility.\n\nHTML-escape the value in the \"html\" branch before concatenating it into the `\u003cp\u003e` wrapper.\n```go\nimport \"html\"\n\n// ...\ncase \"html\":\n    return r.SendString(\"\u003cp\u003e\" + html.EscapeString(b) + \"\u003c/p\u003e\")\n```\n\n`html.EscapeString` escapes `\u003c`, `\u003e`, `\u0026`, `'`, `\"`, which is sufficient for an element-text context. Apply the same change to v2's `(*Ctx).Format()`.\n\n## Proof of Concept\n\n```bash\n# Create project directory\nmkdir fiber-xss-poc \u0026\u0026 cd fiber-xss-poc\n\n# Initialize Go module\ngo mod init fiber-xss-poc\n\n# Install Fiber v3\ngo get github.com/gofiber/fiber/v3\n\n# Create the PoC file\ncat \u003e main.go \u003c\u003c 'EOF'\npackage main\n\nimport (\n\t\"github.com/gofiber/fiber/v3\"\n)\n\ntype User struct {\n\tID   int    `json:\"id\"`\n\tName string `json:\"name\"`\n}\n\nfunc main() {\n\tapp := fiber.New()\n\t\n\tapp.Get(\"/api/user\", func(c fiber.Ctx) error {\n\t\tuser := User{\n\t\t\tID:   1,\n\t\t\tName: c.Query(\"name\", \"anonymous\"),\n\t\t}\n\t\treturn c.AutoFormat(user)\n\t})\n\n\tapp.Listen(\":3000\")\n}\nEOF\n\n# Run it\ngo run main.go\n}\n```\n\nBenign JSON\n```bash\ncurl -s 'http://127.0.0.1:3000/api/user?name=Alice' -H 'Accept: application/json'\n{\"id\":1,\"name\":\"Alice\"}\n```\n\nHTML sink enables XSS\n```bash\ncurl -s 'http://127.0.0.1:3000/api/user?name=\u003cscript\u003ealert(document.domain)\u003c/script\u003e' -H 'Accept: text/html'\n\u003cp\u003e{1 \u003cscript\u003ealert(document.domain)\u003c/script\u003e}\u003c/p\u003e\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gofiber/fiber/v3",
+        "purl": "pkg:golang/github.com/gofiber/fiber/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.2.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-qjv7-627w-8qjv/GHSA-qjv7-627w-8qjv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gofiber/fiber/v2",
+        "purl": "pkg:golang/github.com/gofiber/fiber/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.52.13"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.52.12",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-qjv7-627w-8qjv/GHSA-qjv7-627w-8qjv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gofiber/fiber/security/advisories/GHSA-qjv7-627w-8qjv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gofiber/fiber"
+    }
+  ]
+}
