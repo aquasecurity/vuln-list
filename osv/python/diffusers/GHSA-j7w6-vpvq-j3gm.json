@@ -1,0 +1,153 @@
+{
+  "id": "GHSA-j7w6-vpvq-j3gm",
+  "modified": "2026-05-07T05:32:55.488707Z",
+  "published": "2026-05-07T02:24:22Z",
+  "withdrawn": "2026-05-07T05:25:32Z",
+  "summary": "Duplicate Advisory: Diffusers has a `trust_remote_code` bypass via `custom_pipeline` and local custom components",
+  "details": "### Duplicate Advisory\nThis advisory has been withdrawn because it is a duplicate of GHSA-98h9-4798-4q5v. This link is maintained to preserve external references.\n\n### Original Description\n\n## Background\n\nThis vulnerability is found in the `DiffusionPipeline.from_pretrained` flow, which is used to load a pipeline from the HuggingFace Hub.\n\nThis function accepts an optional `custom_pipeline` keyword argument: the name of a Python file in the repo that contains a custom class inheriting from `DiffusionPipeline`. An equivalent flow is triggered when the `_class_name` field in `model_index.json` (the repo config file) is set to a custom class.\n\nAny attempt to use a custom pipeline throws the following exception, requesting that `trust_remote_code` is also passed:\n\n```python\nDiffusionPipeline.from_pretrained(\n    pretrained_model_name_or_path='ido-shani/custom-pipeline',\n    custom_pipeline=\"custom\"\n)\n\nValueError: The repository for ido-shani/custom-pipeline contains custom code in\ncustom.py which must be executed to correctly load the model. You can inspect the\nrepository content at https://hf.co/ido-shani/custom-pipeline/blob/main/custom.py.\nPlease pass the argument `trust_remote_code=True` to allow custom code to be run.\n```\n\nThe vulnerability is a silent RCE - it allows arbitrary code to be loaded through the custom\\_pipeline flow from a Hub repo, with no `custom_pipeline` or `trust_remote_code` kwargs and nothing suspicious in the config. The `from_pretrained` call succeeds and returns a functional pipeline.\n\n## Naive Flow\n\nFirst, all relevant arguments are popped from kwargs and stored in local variables.\n\nGiven a `pretrained_model_name_or_path` that is a Hub repo ID, `DiffusionPipeline.download()` is called. This function serves two roles: it orchestrates downloading relevant model files, and it is the security gatekeeper for `trust_remote_code`. It is called even if the model is already cached; in that case it exits early. If the repo contains custom code, it checks whether `trust_remote_code` was passed and raises otherwise:\n\n```python\n# pipeline_utils.py:1645-1652\nload_pipe_from_hub = custom_pipeline is not None and f\"{custom_pipeline}.py\" in filenames\n\n...\n\nif load_pipe_from_hub and not trust_remote_code:\n    raise ValueError(...)\n```\n\nIt then runs `_get_pipeline_class`, which returns the class object of the pipeline in order to inspect its `__init__` signature and determine which component files need to be downloaded. As part of building the `allow_patterns` list used to filter the snapshot download to necessary files only, the custom pipeline file is explicitly included if present:\n\n```python\n# pipeline_utils.py:1707\nallow_patterns += [f\"{custom_pipeline}.py\"] if f\"{custom_pipeline}.py\" in filenames else []\n```\n\nThe function then checks if all expected files are already present, and either exits early or triggers a snapshot download with those patterns.\n\nThe next step in `from_pretrained` is loading the pipeline class a second time, this time to actually instantiate it. Before calling `_get_pipeline_class` again, `_resolve_custom_pipeline_and_cls` is called to translate the `custom_pipeline` name into a local path, since the files have already been downloaded:\n\n```python\n# pipeline_loading_utils.py:965-974\ndef _resolve_custom_pipeline_and_cls(folder, config, custom_pipeline):\n    custom_class_name = None\n    if os.path.isfile(os.path.join(folder, f\"{custom_pipeline}.py\")):\n        custom_pipeline = os.path.join(folder, f\"{custom_pipeline}.py\")\n    elif isinstance(config[\"_class_name\"], (list, tuple)) and os.path.isfile(\n        os.path.join(folder, f\"{config['_class_name'][0]}.py\")\n    ):\n        custom_pipeline = os.path.join(folder, f\"{config['_class_name'][0]}.py\")\n        custom_class_name = config[\"_class_name\"][1]\n\n    return custom_pipeline, custom_class_name\n```\n\nWhen `custom_class_name` is `None` (i.e. `custom_pipeline` was given as a kwarg rather than via the config), `_get_pipeline_class` will scan the file and automatically identify the class that subclasses `DiffusionPipeline`.\n\nOnce this is done, `_get_pipeline_class` is invoked with the resolved local path, which loads the custom code, retrieves the class object, and proceeds with instantiation.\n\n## The Vulnerability\n\n`_resolve_custom_pipeline_and_cls` receives `custom_pipeline` from the kwargs - when not supplied it defaults to `None`. That `None` is used in string formatting: `f\"{None}.py\"` = `\"None.py\"`.\n\n**If the repo contains a file with this name, it will be detected as a custom pipeline.**\n\nThis is only reached on the second invocation of `_get_pipeline_class` (inside `from_pretrained`, after `download()` returns). The trust\\_remote\\_code check lives entirely in `download()`, which evaluated `custom_pipeline is None -\u003e False` and skipped it. By the time `_resolve_custom_pipeline_and_cls` runs, it is no longer relevant.\n\nAs a bonus, `None.py` even gets downloaded automatically when the model isn't cached yet. This isn't strictly required - it is quite plausible that the victim has already run `hf download \u003cmodel\u003e` and has all files locally - but if they haven't, revisiting the `allow_patterns` line above shows it makes the same error: `f\"{None}.py\"` = `\"None.py\"` is added to `allow_patterns` and fetched.\n\nWhat should `None.py` contain? To avoid breaking the pipeline load, it must define a class inheriting from `DiffusionPipeline`. To avoid leaving suspicious clues in the config, that class should shadow one that already exists in diffusers. The following satisfies both requirements:\n\n```python\nfrom diffusers import FluxPipeline as _FluxPipeline\n\nclass FluxPipeline(_FluxPipeline):\n    pass\n\n# INSERT MALICIOUS CODE HERE\nimport pathlib\npathlib.Path(\"/tmp/pwned\").write_text(\":)\")\n```\n\nWith this, `model_index.json` can contain `\"_class_name\": \"FluxPipeline\"` - appearing to use the standard diffusers class - and the resulting pipeline is fully functional (it is also functional when running as a local directory). This has been verified against an extracted version of [DDUF/tiny-flux-dev-pipe-dduf](https://huggingface.co/DDUF/tiny-flux-dev-pipe-dduf).\n\nAll the attacker needs the victim to run is:\n\n```python\nfrom diffusers import DiffusionPipeline\n\npipeline = DiffusionPipeline.from_pretrained('ido-shani/none-py-trust-remote-code-bypass')\n```\n\n## PoC\n\n-   Upload this zip as a model to the hub. https://drive.google.com/file/d/1mULARMLJJUTCi57xIv0wtDauko-JW0h7/view?usp=sharing\n-   Run `DiffusionPipeline.from_pretrained` on the uploaded model hub identifier.\n-   RCE occured; `/tmp/pwned` was created. If users are running the exploit on windows, they should change the path touched in `None.py`.\n\n# Impact\n\nThe vulnerability is a silent RCE - it allows arbitrary code to be loaded through the custom\\_pipeline flow from a Hub repo, with no `custom_pipeline` or `trust_remote_code` kwargs and nothing suspicious in the config. The `from_pretrained` call succeeds and returns a functional pipeline.\n\n# Occurrences\n\nhttps://github.com/huggingface/diffusers/blob/e1b5db52bda85d47a4f8f75954f77e672a8f7f1c/src/diffusers/pipelines/pipeline_loading_utils.py#L976\n\n# Patches\n\nYes. Fixed in **diffusers 0.38.0** via [PR #13448](https://github.com/huggingface/diffusers/pull/13448). All users on versions `\u003c 0.38.0` should upgrade:\n\n```bash\npip install --upgrade \"diffusers\u003e=0.38.0\"\n```\n\nThe fix moves the `trust_remote_code` gate out of `DiffusionPipeline.download()` and into `get_cached_module_file` in `src/diffusers/utils/dynamic_modules_utils.py`, which is the actual chokepoint for every dynamic module load (local, Hub, or community mirror). All three variants now raise `ValueError` when trust_remote_code=False instead of executing untrusted code.  \n\n# Workarounds\n\nIf upgrading immediately is not possible:\n\n- Only call `from_pretrained` with `pretrained_model_name_or_path`, `custom_pipeline`, and local snapshot directories from sources you fully trust and have audited.\n- Do not pass `custom_pipeline=` pointing at a Hub repository different from the primary `pretrained_model_name_or_path` unless you have read its `pipeline.py`.\n- Before calling `from_pretrained` on a local snapshot, inspect the snapshot for unexpected `*.py` files, especially under component subdirectories (`unet/`, `scheduler/`, etc.) and at the snapshot root.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "diffusers",
+        "purl": "pkg:pypi/diffusers"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.38.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.12.1",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.18.2",
+        "0.19.0",
+        "0.19.1",
+        "0.19.2",
+        "0.19.3",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.21.1",
+        "0.21.2",
+        "0.21.3",
+        "0.21.4",
+        "0.22.0",
+        "0.22.1",
+        "0.22.2",
+        "0.22.3",
+        "0.23.0",
+        "0.23.1",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.26.1",
+        "0.26.2",
+        "0.26.3",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.28.2",
+        "0.29.0",
+        "0.29.1",
+        "0.29.2",
+        "0.3.0",
+        "0.30.0",
+        "0.30.1",
+        "0.30.2",
+        "0.30.3",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.32.2",
+        "0.33.0",
+        "0.33.1",
+        "0.34.0",
+        "0.35.0",
+        "0.35.1",
+        "0.35.2",
+        "0.36.0",
+        "0.37.0",
+        "0.37.1",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-j7w6-vpvq-j3gm/GHSA-j7w6-vpvq-j3gm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/huggingface/diffusers/security/advisories/GHSA-j7w6-vpvq-j3gm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/huggingface/diffusers/pull/13448"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/huggingface/diffusers/commit/a37f6f8394ac2a7ee8360c3abea811efe54512b1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/huggingface/diffusers"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/huggingface/diffusers/releases/tag/v0.38.0"
+    }
+  ]
+}

