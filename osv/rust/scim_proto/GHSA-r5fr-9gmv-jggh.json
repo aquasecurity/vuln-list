@@ -1,0 +1,67 @@
+{
+  "id": "GHSA-r5fr-9gmv-jggh",
+  "modified": "2026-05-06T23:49:35.828892Z",
+  "published": "2026-05-06T23:38:49Z",
+  "summary": "scim_proton and kanidm_proto have an authenticated process abort via SCIM filter stack exhaustion",
+  "details": "### Summary\n\nA single unauthenticated `GET` to any `/scim/v1/...` endpoint with a `?filter=` query string of a few thousand nested parentheses (≈ 4–12 KB) drives the recursive-descent PEG parser past the worker thread's stack guard page. Rust responds to stack overflow with `std::process::abort()` — the entire `kanidmd` process exits. The parse runs inside axum's `Query\u003cScimEntryGetQuery\u003e` extractor, before any handler body and therefore before any ACL check.\n\n### Details\n\nThe SCIM filter grammar recurses on `(` and `not (` with no depth bound.\n\n**`proto/src/scim_v1/mod.rs:263-433`** — `peg::parser! { grammar scimfilter() ... }`:\n\n```rust\n// line 281\n\"not\" separator()+ \"(\" e:parse() \")\" { ScimFilter::Not(Box::new(e)) }\n// line 293\n\"(\" e:parse() \")\" { e }\n```\n\nBoth rules re-enter `parse()` without a depth counter.\n\n**`proto/src/scim_v1/mod.rs:442-447`** — `impl FromStr for ScimFilter` calls `scimfilter::parse(input)` directly on the raw string with no length or depth pre-check.\n\n**`proto/src/scim_v1/mod.rs:80-81`** — `ScimEntryGetQuery.filter` is `#[serde_as(as = \"Option\u003cDisplayFromStr\u003e\")]`, so deserialising the query struct invokes `ScimFilter::from_str` on attacker bytes.\n\n**Unauthenticated reachability** — nine handlers in `server/core/src/https/v1_scim.rs` (route table at lines 865-1029) take `Query\u003cScimEntryGetQuery\u003e` as an argument: `/scim/v1/Entry`, `/scim/v1/Entry/{id}`, `/scim/v1/Person/{id}`, `/scim/v1/Application`, `/scim/v1/Application/{id}`, `/scim/v1/Class`, `/scim/v1/Attribute`, `/scim/v1/Message`, `/scim/v1/Message/{id}`. The SCIM router is merged unconditionally for every server role (`server/core/src/https/mod.rs:312`).\n\nAxum extracts handler arguments before the handler body runs. The preceding `VerifiedClientInformation` extractor (`server/core/src/https/extractors/mod.rs:16-91`) always returns `Ok` (line 89) regardless of credentials; authorization is deferred to the handler body, which is never reached.\n\nThe existing semantic depth limit (`DEFAULT_LIMIT_FILTER_DEPTH_MAX = 12`, `server/lib/src/constants/mod.rs:212`) is enforced in `Filter::from_scim_ro` (`server/lib/src/filter.rs:786`) **after** the PEG parse has already produced an AST, so it cannot prevent the parser itself from blowing the stack.\n\nThe production daemon (`server/daemon/src/main.rs:735-744`) uses `new_multi_thread()` with default 2 MiB worker stacks; hyper's `max_buf_size` (~400 KiB) is not lowered (`server/core/src/https/mod.rs:708-727`), so a 12 KB URI is accepted.\n\nAn identical unbounded grammar exists in `libs/scim_proto/src/filter.rs:112-276` (not network-reachable, but should be fixed in the same patch).\n\n### PoC\n\n```sh\ncurl -sk \"https://idm.example.com/scim/v1/Application?filter=$(python3 -c 'print(\"(\"*3000+\"a+pr\"+\")\"*3000)')\"\n# → curl: (52) Empty reply from server\n# → server journal: \"fatal runtime error: stack overflow, aborting\", SIGABRT\n```\n\nRelease-build threshold measured at ~2 000 nesting levels / ~4 KB:\n\n```\n$ cargo test --release -p kanidm_proto --test scim_filter_depth -- --nocapture\nparens depth=1500 len=3004\n  -\u003e survived\nparens depth=2000 len=4004\n\nthread 'audit_scim_filter_nested_parens' has overflowed its stack\nfatal runtime error: stack overflow, aborting\n  (signal: 6, SIGABRT: process abort signal)\n```\n\nEnd-to-end against an in-process server via `kanidmd_testkit` (no authentication performed):\n\n```\nTestkit server setup complete - http://localhost:18080/\naudit_scim_dos: sending unauthenticated GET, url len = 12056\n\nthread '...' has overflowed its stack\nfatal runtime error: stack overflow, aborting\n  (signal: 6, SIGABRT: process abort signal)\n```\n\n### Impact\n\nProcess-wide availability loss; no confidentiality or integrity impact.\n\n- **Unauthenticated**, default install, no feature flag required.\n- **Process abort, not task panic.** Stack overflow triggers libstd's guard-page handler, which calls `std::process::abort()`. tokio's per-task `catch_unwind` isolation does not apply to aborts. All in-flight HTTP requests, OAuth2/OIDC sessions, LDAP binds, and the web UI are terminated.\n- **Repeatable.** One ~12 KB GET per crash; a `while true; do curl ...; done` loop holds the service down indefinitely across supervisor restarts.\n- The 6 011-byte variant (`depth=3000`) fits under the nginx default `large_client_header_buffers` limit of 8 KB, so a typical reverse proxy does not mitigate.\n\n**Affected**: v1.7.0 through `master` @ edf50b9da.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "scim_proto",
+        "purl": "pkg:cargo/scim_proto"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-r5fr-9gmv-jggh/GHSA-r5fr-9gmv-jggh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "kanidm_proto",
+        "purl": "pkg:cargo/kanidm_proto"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-r5fr-9gmv-jggh/GHSA-r5fr-9gmv-jggh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kanidm/kanidm/security/advisories/GHSA-r5fr-9gmv-jggh"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kanidm/kanidm"
+    }
+  ]
+}

