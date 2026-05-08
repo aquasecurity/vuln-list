@@ -1,0 +1,56 @@
+{
+  "id": "GHSA-52cq-7v8r-62c6",
+  "modified": "2026-05-08T16:48:27.343537Z",
+  "published": "2026-05-08T16:32:29Z",
+  "summary": "gmaps-mcp's unauthenticated HTTP transport allows unlimited Google Maps API calls at operator expense",
+  "details": "## Unauthenticated HTTP Transport Allows Unlimited Google Maps API Calls at Operator Expense\n\nThe `gmaps-mcp` codebase was reviewed at commit `e671db68c804c9e67d51582d3280839ffa65f127` and three issues worth flagging were discovered — one high-severity, one medium, one structural. There were no preexisiting CVEs for this package yet and the repository had no prior security issues.\n\nThe primary issue is that the HTTP transport in `server.py` skips authentication entirely when `MCP_API_KEY` is not set — which is the default, since `.env.example` ships the key as a blank value. Any unauthenticated caller who knows the server's public URL can invoke all six tools and generate live, billed Google Maps API requests against the operator's key. Because the README explicitly instructs operators to expose the server via ngrok (`ngrok http 8000`, then point MCP clients at the ngrok URL), this configuration gets deployed internet-facing as a matter of normal usage.\n\n**Affected files and exact lines:**\n\n`src/google_maps_mcp/server.py`, lines 186–192:\n```python\nexpected_key = os.getenv(\"MCP_API_KEY\")\n\nif not expected_key:\n    # If no MCP_API_KEY is set, allow all requests (development mode)\n    return await call_next(request)\n\nif api_key != expected_key:\n    return JSONResponse(\n        {\"error\": \"Invalid or missing API key. Provide X-API-Key header.\"},\n        status_code=401\n    )\n```\n\n`run.py` lines 37 and 38 bind to `0.0.0.0:8000` by default (`MCP_HOST=0.0.0.0`, `MCP_PORT=8000`). No rate-limiting middleware exists anywhere in the codebase — not in the middleware stack, not in `GoogleMapsClient`, not in the tool handlers.\n\n**Attack model:** operator deploys with default config (blank `MCP_API_KEY`), exposes via ngrok per the README instructions, attacker discovers the ngrok URL through ngrok's public endpoint scan surface or via a targeted test of shared URLs. No credentials needed to call the server.\n\n**PoC — reproduces from the default config:**\n```bash\n# Start with default .env.example (MCP_API_KEY blank/unset)\nexport GOOGLE_MAPS_API_KEY=\u003coperator_key\u003e\npython run.py  # binds 0.0.0.0:8000\n\n# From attacker machine — no X-API-Key header needed:\ncurl -X POST http://\u003cserver\u003e:8000/mcp/ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"geocode\",\"arguments\":{\"address\":\"Times Square New York\"}}}'\n# Returns geocoding results. Request billed to operator's GCP project.\n```\n\nThe financial harm is real and accumulates fast. Google's $200/month free credit exhausts in roughly 3 hours at Places API pricing (~$17/1,000 requests) with a sustained 1 req/sec flood. More practically: any developer testing the ngrok URL, sharing it in a project thread, or posting it in a demo context creates a window where anyone with the link can silently drain quota. The attacker doesn't need the `GOOGLE_MAPS_API_KEY` value — they only need the MCP server URL.\n\n**Fix — three concrete changes, no new dependencies:**\n\n1. In HTTP transport mode, refuse to start if `MCP_API_KEY` is unset. Add a startup check in `server.py` (or `run.py`) that exits with a clear message if the environment variable is blank when the transport is HTTP. Something like:\n   ```python\n   if transport == \"http\" and not os.getenv(\"MCP_API_KEY\"):\n       raise SystemExit(\n           \"ERROR: MCP_API_KEY must be set before starting the HTTP server. \"\n           \"Unset key allows unauthenticated access to all Google Maps API calls.\"\n       )\n   ```\n2. Update `.env.example` — change `MCP_API_KEY=` to a comment that makes the requirement explicit: `# Required for HTTP transport. Generate with: python -c \"import secrets; print(secrets.token_hex(32))\"`\n3. Add a one-line warning to the README before the ngrok step: \"Before running ngrok, set `MCP_API_KEY` in your `.env`. Without it, anyone with the URL can make unlimited Google Maps API calls billed to your account.\"\n\nA token-bucket rate limiter (e.g., `slowapi`, which is already compatible with Starlette/FastAPI-style apps) would add another layer, but the auth fix is the critical path.\n\n---\n\nThe second issue is in `src/google_maps_mcp/client.py` at line 130:\n\n```python\nurl = f\"https://places.googleapis.com/v1/places/{place_id}\"\n```\n\n`place_id` comes from the MCP tool caller with no format validation and is interpolated verbatim into the URL path. `httpx` does not encode `/` or `?` in f-string URLs — only when using a `params=` dict. A crafted `place_id` like `\":searchText?textQuery=attacker-query\"` produces `https://places.googleapis.com/v1/places/:searchText?textQuery=attacker-query`, which routes to the text search endpoint instead of the details endpoint, with attacker-controlled query content. Injection is bounded to `places.googleapis.com` since the host is hardcoded, but it lets an attacker hit different endpoint semantics within that namespace and potentially force higher-cost API calls.\n\n**Fix:**\n```python\nimport re\n\nPLACE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_\\-]+(/[A-Za-z0-9_\\-]+)?$')\n\nasync def get_place_details(self, place_id: str) -\u003e dict:\n    if not PLACE_ID_PATTERN.match(place_id):\n        raise ValueError(f\"Invalid place_id format: {place_id!r}\")\n    url = f\"https://places.googleapis.com/v1/places/{place_id}\"\n    ...\n```\n\nGoogle Place IDs are alphanumeric strings with an optional `places/` segment prefix. That pattern eliminates all path and query injection.\n\n---\n\nThe third issue is structural and currently benign, but worth flagging given the package is installable via PyPI as `gmaps-mcp`.\n\nThe repository ships `.claude/skills/google-maps-mcp/SKILL.md` at the repo root. Claude Code and any harness using the same skill auto-discovery path pattern will auto-load this file as a system-level instruction when an agent clones the repository or opens the directory after install. The current content is legitimate usage documentation, so there's no active harm — but the file is a persistent injection surface. A future commit to `SKILL.md` could plant arbitrary instructions (exfiltrate environment variables, call an attacker-controlled URL before each tool response, silently modify output) that would enter agent context without any visible indicator for every developer or agent that installs `gmaps-mcp`.\n\nThe exposure is broader than it would be for a private repo: PyPI install means the audience includes every Claude Code, Cursor, and similar agent-enabled IDE user who pulls the package and opens it in an agent context.\n\n**Fix:** Move the skill documentation out of the auto-load path. Rename it to `docs/claude-skill-reference.md` (not auto-loaded), or remove it and note in the README that users who want Claude Code skill integration should add the file locally. Either approach preserves the UX without leaving a standing injection surface in the install tree.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gmaps-mcp",
+        "purl": "pkg:pypi/gmaps-mcp"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.1.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.1.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-52cq-7v8r-62c6/GHSA-52cq-7v8r-62c6.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/arthurkatcher/google-maps-mcp/security/advisories/GHSA-52cq-7v8r-62c6"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/arthurkatcher/google-maps-mcp/commit/00d872507c78e8116bbf9de7be7cd112945c0fd8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/arthurkatcher/google-maps-mcp/commit/3ae32643da469f962e67e8ef9726cd4d9bf4587d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/arthurkatcher/google-maps-mcp"
+    }
+  ]
+}
