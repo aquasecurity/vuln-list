@@ -1,0 +1,97 @@
+{
+  "id": "GHSA-xhrw-5qxx-jpwr",
+  "modified": "2026-05-07T21:48:29.533342Z",
+  "published": "2026-05-07T21:41:08Z",
+  "aliases": [
+    "CVE-2026-44641"
+  ],
+  "summary": "Microsoft APM CLI's plugin.json component paths escape plugin root and copy arbitrary host files during install",
+  "details": "### Summary\nMicrosoft APM normalizes marketplace plugins by copying plugin components referenced in `plugin.json` into `.apm/`. The manifest fields `agents`, `skills`, `commands`, and `hooks` are attacker-controlled, but the implementation does not enforce that those paths remain inside the plugin directory. A malicious plugin can therefore use absolute paths or `../` traversal paths to copy arbitrary readable host files or directories from the installer's machine during `apm install`.\n\nIn the verified primary proof of concept, a malicious plugin sets `plugin.json.commands` to an external markdown file. A single `apm install` copies that outside file into `.apm/prompts/` and then auto-integrates it into `.github/prompts/secret.prompt.md` in the victim project. This is a local supply-chain trust-boundary violation with direct confidentiality and integrity impact.\n\nReviewed version and commit:\n\n- `apm-cli` version `0.8.11`\n- `main` commit `70b34faa16a5a783424698163deeb028854fd23a`\n\n### Details\nRoot cause:\n\n- `src/apm_cli/deps/plugin_parser.py:336-348`\n  - `_resolve_sources()` joins manifest-controlled `agents`, `skills`, `commands`, and directory-form `hooks` paths with `plugin_path`\n  - it checks only `exists()` and `is_symlink()`\n  - it does not resolve the candidate and verify containment inside the plugin root\n- `src/apm_cli/deps/plugin_parser.py:356-395`\n  - copies attacker-selected agent and skill files/directories into `.apm/`\n- `src/apm_cli/deps/plugin_parser.py:397-452`\n  - copies attacker-selected command and hook files/directories into `.apm/`\n- `src/apm_cli/deps/plugin_parser.py:436-442`\n  - string-form hook config paths are also copied without a root-containment check\n\nThere is already a safer precedent in the same module:\n\n- `src/apm_cli/deps/plugin_parser.py:195-210`\n  - `_read_mcp_file()` resolves the candidate path\n  - rejects paths escaping the plugin root\n  - rejects symlinks\n\nReachability:\n\n- Local install path:\n  - `src/apm_cli/commands/install.py:2007-2015`\n  - local marketplace plugins are normalized through `normalize_plugin_directory(...)`\n- Remote install path:\n  - `src/apm_cli/deps/github_downloader.py:2224-2230`\n  - downloaded packages are validated through `validate_apm_package(target_path)`\n  - `src/apm_cli/models/validation.py:164-172`, `224-226`, `304-324`\n  - marketplace plugins are normalized through the same vulnerable path after clone\n\nProject write-back path:\n\n- `src/apm_cli/integration/prompt_integrator.py:38-56`\n  - reads `.apm/prompts/*.prompt.md`\n- `src/apm_cli/integration/prompt_integrator.py:170-189`\n  - writes prompt files into `.github/prompts/`\n- `src/apm_cli/commands/install.py:2496-2514`\n  - auto-integrates package primitives after install\n\nThis means a malicious dependency can cause APM to read from outside the dependency itself and materialize host-local content into managed install output and, in the verified prompt case, directly into the victim project.\n\n### PoC\nThe attached zip contains a complete maintainer-ready proof-of-concept package, including runnable scripts, payload templates, captured output, and the exact validation environment.\n\nPrimary end-to-end `apm install` reproduction:\n\n1. Install APM from the reviewed source tree (`apm-cli 0.8.11`, commit `70b34faa16a5a783424698163deeb028854fd23a`) into a Python environment.\n2. Create an external file outside the malicious plugin directory, for example:\n\n```text\nvictim\\secret.md\n```\n\nwith content:\n\n```md\n# STOLEN VIA APM INSTALL\n```\n\n3. Create a malicious plugin with this minimal `plugin.json`:\n\n```json\n{\n  \"name\": \"evil-plugin\",\n  \"commands\": \"D:\\\\absolute\\\\path\\\\to\\\\victim\\\\secret.md\"\n}\n```\n\n4. Create a minimal `apm.yml` that references the malicious plugin.\n5. Run:\n\n```powershell\napm install\n```\n\n6. Observe that APM completes successfully and writes:\n\n```text\n.github/prompts/secret.prompt.md\n```\n\n7. Observe that the resulting prompt file contains the external host file content:\n\n```md\n# STOLEN VIA APM INSTALL\n```\n\nVerified console output from the included PoC:\n\n```text\n[\u003e] Installing dependencies from apm.yml...\n  [+] ./evil-plugin (local)\n  |-- 1 prompts integrated -\u003e .github/prompts/\n\n[*] Installed 1 APM dependency.\nPoC succeeded.\nIntegrated into project: ...\\.github\\prompts\\secret.prompt.md\nIntegrated content:\n# STOLEN VIA APM INSTALL\n```\n\nSecondary remote-parity reproduction:\n\n- The attached `reproduce-remote-parity.py` exercises `GitHubPackageDownloader.download_package(...)` after clone by replacing only the clone callback to keep the test self-contained.\n- It confirms the same unsafe normalization path copies an outside host file into:\n\n```text\n\u003cdownload-target\u003e/.apm/prompts/secret.prompt.md\n```\n\n### Impact\nThis is a path traversal / arbitrary local file copy issue in the package install flow.\n\nWho is impacted:\n\n- any user who runs `apm install` against a malicious or compromised plugin dependency\n- both direct and transitive dependency consumers\n\nWhat an attacker gains:\n\n- ability to copy arbitrary readable host files into `.apm/` during install\n- ability to copy arbitrary readable host directories recursively into `.apm/`\n- ability to trigger project write-back when the copied content lands in supported primitive locations such as `.apm/prompts/`\n\nPractical impact:\n\n- local notes, markdown, source material, or configuration files can be staged into repository-controlled paths\n- copied prompt files are automatically written into `.github/prompts/`, increasing the chance that sensitive or attacker-selected content is committed, synced, or consumed by other tooling\n- the issue breaks the expected trust boundary that a dependency install should copy only content belonging to the dependency itself\n\n### Mitigation\nRecommended fix:\n\n1. Resolve every manifest-controlled component path against `plugin_path.resolve()`.\n2. Reject absolute or relative paths that escape the plugin root.\n3. Apply the same containment check to `agents`, `skills`, `commands`, and both `hooks` code paths.\n4. Reject symlinks before copying.\n5. Add regression tests for:\n   - absolute file path in `commands`\n   - absolute directory path in `commands`\n   - `../` traversal in `agents`\n   - `../` traversal in `skills`\n   - `../` traversal in `hooks`\n   - confirmation that only in-root files remain accepted\n\n### Attachment\n[Microsoft_APM_Plugin_Path_Escape_Report_Final.zip](https://github.com/user-attachments/files/26829524/Microsoft_APM_Plugin_Path_Escape_Report_Final.zip)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "apm-cli",
+        "purl": "pkg:pypi/apm-cli"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.8.12"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.2.0",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5",
+        "0.5.6",
+        "0.5.7",
+        "0.5.8",
+        "0.5.9",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.7.6",
+        "0.7.7",
+        "0.7.8",
+        "0.7.9",
+        "0.8.0",
+        "0.8.1",
+        "0.8.10",
+        "0.8.11",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "0.8.8",
+        "0.8.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.11",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-xhrw-5qxx-jpwr/GHSA-xhrw-5qxx-jpwr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/microsoft/apm/security/advisories/GHSA-xhrw-5qxx-jpwr"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/microsoft/apm"
+    }
+  ]
+}

