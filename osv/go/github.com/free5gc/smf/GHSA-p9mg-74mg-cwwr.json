@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-p9mg-74mg-cwwr",
+  "modified": "2026-05-08T23:19:43.225090Z",
+  "published": "2026-05-08T23:01:56Z",
+  "aliases": [
+    "CVE-2026-44328"
+  ],
+  "summary": "free5GC's SMF UPI DELETE /upi/v1/upNodesLinks/{ref} panics on AN-node deletion via nil UPF dereference; unauthenticated, state-mutating",
+  "details": "### Summary\nfree5GC's SMF mounts the `UPI` management route group without inbound OAuth2 middleware (same root cause as the broader UPI auth gap reported in free5gc/free5gc#887). On top of that, the `DELETE /upi/v1/upNodesLinks/{upNodeRef}` handler unconditionally dereferences `upNode.UPF` after the type-guarded async release, even though `AN`-typed nodes are constructed without a `UPF` object. As a result, a single unauthenticated `DELETE /upi/v1/upNodesLinks/gNB1` request crashes the handler with a nil-pointer panic AND mutates the in-memory user-plane topology before panicking (the `UpNodeDelete(upNodeRef)` line runs first). This is an unauthenticated, state-mutating panic-DoS sink that an off-path network attacker can trigger by name against any AN entry.\n\n### Details\nValidated against the SMF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/smf:v4.2.1`\n- Runtime SMF commit: `8385c00a`\n- Docker validation date: 2026-03-22 local (container log timestamp `2026-03-21T23:43:17Z`)\n- SMF endpoint: `http://10.100.200.6:8000`\n\nControl comparison on the same SMF instance:\n- `GET /nsmf-oam/v1/` (no token) -\u003e `401 Unauthorized`\n- `DELETE /upi/v1/upNodesLinks/gNB1` (no token) -\u003e `500 Internal Server Error` (panic)\n\nThe sibling `nsmf-oam` returning `401` proves OAuth middleware IS wired in for other SMF route groups; the UPI group specifically is mounted without it.\n\nVulnerable handler logic (paths in `free5gc/smf`):\n```go\n// NFs/smf/internal/sbi/api_upi.go:94..99\nif upNode.Type == smf_context.UPNODE_UPF {\n    go s.Processor().ReleaseAllResourcesOfUPF(upNode.UPF)\n}\nupi.UpNodeDelete(upNodeRef)\nupNode.UPF.CancelAssociation()   // \u003c-- panics for AN-typed nodes; nil UPF\n```\n\nThe `Type == UPNODE_UPF` guard only protects the asynchronous `ReleaseAllResourcesOfUPF` call. After that, `UpNodeDelete(upNodeRef)` runs unconditionally (so the topology mutation lands first), and then `upNode.UPF.CancelAssociation()` is called unconditionally on a `*UPF` that is `nil` for `AN` nodes by construction.\n\nCode evidence:\n- UPI group mounted WITHOUT auth middleware:\n  - `NFs/smf/internal/sbi/server.go:76`\n  - `NFs/smf/internal/sbi/server.go:78`\n- Protected control comparison (other SMF groups DO use auth):\n  - `NFs/smf/internal/sbi/server.go:99`\n  - `NFs/smf/internal/sbi/server.go:105`\n- Delete handler (panic site):\n  - `NFs/smf/internal/sbi/api_upi.go:94`\n  - `NFs/smf/internal/sbi/api_upi.go:99`\n- AN nodes are constructed without a UPF object (root cause of the nil deref):\n  - `NFs/smf/internal/context/user_plane_information.go:95`\n  - `NFs/smf/internal/context/user_plane_information.go:97`\n\n### PoC\nReproduced end-to-end against the running SMF at `http://10.100.200.6:8000`.\n\n1. Control: protected sibling OAM route returns `401`:\n```\ncurl -i http://10.100.200.6:8000/nsmf-oam/v1/\n```\n```\nHTTP/1.1 401 Unauthorized\n```\n\n2. Trigger: unauthenticated DELETE on the default AN node `gNB1`:\n```\ncurl -i -X DELETE http://10.100.200.6:8000/upi/v1/upNodesLinks/gNB1\n```\n```\nHTTP/1.1 500 Internal Server Error\n```\n\n3. SMF container logs (`docker logs --tail 120 smf`) show topology mutation landing BEFORE the panic, and the panic stack pointing at `api_upi.go:99`:\n```\n[INFO][SMF][Init] UPNode [gNB1] found. Deleting it.\n[INFO][SMF][Init] Delete UPLink [UPF] \u003c=\u003e [gNB1].\n[ERRO][SMF][GIN] panic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/free5gc/smf/internal/sbi.(*Server).DeleteUpNodeLink\n    /go/src/free5gc/NFs/smf/internal/sbi/api_upi.go:99 +0x298\n[INFO][SMF][GIN] | 500 | DELETE | /upi/v1/upNodesLinks/gNB1\n```\n\nThe lab state was manually restored after validation by re-creating the AN entry; that POST is restoration-only and is NOT a mitigation.\n\n### Impact\nThree compounding defects on the same SMF SBI surface:\n1. Missing inbound authentication (CWE-306) and authorization (CWE-862) on the `UPI` route group, so the trigger is reachable to any off-path network attacker who can reach SMF on the SBI -- no token, no session, no UE state needed. The same-instance `nsmf-oam` returning `401` proves the middleware is wired in elsewhere and only missing on UPI.\n2. NULL pointer dereference (CWE-476) in `DeleteUpNodeLink`: the `Type == UPNODE_UPF` guard only covers the async release call, then `upNode.UPF.CancelAssociation()` runs unconditionally on AN-typed nodes that have a nil `UPF` field by construction.\n3. Order of operations (CWE-755 / CWE-754): `UpNodeDelete(upNodeRef)` mutates the in-memory user-plane topology BEFORE the dereference panics, so the topology change lands even though the request returns 500. This makes the bug state-mutating, not just a plain panic.\n\nAny party that can reach SMF on the SBI can:\n- Delete arbitrary named entries (e.g. `gNB1`) from SMF's in-memory user-plane topology anonymously via a single `DELETE /upi/v1/upNodesLinks/{ref}` request, denying SMF's ability to consider that AN/UPF in subsequent UPF selection / PFCP path establishment for legitimate UE sessions.\n- Trigger a panic on the SMF goroutine for the deleted-AN case, even though Gin recovers the goroutine, leaving the topology in the mutated state above.\n- Repeat the trigger by name against any AN entry, sustaining the topology denial without ever authenticating.\n\nThis is a strict superset of the impact in free5gc/free5gc#887 for this specific code path: same auth bypass, plus a concrete request-triggerable nil deref, plus state mutation that survives the panic.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/905\nUpstream fix: https://github.com/free5gc/smf/pull/199",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/smf",
+        "purl": "pkg:golang/github.com/free5gc/smf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-p9mg-74mg-cwwr/GHSA-p9mg-74mg-cwwr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-p9mg-74mg-cwwr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/905"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/smf/pull/199"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/smf/commit/b57bc48081c3d3a2f333d02eb78e4fd31a120deb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

