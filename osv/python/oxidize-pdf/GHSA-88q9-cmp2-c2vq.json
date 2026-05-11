@@ -1,0 +1,116 @@
+{
+  "id": "GHSA-88q9-cmp2-c2vq",
+  "modified": "2026-05-11T15:04:46.753471Z",
+  "published": "2026-05-11T14:53:25Z",
+  "summary": "oxidize-pdf: NaN/inf bypass in colour content-stream emission causes PDF rejection (DoS)",
+  "details": "### Impact\n\n  `oxidize-pdf` defines `Color` as a `pub enum` with public tuple-struct variants `Rgb(f64, f64, f64)`, `Gray(f64)`, and `Cmyk(f64, f64, f64, f64)`. The constructors `Color::rgb`, `Color::gray`, and `Color::cmyk` clamp incoming\n  components to `[0.0, 1.0]`, but because the variants are `pub`, callers can construct values directly without going through the constructors:\n\n  ```rust\n  let safe   = Color::rgb(f64::NAN, 0.5, 0.5);   // clamps NaN to 0.0\n  let attack = Color::Rgb(f64::NAN, 0.5, 0.5);    // bypasses clamp\n\n  Color: Copy allows the non-finite value to propagate freely through API surfaces and serialisation. When such a value reaches a content-stream emitter, the writer formats it via format!(\"{:.3}\", v). The Rust standard library renders\n  f64::NAN as \"NaN\", f64::INFINITY as \"inf\", and f64::NEG_INFINITY as \"-inf\" — none of which are valid PDF numeric tokens per ISO 32000-1 §7.3.3:\n\n  ▎ A numeric object shall be represented by one or more decimal digits with an optional sign and a leading, trailing, or embedded PERIOD.\n\n  The resulting content stream contains an invalid token sequence (e.g. NaN 0.500 0.500 rg). Conformant PDF viewers (Adobe Acrobat, Foxit, PDF.js, Apple Preview) reject the content stream, the affected page, or the entire document\n  depending on parser strictness.\n\n  Affected packages (all listed in the \"Affected products\" section of this advisory):\n\n  - oxidize-pdf on crates.io — the core Rust library where the vulnerable code path lives.\n  - OxidizePdf.NET on NuGet — .NET FFI binding that exposes Color through its public API; inherits the vulnerability from its dependency on oxidize-pdf.\n  - oxidize-pdf on PyPI — Python bindings (PyO3) that similarly expose colour construction; inherits the vulnerability from its dependency.\n\n  Who is impacted: any application that uses these packages to generate PDFs and accepts user-influenced colour values without validation. The most exposed surfaces are server-side PDF generators that take arbitrary f64 colour\n  parameters from upstream services.\n\n  Reproduction (Rust API):\n  use oxidize_pdf::{Document, Page, graphics::Color};\n\n  let mut doc = Document::new();\n  let mut page = Page::a4();\n  let gc = page.graphics();\n  gc.set_fill_color(Color::Rgb(f64::NAN, 0.5, 0.5));\n  gc.rectangle(50.0, 50.0, 100.0, 100.0).fill();\n  doc.add_page(page);\n  doc.save(\"malformed.pdf\").unwrap();\n\n  // The resulting content stream contains:\n  //   NaN 0.500 0.500 rg\n  //   50 50 100 100 re\n  //   f\n  // which conformant viewers reject.\n\n  Affected sites in oxidize-pdf 2.5.7 (the same code paths are reached by both .NET and Python bindings via FFI):\n\n  - oxidize-pdf-core/src/text/flow.rs (TextFlowContext)\n  - oxidize-pdf-core/src/text/mod.rs (TextContext::apply_text_state_parameters)\n  - oxidize-pdf-core/src/graphics/mod.rs (GraphicsContext::apply_fill_color / apply_stroke_color)\n  - oxidize-pdf-core/src/graphics/patterns.rs (create_checkerboard_pattern / create_stripe_pattern / create_dots_pattern)\n  - ~45 sibling sites across forms/*, annotations/*, layout/rich_text.rs, and writer/pdf_writer/mod.rs that emit colour through the same code path.\n\n  Patches\n\n  The fix introduces a sanitising helper at the emission boundary in graphics/color.rs:\n\n  pub(crate) fn finite_or_zero(val: f64) -\u003e f64 {\n      if val.is_finite() { val } else { 0.0 }\n  }\n\n  Every colour-operator emitter (~50 sites across 17 files) now routes through fill_color_op / stroke_color_op / write_fill_color / write_stroke_color, which apply finite_or_zero before formatting. Non-finite components are substituted\n  with 0.0, so the wire format remains ISO 32000-1 conformant regardless of the input.\n\n  Patched releases:\n\n  - oxidize-pdf 2.6.0 on crates.io — contains the fix at the source.\n  - OxidizePdf.NET on NuGet — bumped to depend on oxidize-pdf 2.6.0 (see \"Patched versions\" above).\n  - oxidize-pdf on PyPI — bumped to depend on oxidize-pdf 2.6.0 (see \"Patched versions\" above).\n\n  Users should upgrade to the patched version of whichever package(s) they consume.\n\n  Workarounds\n\n  For users who cannot upgrade immediately:\n\n  - Always construct colours via the safe constructors Color::rgb(), Color::gray(), Color::cmyk(), which clamp components to [0.0, 1.0] (no NaN/inf survives clamping).\n  - Never use direct enum construction (Color::Rgb(...), Color::Gray(...), Color::Cmyk(...)) when components originate from untrusted input. The same applies to the corresponding APIs in the .NET and Python bindings.\n  - Validate untrusted f64 colour inputs with f64::is_finite() (Rust) or equivalent checks (!double.IsFinite(v) in .NET, math.isfinite(v) in Python) before passing them to any oxidize-pdf API.\n\n  These mitigations are partial — they cover the application layer but not other code paths that may construct Color values internally. The full fix is the upgrade to the patched versions.\n\n  References\n\n  - Issue: https://github.com/bzsanti/oxidizePdf/issues/220\n  - Companion refactor: https://github.com/bzsanti/oxidizePdf/issues/221\n  - Fix PR: https://github.com/bzsanti/oxidizePdf/pull/225\n  - Release PR (oxidize-pdf 2.6.0): https://github.com/bzsanti/oxidizePdf/pull/226\n  - .NET binding repository: https://github.com/bzsanti/oxidize-pdf-dotnet\n  - Python binding repository: https://github.com/bzsanti/oxidize-python\n  - ISO 32000-1 §7.3.3 (Numeric Objects): https://www.iso.org/standard/51502.html\n\n  A broader follow-up tracks the same CWE class in non-colour numeric content-stream emitters (line widths, transformation matrices, dash arrays, text positioning, path operators) — to be addressed in oxidize-pdf 2.7.0 with its own\n  advisory.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "oxidize-pdf",
+        "purl": "pkg:cargo/oxidize-pdf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.5.7",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-88q9-cmp2-c2vq/GHSA-88q9-cmp2-c2vq.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "NuGet",
+        "name": "OxidizePdf.NET",
+        "purl": "pkg:nuget/OxidizePdf.NET"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.8.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.7.0",
+        "0.7.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.7.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-88q9-cmp2-c2vq/GHSA-88q9-cmp2-c2vq.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "oxidize-pdf",
+        "purl": "pkg:pypi/oxidize-pdf"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.5.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.2.0",
+        "0.2.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.4.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-88q9-cmp2-c2vq/GHSA-88q9-cmp2-c2vq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/bzsanti/oxidizePdf/security/advisories/GHSA-88q9-cmp2-c2vq"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/bzsanti/oxidizePdf"
+    }
+  ]
+}
