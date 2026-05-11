@@ -1715,7 +1715,7 @@
     },
     {
       "CVE": "CVE-2021-47209",
-      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\nsched/fair: Prevent dead task groups from regaining cfs_rq's\n\nKevin is reporting crashes which point to a use-after-free of a cfs_rq\nin update_blocked_averages(). Initial debugging revealed that we've\nlive cfs_rq's (on_list=1) in an about to be kfree()'d task group in\nfree_fair_sched_group(). However, it was unclear how that can happen.\n\nHis kernel config happened to lead to a layout of struct sched_entity\nthat put the 'my_q' member directly into the middle of the object\nwhich makes it incidentally overlap with SLUB's freelist pointer.\nThat, in combination with SLAB_FREELIST_HARDENED's freelist pointer\nmangling, leads to a reliable access violation in form of a #GP which\nmade the UAF fail fast.\n\nMichal seems to have run into the same issue[1]. He already correctly\ndiagnosed that commit a7b359fc6a37 (\"sched/fair: Correctly insert\ncfs_rq's to list on unthrottle\") is causing the preconditions for the\nUAF to happen by re-adding cfs_rq's also to task groups that have no\nmore running tasks, i.e. also to dead ones. His analysis, however,\nmisses the real root cause and it cannot be seen from the crash\nbacktrace only, as the real offender is tg_unthrottle_up() getting\ncalled via sched_cfs_period_timer() via the timer interrupt at an\ninconvenient time.\n\nWhen unregister_fair_sched_group() unlinks all cfs_rq's from the dying\ntask group, it doesn't protect itself from getting interrupted. If the\ntimer interrupt triggers while we iterate over all CPUs or after\nunregister_fair_sched_group() has finished but prior to unlinking the\ntask group, sched_cfs_period_timer() will execute and walk the list of\ntask groups, trying to unthrottle cfs_rq's, i.e. re-add them to the\ndying task group. These will later -- in free_fair_sched_group() -- be\nkfree()'ed while still being linked, leading to the fireworks Kevin\nand Michal are seeing.\n\nTo fix this race, ensure the dying task group gets unlinked first.\nHowever, simply switching the order of unregistering and unlinking the\ntask group isn't sufficient, as concurrent RCU walkers might still see\nit, as can be seen below:\n\n    CPU1:                                      CPU2:\n      :                                        timer IRQ:\n      :                                          do_sched_cfs_period_timer():\n      :                                            :\n      :                                            distribute_cfs_runtime():\n      :                                              rcu_read_lock();\n      :                                              :\n      :                                              unthrottle_cfs_rq():\n    sched_offline_group():                             :\n      :                                                walk_tg_tree_from(…,tg_unthrottle_up,…):\n      list_del_rcu(\u0026tg-\u003elist);                           :\n (1)  :                                                  list_for_each_entry_rcu(child, \u0026parent-\u003echildren, siblings)\n      :                                                    :\n (2)  list_del_rcu(\u0026tg-\u003esiblings);                         :\n      :                                                    tg_unthrottle_up():\n      unregister_fair_sched_group():                         struct cfs_rq *cfs_rq = tg-\u003ecfs_rq[cpu_of(rq)];\n        :                                                    :\n        list_del_leaf_cfs_rq(tg-\u003ecfs_rq[cpu]);               :\n        :                                                    :\n        :                                                    if (!cfs_rq_is_decayed(cfs_rq) || cfs_rq-\u003enr_running)\n (3)    :                                                        list_add_leaf_cfs_rq(cfs_rq);\n      :                                                      :\n      :                                                    :\n      :                                                  :\n      :                                                :\n      :                           \n---truncated---",
+      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\nsched/fair: Prevent dead task groups from regaining cfs_rq's\n\nKevin is reporting crashes which point to a use-after-free of a cfs_rq\nin update_blocked_averages(). Initial debugging revealed that we've\nlive cfs_rq's (on_list=1) in an about to be kfree()'d task group in\nfree_fair_sched_group(). However, it was unclear how that can happen.\n\nHis kernel config happened to lead to a layout of struct sched_entity\nthat put the 'my_q' member directly into the middle of the object\nwhich makes it incidentally overlap with SLUB's freelist pointer.\nThat, in combination with SLAB_FREELIST_HARDENED's freelist pointer\nmangling, leads to a reliable access violation in form of a #GP which\nmade the UAF fail fast.\n\nMichal seems to have run into the same issue[1]. He already correctly\ndiagnosed that commit a7b359fc6a37 (\"sched/fair: Correctly insert\ncfs_rq's to list on unthrottle\") is causing the preconditions for the\nUAF to happen by re-adding cfs_rq's also to task groups that have no\nmore running tasks, i.e. also to dead ones. His analysis, however,\nmisses the real root cause and it cannot be seen from the crash\nbacktrace only, as the real offender is tg_unthrottle_up() getting\ncalled via sched_cfs_period_timer() via the timer interrupt at an\ninconvenient time.\n\nWhen unregister_fair_sched_group() unlinks all cfs_rq's from the dying\ntask group, it doesn't protect itself from getting interrupted. If the\ntimer interrupt triggers while we iterate over all CPUs or after\nunregister_fair_sched_group() has finished but prior to unlinking the\ntask group, sched_cfs_period_timer() will execute and walk the list of\ntask groups, trying to unthrottle cfs_rq's, i.e. re-add them to the\ndying task group. These will later -- in free_fair_sched_group() -- be\nkfree()'ed while still being linked, leading to the fireworks Kevin\nand Michal are seeing.\n\nTo fix this race, ensure the dying task group gets unlinked first.\nHowever, simply switching the order of unregistering and unlinking the\ntask group isn't sufficient, as concurrent RCU walkers might still see\nit, as can be seen below:\n\n    CPU1:                                      CPU2:\n      :                                        timer IRQ:\n      :                                          do_sched_cfs_period_timer():\n      :                                            :\n      :                                            distribute_cfs_runtime():\n      :                                              rcu_read_lock();\n      :                                              :\n      :                                              unthrottle_cfs_rq():\n    sched_offline_group():                             :\n      :                                                walk_tg_tree_from(...,tg_unthrottle_up,...):\n      list_del_rcu(\u0026tg-\u003elist);                           :\n (1)  :                                                  list_for_each_entry_rcu(child, \u0026parent-\u003echildren, siblings)\n      :                                                    :\n (2)  list_del_rcu(\u0026tg-\u003esiblings);                         :\n      :                                                    tg_unthrottle_up():\n      unregister_fair_sched_group():                         struct cfs_rq *cfs_rq = tg-\u003ecfs_rq[cpu_of(rq)];\n        :                                                    :\n        list_del_leaf_cfs_rq(tg-\u003ecfs_rq[cpu]);               :\n        :                                                    :\n        :                                                    if (!cfs_rq_is_decayed(cfs_rq) || cfs_rq-\u003enr_running)\n (3)    :                                                        list_add_leaf_cfs_rq(cfs_rq);\n      :                                                      :\n      :                                                    :\n      :                                                  :\n      :                                                :\n      :                           \n---truncated---",
       "Threats": [
         {
           "Type": "Impact",
@@ -1889,7 +1889,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -2679,7 +2679,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -2997,7 +2997,7 @@
     },
     {
       "CVE": "CVE-2024-22099",
-      "Description": "NULL Pointer Dereference vulnerability in Linux Linux kernel kernel on Linux, x86, ARM (net, bluetooth modules) allows Overflow Buffers. This vulnerability is associated with program files /net/bluetooth/rfcomm/core.C.\n\nThis issue affects Linux kernel: v2.6.12-rc2.\n\n",
+      "Description": "NULL Pointer Dereference vulnerability in Linux Linux kernel kernel on Linux, x86, ARM (net, bluetooth modules) allows Overflow Buffers. This vulnerability is associated with program files /net/bluetooth/rfcomm/core.C.\n\nThis issue affects Linux kernel: v2.6.12-rc2.",
       "Threats": [
         {
           "Type": "Impact",
@@ -3519,7 +3519,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -3693,7 +3693,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "moderate"
+          "Severity": "important"
         }
       ],
       "References": [

@@ -1553,7 +1553,7 @@
     },
     {
       "CVE": "CVE-2024-26759",
-      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\nmm/swap: fix race when skipping swapcache\n\nWhen skipping swapcache for SWP_SYNCHRONOUS_IO, if two or more threads\nswapin the same entry at the same time, they get different pages (A, B). \nBefore one thread (T0) finishes the swapin and installs page (A) to the\nPTE, another thread (T1) could finish swapin of page (B), swap_free the\nentry, then swap out the possibly modified page reusing the same entry. \nIt breaks the pte_same check in (T0) because PTE value is unchanged,\ncausing ABA problem.  Thread (T0) will install a stalled page (A) into the\nPTE and cause data corruption.\n\nOne possible callstack is like this:\n\nCPU0                                 CPU1\n----                                 ----\ndo_swap_page()                       do_swap_page() with same entry\n\u003cdirect swapin path\u003e                 \u003cdirect swapin path\u003e\n\u003calloc page A\u003e                       \u003calloc page B\u003e\nswap_read_folio() \u003c- read to page A  swap_read_folio() \u003c- read to page B\n\u003cslow on later locks or interrupt\u003e   \u003cfinished swapin first\u003e\n...                                  set_pte_at()\n                                     swap_free() \u003c- entry is free\n                                     \u003cwrite to page B, now page A stalled\u003e\n                                     \u003cswap out page B to same swap entry\u003e\npte_same() \u003c- Check pass, PTE seems\n              unchanged, but page A\n              is stalled!\nswap_free() \u003c- page B content lost!\nset_pte_at() \u003c- staled page A installed!\n\nAnd besides, for ZRAM, swap_free() allows the swap device to discard the\nentry content, so even if page (B) is not modified, if swap_read_folio()\non CPU0 happens later than swap_free() on CPU1, it may also cause data\nloss.\n\nTo fix this, reuse swapcache_prepare which will pin the swap entry using\nthe cache flag, and allow only one thread to swap it in, also prevent any\nparallel code from putting the entry in the cache.  Release the pin after\nPT unlocked.\n\nRacers just loop and wait since it's a rare and very short event.  A\nschedule_timeout_uninterruptible(1) call is added to avoid repeated page\nfaults wasting too much CPU, causing livelock or adding too much noise to\nperf statistics.  A similar livelock issue was described in commit\n029c4628b2eb (\"mm: swap: get rid of livelock in swapin readahead\")\n\nReproducer:\n\nThis race issue can be triggered easily using a well constructed\nreproducer and patched brd (with a delay in read path) [1]:\n\nWith latest 6.8 mainline, race caused data loss can be observed easily:\n$ gcc -g -lpthread test-thread-swap-race.c \u0026\u0026 ./a.out\n  Polulating 32MB of memory region...\n  Keep swapping out...\n  Starting round 0...\n  Spawning 65536 workers...\n  32746 workers spawned, wait for done...\n  Round 0: Error on 0x5aa00, expected 32746, got 32743, 3 data loss!\n  Round 0: Error on 0x395200, expected 32746, got 32743, 3 data loss!\n  Round 0: Error on 0x3fd000, expected 32746, got 32737, 9 data loss!\n  Round 0 Failed, 15 data loss!\n\nThis reproducer spawns multiple threads sharing the same memory region\nusing a small swap device.  Every two threads updates mapped pages one by\none in opposite direction trying to create a race, with one dedicated\nthread keep swapping out the data out using madvise.\n\nThe reproducer created a reproduce rate of about once every 5 minutes, so\nthe race should be totally possible in production.\n\nAfter this patch, I ran the reproducer for over a few hundred rounds and\nno data loss observed.\n\nPerformance overhead is minimal, microbenchmark swapin 10G from 32G\nzram:\n\nBefore:     10934698 us\nAfter:      11157121 us\nCached:     13155355 us (Dropping SWP_SYNCHRONOUS_IO flag)\n\n[kasong@tencent.com: v4]\n  Link: https://lkml.kernel.org/r/20240219082040.7495-1-ryncsn@gmail.com",
+      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\nmm/swap: fix race when skipping swapcache\n\nWhen skipping swapcache for SWP_SYNCHRONOUS_IO, if two or more threads\nswapin the same entry at the same time, they get different pages (A, B). \nBefore one thread (T0) finishes the swapin and installs page (A) to the\nPTE, another thread (T1) could finish swapin of page (B), swap_free the\nentry, then swap out the possibly modified page reusing the same entry. \nIt breaks the pte_same check in (T0) because PTE value is unchanged,\ncausing ABA problem.  Thread (T0) will install a stalled page (A) into the\nPTE and cause data corruption.\n\nOne possible callstack is like this:\n\nCPU0                                 CPU1\n----                                 ----\ndo_swap_page()                       do_swap_page() with same entry\n\u003cdirect swapin path\u003e                 \u003cdirect swapin path\u003e\n\u003calloc page A\u003e                       \u003calloc page B\u003e\nswap_read_folio() \u003c- read to page A  swap_read_folio() \u003c- read to page B\n\u003cslow on later locks or interrupt\u003e   \u003cfinished swapin first\u003e\n...                                  set_pte_at()\n                                     swap_free() \u003c- entry is free\n                                     \u003cwrite to page B, now page A stalled\u003e\n                                     \u003cswap out page B to same swap entry\u003e\npte_same() \u003c- Check pass, PTE seems\n              unchanged, but page A\n              is stalled!\nswap_free() \u003c- page B content lost!\nset_pte_at() \u003c- staled page A installed!\n\nAnd besides, for ZRAM, swap_free() allows the swap device to discard the\nentry content, so even if page (B) is not modified, if swap_read_folio()\non CPU0 happens later than swap_free() on CPU1, it may also cause data\nloss.\n\nTo fix this, reuse swapcache_prepare which will pin the swap entry using\nthe cache flag, and allow only one thread to swap it in, also prevent any\nparallel code from putting the entry in the cache.  Release the pin after\nPT unlocked.\n\nRacers just loop and wait since it's a rare and very short event.  A\nschedule_timeout_uninterruptible(1) call is added to avoid repeated page\nfaults wasting too much CPU, causing livelock or adding too much noise to\nperf statistics.  A similar livelock issue was described in commit\n029c4628b2eb (\"mm: swap: get rid of livelock in swapin readahead\")\n\nReproducer:\n\nThis race issue can be triggered easily using a well constructed\nreproducer and patched brd (with a delay in read path) [1]:\n\nWith latest 6.8 mainline, race caused data loss can be observed easily:\n$ gcc -g -lpthread test-thread-swap-race.c \u0026\u0026 ./a.out\n  Polulating 32MB of memory region...\n  Keep swapping out...\n  Starting round 0...\n  Spawning 65536 workers...\n  32746 workers spawned, wait for done...\n  Round 0: Error on 0x5aa00, expected 32746, got 32743, 3 data loss!\n  Round 0: Error on 0x395200, expected 32746, got 32743, 3 data loss!\n  Round 0: Error on 0x3fd000, expected 32746, got 32737, 9 data loss!\n  Round 0 Failed, 15 data loss!\n\nThis reproducer spawns multiple threads sharing the same memory region\nusing a small swap device.  Every two threads updates mapped pages one by\none in opposite direction trying to create a race, with one dedicated\nthread keep swapping out the data out using madvise.\n\nThe reproducer created a reproduce rate of about once every 5 minutes, so\nthe race should be totally possible in production.\n\nAfter this patch, I ran the reproducer for over a few hundred rounds and\nno data loss observed.\n\nPerformance overhead is minimal, microbenchmark swapin 10G from 32G\nzram:\n\nBefore:     10934698 us\nAfter:      11157121 us\nCached:     13155355 us (Dropping SWP_SYNCHRONOUS_IO flag)\n\n[kasong@tencent.com: v4]",
       "Threats": [
         {
           "Type": "Impact",
@@ -2209,7 +2209,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "important"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -2281,7 +2281,7 @@
     },
     {
       "CVE": "CVE-2024-44952",
-      "Description": "** REJECT ** This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
+      "Description": "This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
       "Threats": [
         {
           "Type": "Impact",
@@ -2357,7 +2357,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -2641,7 +2641,7 @@
     },
     {
       "CVE": "CVE-2024-44972",
-      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\nbtrfs: do not clear page dirty inside extent_write_locked_range()\n\n[BUG]\nFor subpage + zoned case, the following workload can lead to rsv data\nleak at unmount time:\n\n  # mkfs.btrfs -f -s 4k $dev\n  # mount $dev $mnt\n  # fsstress -w -n 8 -d $mnt -s 1709539240\n  0/0: fiemap - no filename\n  0/1: copyrange read - no filename\n  0/2: write - no filename\n  0/3: rename - no source filename\n  0/4: creat f0 x:0 0 0\n  0/4: creat add id=0,parent=-1\n  0/5: writev f0[259 1 0 0 0 0] [778052,113,965] 0\n  0/6: ioctl(FIEMAP) f0[259 1 0 0 224 887097] [1294220,2291618343991484791,0x10000] -1\n  0/7: dwrite - xfsctl(XFS_IOC_DIOINFO) f0[259 1 0 0 224 887097] return 25, fallback to stat()\n  0/7: dwrite f0[259 1 0 0 224 887097] [696320,102400] 0\n  # umount $mnt\n\nThe dmesg includes the following rsv leak detection warning (all call\ntrace skipped):\n\n  ------------[ cut here ]------------\n  WARNING: CPU: 2 PID: 4528 at fs/btrfs/inode.c:8653 btrfs_destroy_inode+0x1e0/0x200 [btrfs]\n  ---[ end trace 0000000000000000 ]---\n  ------------[ cut here ]------------\n  WARNING: CPU: 2 PID: 4528 at fs/btrfs/inode.c:8654 btrfs_destroy_inode+0x1a8/0x200 [btrfs]\n  ---[ end trace 0000000000000000 ]---\n  ------------[ cut here ]------------\n  WARNING: CPU: 2 PID: 4528 at fs/btrfs/inode.c:8660 btrfs_destroy_inode+0x1a0/0x200 [btrfs]\n  ---[ end trace 0000000000000000 ]---\n  BTRFS info (device sda): last unmount of filesystem 1b4abba9-de34-4f07-9e7f-157cf12a18d6\n  ------------[ cut here ]------------\n  WARNING: CPU: 3 PID: 4528 at fs/btrfs/block-group.c:4434 btrfs_free_block_groups+0x338/0x500 [btrfs]\n  ---[ end trace 0000000000000000 ]---\n  BTRFS info (device sda): space_info DATA has 268218368 free, is not full\n  BTRFS info (device sda): space_info total=268435456, used=204800, pinned=0, reserved=0, may_use=12288, readonly=0 zone_unusable=0\n  BTRFS info (device sda): global_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): trans_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): chunk_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): delayed_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): delayed_refs_rsv: size 0 reserved 0\n  ------------[ cut here ]------------\n  WARNING: CPU: 3 PID: 4528 at fs/btrfs/block-group.c:4434 btrfs_free_block_groups+0x338/0x500 [btrfs]\n  ---[ end trace 0000000000000000 ]---\n  BTRFS info (device sda): space_info METADATA has 267796480 free, is not full\n  BTRFS info (device sda): space_info total=268435456, used=131072, pinned=0, reserved=0, may_use=262144, readonly=0 zone_unusable=245760\n  BTRFS info (device sda): global_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): trans_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): chunk_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): delayed_block_rsv: size 0 reserved 0\n  BTRFS info (device sda): delayed_refs_rsv: size 0 reserved 0\n\nAbove $dev is a tcmu-runner emulated zoned HDD, which has a max zone\nappend size of 64K, and the system has 64K page size.\n\n[CAUSE]\nI have added several trace_printk() to show the events (header skipped):\n\n  \u003e btrfs_dirty_pages: r/i=5/259 dirty start=774144 len=114688\n  \u003e btrfs_dirty_pages: r/i=5/259 dirty part of page=720896 off_in_page=53248 len_in_page=12288\n  \u003e btrfs_dirty_pages: r/i=5/259 dirty part of page=786432 off_in_page=0 len_in_page=65536\n  \u003e btrfs_dirty_pages: r/i=5/259 dirty part of page=851968 off_in_page=0 len_in_page=36864\n\nThe above lines show our buffered write has dirtied 3 pages of inode\n259 of root 5:\n\n  704K             768K              832K              896K\n  I           |////I/////////////////I///////////|     I\n              756K                               868K\n\n  |///| is the dirtied range using subpage bitmaps. and 'I' is the page\n  boundary.\n\n  Meanwhile all three pages (704K, 768K, 832K) have their PageDirty\n  flag set.\n\n  \u003e btrfs_direct_write: r/i=5/259 start dio filepos=696320 len=102400\n\nThen direct IO writ\n---truncated---",
+      "Description": "This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
       "Threats": [
         {
           "Type": "Impact",
@@ -2753,7 +2753,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -2825,7 +2825,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "moderate"
+          "Severity": "important"
         }
       ],
       "References": [
@@ -3365,7 +3365,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -4485,7 +4485,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -4737,7 +4737,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5385,7 +5385,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "important"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5421,7 +5421,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "important"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5457,7 +5457,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "important"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5885,11 +5885,11 @@
     },
     {
       "CVE": "CVE-2024-46756",
-      "Description": "** REJECT ** This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
+      "Description": "This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5921,11 +5921,11 @@
     },
     {
       "CVE": "CVE-2024-46757",
-      "Description": "** REJECT ** This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
+      "Description": "This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5957,11 +5957,11 @@
     },
     {
       "CVE": "CVE-2024-46758",
-      "Description": "** REJECT ** This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
+      "Description": "This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -5997,7 +5997,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -6609,7 +6609,7 @@
       "Threats": [
         {
           "Type": "Impact",
-          "Severity": "low"
+          "Severity": "moderate"
         }
       ],
       "References": [
@@ -6641,7 +6641,7 @@
     },
     {
       "CVE": "CVE-2024-46797",
-      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\npowerpc/qspinlock: Fix deadlock in MCS queue\n\nIf an interrupt occurs in queued_spin_lock_slowpath() after we increment\nqnodesp-\u003ecount and before node-\u003elock is initialized, another CPU might\nsee stale lock values in get_tail_qnode(). If the stale lock value happens\nto match the lock on that CPU, then we write to the \"next\" pointer of\nthe wrong qnode. This causes a deadlock as the former CPU, once it becomes\nthe head of the MCS queue, will spin indefinitely until it's \"next\" pointer\nis set by its successor in the queue.\n\nRunning stress-ng on a 16 core (16EC/16VP) shared LPAR, results in\noccasional lockups similar to the following:\n\n   $ stress-ng --all 128 --vm-bytes 80% --aggressive \\\n               --maximize --oomable --verify  --syslog \\\n               --metrics  --times  --timeout 5m\n\n   watchdog: CPU 15 Hard LOCKUP\n   ......\n   NIP [c0000000000b78f4] queued_spin_lock_slowpath+0x1184/0x1490\n   LR [c000000001037c5c] _raw_spin_lock+0x6c/0x90\n   Call Trace:\n    0xc000002cfffa3bf0 (unreliable)\n    _raw_spin_lock+0x6c/0x90\n    raw_spin_rq_lock_nested.part.135+0x4c/0xd0\n    sched_ttwu_pending+0x60/0x1f0\n    __flush_smp_call_function_queue+0x1dc/0x670\n    smp_ipi_demux_relaxed+0xa4/0x100\n    xive_muxed_ipi_action+0x20/0x40\n    __handle_irq_event_percpu+0x80/0x240\n    handle_irq_event_percpu+0x2c/0x80\n    handle_percpu_irq+0x84/0xd0\n    generic_handle_irq+0x54/0x80\n    __do_irq+0xac/0x210\n    __do_IRQ+0x74/0xd0\n    0x0\n    do_IRQ+0x8c/0x170\n    hardware_interrupt_common_virt+0x29c/0x2a0\n   --- interrupt: 500 at queued_spin_lock_slowpath+0x4b8/0x1490\n   ......\n   NIP [c0000000000b6c28] queued_spin_lock_slowpath+0x4b8/0x1490\n   LR [c000000001037c5c] _raw_spin_lock+0x6c/0x90\n   --- interrupt: 500\n    0xc0000029c1a41d00 (unreliable)\n    _raw_spin_lock+0x6c/0x90\n    futex_wake+0x100/0x260\n    do_futex+0x21c/0x2a0\n    sys_futex+0x98/0x270\n    system_call_exception+0x14c/0x2f0\n    system_call_vectored_common+0x15c/0x2ec\n\nThe following code flow illustrates how the deadlock occurs.\nFor the sake of brevity, assume that both locks (A and B) are\ncontended and we call the queued_spin_lock_slowpath() function.\n\n        CPU0                                   CPU1\n        ----                                   ----\n  spin_lock_irqsave(A)                          |\n  spin_unlock_irqrestore(A)                     |\n    spin_lock(B)                                |\n         |                                      |\n         ▼                                      |\n   id = qnodesp-\u003ecount++;                       |\n  (Note that nodes[0].lock == A)                |\n         |                                      |\n         ▼                                      |\n      Interrupt                                 |\n  (happens before \"nodes[0].lock = B\")          |\n         |                                      |\n         ▼                                      |\n  spin_lock_irqsave(A)                          |\n         |                                      |\n         ▼                                      |\n   id = qnodesp-\u003ecount++                        |\n   nodes[1].lock = A                            |\n         |                                      |\n         ▼                                      |\n  Tail of MCS queue                             |\n         |                             spin_lock_irqsave(A)\n         ▼                                      |\n  Head of MCS queue                             ▼\n         |                             CPU0 is previous tail\n         ▼                                      |\n   Spin indefinitely                            ▼\n  (until \"nodes[1].next != NULL\")      prev = get_tail_qnode(A, CPU0)\n                                                |\n                                                ▼\n                                       prev == \u0026qnodes[CPU0].nodes[0]\n                                     (as qnodes\n---truncated---",
+      "Description": "In the Linux kernel, the following vulnerability has been resolved:\n\npowerpc/qspinlock: Fix deadlock in MCS queue\n\nIf an interrupt occurs in queued_spin_lock_slowpath() after we increment\nqnodesp-\u003ecount and before node-\u003elock is initialized, another CPU might\nsee stale lock values in get_tail_qnode(). If the stale lock value happens\nto match the lock on that CPU, then we write to the \"next\" pointer of\nthe wrong qnode. This causes a deadlock as the former CPU, once it becomes\nthe head of the MCS queue, will spin indefinitely until it's \"next\" pointer\nis set by its successor in the queue.\n\nRunning stress-ng on a 16 core (16EC/16VP) shared LPAR, results in\noccasional lockups similar to the following:\n\n   $ stress-ng --all 128 --vm-bytes 80% --aggressive \\\n               --maximize --oomable --verify  --syslog \\\n               --metrics  --times  --timeout 5m\n\n   watchdog: CPU 15 Hard LOCKUP\n   ......\n   NIP [c0000000000b78f4] queued_spin_lock_slowpath+0x1184/0x1490\n   LR [c000000001037c5c] _raw_spin_lock+0x6c/0x90\n   Call Trace:\n    0xc000002cfffa3bf0 (unreliable)\n    _raw_spin_lock+0x6c/0x90\n    raw_spin_rq_lock_nested.part.135+0x4c/0xd0\n    sched_ttwu_pending+0x60/0x1f0\n    __flush_smp_call_function_queue+0x1dc/0x670\n    smp_ipi_demux_relaxed+0xa4/0x100\n    xive_muxed_ipi_action+0x20/0x40\n    __handle_irq_event_percpu+0x80/0x240\n    handle_irq_event_percpu+0x2c/0x80\n    handle_percpu_irq+0x84/0xd0\n    generic_handle_irq+0x54/0x80\n    __do_irq+0xac/0x210\n    __do_IRQ+0x74/0xd0\n    0x0\n    do_IRQ+0x8c/0x170\n    hardware_interrupt_common_virt+0x29c/0x2a0\n   --- interrupt: 500 at queued_spin_lock_slowpath+0x4b8/0x1490\n   ......\n   NIP [c0000000000b6c28] queued_spin_lock_slowpath+0x4b8/0x1490\n   LR [c000000001037c5c] _raw_spin_lock+0x6c/0x90\n   --- interrupt: 500\n    0xc0000029c1a41d00 (unreliable)\n    _raw_spin_lock+0x6c/0x90\n    futex_wake+0x100/0x260\n    do_futex+0x21c/0x2a0\n    sys_futex+0x98/0x270\n    system_call_exception+0x14c/0x2f0\n    system_call_vectored_common+0x15c/0x2ec\n\nThe following code flow illustrates how the deadlock occurs.\nFor the sake of brevity, assume that both locks (A and B) are\ncontended and we call the queued_spin_lock_slowpath() function.\n\n        CPU0                                   CPU1\n        ----                                   ----\n  spin_lock_irqsave(A)                          |\n  spin_unlock_irqrestore(A)                     |\n    spin_lock(B)                                |\n         |                                      |\n         v                                      |\n   id = qnodesp-\u003ecount++;                       |\n  (Note that nodes[0].lock == A)                |\n         |                                      |\n         v                                      |\n      Interrupt                                 |\n  (happens before \"nodes[0].lock = B\")          |\n         |                                      |\n         v                                      |\n  spin_lock_irqsave(A)                          |\n         |                                      |\n         v                                      |\n   id = qnodesp-\u003ecount++                        |\n   nodes[1].lock = A                            |\n         |                                      |\n         v                                      |\n  Tail of MCS queue                             |\n         |                             spin_lock_irqsave(A)\n         v                                      |\n  Head of MCS queue                             v\n         |                             CPU0 is previous tail\n         v                                      |\n   Spin indefinitely                            v\n  (until \"nodes[1].next != NULL\")      prev = get_tail_qnode(A, CPU0)\n                                                |\n                                                v\n                                       prev == \u0026qnodes[CPU0].nodes[0]\n                                     (as qnodes\n---truncated---",
       "Threats": [
         {
           "Type": "Impact",
