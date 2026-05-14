@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-5fxq-qcf3-244w",
+  "modified": "2026-05-14T16:57:27.292126Z",
+  "published": "2026-05-14T16:33:42Z",
+  "aliases": [
+    "CVE-2026-44849"
+  ],
+  "summary": "Portainer has an endpoint security bypass via Swarm service create/update",
+  "details": "## Summary\n\nPortainer enforces seven `EndpointSecuritySettings` restrictions that administrators configure to restrict the container configurations non-admin users can launch: **privileged mode**, **host PID namespace**, **device mapping**, **capabilities**, **sysctls**, **security-opt (Seccomp / AppArmor)**, and **bind mounts**.\n\nThe vulnerability is exposed when a non-admin Portainer user (Standard User role, or any role granted endpoint-level access) has been given access to a Docker Swarm endpoint via Portainer RBAC. Admins and users without Swarm endpoint access are not affected.\n\nThese restrictions are enforced on the standard container creation path, but several of them are not applied on the Docker Swarm service API:\n\n- `POST /services/create` — **1 of 7** checks applied. `CapabilityAdd`, `CapabilityDrop`, `Sysctls`, and `Privileges` (Seccomp / AppArmor) are not parsed from the request body and are forwarded to the Docker daemon without validation.\n- `POST /services/{id}/update` — **0 of 7** checks applied. The route dispatches to the generic `restrictedResourceOperation`, which validates RBAC ownership but does not inspect the request body or call `fetchEndpointSecuritySettings()`.\n\nThe `EndpointSecuritySettings` checks apply when the administrator has configured any of `AllowContainerCapabilitiesForRegularUsers`, `AllowSysctlSettingForRegularUsers`, `AllowSecurityOptForRegularUsers`, or `AllowBindMountsForRegularUsers` to restrict standard users.\n\nA regular user with access to a Docker Swarm endpoint can:\n\n- Create a service with `CapabilityAdd: [\"SYS_ADMIN\", \"NET_ADMIN\", \"SYS_PTRACE\", …]` or `Privileges.Seccomp.Mode: \"unconfined\"`.\n- Create a benign service that passes ownership checks, then **update** it to add `CapabilityAdd: [\"ALL\"]` plus a bind mount of `/`, scale to one replica, and access the host filesystem from the running container (e.g. via `chroot /host`).\n\nIn addition, the partial `Mounts[]` struct used by the bind-mount check inspects only the top-level `Type` field. A mount with `Type: \"volume\"` and `VolumeOptions.DriverConfig.Options: {type: \"none\", o: \"bind\", device: \"\u003chost path\u003e\"}` is forwarded to the Docker daemon unchanged; the local volume driver then materialises it as a bind-equivalent mount, bypassing `AllowBindMountsForRegularUsers`. The same field path is accepted by the standalone `POST /volumes/create` endpoint, which never had any `AllowBindMountsForRegularUsers` check on any branch.\n\nThis undermines the administrator's configured security policy on Swarm-enabled endpoints.\n\n## Affected Versions\n\nThe vulnerability exists in every Portainer release with Docker Swarm support — the service-creation path has never checked `CapabilityAdd`, `CapabilityDrop`, `Sysctls`, or `Privileges`, and the service-update path has never performed any `EndpointSecuritySettings` validation. The `VolumeOptions.DriverConfig` field has never been parsed by the partial service struct on any branch, so the volume-driver-bind variant (service create/update and direct `/volumes/create`) shares the same affected range.\n\nFixes are included in the next release of each supported branch:\n\n| Branch              | First vulnerable | Fixed in   |\n|---------------------|------------------|------------|\n| 2.33.x (LTS)        | 2.33.0           | **2.33.8** |\n| 2.39.x (LTS)        | 2.39.0           | **2.39.2** |\n| 2.40.x (STS)        | 2.40.0           | **2.41.0** |\n\nPortainer LTS branches receive fixes for 6 months plus a 3-month overlap after the next LTS ships. STS releases are supported only until the next STS ships — the 2.40.x STS line ends with the 2.41.0 release. All releases **prior to 2.33.0 are end-of-life** and will not receive a fix; users on EOL versions should upgrade to a supported LTS branch.\n\n## Workarounds\n\nAdministrators who cannot immediately upgrade can reduce exposure with the following measures. None of these replaces the fix.\n\n- **Temporarily revoke Swarm endpoint access for non-admin users** via Portainer RBAC until the patched release is deployed. This eliminates the attack surface without service disruption for administrators.\n- **Segregate manager and worker nodes** with placement constraints so user workloads do not run on manager nodes. This limits the exposure of the Swarm control plane if the bypass is exploited against a worker.\n- **Block creation of local-driver volumes that use `type: none` / `o: bind`** on untrusted endpoints via a daemon-side allowlist. This closes the volume-driver-bind variant until the patched release is deployed.\n\n## Affected Code\n\n### Service creation — only `Mounts` inspected (1/7)\n\n```go\n// api/http/proxy/factory/docker/services.go (pre-fix)\n\ntype PartialService struct {\n    TaskTemplate struct {\n        ContainerSpec struct {\n            Mounts []struct {\n                Type string\n            }\n        }\n    }\n}\n```\n\n`CapabilityAdd`, `CapabilityDrop`, `Sysctls`, and `Privileges` are not declared in the struct, so `json.Unmarshal` does not include them in the validated view. The request body is then forwarded to the Docker daemon without those fields being checked.\n\n### Service update — no inspection (0/7)\n\n```go\n// api/http/proxy/factory/docker/transport.go (pre-fix)\n\nif match, _ := path.Match(\"/services/*/*\", requestPath); match {\n    serviceID := path.Base(path.Dir(requestPath))\n    // ... no body inspection, no call to fetchEndpointSecuritySettings ...\n    return transport.restrictedResourceOperation(\n        request, serviceID, serviceID,\n        portainer.ServiceResourceControl, false,\n    )\n}\n```\n\n`fetchEndpointSecuritySettings()` is called in three places in the codebase: container creation, service creation (bind-mount check only), and volume browsing. Service update is not among them.\n\n### Bind-mount check — driver options ignored\n\n```go\n// api/http/proxy/factory/docker/services.go (pre-fix — partial Mounts struct)\n\nMounts []struct {\n    Type string   // only this field was read\n}\n```\n\nBecause `VolumeOptions.DriverConfig.Options` is not declared in the partial struct, a mount of `Type: \"volume\"` passes the `Type != \"bind\"` check and is forwarded to the daemon. The local volume driver treats `{type: \"none\", o: \"bind\", device: \"\u003chost path\u003e\"}` as a bind-equivalent mount, so the check is bypassed.\n\nThe fix extends the partial struct to carry `VolumeOptions.DriverConfig.Options map[string]string`, rejects service create/update requests where that map declares a bind-style driver, and adds a new `CheckVolumeBodyRestrictions` invocation on `POST /volumes/create` (which previously had no `AllowBindMountsForRegularUsers` check on any branch).\n\n## Impact\n\nAn authenticated, non-admin Portainer user with access to any Docker Swarm-enabled endpoint can configure a service with:\n\n- **Elevated Linux capabilities** including `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, or `ALL` — not restricted by `AllowContainerCapabilitiesForRegularUsers`.\n- **Disabled syscall filtering** via `Privileges.Seccomp.Mode: \"unconfined\"` — not restricted by `AllowSecurityOptForRegularUsers`.\n- **Disabled AppArmor confinement** via `Privileges.AppArmor.Mode: \"disabled\"` — not restricted by `AllowSecurityOptForRegularUsers`.\n- **Arbitrary sysctl values** inside the container namespace — not restricted by `AllowSysctlSettingForRegularUsers`.\n- **Bind mounts of any host path**, including `/`, `/var/run/docker.sock`, SSH keys, or Portainer's own database — not restricted by `AllowBindMountsForRegularUsers`.\n- **Bind-mount-equivalent host filesystem access via volume driver options** — a `Type: \"volume\"` mount whose `VolumeOptions.DriverConfig.Options` describe a local-driver bind, or a direct `POST /volumes/create` with the same payload, yields the same capability as a direct bind and is not restricted by `AllowBindMountsForRegularUsers`.\n\nIn combination (e.g. `CapabilityAdd:[\"ALL\"]` + bind mount of `/`), this gives a user access equivalent to root on the Swarm manager host from a restricted account, overriding the administrator's security policy.\n\n## Timeline\n\n- `2026-03-12` — route2shell privately discloses the volume-driver local-bind variant.\n- `2026-04-05` — JohannesLks disclosure of the Swarm service create/update bypass\n- `2026-04-18`  — Fix merged to develop.\n- `2026-04-29` — 2.41.0 released.\n- `2026-05-07` — 2.39.2-LTS and 2.33.8-LTS released.\n## Credit\n\n- **route2shell** — disclosure of the volume-driver local-bind variant on both Swarm service creation/update and the standalone `/volumes/create` endpoint.\n- **JohannesLks** — independent disclosure of the Swarm service create/update bypass",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.33.0"
+            },
+            {
+              "fixed": "2.33.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-5fxq-qcf3-244w/GHSA-5fxq-qcf3-244w.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.39.0"
+            },
+            {
+              "fixed": "2.39.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-5fxq-qcf3-244w/GHSA-5fxq-qcf3-244w.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.40.0"
+            },
+            {
+              "fixed": "2.41.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-5fxq-qcf3-244w/GHSA-5fxq-qcf3-244w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/security/advisories/GHSA-5fxq-qcf3-244w"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/portainer/portainer"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.33.8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.39.2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.41.0"
+    }
+  ]
+}

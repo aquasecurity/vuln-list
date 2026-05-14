@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-rpgq-m5fp-32wr",
+  "modified": "2026-05-14T16:39:53.220789Z",
+  "published": "2026-05-14T16:23:56Z",
+  "aliases": [
+    "CVE-2026-44881"
+  ],
+  "summary": "Portainer Has an Arbitrary File Read via Git Symlink Injection in Stack Auto-Update",
+  "details": "## Summary\nPortainer supports deploying stacks from Git repositories. When a Git-backed stack is created or updated, Portainer clones the repository using `go-git` v5, which translates Git blob entries with mode `0o120000` (symlink) into real OS symlinks on the host filesystem via `os.Symlink`. The only entry blocked from becoming a symlink is `.gitmodules`; every other path — including `docker-compose.yml`, which Portainer treats as the stack entry point — is created as a symlink without validation.\n\nPortainer's `GET /api/stacks/{id}/file` endpoint then reads the stack entry point with `os.ReadFile`, which follows OS symlinks transparently. A repository containing `docker-compose.yml` as a symlink to an arbitrary filesystem path (for example `/etc/passwd` or a mounted Kubernetes service account token) causes the symlink target's contents to be returned verbatim in the HTTP response. Any authenticated user with rights to create or update a Git-backed stack — the default configuration in Portainer CE — can read arbitrary files accessible to the Portainer process.\n\nThe issue is amplified by Git-stack auto-update: an attacker can create a stack from a legitimate repository, pass initial review, and later push a commit that replaces `docker-compose.yml` with a symlink; the file read is then triggered on the next scheduled update cycle with no further interaction required.\n\n## Severity\n**High**\n\nAttack complexity is Low: the attacker needs only the ability to host a Git repository and the default-granted permission to create a Git-backed stack. Privilege required is Low in typical CE deployments, where non-admin users can manage their own stacks; administrators retain the same attack surface regardless of the setting. Impact on confidentiality is High — the Portainer process commonly runs as root (required for Docker socket access), so arbitrary file read includes `/etc/shadow`, Kubernetes service account tokens, Docker secrets, environment variables, and the Portainer database itself. Integrity and availability are not directly affected, but the leaked contents (service account tokens, registry credentials, database session keys) frequently enable onward compromise of the host and managed environments.\n\n## Affected Versions\nThe vulnerability exists in every Portainer release since the introduction of Git-based stack deployment support — Git-backed stacks have always performed an unrestricted `go-git` checkout and subsequently read the entry-point file through `os.ReadFile` without resolving symlinks.\n\nFixes are included in the following releases:\n\n| Branch       | First vulnerable | Fixed in   |\n|--------------|------------------|------------|\n| 2.33.x (LTS) | 2.33.0           | **2.33.8** |\n| 2.39.x (LTS) | 2.39.0           | **2.39.2** |\n| 2.40.x (STS) | all prior        | **2.41.0** |\n\nPortainer releases prior to 2.33.0 are end-of-life and will not receive a fix. Users on EOL versions should upgrade to a supported LTS branch.\n\n## Workarounds\nAdministrators who cannot immediately upgrade can reduce exposure by:\n\n- **Restricting who can create Git-backed stacks.** Disable **Allow non-admin users to manage their stacks** in environment settings so that only administrators can submit a Git repository URL. This reduces the attack to an administrator-only surface but does not remove it.\n- **Avoiding untrusted repositories.** Do not deploy Git-backed stacks from repositories you do not control or review, and do not grant stack-management rights to users who can supply an arbitrary repository URL.\n- **Disabling auto-update on existing stacks.** Auto-update re-clones the repository on a schedule, which allows a repository that was safe at creation time to later become malicious. Disabling auto-update removes the deferred-exploitation path.\n- **Auditing existing stack working directories.** Search project paths under `/data/compose/` (or your configured data directory) for symlink entries — `find /data/compose -type l` — and treat any unexpected results as potential evidence of past exploitation.\n\nNone of these replace the fix.\n\n## Affected Code\nThe vulnerability is the combination of two primitives. `go-git` translates Git symlink entries into OS symlinks unconditionally (except `.gitmodules`):\n\n```go\n// go-git v5 — Worktree.checkoutFileSymlink\nfunc (w *Worktree) checkoutFileSymlink(f *object.File) (err error) {\n    if strings.EqualFold(f.Name, gitmodulesFile) {\n        return ErrGitModulesSymlink\n    }\n    // ... reads blob content as raw bytes ...\n    err = w.Filesystem.Symlink(string(bytes), f.Name)\n    return\n}\n```\n\nRelative symlink targets (`../../etc/passwd`) are passed through to `os.Symlink` as-is and escape the worktree at OS resolution time. (Absolute targets are chrooted to the worktree by `go-billy`'s `ChrootHelper.Symlink` and are not useful to the attacker.)\n\nOn the read side, `GetFileContent` in `api/filesystem/filesystem.go` applies lexical path containment but not symlink resolution:\n\n```go\nfunc (service *Service) GetFileContent(trustedRoot, filePath string) ([]byte, error) {\n    content, err := os.ReadFile(JoinPaths(trustedRoot, filePath))\n    return content, err\n}\n```\n\n`JoinPaths` prevents `../` traversal in the input string but does not call `filepath.EvalSymlinks`, so a symlink already written to the project path resolves through `os.ReadFile` to its ultimate target.\n\nThe fix wraps the `go-billy` filesystem used by the Git checkout with a custom `noSymlinkFS` type whose `Symlink()` method returns `ErrSymlinkDetected`, causing the clone to fail rather than write any OS symlink. Git trees that would otherwise produce a symlink entry are rejected at checkout time, closing the primary attack path. On the 2.33.x and 2.39.x branches the fix also hardens `GetFileContent` to call `filepath.EvalSymlinks` and verify the resolved path remains inside the trusted root, providing a second layer of defence against any future regression in Git-checkout handling.\n\n## Impact\n- **Arbitrary file read as the Portainer process.** Any file readable by the Portainer process — typically root in containerized deployments — can be returned through the stack file endpoint. Common targets include `/etc/shadow`, `/root/.ssh/*`, `/proc/self/environ`, and the Portainer BoltDB (`portainer.db`) which contains all user password hashes, API tokens, and agent credentials.\n- **Kubernetes service account token exposure.** Portainer running on Kubernetes has its cluster service account token mounted at `/var/run/secrets/kubernetes.io/serviceaccount/token`; reading it grants the attacker the Portainer pod's cluster API access.\n- **Docker Swarm secret exposure.** Secrets mounted into the Portainer container at `/run/secrets/` (for example the initial admin password in Swarm deployments) are readable with the same mechanism.\n- **Onward compromise.** Leaked service tokens, registry credentials, and database contents frequently enable authenticated access to managed Docker/Kubernetes environments, container registries, and Portainer itself under other users' identities.\n- **Deferred exploitation via auto-update.** A repository that passes initial review at stack creation can be mutated afterwards; the malicious commit takes effect on the next auto-update cycle without user interaction.\n\n## Timeline\n- 2026-03-20: Reported via GitHub Security Advisory by **b-hermes**.\n- 2026-04-18: Fix merged to `develop`.\n- 2026-04-29: 2.41.0 released with fix.\n- 2026-05-07: 2.33.8, 2.39.2, released with fix.\n\n## Credit\n- **b-hermes** — identified the Git symlink injection primitive, traced the end-to-end chain through `GetFileContent`, and provided a fully validated proof-of-concept.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.33.0"
+            },
+            {
+              "fixed": "2.33.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rpgq-m5fp-32wr/GHSA-rpgq-m5fp-32wr.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.39.0"
+            },
+            {
+              "fixed": "2.39.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rpgq-m5fp-32wr/GHSA-rpgq-m5fp-32wr.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.40.0"
+            },
+            {
+              "fixed": "2.41.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rpgq-m5fp-32wr/GHSA-rpgq-m5fp-32wr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/security/advisories/GHSA-rpgq-m5fp-32wr"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/portainer/portainer"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.33.8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.39.2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.41.0"
+    }
+  ]
+}

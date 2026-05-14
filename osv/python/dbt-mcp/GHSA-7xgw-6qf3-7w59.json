@@ -1,0 +1,121 @@
+{
+  "id": "GHSA-7xgw-6qf3-7w59",
+  "modified": "2026-05-14T18:31:27.004700Z",
+  "published": "2026-05-14T18:24:44Z",
+  "aliases": [
+    "CVE-2026-44969"
+  ],
+  "summary": "dbt MCP Server Logs Tool Arguments Including SQL Queries and Credentials in Plaintext Without Redaction When File Logging Is Enabled",
+  "details": "*Discovered through manual source code review. Verified by PoC execution against a local dbt-mcp v1.15.1 installation.*\n\n### Summary\n\n`DbtMCP.call_tool()` in `src/dbt_mcp/mcp/server.py` logs the complete raw `arguments` dictionary at `INFO` level on every tool invocation (line 67) and again at `ERROR` level if the call raises an exception (lines 77–79). No field is redacted before logging. When the documented `DBT_MCP_SERVER_FILE_LOGGING=true` feature is enabled, these log records are written to `dbt-mcp.log` in the project root directory as plaintext. Sensitive data — raw SQL queries, `--vars` payloads carrying credentials, node selectors — persists on disk indefinitely with no automatic rotation or deletion.\n\n### Details\n\n**Vulnerable log statements (`server.py`):**\n\n```python\n# Line 67 — emitted before every tool execution\nlogger.info(f\"Calling tool: {name} with arguments: {arguments}\")\n\n# Lines 77–79 — emitted if the tool raises an exception (double-logging on failure)\nlogger.error(\n    f\"Error calling tool: {name} with arguments: {arguments} \"\n    f\"in {end_time - start_time}ms: {e}\"\n)\n```\n\n`arguments` is the raw Python dict received from the MCP client. It is string-interpolated directly into the log message. On a tool call that raises an exception, the same dict is logged twice — once at INFO and once at ERROR.\n\nFile logging is activated by `DBT_MCP_SERVER_FILE_LOGGING=true` (a documented feature in the project README). The log file location is resolved by `configure_file_logging()`, which walks up the directory tree from `__file__` looking for `.git` or `pyproject.toml`, falling back to `$HOME`. Arguments are also emitted to stderr by the default stream handler regardless of file logging state.\n\n### PoC\n\n**MCP client script — triggers real tool calls and verifies log file contents:**\n\n```python\n#!/usr/bin/env python3\n# poc4_tool_args_logged.py\n# Vulnerable code: src/dbt_mcp/mcp/server.py line 67, 77-79\n# configure_file_logging(): src/dbt_mcp/telemetry/logging.py\n\nimport logging\nfrom pathlib import Path\n\nLOG_FILENAME = \"dbt-mcp.log\"\n\ndef configure_file_logging(log_level: int = logging.INFO) -\u003e Path:\n    \"\"\"Reproduction of configure_file_logging() from telemetry/logging.py.\"\"\"\n    module_path = Path(__file__).resolve().parent\n    home = Path.home().resolve()\n    for candidate in [module_path, *module_path.parents]:\n        if (candidate / \".git\").exists() or (candidate / \"pyproject.toml\").exists() or candidate == home:\n            repo_root = candidate\n            break\n    log_path = repo_root / LOG_FILENAME\n    root_logger = logging.getLogger()\n    root_logger.setLevel(log_level)\n    file_handler = logging.FileHandler(log_path, encoding=\"utf-8\")\n    file_handler.setLevel(log_level)\n    file_handler.setFormatter(\n        logging.Formatter(\"%(asctime)s %(levelname)s [%(name)s] %(message)s\")\n    )\n    root_logger.addHandler(file_handler)\n    return log_path\n\nlog_path = configure_file_logging()\nserver_logger = logging.getLogger(\"dbt_mcp.mcp.server\")\n\n# Exact log statements from server.py line 67 and line 77-79\nname = \"show\"\narguments = {\"sql_query\": \"SELECT ssn, credit_card_number, salary FROM customers WHERE id = 42\", \"limit\": 5}\nserver_logger.info(f\"Calling tool: {name} with arguments: {arguments}\")\n\nname2 = \"run\"\narguments2 = {\"node_selection\": \"sensitive_model\", \"vars\": '{\"db_password\": \"hunter2\", \"api_key\": \"sk-prod-abc123xyz\"}', \"is_full_refresh\": False}\nserver_logger.info(f\"Calling tool: {name2} with arguments: {arguments2}\")\n\n# Verify file contents\nlines = log_path.read_text(encoding=\"utf-8\").splitlines()\npoc_lines = [l for l in lines if \"dbt_mcp.mcp.server\" in l]\nprint(f\"[log file: {log_path}]\")\nfor line in poc_lines:\n    print(f\"  {line}\")\n\nkeywords = [\"ssn\", \"credit_card_number\", \"salary\", \"db_password\", \"api_key\"]\nfound = [kw for kw in keywords if any(kw in l for l in poc_lines)]\nif found:\n    print(f\"\\n[CONFIRMED] Sensitive keywords in plaintext log: {found}\")\n    print(f\"[CONFIRMED] No redaction applied. File persists at {log_path}\")\n```\n\n**Expected log file entries:**\n\n````\n2026-04-27 ... INFO [dbt_mcp.mcp.server] Calling tool: show with arguments:\n  {'sql_query': 'SELECT ssn, credit_card_number, salary FROM customers', 'limit': 5}\n\n2026-04-27 ... INFO [dbt_mcp.mcp.server] Calling tool: run with arguments:\n  {'node_selection': 'sensitive_model',\n   'vars': '{\"db_password\":\"hunter2\",\"api_key\":\"sk-prod-abc123\"}',\n   'is_full_refresh': False}\n\n[CONFIRMED] Sensitive keywords in plaintext log: ['ssn', 'credit_card_number', 'salary', 'db_password', 'api_key']\n[CONFIRMED] No redaction applied.\n````\n\n\u003cimg width=\"3798\" height=\"462\" alt=\"image\" src=\"https://github.com/user-attachments/assets/b4c23a93-b3d3-4b7f-ba46-3d4a324d609f\" /\u003e\n\n### Impact\n\n**Directly proven by this PoC:**\n\n- When `DBT_MCP_SERVER_FILE_LOGGING=true`, the full `arguments` dict of every tool call — including `sql_query`, `vars`, and `node_selection` — is written to `dbt-mcp.log` in plaintext on every invocation.\n- A tool call that raises an exception produces **two** log entries with the same sensitive content (INFO + ERROR double-logging).\n- The log file has no automatic rotation, expiry, or access restriction beyond filesystem permissions.\n\nCombined with Advisory 3 (telemetry), a single `show` tool call containing PII produces one telemetry transmission to dbt Labs **and** one (or two, on failure) persistent log entries on disk.\n\n### Remediation\n\n**redact known-sensitive argument values before logging:**\n\n```python\n_LOG_REDACT = frozenset({\"sql_query\", \"vars\"})\n\ndef _safe_args(arguments: dict) -\u003e dict:\n    return {k: \"***redacted***\" if k in _LOG_REDACT else v\n            for k, v in arguments.items()}\n\n# server.py line 67:\nlogger.info(f\"Calling tool: {name} with arguments: {_safe_args(arguments)}\")\n\n# server.py lines 77-79:\nlogger.error(\n    f\"Error calling tool: {name} with arguments: {_safe_args(arguments)} \"\n    f\"in {end_time - start_time}ms: {e}\"\n)\n```\n\n**log argument keys only:**\n\n```python\nlogger.info(f\"Calling tool: {name} with argument keys: {list(arguments.keys())}\")\n```\n\n**File logging:** Consider reducing the default log level for the file handler to `WARNING` so that normal-operation INFO records (which include arguments) are not persisted. Sensitive content would only appear in file logs on error.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "dbt-mcp",
+        "purl": "pkg:pypi/dbt-mcp"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.17.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1a1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.2rc1",
+        "0.1.2rc2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.2.1",
+        "0.2.10",
+        "0.2.11",
+        "0.2.12",
+        "0.2.13",
+        "0.2.14",
+        "0.2.15",
+        "0.2.16",
+        "0.2.17",
+        "0.2.18",
+        "0.2.19",
+        "0.2.20",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.7.0",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.1.0",
+        "1.10.0",
+        "1.11.0",
+        "1.12.0",
+        "1.13.0",
+        "1.14.0",
+        "1.15.0",
+        "1.17.0",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.2",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.17.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-7xgw-6qf3-7w59/GHSA-7xgw-6qf3-7w59.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/dbt-labs/dbt-mcp/security/advisories/GHSA-7xgw-6qf3-7w59"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/dbt-labs/dbt-mcp"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/dbt-labs/dbt-mcp/releases/tag/v1.17.1"
+    }
+  ]
+}
