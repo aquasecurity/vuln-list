@@ -1,0 +1,118 @@
+{
+  "id": "GHSA-mq5j-pw29-jcv3",
+  "modified": "2026-05-15T18:31:25.399661Z",
+  "published": "2026-05-15T18:25:34Z",
+  "aliases": [
+    "CVE-2026-46383"
+  ],
+  "summary": "Microsoft APM: Windows absolute-path tar member overwrite during legacy-bundle probing in `apm install`",
+  "details": "### Summary\n\nMicrosoft APM contains a Windows-specific archive extraction boundary failure in the legacy-bundle probe used by `apm install \u003cbundle\u003e` on supported Python 3.10 and 3.11 runtimes. When `apm install` is given a local `.tar.gz` that is not recognized as a plugin-format bundle, APM probes whether it is a legacy `--format apm` bundle. On Python versions earlier than 3.12, that probe extracts untrusted tar members with raw `tar.extractall()` without rejecting Windows absolute member names such as `D:/...`.\n\nThis issue is still present on the latest `main` commit at review time (`2b7a931d58a73cbfc0bcf086cea332d204075e27`) and on the latest release (`v0.12.4`). In both cases, a crafted legacy-looking tarball caused an external file to be created or overwritten outside the temporary extraction root before `apm install` finished rejecting the bundle with the expected legacy-format usage error.\n\nThis report is scoped narrowly to Windows installations running Python 3.10 or 3.11.\n\n### Details\n\nThe broken trust boundary is the boundary between an untrusted local bundle artifact and the host filesystem state that APM is allowed to modify while probing that artifact. The attacker-controlled input is the tar member name inside the `.tar.gz` bundle. A crafted archive can include a member whose name is a Windows absolute path such as `D:/apm/run-main-install/outside/legacy-probe-outside-main.txt`.\n\nThe current install caller path still reaches the legacy probe for `.tar.gz` inputs that are not recognized as plugin-format bundles. In `src/apm_cli/commands/install.py`, the local-bundle branch first calls `detect_local_bundle()`. If the path exists, is a tarball, and is not recognized as a plugin-format bundle, the caller still invokes `_looks_like_legacy_apm_bundle()` to distinguish a legacy bundle from an arbitrary tarball and to choose the error message.\n\nThe root cause is in `src/apm_cli/bundle/local_bundle.py`. `_looks_like_legacy_apm_bundle()`:\n\n- opens the tarball,\n- rejects only symlink and hardlink members,\n- and on Python versions earlier than 3.12 calls raw `tar.extractall(tmp)`.\n\nThat helper does not reject Windows absolute member names and does not perform the Windows-aware containment checks already present elsewhere in the same module.\n\nThis is particularly clear because the adjacent `detect_local_bundle()` path in the same file already contains safer pre-extraction validation. It rejects:\n\n- `PureWindowsPath(name).drive`\n- `PureWindowsPath(name).is_absolute()`\n- path traversal via `validate_path_segments(...)`\n\nThat safer validation is not reused by `_looks_like_legacy_apm_bundle()`.\n\nOn Python versions earlier than 3.12, `_looks_like_legacy_apm_bundle()` performs extraction before legacy-format rejection is raised, so archive member names become filesystem writes during bundle classification rather than during an accepted install step. The write occurs before command rejection because the legacy probe must extract the tarball in order to look for `apm.lock.yaml` at the bundle root and confirm that `plugin.json` is absent. As a result, the out-of-root write happens during classification, before the caller raises the legacy-format usage error.\n\nThe issue is not limited to creating new files. On both latest `main` and latest release, the same vulnerable path overwrote an already-existing writable target file with attacker-controlled contents before the command finished legacy-format rejection. It was further verified the same overwrite primitive against a pre-existing project workflow file at `.github/workflows/ci.yml`, replacing its YAML contents before rejection.\n\nThis is a security issue rather than intended package-manager behavior. The user is asking APM to inspect or install a local bundle. The expected behavior is that bundle contents are handled within the extraction sandbox used for that operation. Writing to an arbitrary host path outside the extraction root during pre-install probing is not part of expected local-bundle behavior, and it happens even when APM ultimately rejects the tarball.\n\nThis issue is also distinct from the prior public APM plugin path-escape issue. The prior public issue involved manifest-controlled path escape during plugin normalization in `plugin_parser.py`, where attacker-controlled manifest entries were resolved outside the plugin root during install. This issue is different in input, timing, and code path: it is an archive-member extraction bug in `src/apm_cli/bundle/local_bundle.py` during legacy-bundle probing, before bundle classification completes and before `apm install` rejects the bundle. No manifest processing is required to trigger it.\n\nAs additional same-family scope information, the same Windows absolute-path extraction weakness is also reproducible in apm unpack.In `src/apm_cli/bundle/unpacker.py`, the unpacker rejects `/` and `..` but still misses Windows absolute tar member names before calling `tar.extractall()` on Python versions earlier than 3.12. Because `apm unpack` is deprecated, I am not presenting it as a second standalone vulnerability title; I am including it only as additional affected surface from the same validation family.\n\n### PoC\n\nValidation environment used for the included proof:\n\n- Windows 11 Pro\n- Python 3.11.9 x64\n- Latest `main` commit: `2b7a931d58a73cbfc0bcf086cea332d204075e27`\n- Latest release commit: `6aceef72be490a9c716547f600a2659f3f2826b7` (`v0.12.4`)\n\nMinimal malicious archive contents:\n\n- `bundle/apm.lock.yaml`\n- `D:/apm/run-main-install/outside/legacy-probe-outside-main.txt`\n\nThe first member makes the archive look like a legacy APM bundle. The second member proves the out-of-root write. The outside target path must be writable by the user running APM. The proof uses a user-controlled directory for that reason.\n\nOne straightforward way to build this input is to use Python's `tarfile` module directly and add:\n\n- `bundle/apm.lock.yaml`\n- `TarInfo(\"D:/apm/run-main-install/outside/legacy-probe-outside-main.txt\")`\n\nwith file content such as:\n\n```text\noutside write via install main\n```\n\nReproduction steps for latest `main`:\n\n1. Check out `microsoft/apm` at `2b7a931d58a73cbfc0bcf086cea332d204075e27`.\n2. Use a real Windows Python 3.11 runtime.\n3. Ensure the `apm_cli` import resolves to the checked-out tree.\n4. Create the malicious legacy-looking tarball described above.\n5. Run:\n\n```powershell\npython -m apm_cli.cli install D:\\apm\\run-main-install\\input\\legacy-bundle.tar.gz\n```\n\nExpected safe behavior:\n\n- APM rejects the tarball without creating or overwriting any host file outside the temporary extraction root.\n\nObserved result on latest `main`:\n\n- the import path resolved to the checked-out `main` tree,\n- the command ended with the expected legacy-format rejection,\n- the process exit code was `2`,\n- and the file below had already been created outside the temporary extraction root:\n\n```text\nD:\\apm\\run-main-install\\outside\\legacy-probe-outside-main.txt\n```\n\nThe file contained:\n\n```text\noutside write via install main\n```\n\nI also verified overwrite, not just creation, by pre-creating a writable target file and then running the same install path. The existing file contents changed from `ORIGINAL-MAIN` to `OVERWRITTEN-MAIN` before rejection.\n\nI further verified overwrite of a pre-existing project workflow file. Before the run, the target file contained:\n\n```yaml\nname: safe\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo safe\n```\n\nAfter the run, the same file contained attacker-controlled replacement YAML:\n\n```yaml\nname: overwritten\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo overwritten-by-archive\n```\n\nObserved command output on latest `main`:\n\n```text\n[!] Install interrupted after 0.0s.\nUsage: python -m apm_cli.cli install [OPTIONS] [PACKAGES]...\nTry 'python -m apm_cli.cli install --help' for help.\n\nError: 'D:\\apm\\run-main-install\\input\\legacy-bundle.tar.gz' was packed with '--format apm' (legacy format). 'apm install \u003cbundle\u003e' requires the plugin format. Repack with 'apm pack --format plugin --archive', or use 'apm unpack' to deploy the legacy bundle.\n```\n\nReproduction steps for latest release `v0.12.4`:\n\n1. Check out tag `v0.12.4` / commit `6aceef72be490a9c716547f600a2659f3f2826b7`.\n2. Use the same Windows Python 3.11 runtime.\n3. Ensure the `apm_cli` import resolves to the `v0.12.4` tree.\n4. Create the same malicious tarball shape, for example with:\n\n```text\nD:/apm/run-release-install/outside/legacy-probe-outside-release.txt\n```\n\n5. Run:\n\n```powershell\npython -m apm_cli.cli install D:\\apm\\run-release-install\\input\\legacy-bundle.tar.gz\n```\n\nObserved result on latest release:\n\n- the import path resolved to the checked-out `v0.12.4` tree,\n- the command ended with the expected legacy-format rejection,\n- the process exit code was `2`,\n- and the file below had already been created outside the temporary extraction root:\n\n```text\nD:\\apm\\run-release-install\\outside\\legacy-probe-outside-release.txt\n```\n\nThe file contained:\n\n```text\noutside write via install release\n```\n\nI also verified overwrite, not just creation, on the latest release by pre-creating a writable target file. The existing file contents changed from `ORIGINAL-RELEASE` to `OVERWRITTEN-RELEASE` before rejection. The same workflow-file overwrite pattern was also reproducible on the latest release.\n\nObserved command output on latest release:\n\n```text\n[!] Install interrupted after 0.0s.\nUsage: python -m apm_cli.cli install [OPTIONS] [PACKAGES]...\nTry 'python -m apm_cli.cli install --help' for help.\n\nError: 'D:\\apm\\run-release-install\\input\\legacy-bundle.tar.gz' was packed with '--format apm' (legacy format). 'apm install \u003cbundle\u003e' requires the plugin format. Repack with 'apm pack --format plugin --archive', or use 'apm unpack' to deploy the legacy bundle.\n```\n\nAdditional same-family affected surface:\n\n- `apm unpack` on latest `main` and latest release also created an outside file when given a tarball containing a Windows absolute member name.\n- In that path the command completed successfully with exit code `0`, which further confirms that the Windows absolute-path validation gap is present outside the primary install probe as well.\n\n### Impact\n\nThis is an arbitrary local file overwrite outside the intended extraction root during a current APM install path. The impacted population is Windows users running APM on supported Python 3.10 or 3.11 runtimes. The attacker capability required is the ability to supply a crafted local bundle and induce the victim to run `apm install` on it.\n\nThe strongest demonstrated real-world consequence is attacker-controlled overwrite of an existing writable file at an attacker-selected Windows path outside the extraction root, using the privileges of the user running APM. An overwrite of a project-controlled GitHub Actions workflow file with attacker-controlled YAML before rejection was verified.  Workflow execution from this report hasn't been claimed; the demonstrated consequence is high-integrity modification of a trusted automation file outside the intended extraction boundary.\n\nThe issue is currently reachable on:\n\n- latest `main` at `2b7a931d58a73cbfc0bcf086cea332d204075e27`\n- latest release `v0.12.4`\n\n### Mitigation\n\n1. Reuse the existing pre-extraction validation already implemented in `detect_local_bundle()` for `_looks_like_legacy_apm_bundle()`.\n2. Reject Windows absolute member names before any extraction step.\n3. Apply equivalent Windows absolute-path validation to the unpacker in `src/apm_cli/bundle/unpacker.py`.\n4. Add regression tests for:\n   - Windows absolute member paths in the legacy-bundle probe path\n   - Windows absolute member paths in the unpack path\n   - confirmation that no host write occurs before the legacy-format rejection is raised\n\n### Attachment\n[apm-legacy-probe-windows-absolute-path-write-20260511.zip](https://github.com/user-attachments/files/27578792/apm-legacy-probe-windows-absolute-path-write-20260511.zip)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "apm-cli",
+        "purl": "pkg:pypi/apm-cli"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.13.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.12.1",
+        "0.12.2",
+        "0.12.3",
+        "0.12.4",
+        "0.2.0",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5",
+        "0.5.6",
+        "0.5.7",
+        "0.5.8",
+        "0.5.9",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.7.6",
+        "0.7.7",
+        "0.7.8",
+        "0.7.9",
+        "0.8.0",
+        "0.8.1",
+        "0.8.10",
+        "0.8.11",
+        "0.8.12",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "0.8.8",
+        "0.8.9",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.12.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-mq5j-pw29-jcv3/GHSA-mq5j-pw29-jcv3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/microsoft/apm/security/advisories/GHSA-mq5j-pw29-jcv3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/microsoft/apm/commit/77d1dda8303c8d7ccb6148788a6274fdece98499"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/microsoft/apm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/microsoft/apm/releases/tag/v0.13.0"
+    }
+  ]
+}
