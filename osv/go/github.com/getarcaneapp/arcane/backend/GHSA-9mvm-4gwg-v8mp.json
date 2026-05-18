@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-9mvm-4gwg-v8mp",
+  "modified": "2026-05-18T14:17:09.206841Z",
+  "published": "2026-05-18T13:59:22Z",
+  "aliases": [
+    "CVE-2026-45626"
+  ],
+  "summary": "Arcane Backend: OS Command Injection in Volume Browser ListDirectory via path query parameter",
+  "details": "## Summary\n\n`GET /environments/{id}/volumes/{volumeName}/browse` accepts a `path` query parameter that is passed to a shell command (`sh -c \"find … | while …\"`) inside an Arcane helper container. The path sanitiser blocks `../` traversal but does not strip Bourne-shell metacharacters such as `$()` or backticks, and `strconv.Quote` only escapes Go string metacharacters, not shell substitution sequences. Any authenticated user with access to a browseable volume can execute arbitrary commands inside the helper container; command output is reflected back in the 500 error body.\n\n## Details\n\nThe execution flow is:\n\n1. `BrowseDirectoryInput.Path` (query: `path`) — `backend/internal/huma/handlers/volumes.go:148`\n2. `VolumeHandler.BrowseDirectory` calls `volumeService.ListDirectory(ctx, volumeName, input.Path)` — `backend/internal/huma/handlers/volumes.go:858-865`. Note the route registration at line 412–419 only declares `BearerAuth`/`ApiKeyAuth`; there is no `checkAdmin(ctx)` call (compare with `customize.go`, `system.go`, `swarm.go`, etc., which do enforce admin).\n3. `VolumeService.ListDirectory` runs the user-supplied path through `sanitizeBrowsePathInternal`, then joins it under `/volume`, quotes it with `strconv.Quote`, and embeds it into a `sh -c` command:\n\n```go\n// backend/internal/services/volume_service.go:286-300\nsanitizedPath, err := s.sanitizeBrowsePathInternal(dirPath)\n...\ntargetPath := path.Join(\"/volume\", sanitizedPath)\nquotedPath := strconv.Quote(targetPath)\ncmd := []string{\"sh\", \"-c\", fmt.Sprintf(\n    \"find %s -mindepth 1 -maxdepth 1 | while IFS= read -r f; do out=$(stat -c \\\"%%s %%Y %%f %%A\\\" -- \\\"$f\\\" 2\u003e/dev/null) || continue; printf \\\"%%s\\\\0%%s\\\\0\\\" \\\"$f\\\" \\\"$out\\\"; done\",\n    quotedPath)}\nstdout, _, err := s.execInContainerInternal(ctx, containerID, cmd)\n```\n\nThe sanitiser is insufficient (`backend/internal/services/volume_service.go:1448-1467`):\n\n```go\nfunc (s *VolumeService) sanitizeBrowsePathInternal(input string) (string, error) {\n    trimmed := strings.TrimSpace(input)\n    if trimmed == \"\" || trimmed == \"/\" { return \"/\", nil }\n    cleaned := path.Clean(trimmed)\n    if !path.IsAbs(cleaned) { cleaned = \"/\" + cleaned }\n    if strings.Contains(cleaned, \"/../\") || strings.HasSuffix(cleaned, \"/..\") || cleaned == \"/..\" {\n        return \"\", fmt.Errorf(\"invalid path: path traversal not allowed\")\n    }\n    if !strings.HasPrefix(cleaned, \"/\") { return \"\", fmt.Errorf(\"invalid path: must be absolute\") }\n    return cleaned, nil\n}\n```\n\nOnly `../` patterns are filtered. `$(...)`, backticks, `;`, `\u0026`, `|`, `\u003e`, etc. all pass through unchanged. `strconv.Quote` then wraps the path in Go-style double quotes, which `sh -c` interprets as a regular double-quoted string — and bash performs `$(...)` command substitution inside double quotes.\n\nFor the input `/$( id)`:\n- `sanitizeBrowsePathInternal` returns `/$( id)` (no `../` present).\n- `path.Join(\"/volume\", \"/$( id)\")` → `/volume/$( id)`.\n- `strconv.Quote(...)` → `\"/volume/$( id)\"`.\n- The shell runs `find \"/volume/$( id)\" …`, which expands to `find \"/volume/uid=0(root) gid=0(root) groups=0(root)\" …`. `find` fails because that path does not exist; the stderr containing the substituted command output is propagated by `execInContainerInternal` (volume_service.go:910-918) into a `command exited with code N: …` error, then re-wrapped by `ListDirectory` and returned to the client as a 500 response body.\n\nErrors from the handler at `volumes.go:863-864` are returned via `huma.Error500InternalServerError(err.Error())`, so the substituted output is reflected in plaintext.\n\n**Blast radius / mitigations actually present:**\n- The helper container is created by `createTempContainerInternal` with `NetworkDisabled: true`, no privileged mode, no Docker socket mount, only the target Docker volume bind-mounted (`:ro` for browse). It is auto-removed.\n- Therefore the injection executes inside an isolated, network-disabled container that already has read access to the same files the browse API exposes.\n- However: the injection grants arbitrary command execution within that container (well beyond the find/stat/readlink/head primitives the API exposes), enables data exfiltration via error-message side channel, and lets an attacker probe the helper image / volume in ways the legitimate API forbids (e.g. read symlink targets the API explicitly censors at `volume_service.go:336-356`, read past size limits, etc.).\n- A non-admin authenticated Arcane user is sufficient (no role check on the volumes browser routes), which makes this a privilege/capability extension for users who otherwise cannot run arbitrary `docker exec`.\n\n**Secondary issue (same sanitiser):** `DeleteFile` (`volume_service.go:924-963`) defends against deleting volume root with `if sanitizedPath == \"/\"`. Input `path=.` yields `path.Clean(\".\") == \".\"` → prefixed to `/.`, which fails the `== \"/\"` check, then `path.Join(\"/volume\", \"/.\") == \"/volume\"`, so the executed command is `rm -rf /volume`, recursively deleting all volume contents. This is a separate logic flaw worth fixing alongside the sanitiser hardening but is reported here only for completeness.\n\n## Impact\n\n- Authenticated user (any role, including non-admin) can execute arbitrary shell commands inside the per-volume helper container.\n- Output of those commands is reflected in HTTP 500 error bodies — usable as an exfiltration channel.\n- Attacker gains capabilities the legitimate API withholds: bypass the symlink-target censoring at `volume_service.go:336-356`, bypass per-file byte limits, enumerate the helper image, mount-time inspection, etc.\n- No host compromise: the container has `NetworkDisabled: true`, no privileged flag, no Docker socket; the volume is bind-mounted read-only for browse. Confidentiality/integrity/availability impact is therefore limited (CVSS C:L / I:L / A:L) but real.\n- The same insufficient sanitiser additionally permits a destructive `rm -rf /volume` by sending `path=.` to `DELETE /environments/{id}/volumes/{volumeName}/browse`, which any authenticated user can also reach.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getarcaneapp/arcane/backend",
+        "purl": "pkg:golang/github.com/getarcaneapp/arcane/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.18.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-9mvm-4gwg-v8mp/GHSA-9mvm-4gwg-v8mp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getarcaneapp/arcane/security/advisories/GHSA-9mvm-4gwg-v8mp"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getarcaneapp/arcane"
+    }
+  ]
+}

