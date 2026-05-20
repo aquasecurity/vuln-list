@@ -1,0 +1,143 @@
+{
+  "id": "GHSA-7wx4-6vff-v64p",
+  "modified": "2026-05-20T15:48:07.566360908Z",
+  "published": "2026-05-20T15:31:33Z",
+  "aliases": [
+    "CVE-2026-45804"
+  ],
+  "summary": "Diffusers: TOCTOU Trust Remote Code Bypass",
+  "details": "## Background\n\nThis vulnerability is found in the `diffusers` package - the `transformers`-equivalent library for diffusion models.\n\nIt is found in the `DiffusionPipeline.from_pretrained` flow, which is used to load a pipeline from the HuggingFace Hub.\n\nThis function has a `trust_remote_code` guard: if the repository’s `model_index.json` references a custom pipeline class defined in a `.py` file in the repo, the load is blocked unless `trust_remote_code=True` is explicitly passed:\n\n```\nValueError: The repository for attacker/repo contains custom code in pipeline.py\nwhich must be executed to correctly load the model. You can inspect the repository\ncontent at https://hf.co/attacker/repo/blob/main/pipeline.py.\nPlease pass the argument `trust_remote_code=True` to allow custom code to be run.\n```\n\nThe vulnerability allows arbitrary code execution through the custom pipeline flow from a Hub repo, with no `custom_pipeline` or `trust_remote_code` kwargs passed. The `from_pretrained` call succeeds and returns a functional pipeline.\n\n---\n\n## Naive Flow\n\n`DiffusionPipeline.from_pretrained` begins by popping all relevant arguments from `kwargs` into local variables, then calls `DiffusionPipeline.download()` to fetch the repo files:\n\n```python\n# pipeline_utils.py:853\ncached_folder = cls.download(\n    pretrained_model_name_or_path,\n    ...\n    custom_pipeline=custom_pipeline,\n    trust_remote_code=trust_remote_code,\n    ...\n)\n```\n\nInside `download()`, `model_index.json` is fetched first as a standalone file via `hf_hub_download`:\n\n```python\n# pipeline_utils.py:1636\nconfig_file = hf_hub_download(\n    pretrained_model_name,\n    cls.config_name,\n    ...\n)\nconfig_dict = cls._dict_from_json_file(config_file)\n```\n\nThis config is used to detect custom pipeline code and enforce the trust check:\n\n```python\n# pipeline_utils.py:1672\nif custom_pipeline is None and isinstance(config_dict[\"_class_name\"], (list, tuple)):\n    custom_pipeline = config_dict[\"_class_name\"][0]\n\nload_pipe_from_hub = custom_pipeline is not None and f\"{custom_pipeline}.py\" in filenames\n\nif load_pipe_from_hub and not trust_remote_code:\n    raise ValueError(...)\n```\n\nAfter the check passes, `snapshot_download` then fetches all files and saves them to disk:\n\n```python\n# pipeline_utils.py:1778\ncached_folder = snapshot_download(\n    pretrained_model_name,\n    ...\n    revision=revision,\n    allow_patterns=allow_patterns,\n    ...\n)\n```\n\nBack in `from_pretrained`, the config is read a second time from the downloaded snapshot, and`_resolve_custom_pipeline_and_cls` reads the config to re-check if custom code needs to be loaded:\n\n```python\n# pipeline_loading_utils.py:974\ndef _resolve_custom_pipeline_and_cls(folder, config, custom_pipeline):\n    custom_class_name = None\n    if os.path.isfile(os.path.join(folder, f\"{custom_pipeline}.py\")):\n        custom_pipeline = os.path.join(folder, f\"{custom_pipeline}.py\")\n    elif isinstance(config[\"_class_name\"], (list, tuple)) and os.path.isfile(\n        os.path.join(folder, f\"{config['_class_name'][0]}.py\")\n    ):\n        custom_pipeline = os.path.join(folder, f\"{config['_class_name'][0]}.py\")\n        custom_class_name = config[\"_class_name\"][1]\n\n    return custom_pipeline, custom_class_name\n```\n\nIf the config points to a `.py` file, it is imported.\n\n---\n\n## The Vulnerability\n\n`hf_hub_download` and `snapshot_download` are two independent HTTP calls to the Hub, both resolving the repository’s default branch (if `revision=None`) to its current HEAD at call time. There is no atomicity guarantee between them - if the repository is updated between the two calls, they will resolve to different commits and download different content, with no warning displayed to the user.\n\nThe trust check in `download()` operates on the content fetched by `hf_hub_download` (commit A). The `snapshot_download` call that immediately follows can silently fetch a newer commit (commit B). The config in the newer commit will be the one parsed by `_resolve_custom_pipeline_and_cls`.\n\n**Therefore, it’s possible to introduce remote code into the repo between the two calls, bypassing the trust check.**\n\nThe race window is everything between the two Hub calls inside `download()`:\n\n```python\n# pipeline_utils.py:1636\nconfig_file = hf_hub_download(...)   # ← sees commit A, trust check passes\n\n# ... filenames processing, pattern building, pipeline_is_cached check ...\n# ~~~ ATTACKER PUSHES COMMIT B HERE ~~~\n\n# pipeline_utils.py:1778\ncached_folder = snapshot_download(...)  # ← sees commit B, downloads pipeline.py\n```\n\nFor the exploit, commit A carries a clean config with `_class_name` as a plain string, which causes `load_pipe_from_hub` to be `False` and the trust check to pass. Commit B changes `_class_name` to a list and adds `pipeline.py`:\n\n**Commit A - `model_index.json`:**\n\n```json\n{\n  \"_class_name\": \"FluxPipeline\",\n  \"_diffusers_version\": \"0.31.0\"\n}\n```\n\n**Commit B - `model_index.json`:**\n\n```json\n{\n  \"_class_name\": [\"pipeline\", \"FluxPipeline\"],\n  \"_diffusers_version\": \"0.31.0\"\n}\n```\n\nWhen `from_pretrained` reads the snapshot after `download()` returns, `config[\"_class_name\"]` is now a list, `pipeline.py` exists on disk (fetched by `snapshot_download`), and `_resolve_custom_pipeline_and_cls` resolves `custom_pipeline` to the local path of that file. `_get_pipeline_class` then imports it - with no trust check at this point in the code.\n\n---\n\n## PoC\n\n1. Create a Hub repo with commit A’s `model_index.json` (plain string `_class_name`).\n2. Run `DiffusionPipeline.from_pretrained(\"attacker/repo\")` with a breakpoint set at `pipeline_utils.py:1778` (the `snapshot_download` call). This is for the window to be large enough to manually respond to it.\n3. When execution pauses at the breakpoint, push commit B: update `model_index.json` to use a list `_class_name` and add `pipeline.py`.\n4. Resume execution.\n5. `snapshot_download` fetches commit B; `/tmp/pwned` is written during the subsequent `_get_pipeline_class` call.\n\n---\n\n## Constraints\n\n- Does not apply when `revision` is pinned to a specific commit hash - both Hub calls resolve to the same content.\n- Does not apply when loading from a local directory.\n- If all expected files are already present in the local HF cache, `download()` returns early before reaching `snapshot_download` (line 1767 early-return), closing the race window. The exploit therefore requires a first (or forced) download.\n\n---\n\n## Exploitability\n\nThe window between the two calls is very short. Local testing resulted in a window of approximately ~0.5 seconds for the attacker to push the change. This is, of course, unfeasible to accomplish for each and every new download. However, given a popular repo with many downloads per day, one may achieve **statistical success** by changing the repo’s state every once in a while or every few seconds, with some percentage of downloaders falling on the exact window. \n\n---\n\n## Impact\n\nThe vulnerability is a silent RCE - it allows arbitrary code to be loaded through the custom pipeline flow from a Hub repo, with no `custom_pipeline` or `trust_remote_code` kwargs. The `from_pretrained` call succeeds and returns a fully functional pipeline.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "diffusers",
+        "purl": "pkg:pypi/diffusers"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.38.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.12.1",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.18.2",
+        "0.19.0",
+        "0.19.1",
+        "0.19.2",
+        "0.19.3",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.21.1",
+        "0.21.2",
+        "0.21.3",
+        "0.21.4",
+        "0.22.0",
+        "0.22.1",
+        "0.22.2",
+        "0.22.3",
+        "0.23.0",
+        "0.23.1",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.26.1",
+        "0.26.2",
+        "0.26.3",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.28.2",
+        "0.29.0",
+        "0.29.1",
+        "0.29.2",
+        "0.3.0",
+        "0.30.0",
+        "0.30.1",
+        "0.30.2",
+        "0.30.3",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.32.2",
+        "0.33.0",
+        "0.33.1",
+        "0.34.0",
+        "0.35.0",
+        "0.35.1",
+        "0.35.2",
+        "0.36.0",
+        "0.37.0",
+        "0.37.1",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-7wx4-6vff-v64p/GHSA-7wx4-6vff-v64p.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/huggingface/diffusers/security/advisories/GHSA-7wx4-6vff-v64p"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/huggingface/diffusers"
+    }
+  ]
+}
