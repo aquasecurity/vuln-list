@@ -1,0 +1,93 @@
+{
+  "id": "GHSA-3r75-xc34-5f44",
+  "modified": "2026-05-21T19:46:27.203596922Z",
+  "published": "2026-05-21T19:28:10Z",
+  "aliases": [
+    "CVE-2026-46497"
+  ],
+  "summary": "Crawlee for Python: SSRF via sitemap-derived URLs",
+  "details": "## Overview\n\n- **Vulnerability type:** Blind SSRF\n- **Affected components:** `src/crawlee/_utils/sitemap.py`, `src/crawlee/_utils/robots.py`, `src/crawlee/request_loaders/_sitemap_request_loader.py`, and all built-in HTTP clients.\n- **Trigger:** an attacker-controlled sitemap or `robots.txt` containing a URL that points to an internal host (layer 1) or uses a non-http scheme (layer 2).\n\nTwo-layer SSRF via sitemap-derived URLs:\n\n### 1) Cross-host HTTP SSRF\n\nBase case, affects every HTTP client.** Sitemap entries and `robots.txt` `Sitemap:` directives were accepted regardless of the host they pointed to. A sitemap on `example.com` could push `http://internal.corp/admin` into the crawler's queue, and the configured HTTP client would dispatch the request.\n\n### 2) Non-HTTP scheme SSRF\n\nEscalation, only `CurlImpersonateHttpClient`.** Nested-sitemap fetching dispatches the URL straight to the HTTP client, bypassing the `Request` construction step where Pydantic enforces `http(s)`. Combined with the libcurl-backed `CurlImpersonateHttpClient`, this lets `gopher://`, `file://`, `dict://`, `ftp://`, etc., through.\n\n\n\n## Root cause\n\nCrawlee already validates URL schemes through Pydantic's `AnyHttpUrl` (via `validate_http_url` in `src/crawlee/_utils/urls.py`) wherever a crawl target is materialised as a `Request`: the `Request.url` field is declared as `Annotated[str, BeforeValidator(validate_http_url), Field(frozen=True)]`. Anything that becomes a `Request` is therefore guaranteed to be `http(s)`.\n\nTwo parts of the sitemap pipeline sidestepped this property in different ways:\n\n### 1) Sitemap-derived URLs were enqueued without any host policy\n\n`SitemapRequestLoader` took every `\u003curlset\u003e\u003curl\u003e\u003cloc\u003e` entry, wrapped it in `Request.from_url` (which accepts any valid `http(s)` URL), and pushed the result into the request queue. `RobotsTxtFile.get_sitemaps()` returned every `Sitemap:` directive verbatim. Neither imposed any host check against the parent sitemap or `robots.txt` URL, so an attacker controlling that content could push internal-network HTTP URLs into the queue and have them crawled by whichever HTTP client was configured.\n\n### 2) Nested sitemap fetching bypassed the `Request` chokepoint entirely\n\nWhen `_XmlSitemapParser` encountered `\u003csitemapindex\u003e\u003csitemap\u003e\u003cloc\u003e…\u003c/loc\u003e\u003c/sitemap\u003e\u003c/sitemapindex\u003e`, or when `RobotsTxtFile.parse_sitemaps` forwarded `Sitemap:` directives into the same pipeline, `_fetch_and_process_sitemap` dispatched the URL directly to the HTTP client:\n\n```python\nasync with http_client.stream(\n    sitemap_url, \n    method='GET', \n    headers=SITEMAP_HEADERS, \n    proxy_info=proxy_info, \n    timeout=timeout,\n) as response:\n    ...\n```\n\nNo `Request` was constructed, so the Pydantic validator never ran. Before the fix, the HTTP clients' own `send_request()` and `stream()` methods did not call `validate_http_url` either, so a non-`http(s)` scheme could pass straight through to the backend client.\n\nThe non-HTTP escalation in layer 2 is **specific to** `CurlImpersonateHttpClient`, which is backed by `curl-cffi` / libcurl and speaks `gopher`, `file`, `dict`, `ftp`, and other non-HTTP protocols. The other clients shipped with Crawlee (`HttpxHttpClient`, `ImpitHttpClient`, `PlaywrightHttpClient`) reject non-`http(s)` schemes at their own backend layer, regardless of what Crawlee passes in, so they were only affected by layer 1.\n\n## Vulnerable paths\n\n### Layer 1 — cross-host HTTP (all HTTP clients)\n\n- *Source:* an attacker-controlled sitemap that lists internal URLs under `\u003curlset\u003e\u003curl\u003e\u003cloc\u003e` or `\u003csitemapindex\u003e\u003csitemap\u003e\u003cloc\u003e`, or an attacker-controlled `robots.txt` that lists internal URLs under `Sitemap:`.\n- *Sink:* the configured HTTP client issues `GET` requests against those URLs — either via `client.request(url=request.url, …)` inside `crawl()` for regular sitemap URLs, or via `client.stream(url, …)` inside the nested-sitemap fetch.\n\n### Layer 2 — non-HTTP schemes (`CurlImpersonateHttpClient` only)\n\n- *Source:* a nested `\u003csitemap\u003e\u003cloc\u003e` entry or a `robots.txt` `Sitemap:` directive pointing to a non-`http(s)` URL.\n- *Sink:* `CurlImpersonateHttpClient.stream(...)` hands the URL string verbatim to `client.request(url=…, …)`, which dispatches via libcurl.\n\nHardening in 1.7.0 was added at both producer and consumer ends — see *Remediation*.\n\n## Exploitation preconditions\n\n1. The crawler uses sitemap loading: any of `SitemapRequestLoader`, `Sitemap.load` / `parse_sitemap`, `discover_valid_sitemaps`, or `RobotsTxtFile.parse_sitemaps`.\n2. The attacker controls the body of a sitemap or `robots.txt` that the crawler fetches — typically by being the target site, or by getting a target site to publish a malicious sitemap.\n3. The crawler's network egress can reach the attacker-chosen destination (e.g., internal services on the same network).\n4. The targeted endpoint accepts unauthenticated requests. Crawlee does not supply credentials to the forged destination, so authenticated services (IMDSv2 with token, password-protected Redis, protected admin panels) are not reachable through this path.\n\nFor layer 2 (non-HTTP), the configured HTTP client must additionally be `CurlImpersonateHttpClient`.\n\n## Impact\n\n### Layer 1 — cross-host HTTP (any client)\n\nThe crawler can be coerced into issuing `GET` requests against internal HTTP services on its own network: admin panels, unauthenticated internal APIs, cloud metadata endpoints, etc. Read-back is blind — Crawlee surfaces fetched content only through its local `Dataset` / `KeyValueStore` (`push_data()` etc.) and does not natively forward scraped bodies anywhere external — so direct impact is mostly existence/timing probing and occasional state changes via side-effecting `GET` endpoints. Read-side leakage of internal content is only exploitable end-to-end if the deployer's own application separately exposes scraped data (for example, a public summariser or aggregator built on top of Crawlee).\n\n### Layer 2 — non-HTTP escalation (only `CurlImpersonateHttpClient`)\n\nUnder the affected client, attackers gain the libcurl scheme set:\n\n- `gopher://` is the canonical RESP-injection vector: pipeline `FLUSHALL`, `CONFIG SET dir`, `CONFIG SET dbfilename`, `SAVE` to an unauthenticated Redis on the crawler's network — enough to write attacker-controlled bytes to disk and, in the standard escalation, achieve remote code execution on the Redis host.\n- `file://` allows the crawler to read local files (application secrets, configuration) on the crawler host.\n- `dict://` and `ftp://` permit fingerprinting and limited interaction with text-protocol services.\n\nIn both layers, the SSRF is blind in the default configuration. Write-side impact (`gopher://` → Redis) and timing-based internal probing do not depend on read-back and remain viable regardless of whether the deployer surfaces scraped content.\n\n## Remediation\n\nBoth layers are fixed in `crawlee==1.7.0`. The fix is split across two PRs, applied at the two complementary boundaries of the affected pipeline:\n\n1. **Producer-side filtering — sitemap and robots.txt loaders (PR #1864).** `SitemapRequestLoader` and `RobotsTxtFile.get_sitemaps()` now run every nested-sitemap entry, every regular sitemap URL, and every `Sitemap:` directive through `crawlee._utils.urls.filter_url`. This applies to an `EnqueueStrategy` (default `'same-hostname'`) against the parent sitemap / `robots.txt` URL — cross-host entries are dropped — and rejects non-`http(s)` schemes. The strategy is stamped onto the emitted `Request`s, so `BasicCrawler._check_url_after_redirects` continues policing the policy across redirects.\n2. **Consumer-side validation — HTTP-client boundary (PR #1862).** `validate_http_url(url)` is now called at the top of `send_request()` and `stream()` in `ImpitHttpClient`, `HttpxHttpClient`, `CurlImpersonateHttpClient`, and `PlaywrightHttpClient`. Non-`http(s)` schemes raise `pydantic.ValidationError` before any backend call. `crawl()` was already covered, because `Request.url` is validated by Pydantic on construction.\n\nAfter these changes, validation is enforced both where sitemap-derived HTTP requests are produced (sitemap and robots.txt loaders) and where they are consumed (HTTP clients). A regression at either layer is caught by the other.\n\n### Behaviour change for upgraders\n\n`SitemapRequestLoader` and `RobotsTxtFile.get_sitemaps()` now default to `enqueue_strategy='same-hostname'`. Deployers that legitimately relied on cross-host sitemap entries (e.g., a sitemap index on `sitemaps.example.com` that points to content on `www.example.com`) must opt in explicitly with `enqueue_strategy='same-domain'` or `enqueue_strategy='all'`.\n\n## Finder credits\n\n- [@r0otsu](https://github.com/r0otsu)\n- [@Yuremin](https://github.com/Yuremin) (Zhengmin Yu)\n- [@FORIMOC](https://github.com/FORIMOC)\n- [@invoke1442](https://github.com/invoke1442) (Ethan Carter)\n- [@Arturo0x90](https://github.com/Arturo0x90) (Arturo Melgarejo)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "crawlee",
+        "purl": "pkg:pypi/crawlee"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.7.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.1.0",
+        "1.1.1",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.5.0",
+        "1.5.1b1",
+        "1.5.1b2",
+        "1.5.1b3",
+        "1.5.1b4",
+        "1.5.1b5",
+        "1.6.0",
+        "1.6.1",
+        "1.6.1b1",
+        "1.6.1b2",
+        "1.6.1b3",
+        "1.6.1b4",
+        "1.6.1b5",
+        "1.6.2",
+        "1.6.2b1",
+        "1.6.2b2",
+        "1.6.2b3",
+        "1.6.2b4",
+        "1.6.3",
+        "1.6.3b1",
+        "1.6.3b2",
+        "1.6.3b3",
+        "1.6.3b4",
+        "1.6.3b5",
+        "1.6.3b6",
+        "1.6.4b1",
+        "1.6.4b2",
+        "1.6.4b3",
+        "1.6.4b4",
+        "1.6.4b5",
+        "1.6.4b6",
+        "1.6.4b7",
+        "1.6.4b8"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-3r75-xc34-5f44/GHSA-3r75-xc34-5f44.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/apify/crawlee-python/security/advisories/GHSA-3r75-xc34-5f44"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/apify/crawlee-python"
+    }
+  ]
+}

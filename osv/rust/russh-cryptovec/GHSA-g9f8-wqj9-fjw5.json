@@ -1,0 +1,70 @@
+{
+  "id": "GHSA-g9f8-wqj9-fjw5",
+  "modified": "2026-05-21T21:00:15.969670353Z",
+  "published": "2026-05-21T20:49:07Z",
+  "aliases": [
+    "CVE-2026-46673"
+  ],
+  "summary": "Russh: Unchecked CryptoVec allocation and growth handling is reachable",
+  "details": "### Title\nUnchecked `CryptoVec` allocation and growth handling was reachable from local agent inputs in current `russh` releases and from remote SSH traffic in historical pre-`0.58.0` releases\n\n### Summary\n`CryptoVec` used unchecked capacity growth, unchecked length arithmetic, and unsafe allocation/locking paths. In current `russh` releases, local SSH agent peers could still feed attacker-controlled frame lengths into buffer growth before validation. In older `russh` releases before `0.58.0`, remote SSH traffic also reached `CryptoVec` through transport and compression buffers.\n\n### Details\nThe underlying unsafe paths were in `CryptoVec`:\n\n- `cryptovec/src/cryptovec.rs`\n  - unchecked capacity growth\n  - unchecked length arithmetic in growth callers\n  - raw allocation and reallocation paths coupled to those sizes\n- `cryptovec/src/platform/unix.rs`\n  - `mlock` / `munlock` previously accepted zero-length calls and performed null-pointer validation inside the `unsafe` OS-call path\n\nThere are two relevant reachability stories:\n\n1. current local reachability in `russh`\n\n- `russh/src/keys/agent/client.rs`\n  - `AgentClient::read_response()` read a peer-supplied `u32` length and then resized `self.buf` to that value before reading the payload\n- `russh/src/keys/agent/server.rs`\n  - `Connection::run()` read a peer-supplied `u32` length and then resized `self.buf` to that value before reading the payload\n\nThis is the path that still existed in current `0.60.x` releases before the fix, although by then those buffers were no longer `CryptoVec`.\n\n2. historical remote reachability in older `russh`\n\n- before commit `712e32b` (first released in `v0.58.0`), non-secret transport and compression buffers in `russh` still used `CryptoVec`\n- I verified this in a detached pre-`712e32b` worktree by adding and running:\n  - `cipher::tests::remote_packet_length_grows_transport_cryptovec_buffer`\n  - `compression::tests::remote_compressed_payload_expands_cryptovec_output`\n- those tests show that remote SSH traffic could grow `CryptoVec` through:\n  - transport packet reads\n  - zlib decompression output\n\nAlso added a constrained-memory reproduction in that historical worktree:\n\n- `compression::tests::remote_compressed_payload_can_crash_under_memory_limit`\n\nThat test re-execs the test binary under `prlimit --as=134217728`, decompresses a highly compressible payload that expands to `96 MiB`, and reliably aborts in the old Unix `CryptoVec` path when `NonNull::new_unchecked()` receives a null pointer after allocation failure.\n\nThe prepared patch does two things:\n\n1. hardens `CryptoVec` itself\n   - checked capacity growth\n   - checked length arithmetic\n   - immediate allocation-failure handling\n   - zero-length `mlock` / `munlock` no-ops\n   - explicit null-pointer validation before entering the Unix `unsafe` locking calls\n\n2. hardens the real untrusted-input path\n   - caps agent frame lengths at `256 * 1024` on both client and server before resizing buffers\n\nThis cap matches OpenSSH’s agent framing guardrail.\n\n### PoC\nThe following end-to-end tests demonstrate the real untrusted-input path by feeding oversized peer-controlled agent frame lengths into the public client and server flows and asserting that they are rejected before buffer growth.\n\nClient-side agent reply path:\n\n```rust\n#[test]\nfn oversized_agent_response_is_rejected_before_allocation() -\u003e std::io::Result\u003c()\u003e {\n    let runtime = tokio::runtime::Builder::new_current_thread()\n        .enable_all()\n        .build()?;\n\n    runtime.block_on(async {\n        let (mut writer, reader) = tokio::io::duplex(64);\n        let server = tokio::spawn(async move {\n            let mut frame = [0u8; 4];\n            writer.read_exact(\u0026mut frame).await?;\n            let len = BigEndian::read_u32(\u0026frame) as usize;\n            let mut body = vec![0; len];\n            writer.read_exact(\u0026mut body).await?;\n\n            BigEndian::write_u32(\u0026mut frame, (MAX_AGENT_FRAME_LEN + 1) as u32);\n            writer.write_all(\u0026frame).await?;\n            Ok::\u003c(), std::io::Error\u003e(())\n        });\n\n        let mut client = AgentClient::connect(reader);\n        let err = client.request_identities().await.unwrap_err();\n        assert!(matches!(err, Error::AgentProtocolError));\n        server.await.expect(\"server task\")?;\n        Ok::\u003c(), std::io::Error\u003e(())\n    })?;\n\n    Ok(())\n}\n```\n\nServer-side agent request path:\n\n```rust\n#[test]\nfn oversized_agent_request_is_rejected_before_allocation() -\u003e std::io::Result\u003c()\u003e {\n    let runtime = tokio::runtime::Builder::new_current_thread()\n        .enable_all()\n        .build()?;\n\n    runtime.block_on(async {\n        let (server, mut client) = tokio::io::duplex(64);\n        let connection = Connection {\n            lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(crate::CryptoVec::new()))),\n            keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(\n                std::collections::HashMap::new(),\n            ))),\n            agent: Some(()),\n            s: server,\n            buf: Vec::new(),\n        };\n        let server = tokio::spawn(async move { connection.run().await });\n\n        let mut frame = [0u8; 4];\n        BigEndian::write_u32(\u0026mut frame, (MAX_AGENT_FRAME_LEN + 1) as u32);\n        client.write_all(\u0026frame).await?;\n        drop(client);\n\n        let err = server.await.expect(\"server task\").unwrap_err();\n        assert!(matches!(err, Error::AgentProtocolError));\n        Ok::\u003c(), std::io::Error\u003e(())\n    })?;\n\n    Ok(())\n}\n```\n\nThese tests pass on the fixed branch and fail on unfixed `v0.60.2`, where oversized agent frame lengths are not rejected at the framing boundary.\n\nFor historical `russh \u003c 0.58.0`, I also verified remote reachability into `CryptoVec` in a detached pre-`712e32b` worktree (`91d431d`, package version `0.57.1`).\n\nTransport packet read path:\n\n```rust\n#[test]\nfn remote_packet_length_grows_transport_cryptovec_buffer() -\u003e std::io::Result\u003c()\u003e {\n    let runtime = tokio::runtime::Builder::new_current_thread()\n        .enable_all()\n        .build()?;\n\n    runtime.block_on(async {\n        let packet_len = MAXIMUM_PACKET_LEN;\n        let (mut writer, mut reader) = tokio::io::duplex(packet_len + 4);\n        let writer_task = tokio::spawn(async move {\n            let mut packet = vec![0u8; packet_len + 4];\n            packet[..4].copy_from_slice(\u0026(packet_len as u32).to_be_bytes());\n            writer.write_all(\u0026packet).await?;\n            Ok::\u003c(), std::io::Error\u003e(())\n        });\n\n        let mut buffer = SSHBuffer::new();\n        let mut cipher = clear::Key;\n        let n = read(\u0026mut reader, \u0026mut buffer, \u0026mut cipher).await.unwrap();\n\n        assert_eq!(n, packet_len + 4);\n        assert_eq!(buffer.buffer.len(), packet_len + 4);\n        assert_eq!(\u0026buffer.buffer[..4], \u0026(packet_len as u32).to_be_bytes());\n\n        writer_task.await.expect(\"writer task\")?;\n        Ok::\u003c(), std::io::Error\u003e(())\n    })?;\n\n    Ok(())\n}\n```\n\nCompression growth path:\n\n```rust\n#[test]\nfn remote_compressed_payload_expands_cryptovec_output() {\n    let payload = vec![b'A'; 64 * 1024];\n\n    let compression = Compression::new(\u0026ZLIB);\n    let mut compressor = Compress::None;\n    let mut decompressor = Decompress::None;\n    compression.init_compress(\u0026mut compressor);\n    compression.init_decompress(\u0026mut decompressor);\n\n    let mut compressed = CryptoVec::new();\n    let encoded = compressor\n        .compress(\u0026payload, \u0026mut compressed)\n        .expect(\"compress\")\n        .to_vec();\n\n    let mut output = CryptoVec::new();\n    let decoded = decompressor\n        .decompress(\u0026encoded, \u0026mut output)\n        .expect(\"decompress\");\n\n    assert_eq!(decoded.len(), payload.len());\n    assert_eq!(decoded, payload.as_slice());\n    assert!(encoded.len() \u003c output.len());\n}\n```\n\nConstrained-memory crash reproduction for the historical remote compression path:\n\n```rust\n#[test]\nfn remote_compressed_payload_can_crash_under_memory_limit() {\n    const CHILD_ENV: \u0026str = \"RUSSH_REMOTE_COMPRESS_CRASH_CHILD\";\n\n    if std::env::var_os(CHILD_ENV).is_some() {\n        let payload = vec![b'A'; 96 * 1024 * 1024];\n\n        let compression = Compression::new(\u0026ZLIB);\n        let mut compressor = Compress::None;\n        let mut decompressor = Decompress::None;\n        compression.init_compress(\u0026mut compressor);\n        compression.init_decompress(\u0026mut decompressor);\n\n        let mut compressed = CryptoVec::new();\n        let encoded = compressor\n            .compress(\u0026payload, \u0026mut compressed)\n            .expect(\"compress\")\n            .to_vec();\n\n        let mut output = CryptoVec::new();\n        let decoded = decompressor\n            .decompress(\u0026encoded, \u0026mut output)\n            .expect(\"decompress\");\n        assert_eq!(decoded.len(), payload.len());\n        return;\n    }\n\n    let exe = std::env::current_exe().expect(\"current exe\");\n    let status = Command::new(\"prlimit\")\n        .args([\n            \"--as=134217728\",\n            \"--\",\n            exe.to_str().expect(\"utf8 exe path\"),\n            \"--exact\",\n            \"compression::tests::remote_compressed_payload_can_crash_under_memory_limit\",\n            \"--nocapture\",\n        ])\n        .env(CHILD_ENV, \"1\")\n        .status()\n        .expect(\"spawn child\");\n\n    assert!(\n        !status.success(),\n        \"expected child to fail under constrained address space\"\n    );\n}\n```\n\nOn that historical worktree, the constrained-memory child aborts in the old Unix `CryptoVec` path with:\n\n```text\nunsafe precondition(s) violated: NonNull::new_unchecked requires that the pointer is non-null\nthread caused non-unwinding panic. aborting.\n```\n\nTo run the reproduced checks:\n\n```bash\ncargo test -p russh oversized_agent_response_is_rejected_before_allocation -- --nocapture\ncargo test -p russh oversized_agent_request_is_rejected_before_allocation -- --nocapture\ncargo test -p russh-cryptovec\n```\n\nHistorical pre-`0.58.0` checks were run from the detached `91d431d` worktree with:\n\n```bash\ncargo test --offline -p russh remote_packet_length_grows_transport_cryptovec_buffer -- --nocapture\ncargo test --offline -p russh remote_compressed_payload_expands_cryptovec_output -- --nocapture\ncargo test --offline -p russh remote_compressed_payload_can_crash_under_memory_limit -- --nocapture\n```\n\n### Impact\nThis is a memory-safety hardening issue with demonstrated untrusted-input reachability.\n\nWhat is demonstrated:\n\n- current local agent peers could previously reach allocation growth directly from attacker-controlled frame lengths\n- historical remote SSH traffic could previously reach `CryptoVec` through transport and compression buffers in `russh \u003c 0.58.0`\n- under constrained memory, the historical remote compression path can be turned into a process abort in the old Unix `CryptoVec` code\n- the fixed code now rejects oversized agent frames early and hardens the underlying allocation paths\n\nWhat is not demonstrated:\n\n- practical code execution\n- a demonstrated integrity or confidentiality break",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh-cryptovec",
+        "purl": "pkg:cargo/russh-cryptovec"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.60.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.60.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g9f8-wqj9-fjw5/GHSA-g9f8-wqj9-fjw5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.60.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.60.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g9f8-wqj9-fjw5/GHSA-g9f8-wqj9-fjw5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-g9f8-wqj9-fjw5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    }
+  ]
+}

