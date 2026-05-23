@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-hvv7-hfrh-7gxj",
+  "modified": "2026-05-23T00:30:09.242052362Z",
+  "published": "2026-05-23T00:18:33Z",
+  "aliases": [
+    "CVE-2026-47124"
+  ],
+  "summary": "Nezha Monitoring: Nezha WebSocket server stream discloses cross-tenant server telemetry to authenticated members",
+  "details": "### Summary\n\nAny authenticated non-admin member can connect to the server-status WebSocket and receive telemetry for all servers, including servers owned by other users. The normal server list API filters objects by `HasPermission`, but the WebSocket stream treats the presence of any authenticated user as authorization for the full unfiltered server list.\n\n### Details\n\nThe server WebSocket route is registered under the optional-auth group in `cmd/dashboard/controller/controller.go:71-73`:\n\n```go\noptionalAuth := api.Group(\"\", optionalAuthMw)\noptionalAuth.GET(\"/ws/server\", commonHandler(serverStream))\n```\n\n`serverStream` treats any `CtxKeyAuthorizedUser` as a member, without checking admin role or per-server ownership, in `cmd/dashboard/controller/ws.go:123-139`:\n\n```go\nu, isMember := c.Get(model.CtxKeyAuthorizedUser)\nvar userId uint64\nif isMember {\n    userId = u.(*model.User).ID\n}\n...\nstat, err := getServerStat(count == 0, isMember)\n```\n\nThe authorization boolean is then used as a full/guest switch in `getServerStat` in `cmd/dashboard/controller/ws.go:160-184`:\n\n```go\nif authorized {\n    serverList = singleton.ServerShared.GetSortedList()\n} else {\n    serverList = singleton.ServerShared.GetSortedListForGuest()\n}\n...\nservers = append(servers, model.StreamServer{\n    ID:           server.ID,\n    Name:         server.Name,\n    PublicNote:   utils.IfOr(withPublicNote, server.PublicNote, \"\"),\n    DisplayIndex: server.DisplayIndex,\n    Host:         utils.IfOr(authorized, server.Host, server.Host.Filter()),\n    State:        server.State,\n    CountryCode:  countryCode,\n    LastActive:   server.LastActive,\n})\n```\n\nFor authenticated members, `GetSortedList()` returns all servers and `server.Host` is not filtered. There is no call to `server.HasPermission(c)`.\n\nThe streamed response model in `model/server_api.go:5-20` includes server ID/name, public note, host details, runtime state, country code, last active time, and global online count. Host and state fields include platform version, agent version, CPU/GPU names, memory/disk/swap totals, architecture, virtualization, boot time, CPU load, memory/disk/swap usage, network transfer/speed, uptime, TCP/UDP/process counts, temperatures, and GPU utilization, as defined in `model/host.go:20-38` and `model/host.go:100-112`.\n\nThe normal list endpoint has the expected object-level authorization. `GET /api/v1/server` is registered with `listHandler` in `cmd/dashboard/controller/controller.go:113`, and `listHandler` filters each returned object with `HasPermission` in `cmd/dashboard/controller/controller.go:263-291`:\n\n```go\nfiltered := filter(c, data)\n...\nreturn slices.DeleteFunc(s, func(e E) bool {\n    return !e.HasPermission(ctx)\n})\n```\n\nThe shared permission model in `model/common.go:44-56` allows admins to see all objects but restricts members to objects whose `UserID` matches their user ID:\n\n```go\nif user.Role == RoleAdmin {\n    return true\n}\nreturn user.ID == c.UserID\n```\n\nMitigations checked:\n\n- Guests receive `GetSortedListForGuest()` and `Host.Filter()` output, but authenticated members bypass both guest restrictions.\n- `HideForGuest` only affects unauthenticated guests, not members.\n- The normal `/api/v1/server` list endpoint uses `listHandler` and is not affected in the same way.\n- No owner/admin filter is applied in the WebSocket path.\n\nCandidate score: 12/14\n\n- Reachability: 2, default WebSocket API\n- Attacker control: 1, attacker controls authentication state and connection\n- Privilege required: 1, authenticated member\n- Sink impact: 2, cross-tenant sensitive telemetry disclosure\n- Mitigation weakness: 2, no object-level auth in the WebSocket path\n- Default exposure: 2, endpoint is part of default dashboard\n- Safe PoC feasibility: 2, can be verified with local users/servers or statically\n\nExploitability gate: statically confirmed\n\n- Reachable source: `GET /api/v1/ws/server`\n- Default/common configuration: dashboard API exposed by default\n- Missing/bypassed mitigation: member-vs-guest check replaces object-level authorization\n- Impact-bearing sink: WebSocket response includes unfiltered all-server telemetry\n- Safe proof: static source-to-sink proof; full runtime test blocked locally by unavailable Go 1.26 toolchain\n- Affected version evidence: confirmed at commit `85b0dd2992733037b019442caffc6c049ba937dd` (`v2.0.7-1-g85b0dd2`)\n- Variant review: normal server list endpoint and guest filtering were checked\n\n### PoC\n\nStatic local PoC steps:\n\n1. Start Nezha with two non-admin users and at least one server assigned to each user.\n2. Authenticate as user A.\n3. Connect to the WebSocket endpoint with user A's token, for example:\n\n```http\nGET /api/v1/ws/server HTTP/1.1\nHost: 127.0.0.1:8008\nCookie: nz-jwt=\u003cuser-a-token\u003e\nUpgrade: websocket\nConnection: Upgrade\n```\n\n4. Observe that the JSON messages contain entries for all servers from `singleton.ServerShared.GetSortedList()`, including servers whose `UserID` does not match user A.\n5. Compare with `GET /api/v1/server` using the same token; that route is filtered through `listHandler`/`HasPermission` and should only return user A's own servers.\n\nCleanup: no persistent state is created by the WebSocket connection.\n\nLocal dynamic confirmation note: the full project test/runtime could not be executed in this audit environment because the repository requires Go 1.26 and the local toolchain reported `go: download go1.26 for linux/amd64: toolchain not available`.\n\n### Impact\n\nThis is an authenticated horizontal information disclosure. A low-privileged member can continuously monitor other users' server inventory and live telemetry, including host platform details, agent versions, CPU/GPU details, resource usage, traffic counters, country code, and last-active timestamps. This may expose infrastructure composition, usage patterns, and operational state across tenants.\n\n## Suggested remediation\n\nApply object-level authorization in `getServerStat` for authenticated non-admin users. For each server in the stream, include it only if the current user is admin or `server.UserID` matches the authenticated user. Keep guest filtering and host redaction for unauthenticated users.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nezhahq/nezha",
+        "purl": "pkg:golang/github.com/nezhahq/nezha"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.4.0"
+            },
+            {
+              "fixed": "1.14.15-0.20260517034128-05e5da253519"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-hvv7-hfrh-7gxj/GHSA-hvv7-hfrh-7gxj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/security/advisories/GHSA-hvv7-hfrh-7gxj"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nezhahq/nezha"
+    }
+  ]
+}
