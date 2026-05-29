@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-c3px-h233-h6fq",
+  "modified": "2026-05-28T22:45:18.323052396Z",
+  "published": "2026-05-28T22:39:25Z",
+  "aliases": [
+    "CVE-2026-47179"
+  ],
+  "summary": "Arcane Has an Authenticated Arbitrary Host File Read via Docker Compose Include Directives",
+  "details": "## Summary\n\n`ProjectService.GetProjectFileContent` returns the contents of any Docker Compose include directive declared in a project's compose file before any path-traversal validation runs. Because `ProjectService.CreateProject` writes attacker-supplied compose content to disk without validating include paths, an authenticated user can create a project whose compose file declares `include: ['../../../../etc/passwd']`, then read the include via the project file API. The result is arbitrary read of any file readable by the Arcane backend process, including `/app/data/arcane.db` (the SQLite database containing every user's password hash and API key), enabling escalation to admin and, via Arcane's Docker control plane, RCE on the host.\n\n## Details\n\n**Root cause #1 — `CreateProject` writes compose content without validation** (`backend/internal/services/project_service.go:1605-1644`):\n\n```go\nfunc (s *ProjectService) CreateProject(ctx context.Context, name, composeContent string, envContent *string, user models.User) (*models.Project, error) {\n    // ... directory setup ...\n    if err := projects.SaveOrUpdateProjectFiles(projectsDirectory, projectPath, composeContent, envContent); err != nil {\n        _ = s.db.WithContext(ctx).Delete(proj).Error\n        return nil, fmt.Errorf(\"failed to save project files: %w\", err)\n    }\n    // ...\n}\n```\n\nCompare with `UpdateProject` (project_service.go:2494, :2577), which calls `validateComposeContentForUpdate`. That validator (line 2599) loads the compose with `missingIncludeStubResourceLoaderInternal`, which calls `ValidateIncludePathForWrite` (includes.go:139) and rejects includes outside the project directory. `CreateProject` bypasses this entirely, so any malicious `include:` array survives to disk.\n\n**Root cause #2 — `GetProjectFileContent` reads include files before path validation** (`backend/internal/services/project_service.go:831-872`):\n\n```go\nincludes, parseErr := projects.ParseIncludes(composeFile, envMap, true)\nif parseErr == nil {\n    for _, inc := range includes {\n        if inc.RelativePath == relativePath {\n            return project.IncludeFile{\n                Path:         inc.Path,\n                RelativePath: inc.RelativePath,\n                Content:      inc.Content,    // \u003c-- arbitrary file content returned here\n            }, nil\n        }\n    }\n}\n\nfullPath := filepath.Join(proj.Path, relativePath)\n// ... IsSafeSubdirectory check at line 870 — never reached when include matches ...\n```\n\n**Root cause #3 — `ParseIncludes` reads include files from anywhere by design** (`backend/pkg/projects/includes.go:24-72`):\n\n```go\n// Security Model for Include Files:\n// - READ: Docker Compose allows include files from anywhere (parent dirs, absolute paths, etc.)\n//         We allow reading from any path to maintain compatibility with standard Docker Compose behavior\n// - WRITE/DELETE: Restricted to files within the project directory only for security\n```\n\n`parseIncludeItemInternal` at includes.go:97-101 builds `fullPath = filepath.Clean(filepath.Join(baseDir, includePath))` and `os.ReadFile(fullPath)` at line 105 — no containment check. The returned `RelativePath` (line 124) is `filepath.ToSlash(filepath.Clean(includePath))`, which preserves `../../../../etc/passwd` verbatim for the equality match in `GetProjectFileContent`.\n\n**Authorization surface**: The handler `GET /api/environments/{id}/projects/{projectId}/file` (`backend/internal/huma/handlers/projects.go:268-279`) and `POST /api/environments/{id}/projects` (line 242-253) only declare `BearerAuth`/`ApiKeyAuth`. There is no admin-role gate on either handler — `GetProjectFile` (line 582) and `CreateProject` (line 524) simply call `humamw.GetCurrentUserFromContext`. The default user role assigned in `users.go:223` is `\"user\"` (not admin), and that role is sufficient to exploit.\n\n**Resulting primitive**: arbitrary read of any file readable by the Arcane backend process (uid/gid of the container). Sensitive targets include `/app/data/arcane.db` (SQLite containing argon2 password hashes and API keys for every user), `/app/data/secrets/*`, mounted host configuration, SSH keys (if mounted), and Docker socket-adjacent secrets.\n\n## Impact\n\n- **Arbitrary file read** as the Arcane backend process for any authenticated user, including users with the lowest-privilege `\"user\"` role.\n- **Credential disclosure**: `arcane.db` contains argon2 password hashes for every account (including admins) and API key material — supports offline cracking and direct token exfiltration.\n- **Privilege escalation**: a `\"user\"`-role attacker can recover or replay admin credentials, then exercise full Arcane functionality (Docker container/exec/volume control), which on a typical deployment with the host Docker socket mounted is host RCE.\n- **Configuration / secret exposure**: any environment files, OIDC client secrets, registry credentials, or files mounted into the container are reachable.\n- The scope crosses the security authority of other user accounts (S:C), since one authenticated user reads credentials belonging to other users and to the admin.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getarcaneapp/arcane/backend",
+        "purl": "pkg:golang/github.com/getarcaneapp/arcane/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.19.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.19.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-c3px-h233-h6fq/GHSA-c3px-h233-h6fq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getarcaneapp/arcane/security/advisories/GHSA-c3px-h233-h6fq"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getarcaneapp/arcane/commit/b6cbffabf61dbc3f12a28d3b5830e3c6b7e67daf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getarcaneapp/arcane"
+    }
+  ]
+}
