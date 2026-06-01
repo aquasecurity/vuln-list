@@ -1,0 +1,51 @@
+{
+  "id": "GHSA-8g2p-pqm3-fcfh",
+  "modified": "2026-06-01T14:30:10.429109700Z",
+  "published": "2026-06-01T14:23:39Z",
+  "aliases": [
+    "CVE-2026-47413"
+  ],
+  "summary": "praisonai-platform: Any workspace member can add arbitrary user as owner via POST /workspaces/{id}/members",
+  "details": "## Summary\n\n**Type:** Privilege escalation / cross-tenant member injection. The `POST /workspaces/{workspace_id}/members` endpoint is gated only by `require_workspace_member(workspace_id)` (default `min_role=\"member\"`) and forwards the request body's `user_id` and `role` straight into `MemberService.add(workspace_id, user_id, role)`, which has no caller-permission check. A user with the lowest workspace privilege can add any user (including a new attacker-controlled second account, or an existing account they want to grief) as owner of the workspace.\n**File:** `src/praisonai-platform/praisonai_platform/api/routes/workspaces.py`, lines 92-101; `services/member_service.py`, lines 26-38.\n**Root cause:** `MemberService.add` validates only that `role` is in `VALID_ROLES = {\"owner\", \"admin\", \"member\"}` — the value, not the caller's right to assign it. The route's `Depends(require_workspace_member)` resolves to the default `min_role=\"member\"`. So a member-level token plus one POST gives the attacker an alternate identity with owner role inside the same workspace, bypassing every owner-only operation that *would* otherwise gate them.\n\n## Affected Code\n\n**File 1:** `src/praisonai-platform/praisonai_platform/api/routes/workspaces.py`, lines 92-101.\n\n```python\n@router.post(\"/{workspace_id}/members\", response_model=MemberResponse, status_code=status.HTTP_201_CREATED)\nasync def add_member(\n    workspace_id: str,\n    body: MemberAdd,\n    user: AuthIdentity = Depends(require_workspace_member),         # \u003c-- BUG: defaults to min_role=\"member\"\n    session: AsyncSession = Depends(get_db),\n):\n    member_svc = MemberService(session)\n    member = await member_svc.add(workspace_id, body.user_id, body.role)  # \u003c-- writes any (user, role)\n    return MemberResponse.model_validate(member)\n```\n\n**File 2:** `src/praisonai-platform/praisonai_platform/services/member_service.py`, lines 26-38.\n\n```python\nasync def add(\n    self,\n    workspace_id: str,\n    user_id: str,\n    role: str = \"member\",\n) -\u003e Member:\n    \"\"\"Add a user to a workspace.\"\"\"\n    if role not in VALID_ROLES:                                      # only validates the value\n        raise ValueError(f\"Invalid role: {role}. Must be one of {VALID_ROLES}\")\n    member = Member(workspace_id=workspace_id, user_id=user_id, role=role)\n    self._session.add(member)                                        # \u003c-- BUG: no caller-permission check\n    await self._session.flush()\n    return member\n```\n\n**Why it's wrong:** workspace member management is the textbook capability that must be gated on owner role. The role hierarchy is implemented (`MemberService.has_role`, member_service.py:80-96), the dependency-tunable `min_role` parameter exists (`require_workspace_member(min_role)`, deps.py:58), but the `POST .../members` route uses neither. The `VALID_ROLES` enum check is purely cosmetic — it accepts `\"owner\"` from any caller because the route never asked whether the caller has the right to assign that role.\n\n## Exploit Chain\n\n1. Attacker registers two accounts (or recruits a member account on the target workspace `W`). Account A is an existing member of `W`; Account B is a fresh signup the attacker controls (any account on the platform — `auth/register` is open by default). State: attacker holds tokens for both A and B.\n2. Attacker authenticates as Account A and POSTs `Authorization: Bearer \u003cA_jwt\u003e` to `POST /workspaces/W/members` with body `{\"user_id\": \"\u003cB_user_id\u003e\", \"role\": \"owner\"}`. State: control flow enters `add_member`.\n3. `require_workspace_member(W, A)` passes (A is a member). `MemberService.add(W, B, \"owner\")` writes a new row `Member(workspace_id=W, user_id=B, role=\"owner\")`. State: Account B is now a workspace-W owner.\n4. Attacker switches to Account B and acts as workspace owner — change settings, add/remove members, delete the workspace, or pivot to the companion advisories' primitives. State: attacker holds owner of any workspace they had member access to, via a fresh attacker-controlled identity that the original workspace's audit logs cannot easily attribute to A.\n5. Final state: with one member-level token plus one POST, the attacker plants an owner-role identity on any workspace they can reach. The same primitive lets the attacker invite a competitor or external-vendor account into the workspace as owner, exfiltrating the workspace's content under that competitor's name.\n\n## Security Impact\n\n**Severity:** sec-critical. CVSS 9.1: network attack, low complexity, low privileges (member tier), no user interaction, scope changed (the new owner is a different security principal), high confidentiality and integrity, no availability claim.\n**Attacker capability:** with one workspace-member token plus one POST request, the attacker grants owner-tier access to any user_id on the platform. From there, full workspace control via the Account B token, plus indirect attribution: the original workspace's audit logs see \"user A added user B as owner\" but the audit trail cannot tell that B is attacker-controlled.\n**Preconditions:** `praisonai-platform` is deployed multi-tenant; the attacker has any membership token in the target workspace; the attacker can register or knows any other user_id on the platform.\n**Differential:** source-inspection-verified. The asymmetry between `MemberService.has_role` (clearly tiered) and `add_member`'s default `min_role=\"member\"` confirms the gap. With the suggested fix below, the gate refuses the member-tier token, the elevated POST returns 403, and the second-identity owner is never created.\n\n## Suggested Fix\n\n```diff\n--- a/src/praisonai-platform/praisonai_platform/api/routes/workspaces.py\n+++ b/src/praisonai-platform/praisonai_platform/api/routes/workspaces.py\n@@ -90,11 +90,15 @@\n+def _require_workspace_owner(workspace_id: str, user, session):\n+    return require_workspace_member(workspace_id, user, session, min_role=\"owner\")\n+\n @router.post(\"/{workspace_id}/members\", response_model=MemberResponse, status_code=status.HTTP_201_CREATED)\n async def add_member(\n     workspace_id: str,\n     body: MemberAdd,\n-    user: AuthIdentity = Depends(require_workspace_member),\n+    user: AuthIdentity = Depends(_require_workspace_owner),\n     session: AsyncSession = Depends(get_db),\n ):\n     member_svc = MemberService(session)\n+    if body.role == \"owner\" and not await member_svc.has_role(workspace_id, user.id, \"owner\"):\n+        raise HTTPException(status_code=403, detail=\"Only owners can add other owners\")\n     member = await member_svc.add(workspace_id, body.user_id, body.role)\n```\n\nThe four other workspace mutation endpoints (`update_workspace`, `delete_workspace`, `update_member_role`, `remove_member`) exhibit the same default-min-role gap and are filed as their own advisories.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai-platform",
+        "purl": "pkg:pypi/praisonai-platform"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.1.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-8g2p-pqm3-fcfh/GHSA-8g2p-pqm3-fcfh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-8g2p-pqm3-fcfh"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    }
+  ]
+}

