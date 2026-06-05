@@ -1,0 +1,73 @@
+{
+  "id": "GHSA-xgx4-4h9w-53pv",
+  "modified": "2026-06-04T20:00:07.142245592Z",
+  "published": "2026-06-04T19:50:23Z",
+  "aliases": [
+    "CVE-2026-47703"
+  ],
+  "summary": "AdGuard Home: DoQ-to-UDP State Reduction and Source-Port Oracle",
+  "details": "## Summary\n\nThis report covers the client-triggered DoQ forwarding path in:\n\n- `dnsproxy` `v0.81.2` (`adguard/dnsproxy:v0.81.2`)\n- `AdGuard Home` `v0.107.74` (`adguard/adguardhome:latest`, image version label `v0.107.74`)\n\nThe issue was reproduced on `2026-04-25` with the products configured through\ntheir documented DoQ listener and plain UDP upstream surfaces. The scope is the\ninternal backend UDP hop created when a DoQ query is forwarded to a `udp://`\nupstream.\n\nOn that path, the backend DNS `ID` is not preserved as an independent source of\nentropy. For both products, the backend observer saw `dns_id=0` for every\nsampled client-triggered query on the tested path. Repeated reruns then showed\nthe same `txid=0` behavior and the same positive source-port oracle on every\nsampled run. A separate quoted-port ICMP oracle distinguished the correct\nbackend UDP source port from a wrong one with a stable, client-visible behavior\nchange.\n\nAttached evidence:\n\n- `dnsproxy` oracle path on `v0.81.2`: [attachments/artifacts/g03/20260425T141500Z-g03-v0812/summary.txt](attachments/artifacts/g03/20260425T141500Z-g03-v0812/summary.txt)\n- `dnsproxy` `v0.81.2` repeatability: [attachments/artifacts/g03/repeatability-v0812.md](attachments/artifacts/g03/repeatability-v0812.md)\n- `dnsproxy` steering follow-up on `v0.81.2`: [attachments/artifacts/g04/20260425T141900Z-g04-v0812/summary.txt](attachments/artifacts/g04/20260425T141900Z-g04-v0812/summary.txt)\n- `AdGuard Home` oracle path: [attachments/artifacts/g05/20260425T113000Z-g05/summary.txt](attachments/artifacts/g05/20260425T113000Z-g05/summary.txt)\n\n## Root Cause Analysis\n\nThe observable behavior is consistent across both products:\n\n1. A DoQ client query is accepted on the frontend listener.\n2. The query is forwarded over a backend UDP leg.\n3. On that backend leg, the forwarded DNS `ID` collapses to `0` on the\n   client-triggered path instead of remaining a fresh per-query variable.\n4. The backend UDP source port is still allocated per query.\n5. When an ICMP error quotes the actual backend source port, the forwarding path\n   flips behavior in a way that does not occur for a wrong quoted port.\n\nThat combination removes `txid` from the backend tuple on the tested path and\nleaves the UDP source port as the main remaining variable. In practical terms,\nthe backend hop stops behaving like a fresh `(txid, source-port)` pair per\nforwarded query and instead becomes a one-variable state exposure.\n\nFor `dnsproxy`, the correct quoted port does more than produce a failure signal:\nit can push resolution away from the primary UDP upstream and into the fallback\nupstream. For `AdGuard Home`, the same condition produces a fast `SERVFAIL`.\n\n## Reproduce\n\nPrerequisites:\n\n- Docker and Docker Compose\n- OpenSSL\n- build the lab helper image used by the attached harness and observer\n\nThe attached reproducer bundle contains only the files needed for this report:\n\n- scripts: `attachments/scripts/`\n- helper image build files: `attachments/docker/unbound-doq-attacker/`\n- compose files: `attachments/docker-compose.g03.yml`,\n  `attachments/docker-compose.g04.yml`, `attachments/docker-compose.g05.yml`\n- shipped evidence: `attachments/artifacts/...`\n\nBuild the helper image first:\n\n1. `cd attachments`\n2. `docker build -t unbound-doq-attacker:latest -f docker/unbound-doq-attacker/Dockerfile docker/unbound-doq-attacker`\n\nTo rerun `dnsproxy`:\n\n1. `cd attachments`\n2. `bash scripts/repro-g03-dnsproxy-oracle.sh`\n3. Inspect `artifacts/g03/\u003cRUN_ID\u003e/summary.txt`\n4. Inspect `artifacts/g03/\u003cRUN_ID\u003e/entropy-backend.jsonl`,\n   `txid_correct-backend.jsonl`, and `port_correct-backend.jsonl`\n\nTo rerun the `dnsproxy` fallback-steering case:\n\n1. `cd attachments`\n2. `bash scripts/repro-g04-dnsproxy-steering.sh`\n3. Inspect `artifacts/g04/\u003cRUN_ID\u003e/summary.txt`\n4. Inspect `steering_correct-main.jsonl` and `steering_correct-fallback.jsonl`\n\nTo rerun `AdGuard Home`:\n\n1. `cd attachments`\n2. `bash scripts/repro-g05-adguardhome-oracle.sh`\n3. Inspect `artifacts/g05/\u003cRUN_ID\u003e/summary.txt`\n4. Inspect `entropy-backend.jsonl`, `txid_correct-backend.jsonl`, and\n   `port_correct-backend.jsonl`\n\nThe attached evidence includes fresh `dnsproxy v0.81.2` reruns, one official-\nprofile `AdGuard Home` run, and the minimal reproducer bundle used by both.\n\n## Impact\n\nFor both products, the tested DoQ-to-UDP path is no longer a full\n`(txid, source-port)` search surface:\n\n- `dnsproxy`: four of four sampled runs showed `txid=0` on the backend hop and\n  a positive source-port oracle on `v0.81.2`. The remaining unknown is\n  `port_only`. Median wrong/correct port latency was `327.99 ms / 40.93 ms`.\n- `AdGuard Home`: four of four sampled runs showed `txid=0` on the backend hop\n  and a positive source-port oracle. The aggregate again classifies the\n  remaining unknown as `port_only`. Median wrong/correct port latency was\n  `319.14 ms / 37.02 ms`.\n\nProduct-specific effects:\n\n- `dnsproxy`: a correct port guess produced an empty client-visible answer on\n  the base oracle path, and in the fallback profile it steered all eight tested\n  queries away from the main upstream and into the fallback upstream.\n- `AdGuard Home`: a correct port guess produced fast `SERVFAIL` and an extra\n  backend query.\n\nThis is the security-relevant point. On the tested official profiles, the\nbackend hop no longer forces an off-path attacker to deal with two fresh random\nfields per forwarded DNS race. The DNS ID is already known: it is\ndeterministically `0` on the client-triggered DoQ-to-UDP path. The only\nremaining backend tuple variable is the UDP source port, and the attached\nevidence shows a repeatable oracle for that remaining variable.\n\nThat places the path in the same threat-model class as oracle-assisted DNS\nforgery work such as SAD DNS and TUdoor: the attack first uses an oracle to\nlearn or validate the tuple state that protects an off-path response race, and\nonly then attempts the forged response. This report stops short of a forgery\ndemo, but the evidence already shows the crucial precondition on the tested\nbackend hop: the tuple is not high-entropy anymore. It has been reduced from\n`(txid, source-port)` to `source-port` only.\n\n\n---\n\n**Attachments**\n[attachments.zip](https://github.com/user-attachments/files/27227054/attachments.zip)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/AdguardTeam/AdGuardHome",
+        "purl": "pkg:golang/github.com/AdguardTeam/AdGuardHome"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.107.75"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.107.74",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-xgx4-4h9w-53pv/GHSA-xgx4-4h9w-53pv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/AdguardTeam/dnsproxy",
+        "purl": "pkg:golang/github.com/AdguardTeam/dnsproxy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.81.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-xgx4-4h9w-53pv/GHSA-xgx4-4h9w-53pv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/AdguardTeam/AdGuardHome/security/advisories/GHSA-xgx4-4h9w-53pv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/AdguardTeam/dnsproxy/commit/f00d992ce9567a50f596853978ad6500acfdcf1d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/AdguardTeam/AdGuardHome"
+    }
+  ]
+}
