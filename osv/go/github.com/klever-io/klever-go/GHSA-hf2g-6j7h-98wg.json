@@ -1,0 +1,47 @@
+{
+  "id": "GHSA-hf2g-6j7h-98wg",
+  "modified": "2026-06-05T16:45:18.301864387Z",
+  "published": "2026-06-05T16:41:23Z",
+  "summary": "klever-go: Unbounded goroutine spawn on direct-message ingress enables peer-driven DoS",
+  "details": "### Summary\n\n`networkMessenger.directMessageHandler` in `network/p2p/libp2p/netMessenger.go` spawns a fresh goroutine for every incoming direct message before the antiflood layer makes an admission decision. There is no semaphore, throttler, or bound on concurrent in-flight spawns.\n\nA single connected libp2p peer can open a `DirectSendID` stream and send well-formed `TopicMessage` envelopes with varying sequence numbers. Each accepted direct message reaches `directMessageHandler` and triggers a fresh goroutine before `processor.ProcessReceivedMessage` runs. This allows unbounded goroutine growth and node availability degradation from one peer.\n\nThis remains present in the latest release `v1.7.17`: `network/p2p/libp2p/netMessenger.go:1060` still spawns `go func(msg p2p.MessageP2P)` before `processor.ProcessReceivedMessage`. I also verified current `develop` commit `10bcfd50`, where the same spawn remains at `network/p2p/libp2p/netMessenger.go:1115`.\n\nThis is distinct from GHSA-74m6-4hjp-7226 and GHSA-87m7-qffr-542v. Those advisories concern `MultiDataInterceptor` decompression/throttler behavior. This report concerns the libp2p direct-message ingress wrapper spawning an unbounded goroutine before processor-level antiflood/admission logic runs. A patch to `Batch.Decompress` or `MultiDataInterceptor` does not bound this direct-message goroutine spawn.\n\n### Details\n\nThe affected path is `network/p2p/libp2p/netMessenger.go` in `directMessageHandler`.\n\nThe direct-message path transforms and validates the message, looks up the topic processor, then immediately spawns a goroutine:\n\n```go\nfunc (netMes *networkMessenger) directMessageHandler(message *pubsub.Message, fromConnectedPeer core.PeerID) error {\n    var processor p2p.MessageProcessor\n\n    topic := *message.Topic\n    msg, err := netMes.transformAndCheckMessage(message, fromConnectedPeer, topic)\n    if err != nil {\n        return err\n    }\n\n    netMes.mutTopics.RLock()\n    processor = netMes.processors[topic]\n    netMes.mutTopics.RUnlock()\n\n    if processor == nil {\n        return fmt.Errorf(\"%w on directMessageHandler for topic %s\", p2p.ErrNilValidator, topic)\n    }\n\n    go func(msg p2p.MessageP2P) {\n        if check.IfNil(msg) {\n            return\n        }\n\n        errProcess := processor.ProcessReceivedMessage(msg, fromConnectedPeer)\n        // ...\n    }(msg)\n\n    return nil\n}\n```\n\nThe processor-level antiflood decision happens inside `ProcessReceivedMessage`, after the goroutine, its stack, and the cloned message reference already exist. That means antiflood can bound processing rate, but not goroutine creation rate.\n\nThe existing `goRoutinesThrottler` with capacity `broadcastGoRoutines = 1000` is wired into outgoing broadcast paths such as `BroadcastOnChannelBlocking`, not this incoming direct-message path.\n\nThe parallel pubsub ingress path in the same file handles a comparable inbound message surface synchronously:\n\n```go\nerr = handler.ProcessReceivedMessage(msg, fromConnectedPeer)\n```\n\nSo the direct-message path is asymmetric: same transform/check function, same `ProcessReceivedMessage` callee, but direct-message ingress adds an unbounded goroutine spawn.\n\nReachability:\n\n- `directSender.go` registers `DirectSendID` as a libp2p stream protocol.\n- `directStreamHandler` reads framed `pubsub.Message` envelopes from the stream.\n- `directStreamHandler` forwards each message to `networkMessenger.directMessageHandler`.\n- Any connected peer can send well-formed envelopes to registered topics.\n- The `seenMessages` cache keys on `From + Seqno`; `Seqno` is attacker-controlled in the envelope, so incrementing it bypasses dedupe.\n\n### PoC\n\nGitHub Private Vulnerability Reporting does not appear to allow file attachments in this form, so I am including the reproduction command and captured output inline. I can provide the full Go test file immediately if useful.\n\nThe PoC is a Go test file intended to be placed under `network/p2p/libp2p/` in a `klever-go` checkout. It exercises the real `network/p2p/libp2p` package with `NewMockMessenger`.\n\nReproduction:\n\n```bash\ngit clone https://github.com/klever-io/klever-go\ncd klever-go\ngit checkout v1.7.16\n\n# Place dos_directmsg_test.go into:\n# network/p2p/libp2p/\n\ngo test ./network/p2p/libp2p/ -run TestPoC_ -count=1 -v -timeout 60s\n```\n\nCaptured output:\n\n```text\n=== RUN   TestPoC_DirectMessageHandler_SpawnsGoroutinePerMessage\n    baseline goroutines: 43\n    peak goroutines after 500 direct messages: 543 (delta = 500)\n    final goroutines after drain + GC: 43\nPOC_RESULT direct=spawn N=500 baseline=43 peak=543 delta=500 threshold=400 final=43\n--- PASS\n\n=== RUN   TestPoC_SynchronousHandler_NoGoroutineGrowth\n    baseline goroutines: 47\n    peak goroutines after 500 synchronous calls: 47 (delta = 0)\nPOC_RESULT sync=block N=500 baseline=47 peak=47 delta=0\n--- PASS\n\n=== RUN   TestPoC_DirectMessageHandler_NoThrottlerInPath\n    all 2000 SendToConnectedPeer calls returned in 2.490708ms -- no throttler blocking\nPOC_RESULT throttler=absent N=2000 elapsed=2.490708ms\n--- PASS\n```\n\nReading:\n\n1. 500 direct messages with slow processors produced exactly 500 new goroutines.\n2. The synchronous control path produced zero goroutine growth.\n3. 2000 messages, twice the outgoing `broadcastGoRoutines = 1000` capacity, returned immediately, showing no ingress throttler blocks this path.\n\n### Impact\n\nA single connected peer can sustain unbounded goroutine spawn growth on a klever-go node. Each spawned goroutine allocates its own stack, holds message references until the processor returns, and adds scheduler and GC pressure before antiflood admission can reject the message.\n\nUnder realistic attacker line rate and non-trivial processor latency, goroutine count can grow faster than the runtime drains it, degrading the node's ability to process legitimate traffic. This maps to the `SECURITY.md` High category: \"Denial of Service affecting network availability.\"\n\nAll testing was local only. I did not contact Klever mainnet, public testnet, hosted RPCs, explorers, or third-party production infrastructure.\n\nSuggested fixes:\n\n1. Wire `goRoutinesThrottler.CanProcess()` or a dedicated ingress throttler before the `go func()` spawn in `directMessageHandler`.\n2. Or remove the goroutine and call `ProcessReceivedMessage` synchronously, matching the existing `pubsubCallback` path.\n\nDisclosure note: I originally sent this report to `security@klever.org` on 2026-05-13. Since `SECURITY.md` lists GitHub Private Vulnerability Reporting as the recommended channel, I am resubmitting it here.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klever-io/klever-go",
+        "purl": "pkg:golang/github.com/klever-io/klever-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.7.14"
+            },
+            {
+              "fixed": "1.7.18"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.7.17",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-hf2g-6j7h-98wg/GHSA-hf2g-6j7h-98wg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/security/advisories/GHSA-hf2g-6j7h-98wg"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klever-io/klever-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/releases/tag/v1.7.18"
+    }
+  ]
+}
