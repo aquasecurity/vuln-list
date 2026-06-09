@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-598g-h2vc-h5vg",
+  "modified": "2026-06-08T23:15:17.691591580Z",
+  "published": "2026-06-08T23:09:02Z",
+  "aliases": [
+    "CVE-2026-47724"
+  ],
+  "summary": "nebula-mesh: API endpoints lack ownership checks, enabling cross-operator privilege escalation",
+  "details": "The `/api/v1/*` route surface trusts the bearer token alone for authorisation on most endpoints. The codebase itself admits this at `internal/api/hosts.go:384`: *\"API trusts the bearer token for authorisation; per-CA ownership is enforced only in the Web layer.\"*\n\nThe Web UI gates state-changing routes through `loadAccessibleCA` (`internal/web/cas.go`); CA-management endpoints in `internal/api/cas.go` ALSO have proper `canAccessCA` gates. **The gap is on the host, network, firewall, mobile-bundle, and most operator endpoints.** Combined with the per-operator CA model from ADR 0002, this gives any non-admin operator API key broad cross-tenant access — instant privilege escalation in the worst case.\n\n## Affected\nAll released versions prior to v0.3.4.\n\n## Exploit chain\n\n### A) Mint admin API key from any operator key (instant privilege escalation)\n`internal/api/operators.go:118` — `handleCreateOperatorAPIKey` does no admin check and no actor/target-operator ownership check. Any operator key can call it for any operator (including admins) and receive a fresh bearer.\n\n```\ncurl -X POST -H \"Authorization: Bearer \u003clow-priv-key\u003e\" \\\n  https://server/api/v1/operators/\u003cadmin-id\u003e/api-keys \\\n  -H 'Content-Type: application/json' -d '{\"name\":\"oops\"}'\n# Returns: {\"key\":\"\u003c32-byte admin bearer\u003e\",\"entry\":{...}}\n```\n\nReuse the returned key for subsequent requests → full admin.\n\n### B) Cross-operator host takeover via reenroll\n`internal/api/hosts.go:321,330` → `mintEnrollmentTokenForHost`. Looks up host by URL param, mints a single-use enrollment token, returns it. No ownership check.\n\n```\ncurl -X POST -H \"Authorization: Bearer \u003clow-priv-key\u003e\" \\\n  https://server/api/v1/hosts/\u003cvictim-host-id\u003e/reenroll\n# Returns: {\"enrollment_token\":\"\u003cuuid\u003e\",...}\n```\n\nCaller POSTs `/api/v1/enroll` with their own X25519 + Ed25519 keypairs. `enroll.go:175` overwrites `signing_pub_pem`; `SaveCertificateAndEnrollHost` overwrites the cert. Legitimate agent's next signed poll fails `bad_signature`. Attacker now owns the victim's Nebula identity.\n\n### C) Cross-tenant CRUD on hosts, networks, firewall\nThe same gap applies across:\n- `/api/v1/hosts*` — create, list, get, update, delete, block, unblock\n- `/api/v1/networks*` — create, list, get\n- `/api/v1/networks/{id}/firewall` — get, PUT\n- `/api/v1/hosts/{id}/mobile-bundle` (already filed as public issue #119)\n\nAll trust bearer-auth alone. Any operator can read or mutate any other operator's resources.\n\n## Affected operator-management handlers (in addition to A)\nBeyond `handleCreateOperatorAPIKey` (covered by A), `internal/api/operators.go` is missing admin gates on:\n- `handleListOperators` (line 66) — operator roster info disclosure\n- `handleDisableOperator` (line 79) — DoS / sabotage\n- `handleEnableOperator` (line 94) — re-enable disabled operators\n- `handleRevokeOperatorAPIKey` (line 157) — invalidate any operator's API keys\n- `handleListOperatorAPIKeys` (line 173) — API-key metadata disclosure\n\n`handleCreateOperator` (line 26) IS properly gated (`actorIsAdmin` at line 27).\n\n## NOT affected (verified)\n`internal/api/cas.go` properly gates every CA endpoint via `canAccessCA` (calls at lines 70, 176, 216) and admin shortcuts at lines 39, 82. An earlier description draft mistakenly listed `/api/v1/cas/{id}/rotate` as affected — that endpoint is properly protected. CAs are not in this gap.\n\n## Impact\n- Any non-admin operator → admin via one curl (A).\n- Any non-admin operator → ownership of any victim's hosts with cert + identity transfer (B).\n- Mass cross-tenant CRUD including firewall-rule mutation (C).\n- Any operator → disable/enable other operators, revoke their API keys, enumerate the operator roster.\n\nCVSS 3.1: AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H — 9.6.\n\n## Suggested fix\nShared helpers in a new `internal/api/authz.go`, mirroring the Web layer's `loadAccessibleCA`:\n\n```go\nfunc (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool\nfunc (s *Server) requireOperatorAccess(w http.ResponseWriter, r *http.Request, operatorID string) bool\nfunc (s *Server) requireHostAccess(w http.ResponseWriter, r *http.Request, hostID string) (*models.Host, bool)\nfunc (s *Server) requireNetworkAccess(w http.ResponseWriter, r *http.Request, networkID string) (*models.Network, bool)\n```\n\nEach loads the resource, resolves its CA via `*.CAID`, accepts if `actorIsAdmin(ctx)` OR actor owns the CA. Reject `403 forbidden`; audit-log `api.\u003cresource\u003e.forbidden` with the reason.\n\nThe operator-management endpoints take `requireAdmin` instead (operator ownership doesn't map to CA ownership).\n\nApply at the top of every host-, network-, firewall-, mobile-bundle-touching API handler, plus the 5 operator endpoints listed above. The legacy config-key path retains admin (preserves backward compatibility); the broader legacy-fallback question is tracked separately as issue #121.\n\n## Test matrix\n- admin → all operations permitted\n- owning non-admin → operations on owned hosts/networks permitted\n- non-owner non-admin → 403 + audit entry\n- legacy config-key → preserved (admin)\n- unauthenticated → existing 401 from middleware\n\n## Coordinated context\nSubsumes public issue #119 (mobile-bundle authz). Issue #121 (actor.go:40 legacy-admin fallback) is a separate concern tracked independently.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/juev/nebula-mesh",
+        "purl": "pkg:golang/github.com/juev/nebula-mesh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.3.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-598g-h2vc-h5vg/GHSA-598g-h2vc-h5vg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/juev/nebula-mesh/security/advisories/GHSA-598g-h2vc-h5vg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/forgekeep/nebula-mesh/commit/9d8bcd7667ecd0c2975cc71fb35a02fe131f76f2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/juev/nebula-mesh"
+    }
+  ]
+}
