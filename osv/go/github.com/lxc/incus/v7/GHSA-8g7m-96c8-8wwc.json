@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-8g7m-96c8-8wwc",
+  "modified": "2026-06-10T20:15:53.035488945Z",
+  "published": "2026-06-10T20:07:21Z",
+  "aliases": [
+    "CVE-2026-47753"
+  ],
+  "summary": "Incus has a Nil-Pointer Dereference Panic via Instance Backup Import (volume omitted)",
+  "details": "## Summary\n\n`(*backend).CreateInstanceFromBackup` in [`internal/server/storage/backend.go`](https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go) contains a nil-pointer dereference that an authenticated user with permission to create instances in any project can trigger remotely by uploading a crafted backup tarball. The Incus daemon panics and the process crashes, causing denial of service to every project on that cluster member.\n\nThis is a sibling of `GHSA-fwj8-62r8-8p8m`, `GHSA-r7w7-mmxr-47r9`, and `GHSA-x5r6-jr56-89pv` (all assigned 2026-05-04). Those patches added guards on adjacent fields of the same `backup/config.Config` struct; the `Volume` field on the instance-import path was missed.\n\n## Vulnerable code\n\n[`internal/server/storage/backend.go`](https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go) (current `main`, commit `1513600`):\n\n```go\n// Lines 763-767 — properly guarded:\nvar volumeConfig map[string]string\nif srcBackup.Config != nil \u0026\u0026 srcBackup.Config.Volume != nil {\n    volumeConfig = srcBackup.Config.Volume.Config\n}\n\n// ... a few lines later ...\n\n// Line 795 — unguarded, dereferences Config.Volume directly:\nif srcBackup.Config.Volume.Config[\"block.type\"] == drivers.BlockVolumeTypeQcow2 {\n```\n\nThe caller `createFromBackup` in [`cmd/incusd/instances_post.go`](https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go) only verifies that `Config` and `Config.Container` are non-nil:\n\n```go\n// instances_post.go:854\nif bInfo.Config == nil || bInfo.Config.Container == nil {\n    return response.BadRequest(errors.New(\"Backup file is missing required information\"))\n}\n```\n\n`Volume` is not checked. The `Volume` field on `internal/server/backup/config.Config` has type `*api.StorageVolume` with `yaml:\"volume,omitempty\"`, so omitting `volume:` from a crafted [`backup/index.yaml`](https://github.com/lxc/incus/blob/1513600/backup/index.yaml) decodes to `nil`. The subsequent unguarded deref on line 795 panics.\n\nThe panic happens on the HTTP request goroutine; no `recover()` is installed by `CreateInstanceFromBackup` or its callers, so the Go runtime kills the entire `incusd` process.\n\n## Reach\n\n1. The attacker is any client authenticated to the Incus REST API (TLS client certificate, OIDC, or unix socket) with permission to create instances in at least one project. This is the most common low-trust authenticated user.\n2. The attacker sends `POST /1.0/instances?project=\u003cp\u003e` with `Content-Type: application/octet-stream`.\n3. The body is an uncompressed tar (the same code path also accepts squashfs / gz / zstd / xz) containing one file, [`backup/index.yaml`](https://github.com/lxc/incus/blob/1513600/backup/index.yaml), whose `config:` block lists `container:` and `pool:` but omits `volume:`.\n4. [`cmd/incusd/instances_post.go`](https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go) `instancesPost` -\u003e `createFromBackup` -\u003e the line 854 guard passes (Container is non-nil) -\u003e `pool.CreateInstanceFromBackup(*bInfo, backupFile, nil)` -\u003e [`internal/server/storage/backend.go:795`](https://github.com/lxc/incus/blob/1513600/internal/server/storage/backend.go#L795) panics on `srcBackup.Config.Volume.Config[...]`.\n5. `incusd` process dies. All running operations on that cluster member are killed. Repeated requests = persistent denial of service.\n\nMinimal crafted [`backup/index.yaml`](https://github.com/lxc/incus/blob/1513600/backup/index.yaml):\n\n```yaml\nname: poc\nbackend: dir\npool: default\ntype: container\noptimized: false\noptimized_header: false\nconfig:\n  container:\n    name: poc\n    architecture: x86_64\n    type: container\n  pool:\n    name: default\n    driver: dir\n  # volume intentionally absent\n```\n\n## Proof of concept\n\nA self-contained Go unit test imports the real `internal/server/backup/config` package, decodes the crafted YAML into the actual `*backupConfig.Config` struct used by the daemon, and executes the literal expression from [`backend.go:795`](https://github.com/lxc/incus/blob/1513600/backend.go#L795). The test is intentionally inert (panics are recovered and reported as the expected outcome):\n\n```go\n// internal/poc_repro/poc_nil_deref_volume_test.go\nfunc TestPoCNilDerefVolumeImport(t *testing.T) {\n    var bi pocInfo // mirrors internal/server/backup.Info, only Config is needed\n    loader, _ := yaml.NewLoader(strings.NewReader(evilIndex))\n    _ = loader.Load(\u0026bi)\n\n    // bi.Config != nil, bi.Config.Container != nil (passes createFromBackup guard)\n    // bi.Config.Volume == nil (passes the line 765 guard's else branch)\n\n    defer func() { _ = recover() }()\n\n    // Literal copy of backend.go:795.\n    if bi.Config.Volume.Config[\"block.type\"] == \"qcow2\" {\n        // unreachable\n    }\n}\n```\n\nResult against `lxc/incus@1513600` on Go 1.26.1:\n\n```\n=== RUN   TestPoCNilDerefVolumeImport\n    poc_nil_deref_volume_test.go:97: yaml decoded: Container != nil (passes createFromBackup guard), Volume == nil\n    poc_nil_deref_volume_test.go:99: backend.go line 795 unguarded deref about to execute...\n    poc_nil_deref_volume_test.go:123: CONFIRMED: nil-pointer panic at the exact line as backend.go:795 =\u003e runtime error: invalid memory address or nil pointer dereference\n--- PASS: TestPoCNilDerefVolumeImport (0.00s)\n```\n\nA tarball builder + uploader (`main.go`) is included in the report's PoC bundle. The tarball is 2560 bytes and contains a single 547-byte [`backup/index.yaml`](https://github.com/lxc/incus/blob/1513600/backup/index.yaml).\n\n## Impact\n\n- **Severity:** denial of service against the entire `incusd` process. Every container / VM operation on the host (and on the cluster member, if clustered) is aborted; subsequent requests fail until the process is restarted by an operator or supervisor.\n- **Privileges required:** authenticated user with `can_create` permission on any project. The path is not behind the admin auth tier.\n- **Network attack surface:** the Incus REST API on `:8443` (or unix socket).\n- **CWE-476** — nil pointer dereference. **CVSS estimate:** 6.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H).\n\n## Suggested fix\n\nMirror the guard already present on line 765 a few lines higher into the path that hits line 795. For example:\n\n```go\nif srcBackup.Config == nil || srcBackup.Config.Volume == nil {\n    return nil, nil, errors.New(\"Backup config missing required volume metadata\")\n}\n\nif srcBackup.Config.Volume.Config[\"block.type\"] == drivers.BlockVolumeTypeQcow2 {\n```\n\nAlternatively, extend the existing `createFromBackup` precondition in [`cmd/incusd/instances_post.go:854`](https://github.com/lxc/incus/blob/1513600/cmd/incusd/instances_post.go#L854) to also reject backups missing `bInfo.Config.Volume`. The latter is the smaller surface change and matches the pattern of `CreateBucketFromBackup` ([`backend.go:7848`](https://github.com/lxc/incus/blob/1513600/backend.go#L7848)):\n\n```go\nif srcBackup.Config == nil || srcBackup.Config.Bucket == nil {\n    return errors.New(\"Valid bucket config not found in index\")\n}\n```\n\n## Reporter notes\n\nReported via Privately-Reported Vulnerability against `lxc/incus`. Reporter: tonghuaroot. The reproducer test is non-destructive (no network, no filesystem mutation beyond the temp directory used by Go's test runner) and recovers the panic.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lxc/incus/v7",
+        "purl": "pkg:golang/github.com/lxc/incus/v7"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "7.1.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-8g7m-96c8-8wwc/GHSA-8g7m-96c8-8wwc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/security/advisories/GHSA-8g7m-96c8-8wwc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lxc/incus/commit/98e64f0a6fcfdc9676eea0246418d490c53297bf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lxc/incus"
+    }
+  ]
+}
