@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-76r6-x97p-67vr",
+  "modified": "2026-06-11T20:45:13.013921933Z",
+  "published": "2026-06-11T20:29:14Z",
+  "aliases": [
+    "CVE-2026-48108"
+  ],
+  "summary": "Russh: SSH identification parsing accepted non-canonical client banners and did not bound pre-banner input",
+  "details": "### Summary\n\n`russh` did not enforce the SSH identification-string rules as deliberately as OpenSSH. In particular, the server-side identification reader used the same permissive path as the client, allowing pre-banner lines from clients, and the reader did not enforce a bounded number of pre-banner lines.\n\nFor a library server built on `russh`, this could allow a remote peer to hold connection setup resources in the cleartext pre-authentication phase with malformed identification input that should have been rejected early.\n\n### Details\n\nRFC 4253 section 4.2 defines the SSH protocol version exchange. The identification string is a single line terminated by CR LF, must fit within 255 characters including CR LF, and clients should not send pre-banner lines before their SSH identification string.\n\nBefore the fix, `russh`'s identification reader lived in:\n\n- `russh/src/ssh_read.rs`\n- `russh/src/server/mod.rs`\n\nThe same `read_ssh_id()` behavior was used for both client and server contexts. That allowed server-side parsing to accept preliminary banner lines from clients, even though RFC 4253 only describes server-side pre-identification text. The reader also discarded preliminary lines without a line-count cap, so a peer could repeatedly send short non-SSH lines and keep the connection in identification parsing until an application-level timeout or external resource limit intervened.\n\nThis also creates a remotely observable parser-state oracle inside a single connection. A client can send candidate identification lines one after another: lines not recognized as SSH identification are discarded as pre-banner text, while an accepted identification string terminates banner parsing and advances the connection into key exchange. A strict server would reject the first invalid client pre-banner line and force a reconnect for each probe. This can disclose server-side parser acceptance behavior and make fingerprinting cheaper, though it does not disclose application secrets, credentials, keys, or authenticated user data.\n\nThe patch splits the behavior between generic/server-banner-tolerant reading and stricter client-identification reading. It also adds explicit limits for line length and pre-banner line count.\n\nRelevant branch commit:\n\n- `3de4a68 Harden SSH identification parsing`\n\n### RFC / OpenSSH Comparison\n\nRFC 4253 section 4.2 says each side sends an identification string of the form `SSH-protoversion-softwareversion SP comments CR LF`. It allows a server to send other lines before its identification string, but says a client must be able to process such lines. It does not grant the same pre-banner allowance to clients.\n\nOpenSSH portable enforces explicit identification limits:\n\n- `/home/mjc/projects/openssh-portable/ssh.h`: `SSH_MAX_BANNER_LEN`\n- `/home/mjc/projects/openssh-portable/ssh.h`: `SSH_MAX_PRE_BANNER_LINES`\n- `/home/mjc/projects/openssh-portable/kex.c`: client-side handling of server pre-banner lines\n- `/home/mjc/projects/openssh-portable/ssh_api.c`: rejects pre-banner lines when acting as a server\n\nI checked `/home/mjc/projects/openssh-portable` at `45b30e0a5`. OpenSSH uses an implementation banner line limit of `8192` bytes and a pre-banner line cap of `1024`, which is more permissive than RFC 4253's 255-character identification-string limit. The relevant alignment is the parser shape: OpenSSH permits bounded pre-banner lines when reading a server banner as a client, but rejects pre-banner lines when acting as a server and reading a client identification string.\n\nThe `russh` fix follows that shape: accept bounded pre-banner lines only where the protocol allows them, and reject malformed or excessive identification input early.\n\n### PoC\n\nInline highest-CVSS PoC: unauthenticated remote client pre-banner input to the server identification parser. This demonstrates `AV:N/AC:L/PR:N/UI:N`.\n\n```rust\n#[tokio::test]\nasync fn poc_server_accepts_client_pre_banner_before_ssh_id() {\n    use russh::server;\n    use tokio::io::{AsyncReadExt, AsyncWriteExt};\n\n    let config = std::sync::Arc::new(server::Config::default());\n    let (mut client, server_stream) = tokio::io::duplex(4096);\n\n    let server = tokio::spawn(async move {\n        server::run_stream(config, server_stream, NoAuthHandler).await\n    });\n\n    let mut server_id = Vec::new();\n    client.read_until(b'\\n', \u0026mut server_id).await.unwrap();\n\n    client\n        .write_all(b\"attacker-controlled pre-banner\\r\\nSSH-2.0-poc\\r\\n\")\n        .await\n        .unwrap();\n\n    let result = tokio::time::timeout(std::time::Duration::from_millis(250), server).await;\n\n    assert!(\n        result.is_err(),\n        \"vulnerable code keeps processing after accepting a client pre-banner before SSH identification\"\n    );\n}\n```\n\nOn vulnerable code, the server-side reader accepts the client pre-banner line and continues instead of rejecting the malformed identification input promptly. The fixed parser rejects client pre-banner lines on the server path.\n\n### Impact\n\nSuggested CVSS v3.1:\n\n- `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L`\n- Score: `5.3`\n\nReasoning:\n\n- `AV:N`: reachable over the SSH transport connection\n- `AC:L`: no special race or unusual setup is required\n- `PR:N`, `UI:N`: occurs before authentication and needs no user interaction\n- `C:N`, `I:N`: no confidentiality or integrity impact demonstrated\n- `A:L`: malformed identification input can consume connection setup resources until rejected by timeout or external limits\n\nAdditional impact investigation did not identify a stronger confidentiality, integrity, downgrade, or code-execution primitive. The accepted client pre-banner line is discarded before key exchange and does not become part of `remote_sshid`; the final client identification string is what feeds the key-exchange transcript. `remote_sshid` is otherwise exposed to library handlers and debug formatting, but the discarded pre-banner text does not influence authentication state, strict-kex negotiation, KEX algorithm selection, or later packet framing.\n\nOne parser-boundary nuance on vulnerable code is that behavior can depend on read chunking: if a client pre-banner line and the real SSH identification line are delivered in the same read, the old parser can discard the buffered identification line and then wait or disconnect; if delivered separately, the old server path can accept the pre-banner and continue. This supports malformed pre-authentication availability impact, but not a demonstrated confidentiality or integrity impact.\n\n### Fix / Patch Direction\n\nUse a stricter server-side client-identification reader, enforce the RFC identification-line length, and cap preliminary banner lines. The server path should reject client pre-banner lines instead of treating them like allowed server pre-identification text.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.34.0-beta.1"
+            },
+            {
+              "fixed": "0.61.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-76r6-x97p-67vr/GHSA-76r6-x97p-67vr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-76r6-x97p-67vr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-48108"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    }
+  ]
+}
