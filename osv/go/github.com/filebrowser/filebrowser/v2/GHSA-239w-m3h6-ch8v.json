@@ -1,0 +1,77 @@
+{
+  "id": "GHSA-239w-m3h6-ch8v",
+  "modified": "2026-06-12T22:00:13.838650892Z",
+  "published": "2026-06-12T21:53:10Z",
+  "aliases": [
+    "CVE-2026-54094"
+  ],
+  "summary": "File Browser: Symlink following lets scoped users read, overwrite, and share files outside their filebrowser scope",
+  "details": "## Summary\n\nFile Browser enforces per-user scope with `afero.NewBasePathFs(afero.NewOsFs(), scope)`, set up in `users/users.go`. This blocks lexical `../` traversal, but it does not stop the HTTP file handlers from following symbolic links before they open, serve, write, share, or list a file. As a result, a scoped user — and in some cases an unauthenticated public-share recipient — can cross the intended scope boundary by following a symlink whose path is lexically inside their scope but whose target is outside it.\n\nTwo distinct shapes are covered here:\n\n- **Variant 1 — symlink as the final path component.** A symlink that lives inside the user's scoped tree and points to a file under the server root but outside the scope. The handlers record the symlink (`IsSymlink`) but then resolve and operate on the target anyway.\n- **Variant 2 — file or directory reached through a symlinked ancestor.** A regular file requested *through* a symlinked directory.\n\nRead, write (including TUS resumable uploads), share creation, and public-share serving are all affected.\n\n## Impact\n\nIn a multi-user deployment, if a symlink (a file symlink for Variant 1, or a directory symlink for Variant 2) exists inside a restricted user's scoped tree and resolves to a location outside that scope but reachable by the server process, the boundary can be crossed. Concretely, a user holding only normal File Browser permissions can:\n\n- Read out-of-scope file contents and metadata via `GET /api/raw/{path}` and `GET /api/resources/{path}`.\n- Overwrite an out-of-scope target via `POST /api/resources/{path}?override=true`.\n- Overwrite or create an out-of-scope target via the TUS resumable upload path: `POST /api/tus/{path}?override=true` followed by `PATCH /api/tus/{path}`.\n- Create a public share for an out-of-scope target via `POST /api/share/{path}`, exposing it through `GET /api/public/dl/{hash}`.\n\nFor Variant 2, the same exposure reaches public-share recipients: a normal public directory share whose subtree contains a linked descendant lets an unauthenticated recipient read regular files behind the link, pull them into the share's archive download, and see the resolved target in directory listings.\n\nThis breaks the confidentiality and integrity guarantees that per-user scopes and password/anonymous shares are relied upon to provide, for any data the server process can reach.\n\n## Technical details\n\nUsers are rooted with `afero.NewBasePathFs(afero.NewOsFs(), scope)`. Base-path rooting blocks lexical `../` traversal but does not prevent ordinary filesystem operations from following a symlink whose path is lexically inside the base.\n\nThe metadata layer records symlinks but does not consistently re-check the resolved target against the user's real scope:\n\n- In `files/file.go`, `stat()` calls `LstatIfPossible`, sets `IsSymlink`, and only invokes the `WithinScope` containment check when `file.IsSymlink == true`. For Variant 1, this guard (where present) covers the final-element symlink; on the commit tested for Variant 1 the handler still resolved the target with `opts.Fs.Stat(opts.Path)` and served it. For Variant 2, `LstatIfPossible` follows a symlinked *ancestor* and returns the leaf as a regular file (`IsSymlink == false`), so `stat()` returns early and the scope check never runs at all.\n- `readListing` in `files/file.go` follows symlink entries to display the target's metadata.\n- `http/raw.go` builds a file object for the requested path and serves non-directories; its archive walker `getFiles` follows symlinks via `Stat`/`Open`, pulling linked descendants into archive downloads.\n- `http/resource.go` writes request bodies with `writeFile(d.user.Fs, r.URL.Path, ...)`, and the destination open follows symlinks.\n- `http/tus_handlers.go` (`tusPostHandler`, `tusPatchHandler`) calls `MkdirAll`/`OpenFile` on the request path directly with no containment check. Because a brand-new leaf does not stat an existing file, it skips the scope check entirely.\n- `http/share.go` stores a share for `r.URL.Path` without checking that the path is not a symlink escape; `http/public.go` later serves it for unauthenticated downloads (routed at `http/http.go:90-91`).\n- `http/data.go` applies dotfile and rule checks to the request path *string*, but never compares the resolved symlink target against the user's real scope.\n\n## Proof of concept\n\n### Variant 1 — symlink as final path component\n\nHarness layout: server root is a temp directory; restricted user `restricted` is scoped to `/u1` with create, modify, rename, share, and download permissions; a second scope `/u2` holds the outside target `/u2/secret.txt` containing `other-secret`; and `/u1/link-out` is a symlink to `/u2/secret.txt`.\n\nConfirmed bypasses (route-level tests against the real HTTP handlers):\n\n- `GET /api/raw/link-out` → `200 OK`, body contains `other-secret` from `/u2/secret.txt`.\n- `POST /api/resources/link-out?override=true` → `200 OK`, `/u2/secret.txt` changed to `pwn`.\n- `POST /api/tus/link-out?override=true` → `201`, then `PATCH /api/tus/link-out` → `204`, `/u2/secret.txt` changed.\n- `POST /api/share/link-out` → `200 OK`, created a public share whose `GET /api/public/dl/{hash}` returned a body containing `other-secret`.\n\nMinimal core of the read proof:\n\n```go\nroot := t.TempDir()\nos.MkdirAll(filepath.Join(root, \"u1\"), 0755)\nos.MkdirAll(filepath.Join(root, \"u2\"), 0755)\nos.WriteFile(filepath.Join(root, \"u2\", \"secret.txt\"), []byte(\"other-secret\"), 0644)\nos.Symlink(filepath.Join(root, \"u2\", \"secret.txt\"), filepath.Join(root, \"u1\", \"link-out\"))\n\n// restricted is a File Browser user scoped to /u1 with Download permission.\nrr := authenticatedRequest(t, restricted, http.MethodGet, \"/api/raw/link-out\", nil)\nif rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), \"other-secret\") {\n    t.Fatalf(\"raw symlink exposed outside target: status=%d body=%q\", rr.Code, rr.Body.String())\n}\n```\n\n### Variant 2 — file reached through a symlinked ancestor\n\nAuthenticated scoped user whose scope contains a directory symlink `escape_link -\u003e /srv/users/otheruser`:\n\n```\n# The symlink itself is correctly blocked\nGET /api/resources/escape_link              -\u003e 403 Forbidden\n\n# A regular file THROUGH the symlinked directory is not\nGET /api/resources/escape_link/private.txt  -\u003e 200 OK  {\"content\":\"OTHER_USER_SECRET_DATA=...\",...}\nGET /api/raw/escape_link/private.txt        -\u003e 200 OK  OTHER_USER_SECRET_DATA=...\n\n# Create/overwrite THROUGH the symlinked directory (TUS)\nPOST  /api/tus/escape_link/injected.txt  (Upload-Length: 20) -\u003e 201 Created\nPATCH /api/tus/escape_link/injected.txt  (Upload-Offset: 0)  -\u003e 204 No Content  (written into /srv/users/otheruser/)\n```\n\nPublic directory share for `/shared`, where `/shared/link -\u003e ../private` and `private/secret.txt` lives outside the share:\n\n```\nGET /api/public/dl/\u003chash\u003e/link/secret.txt     -\u003e 200 OK  symlink-secret\nGET /api/public/share/\u003chash\u003e/link/secret.txt  -\u003e 200 OK  {\"path\":\"/link/secret.txt\", ...}\n```\n\nRequesting the whole share as an archive pulls `link/secret.txt` into the zip, and listing the share root exposes the `link` entry with its resolved target metadata.\n\n### Controls that held\n\nThe same harness confirmed that ordinary traversal is still rejected, so this is not generic `../` traversal:\n\n- `GET /api/resources/../u2/secret.txt?checksum=sha256` did not succeed as the restricted user.\n- `GET /api/resources/%2e%2e/u2/secret.txt` did not succeed (encoded dot-dot).\n- `POST /api/resources/../u2/new.txt` did not create `/u2/new.txt`.\n- `PATCH /api/resources/own.txt?action=rename\u0026destination=/../u2/moved.txt` did not move a file outside scope.\n\n## Affected code\n\n`users/users.go` (scope setup); `files/file.go` (`stat`, `readListing`); `http/raw.go` (`getFiles`); `http/resource.go` (`writeFile` destination); `http/tus_handlers.go` (`tusPostHandler`, `tusPatchHandler`); `http/share.go`; `http/public.go`; `http/http.go:90-91` (public routes); `http/data.go` (string-only path checks).\n\n## Remediation\n\nResolve symlinks and verify that the resolved target remains inside the user's real scoped root before any file operation — serving, sharing, writing, truncating, renaming, copying, or deleting. Specifically:\n\n- Call `WithinScope` (which resolves every path component with `filepath.EvalSymlinks`) for **all** paths in `stat()`, not only when the final element is a symlink. This closes the ancestor-symlink gap (Variant 2).\n- Add a `WithinScope` check before `MkdirAll`/`OpenFile` in `tusPostHandler` and `tusPatchHandler`, so a not-yet-existing leaf cannot skip containment.\n- Omit entries whose resolved target escapes the scope from `readListing`, and skip them in `getFiles` before stat/open/recursion.\n- Apply the same resolved-path check consistently to public share creation and public share serving.\n- As an alternative or defense-in-depth, reject symlinks for file operations unless an explicit administrator option enables them.\n\nAdd regression tests covering symlink reads, overwrites, TUS create/write, public shares (download, share-info, listing, and archive read paths), and the existing dot-dot controls — plus a positive test confirming that legitimately in-scope symlinks still resolve.\n\n## Limitations and non-claims\n\n- This is not generic `../` path traversal; dot-dot and encoded dot-dot controls held in the route-level tests.\n- This is not a proxy-auth confusion issue; the proofs use normal authenticated requests for a restricted user (and, for Variant 2's share case, an ordinary public-share recipient).\n- The proofs assume the relevant symlink already exists inside the scoped tree, or that another allowed workflow in the deployment can place it there — for example an SMB/NFS export, a Docker bind-mount, or an admin-created link. Web-UI-only creation of the symlink from scratch was not demonstrated.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser/v2",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.63.14"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.63.13",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-239w-m3h6-ch8v/GHSA-239w-m3h6-ch8v.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.11.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-239w-m3h6-ch8v/GHSA-239w-m3h6-ch8v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/security/advisories/GHSA-239w-m3h6-ch8v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/commit/7c2c0a11b31b2bb214d741005a0b02b1764208b3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/filebrowser/filebrowser"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/releases/tag/v2.63.14"
+    }
+  ]
+}
