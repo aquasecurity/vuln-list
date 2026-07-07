@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-gv83-gqw6-9j2c",
+  "modified": "2026-07-06T20:45:09.956040417Z",
+  "published": "2026-07-06T20:43:12Z",
+  "aliases": [
+    "CVE-2026-53624"
+  ],
+  "summary": "GoFiber never set HSTS header in helmet middleware due to incorrect protocol check",
+  "details": "### Summary\n\nThe `helmet` middleware in gofiber/fiber never sets the `Strict-Transport-Security` (HSTS) response header, even when `HSTSMaxAge` is explicitly configured, because the condition check at `helmet.go:67` uses `c.Protocol()` — which returns the HTTP protocol version string (e.g., `\"HTTP/1.1\"`, `\"HTTP/2.0\"`) — instead of `c.Scheme()` — which returns the URL scheme (`\"http\"` or `\"https\"`). Since `c.Protocol()` never equals `\"https\"` in any real deployment, the HSTS header is permanently disabled, defeating the security protection.\n\n### Details\n\n**Root cause:** `middleware/helmet/helmet.go`, line 67:\n\n```go\nif c.Protocol() == \"https\" \u0026\u0026 cfg.HSTSMaxAge != 0 {\n```\n\n`c.Protocol()` (defined at `req.go:865-867`) delegates to `fasthttp.Request.Header.Protocol()`, which returns the HTTP protocol version:\n- `\"HTTP/1.1\"` for HTTP/1.1 connections\n- `\"HTTP/2.0\"` for HTTP/2 connections\n\nThe correct method is `c.Scheme()` (defined at `req.go:844-862`), which returns:\n- `\"http\"` for plain HTTP connections\n- `\"https\"` for TLS connections\n\nSince `\"HTTP/1.1\" != \"https\"` always evaluates to `true`, the entire HSTS block (lines 67-76) is dead code.\n\n**Note on test coverage:** The existing helmet test (`helmet_test.go`) passes because it uses `ctx.Request.Header.SetProtocol(\"https\")` to artificially force `Protocol()` to return `\"https\"`. However, `fasthttp.Request.Header.SetProtocol()` sets the HTTP version field, and real HTTP requests never have protocol `\"https\"` — they have `\"HTTP/1.1\"` or `\"HTTP/2.0\"`. The test is validating the wrong thing.\n\n### PoC\n\n**Clean-checkout maintainer-runnable recipe:**\n\n1. Save the following as `middleware/helmet/poc_hsts_test.go`:\n\n```go\npackage helmet\n\nimport (\n    \"crypto/tls\"\n    \"net/http/httptest\"\n    \"testing\"\n\n    \"github.com/gofiber/fiber/v3\"\n)\n\nfunc Test_PoC_HSTS_NeverSet(t *testing.T) {\n    app := fiber.New()\n    app.Use(New(Config{\n        HSTSMaxAge: 31536000,\n    }))\n    app.Get(\"/\", func(c fiber.Ctx) error {\n        return c.SendString(\"ok\")\n    })\n\n    // Simulate HTTPS connection\n    req := httptest.NewRequest(fiber.MethodGet, \"/\", nil)\n    req.TLS = \u0026tls.ConnectionState{}\n\n    resp, _ := app.Test(req)\n    hsts := resp.Header.Get(\"Strict-Transport-Security\")\n\n    if hsts == \"\" {\n        t.Log(\"BUG CONFIRMED: HSTS header not set. c.Protocol() returns 'HTTP/1.1', not 'https'\")\n        t.Log(\"Fix: change c.Protocol() == 'https' to c.Scheme() == 'https' on line 67\")\n    }\n}\n```\n\n2. Run: `go test -run Test_PoC_HSTS_NeverSet -v ./middleware/helmet/`\n\n**Expected vulnerable output:**\n```\n=== RUN   Test_PoC_HSTS_NeverSet\n    BUG CONFIRMED: HSTS header not set. c.Protocol() returns 'HTTP/1.1', not 'https'\n    Fix: change c.Protocol() == 'https' to c.Scheme() == 'https' on line 67\n--- PASS: Test_PoC_HSTS_NeverSet\n```\n\n**Expected output after fix:**\n```\n=== RUN   Test_PoC_HSTS_NeverSet\n--- PASS: Test_PoC_HSTS_NeverSet\n    (HSTS header is set: \"max-age=31536000; includeSubDomains\")\n```\n\n**Observed output from this environment (commit `ee98695f`):**\n```\n=== RUN   Test_PoC_HSTS_NeverSet\n    poc_hsts_test.go:39: HSTS header value: \"\"\n    poc_hsts_test.go:42: BUG CONFIRMED: HSTS header is NOT set even over TLS\n    poc_hsts_test.go:43: Root cause: helmet.go:67 uses c.Protocol() which returns HTTP version\n    poc_hsts_test.go:44: c.Protocol() returns 'HTTP/1.1' not 'https'\n    poc_hsts_test.go:45: Fix: use c.Scheme() == 'https' instead of c.Protocol() == 'https'\n--- PASS: Test_PoC_HSTS_NeverSet\n```\n\n**Negative/control case:** With `HSTSMaxAge: 0` (default), HSTS is correctly not set (this is expected behavior, not a bug).\n\n**Cleanup:** Remove `poc_hsts_test.go` after verification.\n\n### Impact\n\nThe HSTS header is never applied in production, leaving all users vulnerable to:\n- **SSL stripping attacks:** An active network attacker can downgrade HTTPS connections to HTTP, intercepting traffic between the client and server.\n- **Protocol downgrade:** Without HSTS, browsers will silently accept HTTP connections to the site, even if the site supports HTTPS.\n- **Cookie theft over HTTP:** Session cookies without the `Secure` flag will be sent over HTTP if the user is tricked into an HTTP connection.\n\nThis affects any application that:\n1. Uses the `helmet` middleware\n2. Configures `HSTSMaxAge \u003e 0` expecting HSTS protection\n3. Serves traffic over HTTPS\n\nThe vulnerability requires an active MITM attacker on the network path, which is realistic in public Wi-Fi, corporate networks, and ISP-level scenarios.\n\n### Suggested remediation\n\nIn `middleware/helmet/helmet.go`, line 67, replace `c.Protocol()` with `c.Scheme()`:\n\n```go\n// Before (broken):\nif c.Protocol() == \"https\" \u0026\u0026 cfg.HSTSMaxAge != 0 {\n\n// After (fixed):\nif c.Scheme() == \"https\" \u0026\u0026 cfg.HSTSMaxAge != 0 {\n```\n\nAdditionally, update the existing test to use a realistic TLS simulation instead of `SetProtocol(\"https\")`:\n\n```go\n// Before (artificial - sets HTTP version to \"https\" which never happens in practice):\nctx.Request.Header.SetProtocol(\"https\")\n\n// After (realistic - simulates TLS connection):\nctx.RequestCtx().Request.Header.SetProtocol(\"HTTP/1.1\")\nctx.RequestCtx().TLS = \u0026tls.ConnectionState{}\n```\n\n**Regression test:** Add a test case that verifies HSTS is set when `req.TLS` is non-nil and `HSTSMaxAge \u003e 0`, without using `SetProtocol`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gofiber/fiber",
+        "purl": "pkg:golang/github.com/gofiber/fiber"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-gv83-gqw6-9j2c/GHSA-gv83-gqw6-9j2c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gofiber/fiber/security/advisories/GHSA-gv83-gqw6-9j2c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gofiber/fiber"
+    }
+  ]
+}

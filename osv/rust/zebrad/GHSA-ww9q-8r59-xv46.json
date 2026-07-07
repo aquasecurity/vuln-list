@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-ww9q-8r59-xv46",
+  "modified": "2026-07-06T21:30:08.195328644Z",
+  "published": "2026-07-06T21:23:41Z",
+  "aliases": [
+    "CVE-2026-54496"
+  ],
+  "summary": "Zebra: Missing copy constraint in halo2_gadgets variable-base scalar multiplication allows under-constrained base, breaking Orchard Action circuit soundness",
+  "details": "### Summary\n\nA soundness vulnerability in the variable-base scalar multiplication gadget of `halo2_gadgets` allowed a malicious prover to produce a valid proof for an Orchard Action with an *under-constrained* base point. Because this gadget enforces the diversified-address-integrity condition of the Orchard Action statement, the flaw let a prover satisfy that condition for an arbitrary (pk\u003csub\u003ed\u003c/sub\u003e, g\u003csub\u003ed\u003c/sub\u003e, ivk) triple, effectively bypassing the check that binds an Action to the correct incoming viewing key — and therefore to the correct nullifier (nf) and spend validating key (ak) — of the note being spent.\n\nThe main practical consequence is that an adversary could have performed a **double-spend within the Orchard pool**, resulting in a balance violation: the same note could be spent multiple times, each time revealing a distinct, valid-looking nullifier. The total ZEC supply was protected by Zcash's turnstile mechanism, which bounds value flowing out of any pool, so unbounded inflation of the overall supply was not possible; the exposure was inflation of value *within* the Orchard pool up to the turnstile-enforced limit.\n\nExploiting the vulnerability via a double-spend is **undetectable on-chain**. Exploitation only requires setting private circuit inputs to chosen values, and nullifiers produced by a double-spend are indistinguishable from honest nullifiers, so the zero-knowledge property hides any signature of the attack.\n\nAlternatively, an adversary could (before the fix) have **stolen funds** by forging a spend authorization for an existing note. To do so they would have to know the note plaintext, which in practice they might obtain by knowing the corresponding incoming viewing key. For example, this could be used to bypass the protection provided by holding spending keys on a hardware wallet, if the linked software wallet were compromised. This form of exploitation cannot be detected via the turnstile (which might be a motivation to exploit the vulnerability in this way rather than via balance violation). It can be detected by the legitimate holder of stolen funds being unable to spend them, or by seeing the note's nullifier on-chain — but this cannot necessarily be distinguished from compromise of the spending key by other means.\n\nThe vulnerability has existed since the Orchard pool was introduced in the NU5 network upgrade (activated May 31, 2022). There is no evidence it was exploited prior to remediation.\n\nNote that use of the vulnerability, either for balance violation or for theft of funds, would need to have occurred before it was remediated. Theft would be in principle detectable from that point (since the real nullifier would appear on-chain). Balance violation would not be detectable at the point of exploitation.\n\n### Root cause\n\nThe defect is in the double-and-add implementation of variable-base scalar multiplication in `halo2_gadgets/src/ecc/chip/mul/incomplete.rs`. For performance, the algorithm uses incomplete point-addition formulas in its intermediate stage. (Incomplete addition is safe here in principle: the first and last stages use complete addition, and reaching a degenerate case would require breaking discrete log.)\n\nThe base point is fed into the incomplete-addition stage via `assign_advice()`, which assigns a witness value (a private circuit input) **without** introducing a constraint that ties that value to the actual base the algorithm is supposed to operate on:\n\n```rust\nregion.assign_advice(|| \"x_p\", self.double_and_add.x_p, row + offset, || x_p)?;\nregion.assign_advice(|| \"y_p\", self.y_p, row + offset, || y_p)?;\n```\n*(`halo2_gadgets/src/ecc/chip/mul/incomplete.rs`, around L309–L310 at commit `32a87582dfb0ad9364ef3ffe71751ceab2a502ea`.)*\n\nThe existing `q_mul_2` constraint forces the base values used *across* the incomplete-addition loop to be equal to one another, but nothing forces them to equal the **actual base**. A malicious prover therefore has complete freedom to choose the base used by the loop. Given target pk\u003csub\u003ed\u003c/sub\u003e, g\u003csub\u003ed\u003c/sub\u003e, and ivk, the prover can solve for the base value that makes the computed [ivk] g\u003csub\u003ed\u003c/sub\u003e equal the desired pk\u003csub\u003ed\u003c/sub\u003e, satisfying the diversified-address-integrity equation pk\u003csub\u003ed\u003c/sub\u003e\u003csup\u003eold\u003c/sup\u003e = [ivk] g\u003csub\u003ed\u003c/sub\u003e\u003csup\u003eold\u003c/sup\u003e for inputs that an honest prover could never satisfy.\n\n### Why this enables a double-spend\n\nThe Orchard Action statement constrains the nullifier of the spent note to be derived from the correct nullifier key nk, which in turn is bound to the correct incoming viewing key ivk, via ivk = Commit\u003csup\u003eivk\u003c/sup\u003e\u003csub\u003erivk\u003c/sub\u003e(Extract\u003csub\u003eℙ\u003c/sub\u003e(ak\u003csup\u003eℙ\u003c/sup\u003e), nk). The diversified-address-integrity check pk\u003csub\u003ed\u003c/sub\u003e = [ivk] g\u003csub\u003ed\u003c/sub\u003e is what normally guarantees the prover used the correct ivk —and hence the correct nk— for the note. With that check bypassable:\n\n1. The prover picks a fresh, **incorrect** nk for the note being spent. Since nk feeds the nullifier computation, a wrong nk yields a different nullifier for the same note.\n2. Other circuit constraints still force the prover to derive ivk honestly from that wrong nk, producing a wrong ivk for the note — which would normally be caught by the integrity check.\n3. The prover uses the under-constrained base to satisfy pk\u003csub\u003ed\u003c/sub\u003e = [ivk] g\u003csub\u003ed\u003c/sub\u003e anyway, defeating the check.\n4. Each distinct wrong nk produces a distinct valid nullifier, allowing the note to be spent repeatedly.\n\n### Why this enables theft\n\nThe spend validating key, ak\u003csup\u003eℙ\u003c/sup\u003e (essentially equivalent to ak), is also constrained via ivk = Commit\u003csup\u003eivk\u003c/sup\u003e\u003csub\u003erivk\u003c/sub\u003e(Extract\u003csub\u003eℙ\u003c/sub\u003e(ak\u003csup\u003eℙ\u003c/sup\u003e), nk). As above, the diversified-address-integrity check is what normally guarantees the prover used the correct ivk —and hence the correct ak— for the note. With that check bypassable:\n\n1. The prover picks an ak for which they know the private key, ask.\n2. They construct a transaction that spends the victim's notes, and sign it using that ask.\n\n### Impact\n\n- **Integrity:** High. A malicious prover could spend Orchard notes multiple times, inflating value within the Orchard pool. This is bounded only by the turnstile limit on the pool. Alternatively, the prover could authorize spending other users' notes without having the spending key.\n- **Confidentiality:** None. The zero-knowledge property is intact; no private data is disclosed. This is also why the attack leaves no observable on-chain signature.\n- **Availability:** Not directly affected by the bug. (The coordinated response temporarily disabled Orchard actions as a mitigation; that was an operational choice, not an effect of the vulnerability.) On the other hand, either theft of funds, or inability to spend funds due to a future turnstile violation could be considered an availability consequence.\n\n### Affected versions\n\n- `halo2_gadgets` `\u003c 0.5.0`\n- `orchard` `\u003c 0.14.0`\n- `zcash_primitives` `\u003c 0.28.0`\n- `zcashd` `\u003c 6.20.0`\n- `zebrad` `\u003c 5.0.0`\n\n### Patches\n\nThe circuit-level fix replaces the first-iteration `assign_advice()` calls for the base point with `copy_advice()`, introducing a copy constraint that requires the first base value to equal the correct base. Combined with the existing `q_mul_2` equality constraint across the loop, this transitively constrains every base value in the incomplete-addition stage to the correct base, closing the freedom the attacker relied on.\n\nBecause remediating a zero-knowledge circuit changes the pinned verifying key, the network-level fix required a hard fork (NU6.2). NU6.2 re-enables Orchard with the corrected circuit and routes Orchard proofs to a per-circuit verifying key (`InsecurePreNu6_2` / `FixedPostNu6_2`).\n\n- `halo2_gadgets` 0.5.0\n- `orchard` 0.14.0\n- `zcash_primitives` 0.28.0\n- `zebrad` 5.0.0 (NU6.2); 4.5.3 ships the interim soft-fork mitigation\n-  `zcashd` 6.20.0 (NU6.2)\n\n### Workarounds / mitigations\n\nThere is no client-side workaround for the underlying soundness flaw short of the circuit fix. The deployed interim mitigation (Zebra 4.5.3 / equivalent) was a soft fork that rejected all Orchard-containing transactions and blocks, fully neutralizing exploitation until NU6.2 activated.\n\nDownstream projects that depend on the affected crates should:\n\n- Upgrade `halo2_gadgets`, `orchard`, and `zcash_primitives` to the patched versions above.\n- Audit any other use of `assign_advice()` (and similar non-constraining assignment APIs) where the intended invariant is that a witnessed value equals a known/fixed value; such sites should use `copy_advice()` (or otherwise enforce an explicit constraint).\n\n### Indicators / detection\n\nExploitation produces no distinguishing on-chain signature. The turnstile mechanism, which tracks total ZEC across all value pools, provides a ground-truth supply check and confirmed the total supply remained intact. Heuristic analysis of Orchard transaction arity (e.g. patterns of duplicate-then-consolidate behavior) is possible but inconclusive against normal shielded-activity variance.\n\n### Timeline (MDT)\n\n| Date / Time | Event |\n|---|---|\n| 2022-05-31 11:50 | Vulnerable NU5 upgrade activates (bug introduced) |\n| 2026-05-29 (evening) | Vulnerability discovered during a protocol audit |\n| 2026-05-29 23:53 | Responsibly disclosed to ZODL core engineers |\n| 2026-05-30 06:30 | Disclosure acknowledged by ZODL |\n| 2026-06-01 (~21:30) | Emergency soft-fork mitigation activated (block 3,363,426) |\n| 2026-06-03 00:05 EDT | NU6.2 hard fork activates, Orchard re-enabled with fix (block 3,364,600) |\n\n### Credits\n\nDiscovered and responsibly disclosed by **Taylor Hornby**, independent security researcher, during a protocol audit conducted on behalf of **Shielded Labs**. Analysis and remediation was led by ZODL engineers **Jack Grigg**, **Daira-Emma Hopwood**, and **Kris Nuttycombe**, with Zebra patch work by **Arya Solhi** (Zcash Foundation).\n\n### Resources\n\n- Zcash Foundation: *Zebra 4.5.3 and 5.0.0: Emergency Soft Fork and NU6.2 Activation* — https://zfnd.org/zebra-4-5-3-and-5-0-0-emergency-soft-fork-and-nu6-2-activation/\n- Affected source (pre-fix): `halo2_gadgets/src/ecc/chip/mul/incomplete.rs` @ commit `32a87582dfb0ad9364ef3ffe71751ceab2a502ea`, L309–L310",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zebrad",
+        "purl": "pkg:cargo/zebrad"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.5.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-ww9q-8r59-xv46/GHSA-ww9q-8r59-xv46.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "halo2_gadgets",
+        "purl": "pkg:cargo/halo2_gadgets"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.5.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-ww9q-8r59-xv46/GHSA-ww9q-8r59-xv46.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "orchard",
+        "purl": "pkg:cargo/orchard"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.14.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-ww9q-8r59-xv46/GHSA-ww9q-8r59-xv46.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zcash_primitives",
+        "purl": "pkg:cargo/zcash_primitives"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.28.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-ww9q-8r59-xv46/GHSA-ww9q-8r59-xv46.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-ww9q-8r59-xv46"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ZcashFoundation/zebra"
+    }
+  ]
+}
