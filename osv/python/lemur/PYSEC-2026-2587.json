@@ -1,0 +1,83 @@
+{
+  "id": "PYSEC-2026-2587",
+  "modified": "2026-07-13T16:32:02.487658420Z",
+  "published": "2026-07-13T15:46:24.309453Z",
+  "aliases": [
+    "CVE-2026-55164",
+    "GHSA-q437-g7fv-2jvv"
+  ],
+  "summary": "Lemur user-update path stores plaintext passwords",
+  "details": "## Summary\n\n`lemur.users.service.update()` writes a user's new password as plaintext to the `users.password` column. The `User` model wires bcrypt hashing to SQLAlchemy's `before_insert` event but registers no equivalent listener for `before_update`, and `service.update()` does not call `user.hash_password()` after assigning the new value. Every password change performed through the admin-gated `PUT /api/1/users/\u003cid\u003e` endpoint persists the user's password to the database in cleartext.\n\n## Root Cause\n\n`lemur/users/models.py`:\n\n```python\n# line 38\nclass User(BaseModel):\n    __tablename__ = \"users\"\n    id = Column(Integer, primary_key=True)\n    password = Column(String(128))            # plain column, no setter, no Vault descriptor\n\n# line 74\n    def hash_password(self):\n        if self.password:\n            self.password = bcrypt.generate_password_hash(self.password).decode(\"utf-8\")\n\n# line 111\nlisten(User, \"before_insert\", hash_password)  # only before_insert is wired\n```\n\n`lemur/users/service.py`:\n\n```python\n# line 46\ndef update(user_id, username, email, active, profile_picture, roles, password=None):\n    ...\n    user = get(user_id)\n    user.username = username\n    user.email = email\n    user.active = active\n    user.profile_picture = profile_picture\n    if password:\n        user.password = password              # raw assignment\n    update_roles(user, roles)\n    return database.update(user)              # commits, no hashing\n```\n\nNo `before_update` listener exists. `User.password` is a plain `Column(String(128))` with no property setter that hashes on assignment. The bcrypt code path is bypassed entirely on every UPDATE statement that touches this column.\n\n## Affected Endpoints\n\n| Method | Path | Source |\n|---|---|---|\n| PUT | /api/1/users/`\u003cid\u003e` | lemur/users/views.py:274 (gated by `@admin_permission.require`) |\n\n`lemur/auth/views.py:323` also calls `user_service.update()` during SSO/OAuth login, but passes only six positional arguments. `password` defaults to `None` on that path and the `if password:` guard short-circuits. The bug is triggered only through the admin-only PUT handler.\n\n## Impact\n\nWhen an administrator changes a user's password via `PUT /api/1/users/\u003cid\u003e`, the cleartext password is persisted to `users.password`. Subsequent login attempts for that user will fail (`check_password` calls `bcrypt.check_password_hash` against an unhashed value), pushing operators toward workarounds.\n\nThe more serious consequence is a defense-in-depth bypass. Bcrypt is the protection that prevents a database compromise from yielding usable credentials. With plaintext rows present, an attacker who exfiltrates the `users` table, a backup, a read replica, or query logs obtains directly usable login credentials — no offline cracking required. Because users reuse passwords across services, the blast radius extends beyond Lemur.\n\nThe bug specifically affects admin-driven password resets, which are the normal post-incident workflow and exactly when plaintext storage is most harmful.\n\n## Steps to Reproduce\n\n1. Install Lemur with default config. Create an admin user and a target user 'alice' (created via the standard flow, password will be hashed correctly on insert).\n\n2. Verify the initial hash:\n   psql lemur -c \"SELECT password FROM users WHERE username='alice';\"\n   # Output: $2b$12$N9Q...   (bcrypt hash, as expected)\n\n3. As admin, change alice's password via the API:\n   curl -X PUT https://lemur.local/api/1/users/\u003calice_id\u003e \\\n        -H \"Authorization: Bearer \u003cadmin_jwt\u003e\" \\\n        -H \"Content-Type: application/json\" \\\n        -d '{\n          \"username\": \"alice\",\n          \"email\": \"alice@example.com\",\n          \"active\": true,\n          \"profile_picture\": null,\n          \"roles\": [{\"name\": \"operator\"}],\n          \"password\": \"ProofOfConcept_2026\"\n        }'\n\n4. Read the column again:\n   psql lemur -c \"SELECT password FROM users WHERE username='alice';\"\n   # Output: ProofOfConcept_2026   ← plaintext, not hashed\n\n5. Confirm the failure mode: 'alice' can no longer log in with 'ProofOfConcept_2026'\n   because check_password runs bcrypt.check_password_hash() against the cleartext column.\n\n\n## Remediation\n\nRegister the listener for both events:\n\n```python\n# lemur/users/models.py\nlisten(User, \"before_insert\", hash_password)\nlisten(User, \"before_update\", hash_password)\n```\n\nAlternative, equivalent fix in the service layer:\n\n```python\n# lemur/users/service.py, in update()\n    if password:\n        user.password = password\n        user.hash_password()\n```\n\nThe listener fix is preferred because it closes the gap for any future code path that mutates `user.password`.\n\nA one-time migration is recommended to detect and re-hash any rows already stored in cleartext. Bcrypt hashes begin with `$2b$`, `$2a$`, or `$2y$`. Any cleartext credential should be treated as **compromised** — rotate it, do not just re-hash it — since it has been at rest in plaintext and may exist in backups, audit logs, and replicas.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lemur",
+        "purl": "pkg:pypi/lemur"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.0",
+        "0.2.1",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.9.0",
+        "1.9.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/lemur/PYSEC-2026-2587.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/security/advisories/GHSA-q437-g7fv-2jvv"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Netflix/lemur"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/releases/tag/v1.9.2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/lemur"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-q437-g7fv-2jvv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55164"
+    }
+  ]
+}

