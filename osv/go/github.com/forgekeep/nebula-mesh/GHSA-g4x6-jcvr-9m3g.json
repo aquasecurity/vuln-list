@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-g4x6-jcvr-9m3g",
+  "modified": "2026-07-14T20:30:19.636565443Z",
+  "published": "2026-07-14T20:26:21Z",
+  "aliases": [
+    "CVE-2026-55513"
+  ],
+  "summary": "nebula-mesh: Web UI host creation ignores configured enrollment token TTL and mints 24-hour bearer enrollment tokens",
+  "details": "### Summary\nThe `nebula-mgmt` Web UI host-creation path ignores both the server-wide `enrollment_token_ttl` security setting and per-network `network_config.enrollment_token_ttl` overrides. API host creation and token-regeneration paths use the configured TTL resolver, but `POST /ui/hosts` hardcodes `now.Add(24 * time.Hour)` for newly minted agent enrollment tokens. In deployments that intentionally reduce enrollment-token lifetime, any authenticated operator who can create a host through the Web UI can still mint a bearer enrollment token valid for about 24 hours.\n\n### Details\nEnrollment tokens are bearer credentials for the public `POST /api/v1/enroll` endpoint: possession of a valid token allows enrolling the pending host and receiving a signed Nebula certificate/config for that host. The server configuration documents a security knob for their default lifetime and per-network overrides:\n\n- `internal/config/server.go:82` defines `EnrollmentTokenTTL` as the default lifetime for freshly minted enrollment tokens.\n- `internal/config/server.go:83` documents per-network overrides in `network_config` under `enrollment_token_ttl`.\n\nThe API server implements and consistently uses this resolver:\n\n- `internal/api/server.go:77` defines `tokenTTLFor`, with precedence of per-network `enrollment_token_ttl`, then server default, then 24h fallback.\n- `internal/api/server.go:82` reads `network_config.enrollment_token_ttl`.\n- `internal/api/server.go:89` falls back to the configured server default.\n- `internal/api/hosts.go:190` through `internal/api/hosts.go:196` use `now.Add(s.tokenTTLFor(r.Context(), host.NetworkID))` for API host creation.\n\nThe Web UI sibling path does not call the resolver and instead always sets a 24-hour expiry:\n\n- `internal/web/handlers.go:874` mints the raw token for `POST /ui/hosts`.\n- `internal/web/handlers.go:879` sets `ExpiresAt: now.Add(24 * time.Hour)`.\n\nThis creates inconsistent behavior between API and Web UI host creation and bypasses an operator-configured token lifetime policy. The issue is reachable by an authenticated Web UI operator who can create hosts. Admins can create hosts in any network; non-admin operators can create hosts in networks whose CA they own.\n\nAffected version evidence: the configurable enrollment-token TTL feature was introduced by commit `6c344a6` (`feat(api): configurable enrollment-token TTL + regenerate endpoint (#75) (#79)`), and `git tag --contains 6c344a6 --sort=version:refname` returns `v0.3.0` through `v0.3.8`. Pattern checks across all release tags showed the TTL config/API resolver and the Web UI 24-hour hardcode are present in every `v0.3.x` release from `v0.3.0` to `v0.3.8`, and are not meaningfully applicable to `v0.1.x`/`v0.2.0` because the TTL policy knob was not present there. The current checkout at commit `d92dd9a60de291e2bc1caf73b4e9a99567b31ec0` (`git describe`: `v0.3.8-1-gd92dd9a`) remains affected.\n\n### PoC\nSafe local PoC run from a clean checkout at commit `d92dd9a60de291e2bc1caf73b4e9a99567b31ec0` on 2026-06-12. The PoC is a temporary Go test that uses only in-memory SQLite and `httptest`; it does not start a real server and does not contact external services.\n\n1. Create a temporary test file `internal/web/security_audit_poc_test.go` in package `web`.\n2. In the test, create an in-memory Web UI with `newTestWeb(t)`, create a network `audit-poc-net` with CIDR `10.77.0.0/24`, and set `network_config.enrollment_token_ttl` to `30m`.\n3. Log in as the seeded test admin through the normal Web UI helper and obtain a CSRF token from `GET /ui/hosts/new`.\n4. Submit `POST /ui/hosts` with `network_id=audit-poc-net`, `name=audit-poc-host`, `nebula_ips=10.77.0.10`, `role=host`, and `kind=agent`.\n5. Parse the one-shot enrollment token from the returned host-detail page and read the token row with `GetEnrollmentToken`.\n6. Compare the observed expiry to the configured 30-minute network override.\n\nCommand run:\n\n```bash\ngo test ./internal/web -run 'TestSecurityAuditPOC' -count=1 -v\n```\n\nObserved vulnerable output from this environment:\n\n```text\n=== RUN   TestSecurityAuditPOC_UIHostCreateIgnoresNetworkEnrollmentTokenTTL\nPOC_UI_TTL_BYPASS observed_token_ttl=24h0m0s configured_network_ttl=30m expires_at=2026-06-13T14:51:45Z\n--- PASS: TestSecurityAuditPOC_UIHostCreateIgnoresNetworkEnrollmentTokenTTL (0.05s)\n```\n\nThe meaningful control is the API sibling: `internal/api/hosts.go:190` through `internal/api/hosts.go:196` uses `s.tokenTTLFor(...)`, and existing tests in `internal/api/hosts_token_ttl_test.go` verify API-created/regenerated enrollment tokens honor server-default and per-network TTLs. Variant review also found API regenerate-token, API re-enroll, and signed-poll rekey token minting use the resolver rather than a hardcoded 24h value. After recording the output, the temporary test file was removed and `git status --short` returned clean. The PoC was re-run after drafting this report and produced the output shown above.\n\n### Impact\nAn authenticated Web UI operator can bypass a configured enrollment-token lifetime policy and obtain a token valid for approximately 24 hours even when the deployment or network is configured for a much shorter lifetime such as 30 minutes. Because enrollment tokens are bearer credentials for the public enrollment endpoint, longer-than-intended validity increases the window in which a copied, logged, shared, or otherwise exposed token can be used to enroll the pending host and obtain its Nebula certificate/config. This weakens confidentiality and integrity for deployments relying on short token lifetimes to reduce enrollment-token exposure.\n\nSuggested remediation: refactor the Web UI host-creation path to use the same TTL resolution as the API path, or move the resolver into a shared package/service used by both API and Web UI. Add a regression test under `internal/web` that sets `network_config.enrollment_token_ttl = \"30m\"`, creates an agent host through `POST /ui/hosts`, and asserts the persisted enrollment token expires within the configured 30-minute window rather than 24 hours.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/forgekeep/nebula-mesh",
+        "purl": "pkg:golang/github.com/forgekeep/nebula-mesh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.3.0"
+            },
+            {
+              "fixed": "0.5.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-g4x6-jcvr-9m3g/GHSA-g4x6-jcvr-9m3g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/forgekeep/nebula-mesh/security/advisories/GHSA-g4x6-jcvr-9m3g"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/forgekeep/nebula-mesh/commit/514006029e09f1991122b86a80e7b25970bcfa98"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/forgekeep/nebula-mesh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/forgekeep/nebula-mesh/releases/tag/v0.5.0"
+    }
+  ]
+}
