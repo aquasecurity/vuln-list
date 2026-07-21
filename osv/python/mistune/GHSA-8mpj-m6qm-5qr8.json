@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-8mpj-m6qm-5qr8",
+  "modified": "2026-07-20T21:30:45.969881443Z",
+  "published": "2026-07-20T21:24:42Z",
+  "aliases": [
+    "CVE-2026-59927",
+    "PYSEC-2026-2215"
+  ],
+  "summary": "Mistune directives/include: mutual `.. include::` recursion crashes the renderer with `RecursionError`, denial of service via two attacker-controlled markdown files",
+  "details": "## Summary\n\n**Type:** Uncontrolled recursion via mutual include. The `Include` directive checks for direct self-reference (`a.md` cannot include `a.md`), but does not detect indirect cycles. Two markdown files that include each other (`a.md` → includes `b.md` → includes `a.md`) cause unbounded recursion until Python's stack limit fires `RecursionError`. The exception propagates out of the renderer and crashes the calling code.\n**File:** `src/mistune/directives/include.py`, lines 33-37 (the self-include check is the only cycle-detection logic).\n**Root cause:** the include logic only compares `os.path.abspath(dest) == os.path.abspath(source_file)`. There is no per-render set of \"files already included\" that would catch transitive cycles. When `a.md` includes `b.md`, the recursive `block.parse(new_state)` call uses `dest` (b.md) as the new `__file__`, which then includes `a.md` (passing the self-check, because the immediate parent file is `b.md`, not `a.md`), which then includes `b.md`, and so on. Each recursion level adds Python frames; the default stack limit of 1000 frames trips after ~7-10 cycle iterations and Python raises `RecursionError`. Since the directive does not catch the exception, it propagates out of `Markdown.parse()` and surfaces in the calling code, crashing the request.\n\n## Affected Code\n\n**File:** `src/mistune/directives/include.py`, lines 28-54.\n\n```python\nrelpath = self.parse_title(m)\ndest = os.path.join(os.path.dirname(source_file), relpath)\ndest = os.path.normpath(dest)\n\nif os.path.abspath(dest) == os.path.abspath(source_file):       # \u003c-- only catches direct self-include\n    return {\"type\": \"block_error\", \"raw\": \"Could not include self: \" + relpath}\n\nif not os.path.isfile(dest):\n    return {\"type\": \"block_error\", \"raw\": \"Could not find file: \" + relpath}\n\nwith open(dest, \"rb\") as f:\n    content = f.read().decode(encoding)\n\next = os.path.splitext(relpath)[1]\nif ext in {\".md\", \".markdown\", \".mkd\"}:\n    new_state = block.state_cls()\n    new_state.env[\"__file__\"] = dest\n    new_state.process(content)\n    block.parse(new_state)                                       # \u003c-- recursive parse, no cycle tracking\n    return new_state.tokens\n```\n\n**Why it's wrong:** the cycle-detection check is one level deep. Multi-file cycles slip through trivially. Python's default recursion limit is 1000 frames, so a cycle of length 2 trips after a few hundred mutual includes; the exception is uncaught by the directive, propagating out of `Markdown.__call__()` and crashing whatever called it.\n\n## Exploit Chain\n\n1. Application uses mistune with the `Include` directive enabled. Application accepts user-supplied markdown files (CMS, wiki, multi-user documentation platform, note-taking app, CI/CD doc renderer).\n2. Attacker uploads two markdown files:\n   - `a.md`: `.. include:: b.md`\n   - `b.md`: `.. include:: a.md`\n3. Renderer is invoked on `a.md` (or any markdown that references this pair). `Include` directive includes `b.md`, which includes `a.md`, which includes `b.md`, ... Each recursion adds Python frames.\n4. After ~340 cycle iterations (depending on default `sys.setrecursionlimit(1000)` and the per-include frame depth), Python raises `RecursionError: maximum recursion depth exceeded`.\n5. The exception is not caught by the directive. It propagates through `block.parse`, through `Markdown.__call__`, and into the application's request handler. If the application doesn't catch it explicitly, the request errors out (HTTP 500 in web contexts, crash in CLI tools).\n\n## Security Impact\n\n**Attacker capability:** crash the rendering engine on demand by submitting any markdown that triggers the cycle. Repeated requests deny service. If the renderer is used in a hot path (per-page-view docs rendering, search-index regeneration, scheduled doc-export jobs), the cycle persists across the whole pipeline.\n**Preconditions:** application uses mistune with the `Include` directive enabled and renders user-supplied markdown that can reference other user-uploaded files. Attacker needs write access to two .md files in the include search path (or a single file including a known-recurring pair).\n**Differential:** PoC-verified against mistune@3.2.1:\n\n```python\nimport os, mistune\nfrom mistune.directives import RSTDirective, Include\n\nos.makedirs('/tmp/mistune-recur', exist_ok=True)\nwith open('/tmp/mistune-recur/a.md', 'w') as f:\n    f.write('A\\n\\n.. include:: b.md')\nwith open('/tmp/mistune-recur/b.md', 'w') as f:\n    f.write('B\\n\\n.. include:: a.md')\n\nmd = mistune.create_markdown(plugins=[RSTDirective([Include()])])\nstate = md.block.state_cls()\nstate.env['__file__'] = '/tmp/mistune-recur/a.md'\nmd.parse('.. include:: b.md', state=state)\n# RecursionError: maximum recursion depth exceeded\n```\n\nThe patched build (with the suggested fix below) returns a `block_error` token like the existing self-include check, instead of recursing forever.\n\n## Suggested Fix\n\nTrack included paths in `state.env` and reject any include that would re-enter a path already on the include stack:\n\n```diff\n--- a/src/mistune/directives/include.py\n+++ b/src/mistune/directives/include.py\n@@ -28,8 +28,18 @@ class Include(DirectivePlugin):\n         relpath = self.parse_title(m)\n-        dest = os.path.join(os.path.dirname(source_file), relpath)\n-        dest = os.path.normpath(dest)\n+        base = os.path.realpath(os.path.dirname(source_file))\n+        dest = os.path.realpath(os.path.join(base, relpath))\n+\n+        # Track include stack across recursive parses to detect cycles.\n+        include_stack = state.env.setdefault(\"__include_stack__\", [])\n+        if dest in include_stack or dest == os.path.realpath(source_file):\n+            return {\n+                \"type\": \"block_error\",\n+                \"raw\": \"Could not include (cycle): \" + relpath,\n+            }\n\n-        if os.path.abspath(dest) == os.path.abspath(source_file):\n-            return {\n-                \"type\": \"block_error\",\n-                \"raw\": \"Could not include self: \" + relpath,\n-            }\n@@ ... in the markdown-include branch ...\n+        include_stack.append(dest)\n+        try:\n+            new_state = block.state_cls()\n+            new_state.env[\"__file__\"] = dest\n+            new_state.env[\"__include_stack__\"] = include_stack\n+            new_state.process(content)\n+            block.parse(new_state)\n+            return new_state.tokens\n+        finally:\n+            include_stack.pop()\n```\n\nThis catches cycles of any length (`a → b → a`, `a → b → c → a`, etc.). Pair this with the path-containment fix from the LFI advisory and the HTML-extension fix from the include-XSS advisory; together those three patches make the `Include` directive safe to enable on user-supplied markdown.\n\nAdd a regression test asserting that a 2-cycle and a 3-cycle both produce `block_error` rather than `RecursionError`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.0a3",
+        "2.0.0a4",
+        "2.0.0a5",
+        "2.0.0a6",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.1.0",
+        "3.0.0",
+        "3.0.0a1",
+        "3.0.0a2",
+        "3.0.0a3",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.0rc4",
+        "3.0.0rc5",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.2.0",
+        "3.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-8mpj-m6qm-5qr8/GHSA-8mpj-m6qm-5qr8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-8mpj-m6qm-5qr8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59927"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/releases/tag/v3.3.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2215.yaml"
+    }
+  ]
+}

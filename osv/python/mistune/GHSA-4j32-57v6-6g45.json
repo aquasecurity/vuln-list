@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-4j32-57v6-6g45",
+  "modified": "2026-07-20T21:46:43.348949802Z",
+  "published": "2026-07-20T21:32:40Z",
+  "aliases": [
+    "CVE-2026-59925",
+    "PYSEC-2026-2213"
+  ],
+  "summary": "Mistune inline_parser: quadratic-time parsing on long runs of `**x**` and `***x***` emphasis pairs",
+  "details": "## Summary\n\n**Type:** Algorithmic-complexity DoS in core emphasis parsing. A long sequence of well-formed `**x**` (strong) or `***x***` (strong-emphasis combined) pairs causes O(N²) parser work. Distinct from the bracket-bomb DoS (`[` repetition) and from the formatting-plugin DoS (`~~`/`==`/`^^`); this one fires on default-config mistune with no plugins required.\n**File:** `src/mistune/inline_parser.py` lines 41-48 (the `EMPHASIS_END_RE` family) and the surrounding emphasis dispatch.\n**Root cause:** for every opening run of `*`s the parser scans forward using one of `EMPHASIS_END_RE['*']` / `['**']` / `['***']` to find the matching close. Each scan is bounded per call, but the parser invokes the scan from every potential start position. For input shaped `**x**` repeated N times, every `**` is treated as a potential start, each scan can cover up to the end of input. Total work is O(N²). The triple-emphasis variant `***x***` is slightly worse due to the extra alternation between `*`, `**`, and `***` close patterns. Reproducible against default mistune with no plugins.\n\n## Affected Code\n\n**File:** `src/mistune/inline_parser.py`, lines 41-48.\n\n```python\nEMPHASIS_END_RE = {\n    \"*\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\\\*|[^\\s*])\\*(?!\\*)\"),\n    \"_\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\_|[^\\s_])_(?!_)\\b\"),\n    \"**\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\\\*|[^\\s*])\\*\\*(?!\\*)\"),\n    \"__\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\_|[^\\s_])__(?!_)\\b\"),\n    \"***\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\\\*|[^\\s*])\\*\\*\\*(?!\\*)\"),\n    \"___\": re.compile(r\"(?:\" + PREVENT_BACKSLASH + r\"\\\\_|[^\\s_])___(?!_)\\b\"),\n}\n# Each of the six end-patterns is invoked from every emphasis open position\n# fired by the inline rule `r\"\\*{1,3}(?=[^\\s*])|\\b_{1,3}(?=[^\\s_])\"`. The\n# scan itself is bounded per call; the cost comes from the parser invoking\n# the scan at every matching open marker, giving O(N²) total work.\n```\n\n**Why it's wrong:** same shape as the formatting-plugin and bracket-bomb DoS findings. The CommonMark reference parser handles emphasis in linear time using a delimiter-stack algorithm (`commonmark.js`, `commonmark-py`, `markdown-it-py` all do this). mistune retries the close-scan from each open marker. The bounded regex is not enough; the surrounding loop is the source of the quadratic.\n\n## Exploit Chain\n\n1. Application uses mistune to render user-supplied markdown. No plugins required — affects the default `mistune.create_markdown()` configuration.\n2. Attacker submits a 40 KB payload of `**x**` repeated 8000 times.\n3. Server CPU pegs for ~4 seconds; 16 KB → ~17 seconds. Doubling input quadruples time.\n4. Repeating the request floods the worker pool.\n\n## Security Impact\n\n**Severity:** sec-high. Network-reachable, no authentication, no plugin requirement. Default mistune is vulnerable.\n**Attacker capability:** O(N²) CPU cost from a single small input. Predictable scaling, easy to combine with concurrent requests for service denial.\n**Preconditions:** application uses `mistune.create_markdown()` (default config) on attacker-supplied markdown. No plugins required.\n**Differential:** PoC-verified against mistune@3.2.1, default config:\n\n```python\nimport mistune, time\nmd = mistune.create_markdown()                     # no plugins\nfor n in [500, 1000, 2000, 4000, 8000]:\n    s = '**x**' * n\n    t = time.time()\n    md(s)\n    print(f'  **x** * {n} ({len(s)}b): {(time.time() - t) * 1000:.0f}ms')\n\n# Output (Python 3.13, Linux, 2.5GHz CPU):\n#   **x** *  500  (2500b):    20ms\n#   **x** * 1000  (5000b):    74ms\n#   **x** * 2000 (10000b):   284ms\n#   **x** * 4000 (20000b):  1079ms\n#   **x** * 8000 (40000b):  4309ms\n\n# Triple-emphasis is similar:\nmd('***x***' * 4000)   # ~1500ms\n\n# Linear in N for non-emphasis input of comparable size:\nmd('xxxxx' * 8000)     # 1ms (4000x faster)\n```\n\nThe patched build (with the suggested fix below — delimiter-stack rewrite or hard cap on simultaneous open markers) keeps the time linear in N.\n\n## Suggested Fix\n\nCap the number of unmatched opening emphasis markers the parser will track simultaneously, treating the rest as literal text:\n\n```diff\n--- a/src/mistune/inline_parser.py\n+++ b/src/mistune/inline_parser.py\n@@ ... in the emphasis-handling code path\n+    # Bound the number of open emphasis markers tracked. CommonMark gives\n+    # no semantics to deeply nested unmatched emphasis; this cap turns the\n+    # parser-level O(N^2) into O(N) for adversarial inputs while preserving\n+    # behaviour on every realistic markdown document.\n+    MAX_OPEN_EMPHASIS = 100\n+    if open_emphasis_count \u003e MAX_OPEN_EMPHASIS:\n+        # treat remaining * / _ as literal text\n+        ...\n```\n\nThe proper fix is a delimiter-stack pass, the same approach the formatting-plugin advisory and the bracket-bomb advisory recommend. All three DoS findings share the same algorithmic pattern; a single rewrite of the inline-token retry loop closes them together. Add a regression test asserting that `md('**x**' * 50_000)` completes in under 1 second.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.0a3",
+        "2.0.0a4",
+        "2.0.0a5",
+        "2.0.0a6",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.1.0",
+        "3.0.0",
+        "3.0.0a1",
+        "3.0.0a2",
+        "3.0.0a3",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.0rc4",
+        "3.0.0rc5",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.2.0",
+        "3.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-4j32-57v6-6g45/GHSA-4j32-57v6-6g45.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-4j32-57v6-6g45"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59925"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/commit/5de41fb8e527004dbc363e047a3c380c9288c74f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/releases/tag/v3.3.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2213.yaml"
+    }
+  ]
+}

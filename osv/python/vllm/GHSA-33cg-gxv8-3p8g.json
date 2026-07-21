@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-33cg-gxv8-3p8g",
+  "modified": "2026-07-20T19:15:27.604864519Z",
+  "published": "2026-07-20T19:13:07Z",
+  "aliases": [
+    "CVE-2026-55514",
+    "PYSEC-2026-2303"
+  ],
+  "summary": "vLLM denial of service via prompt embeds on M-RoPE models",
+  "details": "### Summary\n_Short summary of the problem. Make the impact and severity as clear as possible. For example: An unsafe deserialization vulnerability allows any unauthenticated user to execute arbitrary code on the server._\n\nSending a pure prompt embeds payload in a `/v1/completions` request with a model using M-RoPE causes the EngineCore to fail an assertion and fatally crash, shutting down the entire server application.\n\nAny remote user who is authorized to make a `/v1/completions` endpoint can trivially make such a request and induce a crash.\n\n### Details\n_Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._\n\nIn commit [56669c1](https://github.com/vllm-project/vllm/commit/56669c1f293d5c53b6a19ddf2f78802fa9fff2c2), a simple assert intended to be a type-narrowing assert was added to the `_init_mrope_positions` method in `GPUModelRunner` (the offending line on main at the time of writing: https://github.com/vllm-project/vllm/blob/2d481f8a946ee0521872af0f098674a8ee01ce4a/vllm/v1/worker/gpu_model_runner.py#L1588-L1607).\n\n```python\nassert req_state.prompt_token_ids is not None, (\n            \"M-RoPE requires prompt_token_ids to be available.\"\n        )\n```\n\nThis type narrowing assert is to prevent mypy errors later in the function because `None` is not a valid type for `mrope_model.get_mrope_input_positions`. Unfortunately, this assertion is not always true. `/v1/completions` requests that specify `prompt=None` and `prompt_embeds=\u003cnot none\u003e` will indeed create a CachedRequestState where `prompt_token_ids` is `None`. This triggers the assertion, which in turn crashes the EngineCore and the Server application.\n\n```\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]   File \"/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py\", line 3997, in execute_model\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]     deferred_state_corrections_fn = self._update_states(scheduler_output)\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]   File \"/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py\", line 1239, in _update_states\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]     self._init_mrope_positions(req_state)\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]   File \"/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py\", line 1582, in _init_mrope_positions\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]     assert req_state.prompt_token_ids is not None, (\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n(EngineCore pid=351) ERROR 06-11 00:48:03 [core.py:1167] AssertionError: M-RoPE requires prompt_token_ids to be available.\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704] AsyncLLM output_handler failed.\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704] Traceback (most recent call last):\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704]   File \"/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/async_llm.py\", line 660, in output_handler\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704]     outputs = await engine_core.get_output_async()\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704]   File \"/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py\", line 1030, in get_output_async\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704]     raise self._format_exception(outputs) from None\n(APIServer pid=1) ERROR 06-11 00:48:03 [async_llm.py:704] vllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.\n```\n\nAll requests using the `/v1/chat/completions` endpoints will have text/`prompt_token_ids` parts (corresponding to the chat template), and `prompt_embeds` parts are handled as mm_features. This method (rightly) filters out those `prompt_embeds` content parts as they are treated as text positions.\n\nA sufficient solution to type narrowing here without raising a fatal assertion is to instead replace the assertion with a using dummy token ids:\n\n```python\ndef _init_mrope_positions(self, req_state: CachedRequestState):\n    model = self.get_model()\n    assert supports_mrope(model), \"M-RoPE support is not implemented.\"\n    mrope_model = cast(SupportsMRoPE, model)\n\n    # Filter out prompt_embeds modality (text-only position info)\n    mrope_features = [\n        f for f in req_state.mm_features if f.modality != \"prompt_embeds\"\n    ]\n    \n    # Handle both token_ids and embeddings-only inputs\n    if req_state.prompt_token_ids is not None:\n        input_tokens = req_state.prompt_token_ids\n    elif req_state.prompt_embeds is not None:\n        # For text-only embeddings, dummy token IDs are safe since\n        # get_mrope_input_positions only uses len(input_tokens) when mm_features is empty\n        seq_len = req_state.prompt_embeds.shape[0]\n        input_tokens = list(range(seq_len))\n        # Verify no mm_features remain (should be true after prompt_embeds filter)\n        assert len(mrope_features) == 0, (\n            \"M-RoPE with prompt_embeds-only input should have no multimodal features\"\n        )\n    else:\n        raise ValueError(\n            \"M-RoPE requires either prompt_token_ids or prompt_embeds.\"\n        )\n\n    req_state.mrope_positions, req_state.mrope_position_delta = (\n        mrope_model.get_mrope_input_positions(\n            input_tokens,\n            mrope_features,\n        )\n    )\n```\n\nTechnically, in isolation, this method still crashes in the case where `req_state.prompt_token_ids is None and req_state.mm_features`, so the solution above still leaves that potential vector open. As far as can be determined, however, such a `req_state` is impossible in the first place in online mode, because it would require a `/v1/completions` request with `prompt_embeds` AND multimodal features, but the `/v1/completions` request schema does not expose multimodal inputs in any discernible way. Today, those are the only two endpoints with `prompt_embeds` support. \n\nWhen in offline mode, it *is technically* possible to directly create an `EngineCoreRequest` that has `prompt_embeds and not prompt_token_ids and mm_features`, and pass that to `LLM.generate`. That would trigger this same assertion, and no validation would prevent that combination. It is strongly suspected, though, that this combination would be undefined in any model that support M-RoPE, because it would not be possible to determine which token positions correspond to `mm_features`. The proposed solution above would end up not setting `req_state.mrope_positions` and `req_state.mrope_position_delta` in this scenario, which could result in undefined behavior.\n\n`prompt_embeds` is far more familiar here than M-RoPE, and it is understood that each model that supports it is responsible for defining its own `get_mrope_input_positions` which have varying implementations. There is insufficient knowledge to be prescriptive in how the two features should interact in the offline case, other than possibly raising a validation error earlier on preventing that combination (which would emulate the current assertion behavior). Regardless, in offline mode, the chances of a remote user being able to exploit this are slim-to-nil compared to the online case which is incredibly straightforward.\n\n### Impact\n_What kind of vulnerability is it? Who is impacted?_\n\n- Denial of Service caused by an incorrect assertion inside of the `GPUModelRunner` which causes a fatal EngineCore exception\n- Any configuration with `--enable-prompt-embeds` and M-RoPE-supported model is vulnerable\n- The attack is extremely easy from the remote attacker's perspective (copying the official `prompt_embeds` online mode docs examples almost-verbatim, accounting for model-name and connection details, of course, will induce a guaranteed shutdown)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.12.0"
+            },
+            {
+              "fixed": "0.24.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-33cg-gxv8-3p8g/GHSA-33cg-gxv8-3p8g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-33cg-gxv8-3p8g"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55514"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/45252"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/470229c37efaf69c86e8bc97482b0b1ff7551c65"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-2303.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.24.0"
+    }
+  ]
+}

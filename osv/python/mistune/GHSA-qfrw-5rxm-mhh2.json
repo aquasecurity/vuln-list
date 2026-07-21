@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-qfrw-5rxm-mhh2",
+  "modified": "2026-07-20T21:46:41.246867209Z",
+  "published": "2026-07-20T21:35:30Z",
+  "aliases": [
+    "CVE-2026-59929",
+    "PYSEC-2026-2217"
+  ],
+  "summary": "Mistune renderers/html.safe_url: HARMFUL_PROTOCOLS list misses legacy and chained schemes that historically chain to `javascript:` execution",
+  "details": "## Summary\n\n**Type:** URL-scheme allowlist gap. The `safe_url` filter only blocks the four schemes `javascript:`, `vbscript:`, `file:`, `data:`. Several other schemes are accepted into rendered `\u003ca href=\"...\"\u003e` and `\u003cimg src=\"...\"\u003e` tags despite being known XSS vectors in legacy or chain-handling browsers. The same gap applies to direct links, reference links, and autolinks.\n**File:** `src/mistune/renderers/html.py`, line 11-23 (HARMFUL_PROTOCOLS list).\n**Root cause:** the HARMFUL_PROTOCOLS tuple is a hardcoded, opt-out denylist of four entries. Browsers historically supported (and some still partially support) several other schemes that either execute JavaScript directly (`livescript:`, `mocha:`) or wrap a `javascript:` payload (`feed:javascript:`, `view-source:javascript:`, `jar:javascript:`, `ms-its:javascript:`, `mk:@MSITStore:javascript:`). On user-agents that still recognise these schemes (older Firefox builds for `feed:`/`jar:`, all Internet Explorer / Edge Legacy for `ms-its:`/`mk:`/`res:`, niche chrome-style browsers, browser extensions that register custom protocol handlers), clicking a link rendered by mistune executes attacker-controlled JavaScript in the page's origin.\n\n## Affected Code\n\n**File:** `src/mistune/renderers/html.py`, lines 10-62.\n\n```python\nclass HTMLRenderer(BaseRenderer):\n    HARMFUL_PROTOCOLS: ClassVar[Tuple[str, ...]] = (\n        \"javascript:\",\n        \"vbscript:\",\n        \"file:\",\n        \"data:\",\n    )                                                         # \u003c-- BUG: incomplete denylist\n    GOOD_DATA_PROTOCOLS: ClassVar[Tuple[str, ...]] = (\n        \"data:image/gif;\",\n        \"data:image/png;\",\n        \"data:image/jpeg;\",\n        \"data:image/webp;\",\n    )\n\n    def safe_url(self, url: str) -\u003e str:\n        if self._allow_harmful_protocols is True:\n            return escape_text(url)\n        _url = url.lower()\n        if self._allow_harmful_protocols and _url.startswith(tuple(self._allow_harmful_protocols)):\n            return escape_text(url)\n        if _url.startswith(self.HARMFUL_PROTOCOLS) and not _url.startswith(self.GOOD_DATA_PROTOCOLS):\n            return \"#harmful-link\"\n        return escape_text(url)                               # \u003c-- BUG: any scheme not in HARMFUL_PROTOCOLS passes through\n```\n\n**Why it's wrong:** an opt-out denylist for URL schemes is the wrong shape. The set of schemes a user-agent might honour is unbounded (registered handlers, browser extensions, OS-level protocol registrations, custom intent handlers on Android, etc.), but the set of schemes a markdown renderer needs to allow is small (`http://`, `https://`, `mailto:`, optionally `tel:`, `ftp:`, fragment-only `#anchor`, and a few image-only `data:` types). Switching to an opt-in allowlist with a `safe_extra_protocols` knob for callers who need others would close every variant of this bug class permanently. The current code accepts every chained-scheme XSS vector for as long as the project remembers to keep the denylist current.\n\n## Exploit Chain\n\n1. Application accepts attacker-supplied markdown and renders it with mistune. The default `escape=True` prevents raw HTML, but link href/image src filtering is the only XSS defense for `[click](...)` and `![alt](...)` syntax.\n2. Attacker writes `[click here](feed:javascript:alert(document.cookie))`. mistune's `safe_url` checks `feed:javascript:alert(document.cookie)` against `HARMFUL_PROTOCOLS = ('javascript:', 'vbscript:', 'file:', 'data:')` — none match. The href is escape_text'd (HTML-entity escape) and emitted as `\u003ca href=\"feed:javascript:alert(document.cookie)\"\u003eclick here\u003c/a\u003e`.\n3. Victim using a Firefox build that still has the feed handler registered (extension, configuration, or LTS that retained the feed reader past the 64.0 removal — including some forks and ESR builds) clicks the link. Firefox's feed handler invokes the inner URL, which is `javascript:alert(...)`. JS executes in the page's origin. Victim's session cookie is exfiltrated.\n4. Same pattern for `livescript:alert(1)` (Netscape Communicator era, still recognised by some niche browsers / browser-emulator tools), `view-source:javascript:alert(1)` (Firefox, see CVE-2009-1938), `jar:javascript:alert(1)` (older Firefox), `ms-its:javascript:` (IE/Edge Legacy), `res:javascript:` (IE), `mk:@MSITStore:javascript:` (IE CHM viewer). Each user-agent that recognises one of these is exploitable; the user-agent population that recognises at least one is not negligible (corporate environments still running Edge Legacy compatibility mode, locked-down kiosk browsers, Android WebView in apps that register custom intent handlers, Linux distros with old Firefox ESR plus the `feed:` extension, etc.).\n\nThe same primitive applies to image src (`![](feed:javascript:...)` rendered as `\u003cimg src=\"feed:...\"\u003e`) — though most browsers don't fetch javascript: from img src, the same chained handler quirk applies on a few user-agents — and to reference links and autolinks (verified in the PoC below; the rendered HTML is identical regardless of which markdown link syntax is used).\n\n## Security Impact\n\n**Severity:** sec-moderate. Conditional XSS depending on user-agent. Modern Chrome / Edge Chromium / Safari ignore most of these schemes, but Firefox forks, Edge Legacy, in-app WebViews, browser extensions registering custom handlers, and corporate browser deployments are exposed. Defence-in-depth is the framing: a markdown renderer should not need to track which browsers still honour which legacy chained-scheme.\n**Attacker capability:** plant a link in any place the application renders user-supplied markdown. When clicked by a user-agent that honours the legacy scheme, the attacker's JavaScript runs in the page's origin (steal cookies, perform actions as the victim, etc.).\n**Preconditions:** application uses mistune to render attacker-influenced markdown. Default config. Victim user-agent is one of the affected populations. No specific mistune option is required.\n**Differential:** PoC-verified against mistune@3.2.1, default config. The following inputs all PASS the filter and reach the rendered HTML unchanged:\n\n```python\nimport mistune\nmd = mistune.create_markdown()\nfor url in [\n    'feed:javascript:alert(1)',                  # Firefox feed handler chain\n    'livescript:alert(1)',                       # Netscape, niche browsers\n    'mocha:alert(1)',                            # Netscape, niche browsers\n    'view-source:javascript:alert(1)',           # Firefox view-source chain (CVE-2009-1938 class)\n    'jar:javascript:alert(1)',                   # Firefox jar: handler chain\n    'ms-its:javascript:alert(1)',                # IE/Edge Legacy InfoTech Storage handler\n    'mk:@MSITStore:javascript:alert(1)',         # IE CHM viewer chain\n    'res:javascript:',                           # IE resource: handler\n]:\n    print(md(f'[click]({url})').strip())\n\n# Output (each one passes the filter):\n#   \u003cp\u003e\u003ca href=\"feed:javascript:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"livescript:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"mocha:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"view-source:javascript:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"jar:javascript:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"ms-its:javascript:alert(1)\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"mk:@MSITStore:javascript:\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n#   \u003cp\u003e\u003ca href=\"res:javascript:\"\u003eclick\u003c/a\u003e\u003c/p\u003e\n```\n\nFor comparison, the four schemes already in the denylist are correctly blocked: `javascript:`, `vbscript:`, `file:`, `data:text/html` all return `\u003ca href=\"#harmful-link\"\u003e`.\n\nThe same gap applies to reference links (`[click][ref]\\n\\n[ref]: feed:javascript:alert(1)` → `\u003ca href=\"feed:javascript:alert(1)\"\u003e`) and to autolinks (`\u003cfeed:javascript:alert(1)\u003e` → `\u003ca href=\"feed:javascript:alert(1)\"\u003e`).\n\n## Suggested Fix\n\nSwitch from denylist to allowlist. The set of schemes a markdown renderer needs to allow is small and well-known; the set of schemes that might trigger handler chains is unbounded.\n\n```diff\n--- a/src/mistune/renderers/html.py\n+++ b/src/mistune/renderers/html.py\n@@ -7,21 +7,28 @@ class HTMLRenderer(BaseRenderer):\n\n     _escape: bool\n     NAME: ClassVar[Literal[\"html\"]] = \"html\"\n-    HARMFUL_PROTOCOLS: ClassVar[Tuple[str, ...]] = (\n-        \"javascript:\",\n-        \"vbscript:\",\n-        \"file:\",\n-        \"data:\",\n-    )\n+    SAFE_PROTOCOLS: ClassVar[Tuple[str, ...]] = (\n+        \"http:\",\n+        \"https:\",\n+        \"mailto:\",\n+        \"tel:\",\n+        \"ftp:\",\n+        \"ftps:\",\n+        \"irc:\",\n+        \"ircs:\",\n+    )\n     GOOD_DATA_PROTOCOLS: ClassVar[Tuple[str, ...]] = (\n         \"data:image/gif;\",\n         \"data:image/png;\",\n         \"data:image/jpeg;\",\n         \"data:image/webp;\",\n     )\n\n@@ -49,15 +56,21 @@ class HTMLRenderer(BaseRenderer):\n     def safe_url(self, url: str) -\u003e str:\n-        if self._allow_harmful_protocols is True:\n-            return escape_text(url)\n-\n-        _url = url.lower()\n-        if self._allow_harmful_protocols and _url.startswith(tuple(self._allow_harmful_protocols)):\n-            return escape_text(url)\n-\n-        if _url.startswith(self.HARMFUL_PROTOCOLS) and not _url.startswith(self.GOOD_DATA_PROTOCOLS):\n-            return \"#harmful-link\"\n-        return escape_text(url)\n+        # Allow-list: only schemes in SAFE_PROTOCOLS, image-only data: URLs in\n+        # GOOD_DATA_PROTOCOLS, scheme-relative URLs (//host/path), absolute\n+        # paths (/path), and anchor-only references (#fragment) reach the\n+        # rendered output. Everything else is replaced with '#harmful-link'.\n+        if self._allow_harmful_protocols is True:\n+            return escape_text(url)\n+        _url = url.lower().lstrip()\n+        if (\n+            _url.startswith(self.SAFE_PROTOCOLS)\n+            or _url.startswith(self.GOOD_DATA_PROTOCOLS)\n+            or _url.startswith((\"/\", \"#\", \"?\"))\n+            or \":\" not in _url.split(\"/\", 1)[0]   # bare relative path\n+        ):\n+            return escape_text(url)\n+        if self._allow_harmful_protocols and _url.startswith(tuple(self._allow_harmful_protocols)):\n+            return escape_text(url)\n+        return \"#harmful-link\"\n```\n\nThe `allow_harmful_protocols` option is preserved, so callers who genuinely want to allow a custom scheme can still opt in. The `lower().lstrip()` also closes the leading-whitespace evasion sub-case (e.g., ` javascript:` is already blocked by the current code via `lower().startswith`, but the same pattern needs to apply on the new allowlist branch). Add regression tests for each scheme listed in the PoC above asserting they resolve to `#harmful-link`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mistune",
+        "purl": "pkg:pypi/mistune"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.7.4",
+        "0.8",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.0a3",
+        "2.0.0a4",
+        "2.0.0a5",
+        "2.0.0a6",
+        "2.0.0rc1",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.1.0",
+        "3.0.0",
+        "3.0.0a1",
+        "3.0.0a2",
+        "3.0.0a3",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.0rc4",
+        "3.0.0rc5",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.2.0",
+        "3.2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-qfrw-5rxm-mhh2/GHSA-qfrw-5rxm-mhh2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/security/advisories/GHSA-qfrw-5rxm-mhh2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59929"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/commit/c7101fcbb6e8790e8e39157c5ca2238fc6dd6cbc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lepture/mistune"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lepture/mistune/releases/tag/v3.3.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/mistune/PYSEC-2026-2217.yaml"
+    }
+  ]
+}

