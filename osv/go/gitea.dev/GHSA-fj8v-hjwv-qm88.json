@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-fj8v-hjwv-qm88",
+  "modified": "2026-07-21T20:45:35.307883576Z",
+  "published": "2026-07-21T20:40:03Z",
+  "aliases": [
+    "CVE-2026-58416"
+  ],
+  "summary": "Gitea: Fork-PR Actions task can read a third private repository via the collaborative-owner branch (missing fork-PR guard)",
+  "details": "### Summary\n\n`GetActionsUserRepoPermission` (`models/perm/access/repo_permission.go`) decides whether an Actions\ntask token may access a target repo. Its cross-repo branches each enforce a fork-PR discriminator —\n**except the collaborative-owner branch**, which is missing the `!task.IsForkPullRequest` guard that\nits sibling has. As a result, when a private repo **B** lists owner **A** as a collaborative owner, an\n**attacker-controlled fork pull-request** workflow whose base repo is owned by A is granted code-read\non B — i.e. the fork's YAML can clone a third private repository it has no rights to.\n\n### Details\n\n```go\n// models/perm/access/repo_permission.go (v1.26.2), in GetActionsUserRepoPermission\nif checkSameOwnerCrossRepoAccess(ctx, taskRepo, repo, task.IsForkPullRequest) { // passes isForkPR -\u003e denies forks\n    return maxPerm, nil\n}\n...\nif taskRepo.IsPrivate {                                   // \u003c-- NO IsForkPullRequest check here\n    actionsUnit := repo.MustGetUnit(ctx, unit.TypeActions)\n    if actionsUnit.ActionsConfig().IsCollaborativeOwner(taskRepo.OwnerID) {\n        return maxPerm, nil                              // grants code-read to target repo B\n    }\n}\n```\n\nThe sibling same-owner path correctly denies fork PRs:\n\n```go\nfunc checkSameOwnerCrossRepoAccess(ctx, taskRepo, targetRepo, isForkPR bool) bool {\n    if isForkPR {\n        return false // Fork PRs are never allowed cross-repo access to other private repositories.\n    }\n    ...\n}\n```\n\n`taskRepo` = the repo whose workflow is running (the PR's base repo A); `repo` = the target being\ncloned (B). `IsCollaborativeOwner(taskRepo.OwnerID)` asks \"does target B's Actions config trust A's\nowner for cross-repo read?\" When B trusts ownerA, the branch returns `maxPerm` (code-read) **even when\n`task.IsForkPullRequest` is true** — i.e. when the executing YAML is the fork's, not A's.\n\nEvery sibling enforces the fork-PR discriminator; except for this branch:\n`checkSameOwnerCrossRepoAccess` denies forks; `ComputeTaskTokenPermissions`\n(`models/actions/token_permissions.go`) only clamps the token *ceiling* to read-only for fork/cross-repo\n(its own comment notes the access *decision* is in `GetActionsUserRepoPermission`, so it does not\nneutralize the gap — it just makes the leak read-only); secrets (`models/secret/secret.go`) and the\napproval gate (`services/actions/notifier_helper.go`) both correctly key on `IsForkPullRequest`.\n\n**Reachability** — the runner clones target repo B over git-HTTP with the task token:\n`routers/web/repo/githttp.go` → `GetDoerRepoPermission(ctx, repoB, ActionsUser)` →\n`GetActionsUserRepoPermission(ctx, repoB, actionsUser, taskID)` with `IsForkPullRequest == true` →\ncollaborative-owner branch returns code-read → `p.CanAccess(Read, code)` passes → private clone of B\nsucceeds. (`CheckRepoScopedToken` in githttp is a no-op for the Actions token.)\n\n### PoC\n\nSetup: private base repo A (`usera/repoA`), private third repo\nB (`userb/repoB`) with a planted `SECRET.txt`, B's Actions config trusting `usera` as a collaborative\nowner, and a genuine running fork-PR task token (`token_hash` computed with Gitea's own `HashToken`)\npresented as HTTP Basic. Requesting `GET /userb/repoB.git/info/refs?service=git-upload-pack`:\n\n| Condition (same fork-PR token) | HTTP | Meaning |\n|---|---|---|\n| anonymous (no token) | 401 | auth required |\n| token, A **public**, B trusts A | 404 | branch gated on `taskRepo.IsPrivate` ⇒ A public skips it |\n| token, A private, B has **no** collab-owner config | 404 | no trust ⇒ denied |\n| **token, A private, B trusts A (collab-owner)** | **200** | **`git clone` of private B succeeds** |\n| config removed / restored | 404 / 200 | deterministic |\n\nIn the 200 case, `git clone` of private repo B succeeded and yielded its `SECRET.txt` — the full source\nof a third private repo the fork-PR author has no rights to.\n\n### Impact\n\nRead-only confidentiality breach: discloses the full source of a *third* private repository (B) to an\nuntrusted external fork-PR author. Read-only, not write/RCE.\n\nPreconditions (honest):\n1. B is deliberately configured with a collaborative owner — but that is exactly the feature's intended\n   use, so realistic for any deployment using it.\n2. The fork PR's base repo A is itself private (the branch is gated on `taskRepo.IsPrivate`). Forking a\n   private A already requires read on A, so this is a normal internal-contributor situation, not a\n   weakening — the escalation is \"read A (granted) → read a *different* private repo B (never granted).\"\n3. The fork-PR workflow must actually run — most realistically via an attacker who had one earlier PR\n   approved (the \"approved before\" path in `ifNeedApproval`), after which fork PRs auto-run.\n\n### Suggested remediation\n\nAdd the same fork-PR guard the sibling path has (one line):\n\n```go\nif taskRepo.IsPrivate \u0026\u0026 !task.IsForkPullRequest {\n    actionsUnit := repo.MustGetUnit(ctx, unit.TypeActions)\n    if actionsUnit.ActionsConfig().IsCollaborativeOwner(taskRepo.OwnerID) {\n        return maxPerm, nil\n    }\n}\n```\n\nThis flips `Vuln_ForkPR_LeaksThirdPrivateRepo` to PASS, keeps `Control_NonFork_Allowed` PASS\n(legitimate collaborative-owner sharing still works), and leaves the existing\n`TestGetActionsUserRepoPermission` suite all green.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gitea.dev",
+        "purl": "pkg:golang/gitea.dev"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-fj8v-hjwv-qm88/GHSA-fj8v-hjwv-qm88.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-fj8v-hjwv-qm88"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38214"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/1d43b736b5a16c5f80cfdcd9a9448a9c983ddaa0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

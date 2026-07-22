@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-8p9h-49rc-qgxj",
+  "modified": "2026-07-21T21:15:33.315156535Z",
+  "published": "2026-07-21T21:02:44Z",
+  "aliases": [
+    "CVE-2026-58437"
+  ],
+  "summary": "Gitea: Repository Visibility Manipulation via Git Push Options",
+  "details": "### Repository Visibility Manipulation via Git Push Options\n\n| Field | Value |\n|-------|-------|\n| **Affected File** | `routers/private/hook_post_receive.go` |\n| **Affected Function** | `HookPostReceive()` |\n| **Affected Lines** | 173–225 |\n| **Prerequisite** | Attacker must have owner-level or admin collaborator access to the target repository |\n\n---\n\n#### Description\n\nGitea's post-receive git hook handler processes git push options — key-value pairs transmitted by a client during `git push` using the `-o` flag. Two undocumented push options, `repo.private` and `repo.template`, allow any user with repository owner or admin-collaborator access to toggle the visibility (`private/public`) and template status of a repository as a side effect of a normal git push.\n\nThis capability was originally intended solely for the \"push-to-create\" feature (automatically creating a repo on first push). However, the options are processed without restriction on already-existing repositories, and — critically — the visibility change bypasses every control that a proper settings change would trigger:\n\n- No entry written to the repository's audit/activity log\n- No webhook event fired (`repository` event with `visibility_changed` action)\n- No org-level notification to owners\n- No team permission re-calculation\n- No email alert to watchers\n- The database update uses `UpdateRepositoryColsNoAutoTime`, which also suppresses the `updated_at` timestamp change\n\n\n---\n\n#### Vulnerable Code\n\n**`routers/private/hook_post_receive.go:173–225`**\n\n```go\nisPrivate  := opts.GitPushOptions.Bool(private.GitPushOptionRepoPrivate)  // \"repo.private\"\nisTemplate := opts.GitPushOptions.Bool(private.GitPushOptionRepoTemplate) // \"repo.template\"\n\nif isPrivate.Has() || isTemplate.Has() {\n    // ... loads repo and verifies pusher is owner or admin ...\n    if !perm.IsOwner() \u0026\u0026 !perm.IsAdmin() {\n        ctx.JSON(http.StatusNotFound, ...)\n        return\n    }\n\n    // FIXME: these options are not quite right, for example: changing visibility\n    //        should do more works than just setting the is_private flag\n    // These options should only be used for \"push-to-create\"\n    if isPrivate.Has() \u0026\u0026 repo.IsPrivate != isPrivate.Value() {\n        // TODO: it needs to do more work\n        repo.IsPrivate = isPrivate.Value()\n        repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, \"is_private\")\n        //         ^^^ bypasses updated_at timestamp, audit trail suppressed\n    }\n    if isTemplate.Has() \u0026\u0026 repo.IsTemplate != isTemplate.Value() {\n        repo.IsTemplate = isTemplate.Value()\n        repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, \"is_template\")\n    }\n}\n```\n\nThe push option constants are defined in `modules/private/pushoptions.go:18–19`:\n\n```go\nGitPushOptionRepoPrivate  = \"repo.private\"\nGitPushOptionRepoTemplate = \"repo.template\"\n```\n\n---\n\n#### Attack Scenario\n\n**Scenario A — Insider threat / rogue admin collaborator**\n\nAn organization grants a contractor repo admin access to contribute to a private repository containing proprietary source code. The contractor, before their access is revoked, makes a private repo public for several minutes — long enough to clone, archive, or index the content — then makes it private again. The action leaves no audit trail distinguishable from a normal git push.\n\n**Scenario B — Supply-chain template poisoning**\n\nA repository marked as a template is used by CI/CD pipelines to generate new project repositories. An admin collaborator uses `repo.template=false` to silently remove the template designation, then makes changes to the repo's content, re-marks it as a template with `repo.template=true`, and waits for downstream consumers to regenerate projects from the now-backdoored template. The `updated_at` timestamp is unchanged due to `UpdateRepositoryColsNoAutoTime`, making diff-detection harder.\n\n---\n\n#### Step-by-Step Reproduction\n\n**Prerequisites:**\n- A Gitea user account with either owner or admin-collaborator access to a private repository\n- `git` client with push access to the repository\n\n---\n\n**Step 1 — Confirm the target repository is private**\n\n---\n\n**Step 2 — Clone the repository**\n\n```bash\ngit clone http://USER:PASSWORD@\u003cgitea-host\u003e/OWNER/REPO.git /tmp/target-repo\ncd /tmp/target-repo\n```\n\n---\n\n**Step 3 — Make any commit** *(the push option rides on a real push)*\n\n```bash\necho \"$(date)\" \u003e\u003e .gitkeep\ngit add .gitkeep\ngit commit -m \"routine update\"\n```\n\n---\n\n**Step 4 — Execute the exploit push**\n\n```bash\n# Make the repository public\ngit push http://USER:PASSWORD@\u003cgitea-host\u003e/OWNER/REPO.git main \\\n  -o repo.private=false\n\n# The push completes with a normal success message:\n#   remote: Processed 1 references in total\n#   To http://\u003cgitea-host\u003e/OWNER/REPO.git\n#      abc1234..def5678  main -\u003e main\n```\n\n---\n\n**Step 5 — Verify the repository is now public**\n\n\n---\n\n**Step 6 — Restore and cover tracks**\n\nRe-make it private in the same session, leaving no visible audit trail\n\nThe repository activity feed shows only two normal push events. The visibility change is invisible.\n\n**Verification: confirm no activity log entry**\n\n\n---\n\n#### Impact Details\n\n| Impact | Description |\n|--------|-------------|\n| **Data exfiltration** | Private source code, CI/CD secrets in plain-text files, environment configs become publicly cloneable for the window the repo is public |\n| **No audit trail** | `UpdateRepositoryColsNoAutoTime` suppresses the `updated_at` change; no activity log entry; no webhook; no notification |\n| **Supply chain** | Combined with `repo.template=true/false`, an attacker can silently rotate repository template status, affecting all downstream repositories that generate from this template |\n| **Scope** | Affects all repos where the attacker has admin-collaborator access — not only repos they own |\n\n---\n\n#### Recommended Fix\n\n**Option 1 (preferred) — Remove the options from post-receive hook entirely.** The `repo.private` and `repo.template` push options were designed for the push-to-create flow and have no legitimate use on existing repositories. They should be gated with:\n\n```go\n// routers/private/hook_post_receive.go\nif isPrivate.Has() || isTemplate.Has() {\n    if !wasEmpty {\n        // repo already existed — refuse these options on established repos\n        log.Warn(\"Repo push options repo.private/repo.template ignored for existing repo %s\", repoName)\n        // do not process\n    } else {\n        // original push-to-create path only\n        ...\n    }\n}\n```\n\n**Option 2 — Route through the full visibility-change service** so that audit events, webhooks, and team re-syncs are triggered:\n\n```go\n// Instead of the raw UpdateRepositoryColsNoAutoTime call:\nif err := repo_service.UpdateRepositoryVisibility(ctx, repo, isPrivate.Value()); err != nil {\n    ...\n}\n```\n\nWhere `UpdateRepositoryVisibility` fires the `repository` webhook event and writes an activity log entry.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-8p9h-49rc-qgxj/GHSA-8p9h-49rc-qgxj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-8p9h-49rc-qgxj"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

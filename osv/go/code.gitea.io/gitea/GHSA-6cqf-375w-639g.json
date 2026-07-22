@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-6cqf-375w-639g",
+  "modified": "2026-07-21T20:45:35.207109485Z",
+  "published": "2026-07-21T20:40:24Z",
+  "aliases": [
+    "CVE-2026-50105"
+  ],
+  "summary": "Gitea: RSS/Atom feed handlers bypass API-token scope \u0026 public-only confinement (incomplete fix of #37698)",
+  "details": "### Summary\n\nGitea's RSS/Atom feed handlers accept API-token Basic auth but perform **no token-scope or\npublic-only enforcement**. A personal access token that is correctly blocked (HTTP 403) from a\nprivate repository on `/raw`, `/media`, `/archive`, and `/releases/download/...` — because it is\nmarked *public-only* or lacks the `repository` scope category — still returns that repository's\nprivate content through the feed routes. This is a token-confinement bypass and appears to be an\nincomplete fix of #37698, which added that scope enforcement to the download handlers but not to the\nsibling feed handlers.\n\nThis is **not** a cross-user access bug: the requesting account must still legitimately have repo\nread access (`RepoAssignment` + `reqUnitCodeReader` are enforced). What is bypassed is the guarantee\nthat a *confined* token cannot reach private content — which is exactly the property #37698 was\nshipped to provide for downloads, and which matters when such a token is handed to a third-party\nservice/CI, leaked, or used in a lower-trust integration.\n\n### Details\n\n#37698 added `context.CheckTokenScopes` / `CheckRepoScopedToken`\n(`services/context/permission.go`) to the raw / media / archive / attachment download handlers, so a\npublic-only or wrong-scope-category token cannot read private-repo content even when the owning user\notherwise has access.\n\nThe feed handlers are registered with `webAuth.AllowBasic` (so they accept token Basic auth) but call\nno scope / public-only check. A grep for `CheckTokenScopes` / `CheckRepoScopedToken` / `IsApiToken`\nacross `routers/web/feed/` and the release feed handlers returns nothing.\n\nAffected routes (all token-reachable via `webAuth.AllowBasic`, none call the scope check):\n\n| Route | Handler | Private data exposed |\n|---|---|---|\n| `GET /{owner}/{repo}.rss` / `.atom` | `repo.Home` → `handleRepoHomeFeed` (`view_home.go`) | last-10 commits: SHA, full message, author name + email |\n| `GET /{owner}/{repo}/rss/branch/*`, `/atom/branch/*` | `feed.RenderBranchFeed*` → `ShowBranchFeed` (`routers/web/feed/branch.go`) | same commit data, any branch |\n| `GET /{owner}/{repo}/releases.rss` / `.atom` | `ReleasesFeedRSS/Atom` (`routers/web/repo/release.go`) → `ShowReleaseFeed` | private release names, notes, descriptions |\n| `GET /{owner}/{repo}/tags.rss` / `.atom` | `TagsListFeedRSS/Atom` → `ShowReleaseFeed` | private tag names + messages |\n| `GET /{user}.rss` / `.atom` | `showUserFeed` (`routers/web/feed/profile.go`), `includePrivate = self \\|\\| admin` | the token owner's private cross-repo activity stream |\n\nInconsistency that pins this down: the branch-feed routes sit in the **same route group** as `/raw`,\n`/media`, `/archive` (all of which call `checkDownloadTokenScope`), and `releases.rss` sits next to\n`/releases/attachments/{uuid}` and `/releases/download/...` (both go through `ServeAttachment` → scope\ncheck). Only the feeds were missed. The API equivalents (`ListReleases` / `ListTags`) are scope-gated\nvia `tokenRequiresScopes`.\n\nTwo distinct confinement bypasses:\n\n1. **Public-only bypass.** A token created with the *public-only* option is blocked (403) from a\n   private repo on `/raw`, `/archive`, `/releases/download/...`, but returns private commit / release\n   data via `.../releases.rss`, `.../rss/branch/*`, `/{owner}/{repo}.rss`, and the owner's private\n   activity via `/{user}.rss`.\n2. **Scope-category bypass.** A token scoped to only e.g. `read:issue` (no `read:repository`) is\n   rejected by the download handlers but reads repository commit/release content via the feeds.\n\n### PoC\n\nVerified live against the official `gitea/gitea:1.26.2` Docker image (sqlite, feeds enabled).\n\nSetup: non-admin user `alice`; private repo `alice/secret` with a commit\n`\"SECRET-COMMIT-MARKER ...\"` (file `secret.txt`) and a release `\"Private Release\"` / body\n`\"SECRET-RELEASE-MARKER ...\"`. Two confined personal access tokens, both sent via HTTP Basic so the\nauth method is identical across download and feed — only the route differs:\n- Token A: scopes `[\"public-only\", \"read:repository\"]`\n- Token B: scopes `[\"read:issue\"]`\n\n```bash\n# Token A — download is correctly blocked, feeds leak private content:\ncurl -u alice:$TOKEN_A https://\u003chost\u003e/alice/secret/raw/branch/main/secret.txt   # =\u003e 403  (fix works)\ncurl -u alice:$TOKEN_A https://\u003chost\u003e/alice/secret/rss/branch/main             # =\u003e 200, \u003ctitle\u003eSECRET-COMMIT-MARKER ...\u003c/title\u003e\ncurl -u alice:$TOKEN_A https://\u003chost\u003e/alice/secret/releases.rss               # =\u003e 200, SECRET-RELEASE-MARKER ...\ncurl -u alice:$TOKEN_A \"https://\u003chost\u003e/alice.rss\"                             # =\u003e 200, private activity\n\n# Token B — wrong scope category, same split:\ncurl -u alice:$TOKEN_B https://\u003chost\u003e/alice/secret/raw/branch/main/secret.txt   # =\u003e 403\ncurl -u alice:$TOKEN_B https://\u003chost\u003e/alice/secret/rss/branch/main             # =\u003e 200, private commit leaked\n```\n\nAnonymous baseline returns 404 on the repo feeds (data is genuinely private) and a marker-free 200 on\n`/alice.rss` (public activity only) — confirming the leak is gated only by the missing token check.\n\n### Impact\n\nInformation disclosure of private **commit metadata** (SHA, message, author name+email),\n**release/tag notes**, and the owner's **private activity stream**, to the holder of a confined token\nthat was specifically configured *not* to reach private content. Not raw file blobs (feeds don't\nserve file contents). Requires a token belonging to an account that already has repo read access, so\nthe realistic threat is a leaked / shared / lower-trust token rather than an anonymous attacker —\nwhich is precisely the threat model #37698 addressed for downloads.\n\n### Suggested remediation\n\nAdd a token-scope check at the top of each feed handler, mirroring `checkDownloadTokenScope`:\n\n```go\nif context.CheckRepoScopedToken(ctx, ctx.Repo.Repository, auth_model.Read); ctx.Written() {\n    return\n}\n```\n\nfor `ShowBranchFeed`, `ShowRepoFeed`, `ShowFileFeed`, `ShowReleaseFeed` (repo feeds). For the user\nfeed, gate `includePrivate` behind a non-public-only token (or require the `user` / `repository`\nscope) so a confined token can't pull private activity.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-6cqf-375w-639g/GHSA-6cqf-375w-639g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-6cqf-375w-639g"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

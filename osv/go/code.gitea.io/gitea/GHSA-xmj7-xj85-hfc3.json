@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-xmj7-xj85-hfc3",
+  "modified": "2026-07-21T20:45:36.420143173Z",
+  "published": "2026-07-21T20:37:29Z",
+  "aliases": [
+    "CVE-2026-58441"
+  ],
+  "summary": "Gitea: SSRF in restore-repo via unsanitized pull_request.yml Head.CloneURL",
+  "details": "### Summary\nGitea's `restore-repo` CLI command restores a repository from a dump\ndirectory/archive. When parsing `pull_request.yml` from that dump, the\n`Head.CloneURL` field is used to add a git remote and fetch from it with\nno validation, because the safety check that's supposed to guard it\n(`CheckAndEnsureSafePR`) is called with an empty `commonCloneBaseURL`,\nwhich silently disables it. This lets a malicious dump make the Gitea\nserver execute `git fetch` against an attacker-chosen URL (SSRF), or\ndisclose a local git repository via `file://`. This is a different root\ncause from the recently fixed path-traversal issue in the same command\n(#38215), which patched `DownloadURL`/`PatchURL` but not `Head.CloneURL`.\n\n### Details\n`services/migrations/restore.go`'s `GetPullRequests()` unmarshals\n`pull_request.yml` directly into `base.PullRequest` structs with no\nvalidation of `Head.CloneURL`:\n\n```go\nerr = yaml.Unmarshal(bs, \u0026pulls)\n...\nfor _, pr := range pulls {\n    if pr.PatchURL != \"\" {\n        pr.PatchURL = \"file://\" + util.FilePathJoinAbs(r.baseDir, pr.PatchURL)\n    }\n    CheckAndEnsureSafePR(pr, \"\", r)   // \u003c-- empty baseURL\n}\n```\n\n`CheckAndEnsureSafePR` (`services/migrations/common.go`) is supposed to\nreject `Head.CloneURL`/`PatchURL` values that don't share a common base\nURL:\n\n```go\nfunc hasBaseURL(toCheck, baseURL string) bool {\n    if len(baseURL) \u003e 0 \u0026\u0026 baseURL[len(baseURL)-1] != '/' {\n        baseURL += \"/\"\n    }\n    return strings.HasPrefix(toCheck, baseURL)\n}\n\nfunc CheckAndEnsureSafePR(pr *base.PullRequest, commonCloneBaseURL string, g base.Downloader) bool {\n    valid := true\n    if pr.PatchURL != \"\" \u0026\u0026 !hasBaseURL(pr.PatchURL, commonCloneBaseURL) {\n        pr.PatchURL = \"\"\n        valid = false\n    }\n    if pr.Head.CloneURL != \"\" \u0026\u0026 !hasBaseURL(pr.Head.CloneURL, commonCloneBaseURL) {\n        pr.Head.CloneURL = \"\"\n        valid = false\n    }\n    return valid\n}\n```\n\n`strings.HasPrefix(anything, \"\")` is always `true` in Go. Because\n`restore.go` is the only caller that passes `\"\"` as\n`commonCloneBaseURL`, this check is a complete no-op on the restore-repo\npath — `Head.CloneURL` survives unchanged regardless of its value. Every\nother downloader (`github.go`, `gitlab.go`, `gitea_downloader.go`,\n`codebase.go`, `codecommit.go`, `onedev.go`) passes a real base URL, so\nthey are not affected.\n\n`services/migrations/gitea_uploader.go` then uses the unvalidated value\ndirectly:\n\n```go\nerr := g.gitRepo.AddRemote(remote, pr.Head.CloneURL, true)\n// ... later: fetch from that remote\n```\n\nresulting in the server executing `git fetch` against an\nattacker-controlled URL sourced from the dump file.\n\n**RCE via git's `ext::` transport helper was tested and ruled out** — a\nnormal `git` install rejects it by default (`fatal: transport 'ext' not\nallowed`), independent of Gitea's own configuration. This report is\nscoped to SSRF and local git-repository disclosure.\n\nConfirmed present, byte-for-byte identical, in `v1.26.4` (latest stable\ntag), `release/v1.27`, and `main`, by direct checkout and diff.\n\n### PoC\n1. Create a dump directory following the normal `restore-repo` layout\n   (`repo.yml`, etc.), and add a `pull_request.yml` containing at least\n   one entry with:\n```yaml\n   - number: 1\n     head:\n       cloneURL: \"http://\u003cattacker-controlled-or-internal-host\u003e:\u003cport\u003e/ssrf-proof\"\n       ref: \"main\"\n```\n2. Run `gitea restore-repo` against that dump directory for any repo\n   owner.\n3. Observe on the target host/listener: an actual `git` HTTP\n   discovery request arrives, e.g.\n   `GET /ssrf-proof/info/refs?service=git-upload-pack`, driven entirely\n   by the value from the dump file.\n\nVerified the core mechanism (steps 2–3, i.e. the unvalidated\n`Head.CloneURL` surviving `CheckAndEnsureSafePR(\"\")` and then being used\nin a real `git remote add` + `git fetch`) with a minimal, standalone Go\nprogram built from the **verbatim, unmodified** `hasBaseURL` /\n`CheckAndEnsureSafePR` function bodies (attached: `gitea_ssrf_poc.go`),\nrun end-to-end against a local HTTP listener. The listener's access log\nconfirms the request actually arrives. \n\n### Impact\nAn attacker who can get an administrator to run `gitea restore-repo`\nagainst a malicious dump (the same threat model already accepted for the\njust-fixed path-traversal issue in this command, #38215) can make the\nGitea server issue a `git fetch` against an arbitrary attacker-chosen\nURL. This allows:\n- SSRF against internal-only services or cloud metadata endpoints\n  reachable from the Gitea host.\n- Disclosure of local git repositories reachable via `file://` paths\n  readable by the Gitea process.\n\nNo public disclosure planned. Happy to provide further detail on\nrequest.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-xmj7-xj85-hfc3/GHSA-xmj7-xj85-hfc3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-xmj7-xj85-hfc3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

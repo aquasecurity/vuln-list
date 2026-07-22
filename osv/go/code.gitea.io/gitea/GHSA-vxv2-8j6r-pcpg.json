@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-vxv2-8j6r-pcpg",
+  "modified": "2026-07-21T20:30:34.315519521Z",
+  "published": "2026-07-21T20:21:33Z",
+  "aliases": [
+    "CVE-2026-58425"
+  ],
+  "summary": "Gitea: OAuth token introspection returns metadata of tokens issued to other clients (RFC 7662 section 4 violation)",
+  "details": "## Live reproduction against Gitea 1.26.1\n\nSetup: Gitea 1.26.1 docker stack with two users (`admin` and `victim`) and two OAuth applications owned by different users:\n\n```\nClient A: id=5dda747d-7fdd-4694-85ff-ce4f893ce51e   owner=admin\nClient B: id=588f778f-4a41-4914-ae01-85d776c369db   owner=victim\n```\n\n`admin` runs an OAuth flow against Client A and obtains an access token. `victim` (acting through Client B's credentials) calls the introspection endpoint with Client A's access token in the body:\n\n```\n$ curl -s -u \"$B_ID:$B_SEC\" -X POST http://localhost:3001/login/oauth/introspect \\\n       --data-urlencode \"token=$CLIENT_A_ACCESS_TOKEN\"\n{\n    \"active\": true,\n    \"username\": \"admin\",\n    \"iss\": \"http://localhost:3001\",\n    \"sub\": \"1\",\n    \"aud\": [\n        \"5dda747d-7fdd-4694-85ff-ce4f893ce51e\"\n    ]\n}\n```\n\nNote the `aud` claim: the server explicitly states the token's audience is Client A, yet returns the full metadata to Client B. Per RFC 7662 section 4 (\"The authorization server SHOULD also limit the information it discloses about each token to the resources that are authorized to receive it\") the introspection result must not be disclosed to clients other than the token's audience.\n\nFull reproduction script attached as `poc.sh`. Full session log attached as `live_run.log`.\n\n## Root cause\n\n`routers/web/auth/oauth2_provider.go:130-175` `IntrospectOAuth`:\n\n```go\nfunc IntrospectOAuth(ctx *context.Context) {\n    clientIDValid := false\n    authHeader := ctx.Req.Header.Get(\"Authorization\")\n    if parsed, ok := httpauth.ParseAuthorizationHeader(authHeader); ok \u0026\u0026 parsed.BasicAuth != nil {\n        clientID, clientSecret := parsed.BasicAuth.Username, parsed.BasicAuth.Password\n        app, err := auth.GetOAuth2ApplicationByClientID(ctx, clientID)\n        if err != nil \u0026\u0026 !auth.IsErrOauthClientIDInvalid(err) {\n            log.Error(\"Error retrieving client_id: %v\", err)\n            ctx.HTTPError(http.StatusInternalServerError)\n            return\n        }\n        clientIDValid = err == nil \u0026\u0026 app.ValidateClientSecret([]byte(clientSecret))\n    }\n    if !clientIDValid {\n        ctx.Resp.Header().Set(\"WWW-Authenticate\", `Basic realm=\"Gitea OAuth2\"`)\n        ctx.PlainText(http.StatusUnauthorized, \"no valid authorization\")\n        return\n    }\n\n    var response struct {\n        Active   bool   `json:\"active\"`\n        Scope    string `json:\"scope,omitempty\"`\n        Username string `json:\"username,omitempty\"`\n        jwt.RegisteredClaims\n    }\n\n    form := web.GetForm(ctx).(*forms.IntrospectTokenForm)\n    token, err := oauth2_provider.ParseToken(form.Token, oauth2_provider.DefaultSigningKey)\n    if err == nil {\n        grant, err := auth.GetOAuth2GrantByID(ctx, token.GrantID)\n        if err == nil \u0026\u0026 grant != nil {\n            app, err := auth.GetOAuth2ApplicationByID(ctx, grant.ApplicationID)  // shadows the introspecting client's `app`\n            if err == nil \u0026\u0026 app != nil {\n                response.Active = true\n                response.Scope = grant.Scope\n                response.RegisteredClaims = oauth2_provider.NewJwtRegisteredClaimsFromUser(app.ClientID, grant.UserID, nil)\n            }\n            if user, err := user_model.GetUserByID(ctx, grant.UserID); err == nil {\n                response.Username = user.Name\n            }\n        }\n    }\n\n    ctx.JSON(http.StatusOK, response)\n}\n```\n\nThe handler:\n\n1. Authenticates the introspecting client via HTTP Basic (`app.ValidateClientSecret`). The local variable `app` at this point references the introspecting client.\n2. Loads the grant for `form.Token` via `auth.GetOAuth2GrantByID(ctx, token.GrantID)`.\n3. **Reassigns** `app` to `auth.GetOAuth2ApplicationByID(ctx, grant.ApplicationID)` (line 162). After this point, `app` is the token's issuing client, not the introspecting client.\n4. Populates `response` from the reassigned `app` and the grant.\n\nThere is no comparison between the introspecting client's id and `grant.ApplicationID`. The endpoint will return metadata for any token whose JWT signature validates, regardless of which client is asking.\n\n## Patch parity with PR #37704\n\nThe same file contains two recently-hardened handlers in commit `7e54514316` (\"fix(oauth): bind token exchanges to the original client request\", PR #37704, 2026-05-15) that added exactly this missing check:\n\n`handleRefreshToken` (routers/web/auth/oauth2_provider.go:561-568):\n\n```go\nif grant.ApplicationID != app.ID {\n    handleAccessTokenError(ctx, oauth2_provider.AccessTokenError{\n        ErrorCode:        oauth2_provider.AccessTokenErrorCodeInvalidGrant,\n        ErrorDescription: \"refresh token belongs to a different client\",\n    })\n    return\n}\n```\n\n`handleAuthorizationCode` (routers/web/auth/oauth2_provider.go:640-647):\n\n```go\nif authorizationCode.RedirectURI != \"\" \u0026\u0026 form.RedirectURI != authorizationCode.RedirectURI {\n    handleAccessTokenError(ctx, oauth2_provider.AccessTokenError{ ... })\n    return\n}\n// later in the same function:\nif authorizationCode.Grant.ApplicationID != app.ID {\n    handleAccessTokenError(ctx, ...)\n    return\n}\n```\n\n`IntrospectOAuth` shares the same problem space (it consumes a token bound to a grant whose application may differ from the requesting client) but did not receive the parallel patch.\n\n## Impact\n\nAny authenticated OAuth client can call `/login/oauth/introspect` with another client's access or refresh token in the body and learn:\n\n* `active` (true or false). A token-validity oracle that survives across application boundaries without consuming or \"using\" the token.\n* `scope`. The scope of the token.\n* `username`. The user the token belongs to.\n* `iss`, `sub`, `aud`. Standard JWT registered claims. `aud` reveals the issuing client_id, making it obvious to the introspecting client that the token does not belong to them. The server returns the data anyway.\n\nPractical scenarios:\n\n1. **Stolen-token validation oracle.** An attacker who exfiltrates an access token from logs, traffic capture, browser memory, or a leaked dump can verify the token is still active before using it for higher-noise actions like API calls. The probe does not consume the grant counter, so it does not appear in audit trails of \"actual token use\".\n2. **Cross-tenant metadata enumeration.** Any user can register their own OAuth application on a Gitea instance (web UI: /user/settings/applications). The attacker uses their own valid credentials to introspect tokens belonging to other tenants' clients. They learn which user/scope each token corresponds to without ever using it.\n3. **Token-confusion reconnaissance.** Before chaining a separate vulnerability (e.g., a future token-replay or session-fixation bug), the attacker can use introspection to map the token universe.\n\n## Suggested remediation\n\nA one-line fix matching the PR #37704 pattern:\n\n```diff\n grant, err := auth.GetOAuth2GrantByID(ctx, token.GrantID)\n if err == nil \u0026\u0026 grant != nil {\n+    if grant.ApplicationID != app.ID {\n+        // do not reveal token metadata for tokens not issued to this client\n+        ctx.JSON(http.StatusOK, response)  // response is zero-valued, active=false\n+        return\n+    }\n     app, err := auth.GetOAuth2ApplicationByID(ctx, grant.ApplicationID)\n```\n\nOr, equivalently, replace the inner `app` reassignment with a check that uses the introspecting client's `app.ClientID` directly for the response claims.\n\n## Affected versions\n\nConfirmed at Gitea v1.26.1 (latest release, 2026-04-24, docker image `gitea/gitea:1.26.1`). The vulnerable code path has been in place since the introspection endpoint was introduced; the recent PR #37704 / #37706 OAuth hardening landed in master May 15-16 2026 but did not touch this endpoint.\n\n## Attachments\n-  [poc.sh](https://github.com/user-attachments/files/28182098/poc.sh): Full reproduction script.\n-  [live_run.log](https://github.com/user-attachments/files/28182115/live_run.log): Full session log.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-vxv2-8j6r-pcpg/GHSA-vxv2-8j6r-pcpg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-vxv2-8j6r-pcpg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38042"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/c9920b7bd0f6ec1f7590f104711b09d55917f9e8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

