@@ -1,0 +1,179 @@
+{
+  "id": "PYSEC-2026-3493",
+  "modified": "2026-07-23T15:11:42.568996050Z",
+  "published": "2026-07-23T11:41:47.654008Z",
+  "aliases": [
+    "BIT-pillow-2026-54058",
+    "CVE-2026-54058",
+    "GHSA-62p4-gmf7-7g93"
+  ],
+  "summary": "Pillow: Out-of-bounds read via attacker-controlled row stride on Pillow's mmap path (McIdas AREA files)",
+  "details": "## Summary\n\nWhen Pillow loads an uncompressed image whose tile uses the `raw` codec and a mode in `Image._MAPMODES`, and the image was opened **from a filename**, it memory-maps the file and builds the image's row pointers directly into the mapping via `PyImaging_MapBuffer` (`src/map.c`). The per-row spacing (`stride`) is taken from the tile arguments. `map.c` validates `offset + ysize*stride \u003c= buffer_len` but **never checks that `stride` is at least the natural row width `xsize * pixelsize`**.\n\nThe **McIdas** AREA plugin (`McIdasImagePlugin.py`) derives `stride`, `offset`, `xsize`, and `ysize` directly from attacker-controlled 32-bit header words with no validation. By supplying a `stride` far smaller than the row width, an attacker makes each row pointer read `xsize*pixelsize` bytes that run past the mapped region. Accessing the pixels (e.g. `Image.tobytes()`,\n`getpixel`, `convert`, `save`) then reads adjacent process memory (information disclosure) or faults (SIGBUS, denial of service).\n\n\n## Complete Code Trace\n\n**Step 1: `McIdasImageFile._open`** - turns attacker header words into image size, file offset, and row stride with no validation.\n\n```python\n# src/PIL/McIdasImagePlugin.py:41-70\ns = self.fp.read(256)\nif not _accept(s) or len(s) != 256:        # _accept: prefix == b\"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x04\"\n    raise SyntaxError(...)\nself.area_descriptor = w = [0, *struct.unpack(\"!64i\", s)]   # w[1..64] = signed BE int32, ALL attacker-controlled\n\nif w[11] == 1:\n    mode = rawmode = \"L\"                    # pixelsize 1, in _MAPMODES\nelif w[11] == 2:\n    mode = rawmode = \"I;16B\"                # pixelsize 2, in _MAPMODES\n...\nself._mode = mode\nself._size = w[10], w[9]                    # (xsize, ysize)  \u003c-- attacker\noffset = w[34] + w[15]                       # \u003c-- attacker\nstride = w[15] + w[10] * w[11] * w[14]       # \u003c-- attacker (set w[14]=0, w[15]=1 =\u003e stride=1)\nself.tile = [\n    ImageFile._Tile(\"raw\", (0, 0) + self.size, offset, (rawmode, stride, 1))\n]\n```\n\n**Step 2: `ImageFile.load` (mmap branch)** - selects mmap and delegates to `map_buffer`.\n\n```python\n# src/PIL/ImageFile.py:322-348\nif use_mmap:                                 # use_mmap = self.filename and len(self.tile) == 1\n    decoder_name, extents, offset, args = self.tile[0]\n    if (decoder_name == \"raw\" and isinstance(args, tuple) and len(args) \u003e= 3\n            and args[0] == self.mode and args[0] in Image._MAPMODES):\n        if offset \u003c 0:                       # only lower-bound guard on offset\n            raise ValueError(\"Tile offset cannot be negative\")\n        with open(self.filename) as fp:\n            self.map = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)\n        if offset + self.size[1] * args[1] \u003e self.map.size():   # == offset + ysize*stride; NO stride\u003e=linesize check\n            raise OSError(\"buffer is not large enough\")\n        self.im = Image.core.map_buffer(\n            self.map, self.size, decoder_name, offset, args      # args = (\"L\", stride, 1)\n        )\n```\n\n**Step 3: `PyImaging_MapBuffer`** - builds row pointers at `stride` spacing into the mmap; validates everything except `stride \u003e= row width`.\n\n```c\n/* src/map.c:65-140 */\nif (!PyArg_ParseTuple(args, \"O(ii)sn(sii)\",\n        \u0026target, \u0026xsize, \u0026ysize, \u0026codec, \u0026offset, \u0026mode_name, \u0026stride, \u0026ystep))\n    return NULL;\n...\nconst ModeID mode = findModeID(mode_name);          /* \"L\" */\n\nif (stride \u003c= 0) {                                  /* attacker sets stride=1 (\u003e0) -\u003e NOT recomputed */\n    if (mode == IMAGING_MODE_L || mode == IMAGING_MODE_P) stride = xsize;\n    else if (isModeI16(mode)) stride = xsize * 2;\n    else stride = xsize * 4;\n}\n\nif (stride \u003e 0 \u0026\u0026 ysize \u003e PY_SSIZE_T_MAX / stride) {/* overflow guard only */\n    PyErr_SetString(PyExc_MemoryError, \"Integer overflow in ysize\"); return NULL;\n}\nsize = (Py_ssize_t)ysize * stride;                  /* = 1*1 = 1 */\n\nif (offset \u003e PY_SSIZE_T_MAX - size) { ... }\n...\nif (offset + size \u003e view.len) {                     /* 1 + 1 = 2 \u003c= 256 -\u003e PASSES */\n    PyErr_SetString(PyExc_ValueError, \"buffer is not large enough\");\n    PyBuffer_Release(\u0026view); return NULL;\n}\n\nim = ImagingNewPrologueSubtype(mode, xsize, ysize, sizeof(ImagingBufferInstance));\n/* im-\u003elinesize = xsize * pixelsize = 200000  (the REAL per-row read width) */\n\n/* setup file pointers -- NO check that stride \u003e= im-\u003elinesize */\nif (ystep \u003e 0) {\n    for (y = 0; y \u003c ysize; y++) {\n        im-\u003eimage[y] = (char *)view.buf + offset + y * stride;   /* row points into mmap, spacing=1 */\n    }\n} else { ... }\n```\n\n`im-\u003elinesize` (the number of bytes any consumer reads per row) is `xsize * pixelsize = 200000`, but the row pointers are only `stride = 1` byte apart and the buffer is only `offset + ysize*stride = 2` bytes \"claimed\". Nothing reconciles the two.\n\n**Step 4: pixel access (`Image.tobytes()` → raw encoder `copy1`)** - reads `linesize` bytes from `im-\u003eimage[0]`, i.e. `xsize` bytes starting at `view.buf + offset`, running far past the mmap.\n\n```c\n/* the raw \"L\" packer copies linesize (=xsize) bytes per row from im-\u003eimage[y];\n   for row 0 that is view.buf+1 .. view.buf+1+200000, vs a 256-byte file. */\n```\n\n## Chain Summary\n\n```\nSOURCE: McIdas AREA header words w[9],w[10],w[11],w[14],w[15],w[34]  (Image.open on a path)\n  ↓ McIdasImagePlugin._open: stride = w[15]+w[10]*w[11]*w[14]  -\u003e attacker sets stride=1   [McIdasImagePlugin.py:66]\n  ↓ tile = (\"raw\", (0,0,xsize,1), offset, (\"L\", 1, 1))                                     [McIdasImagePlugin.py:68]\nGADGET: ImageFile.load mmap branch -- only checks offset+ysize*stride\u003c=len  \u003c- BUG: no stride\u003e=linesize check  [ImageFile.py:343]\n  ↓ core.map_buffer(map, (xsize,1), \"raw\", offset, (\"L\",1,1))                              [ImageFile.py:346]\nSINK: PyImaging_MapBuffer: im-\u003eimage[0] = view.buf + offset + 0*stride; linesize=xsize   [map.c:134]\n  ↓ Image.tobytes() raw \"L\" encoder reads linesize (=xsize) bytes from im-\u003eimage[0]\nIMPACT: reads xsize bytes from a tiny mmap -\u003e OOB read of adjacent process memory (leak) or SIGBUS (DoS)\n```\n## Proof of Concept\n\nSee attached [poc.zip](https://github.com/user-attachments/files/28460498/poc.zip)\n\n\n## Impact on a Parent Application\n\nAny application that opens image files supplied by users **from a path on disk** (the common pattern: save upload to a temp file, then `Image.open(path)`), has the default plugin set (McIdas is registered by default), and subsequently reads/returns/re-encodes the decoded pixels (thumbnailing, format conversion, serving a preview), is exposed:\n\n- **Information disclosure (High):** the decoded \"image\" contains bytes of the   worker process's adjacent heap/mapped memory, which the app then serves or stores - potentially leaking secrets, credentials, or other users' data.\n- **Denial of service (High):** a larger `xsize` reliably crashes the worker with SIGBUS.\n\n## Suggested fix\nCore fix in `src/map.c` (`PyImaging_MapBuffer`): reject `offset \u003c 0` and `stride \u003c im-\u003elinesize`. Defense-in-depth in `McIdasImagePlugin._open`: reject `offset \u003c 0` or `stride \u003c xsize*pixelsize` .",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/pillow/PYSEC-2026-3493.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-62p4-gmf7-7g93"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54058"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/pull/9719"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/6a8de891fb00968e5ea79bfa84368ed90b3cfc1d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/12.3.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/pillow"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-62p4-gmf7-7g93"
+    }
+  ]
+}

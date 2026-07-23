@@ -1,0 +1,80 @@
+{
+  "id": "PYSEC-2026-3542",
+  "modified": "2026-07-23T15:00:26.292150215Z",
+  "published": "2026-07-23T11:41:46.686181Z",
+  "aliases": [
+    "CVE-2026-54234",
+    "GHSA-8wr5-jm2h-8r4f"
+  ],
+  "summary": "vLLM has Remote DoS via Invalid Recovered Token Reinjection",
+  "details": "## Summary\n\nA frontend-legal multi-request speculative workload can make vLLM produce an out-of-vocabulary recovered token equal to `vocab_size`, convert that value to `-1` when choosing the next live token for a request, and then feed that `-1` back into the next drafter input ids. On Qwen3 GPTQ this reaches the worker-side drafting / attention path and crashes the engine with a GPU `device-side assert`.\n\nThe same issue is reachable through the public gRPC request surface by sending a specific overlapping `Generate` / `Abort` sequence.\n\n## Impact\n\n- A remote client that can send public gRPC generation requests can crash the\n  shared vLLM engine worker\n- The triggering request sequence aborts concurrent requests and prevents later\n  requests from completing until the worker is restarted\n- In shared deployments, this is a service-wide denial of service for other\n  clients, not just a failure isolated to the attacking requests\n- The failure is reproducible, so repeated request sequences can sustain the\n  outage\n\n## Affected version\n\n- Confirmed on vLLM `0.17.1`\n- Earlier and later versions have not been checked yet in this report\n\n## Repro model\n\n- Official Hugging Face repo:\n  - [`Qwen/Qwen3-0.6B-GPTQ-Int8`](https://huggingface.co/Qwen/Qwen3-0.6B-GPTQ-Int8)\n- Anyone wants to reproduce the bug with my PoC scripts should download `Qwen3-0.6B-GPTQ-Int8` first\n\n## Trigger chain\n\n1. A legal multi-request speculative workload keeps structured-output state,\n   speculative decoding, overlap, and request cancellation active in the same\n   live engine.\n2. During rejection sampling, vLLM produces a recovered token equal to the\n   model `vocab_size` boundary value.\n3. That recovered token appears in position 0 of the sampled speculative row\n   for a live request. The same row also contains trailing padding entries\n   equal to `-1`, but those padding entries are not the key fault by\n   themselves.\n4. The next-token preparation step treats the position-0 recovered token as the\n   real next token for that request and converts that out-of-vocabulary value\n   to `-1`.\n5. The drafter writes that converted `-1` back into the live next-step input-id\n   row for the request.\n6. The drafting / embedding / attention path later consumes that live invalid\n   token and the worker crashes on GPU.\n\n## Details\n\n### Simple example\n\nThe important distinction is:\n\n- trailing `-1` values in a speculative row can be ordinary padding\n- the bug appears when the first live token for a request becomes\n  `151936 == vocab_size`, and that live token is then converted into `-1`\n\nIn simplified form, the bad transition looks like this:\n\n```text\nsampled speculative row:\n[151936, -1, -1, -1, ...]\n```\n\nAt this point, the trailing `-1` values are only padding. The critical problem\nis that the first position holds `151936`, which is out of vocabulary and is\nbeing treated as the request's real next token.\n\nThen vLLM prepares the next-token buffer:\n\n```text\nnext_token_ids:\n[-1, ...]\n```\n\nFinally, that converted `-1` is written back into the live model input ids:\n\n```text\ninput_ids_after:\n[-1, 0, 0, 0, ...]\n```\n\nThe crash happens because the live next token became `-1` and was later consumed by the drafting / embedding / attention path, not merely because the speculative row contained padded `-1` entries.\n\n### Trigger path in code\n\n1. The workload is frontend-legal. The requests use normal `SamplingParams`\n   features such as structured outputs, `stop`, `bad_words`, `min_tokens`, and\n   streaming overlap. No malformed token-id list is required at the request\n   boundary.\n2. In speculative decoding, the rejection sampler can generate recovered tokens\n   when drafted tokens are rejected.\n   ```python\n   # vllm/v1/sample/rejection_sampler.py\n   def sample_recovered_tokens(...):\n       recovered_token_ids = torch.empty_like(draft_token_ids)\n       sample_recovered_tokens_kernel[(batch_size, max_spec_len)](...)\n       return recovered_token_ids\n   ```\n   On the verified Qwen3 run, the recovered-token trace shows\n   `recovered_token_ids[0] = 151936`, which is exactly `vocab_size` for this\n   checkpoint.\n3. The speculative proposer then prepares the next-token row from the sampled\n   speculative row.\n   ```python\n   # vllm/v1/spec_decode/eagle.py\n   def prepare_next_token_ids_padded(...):\n       ...\n       eagle_prepare_next_token_padded_kernel[grid](\n           sampled_token_ids,\n           discard_request_mask,\n           backup_tokens_gpu,\n           next_token_ids,\n           valid_sampled_tokens_count,\n           gpu_input_batch.vocab_size,\n           ...\n       )\n       return next_token_ids, valid_sampled_tokens_count\n   ```\n   In the verified trace, this step receives a sampled row beginning with\n   `151936`, followed by `-1` padding. The important point is that `151936`\n   occupies the first live token position for the request. This step then\n   produces `next_token_ids[0] = -1`, meaning the live next token for the\n   request has been converted to `-1`.\n4. The drafter then rotates the draft input ids and inserts those\n   `next_token_ids` back into the live input-id buffer.\n   ```python\n   # vllm/v1/spec_decode/eagle.py\n   def set_inputs_first_pass(...):\n       ...\n       self.input_ids[token_indices_to_sample] = next_token_ids\n   ```\n   In the verified trace, this produces `input_ids_after[0] = -1`.\n5. The model-side embed path later consumes those input ids.\n   ```python\n   # vllm/model_executor/models/qwen2.py\n   def embed_input_ids(self, input_ids: torch.Tensor) -\u003e torch.Tensor:\n       return self.embed_tokens(input_ids)\n   ```\n   In the verified trace, this is the first point where the converted `-1`\n   becomes visible as a real model input. The bug is not merely that the\n   sampled speculative row contained padding `-1`; the bug is that the live\n   next token for the request became `-1` and was written back into input ids.\n6. After that point, the visible sink depends on timing and backend state. On\n   the attached Qwen3 reproducer, the engine commonly dies later in the\n   drafting / attention path with `CUDA error: device-side assert triggered`,\n   for example under `flash_attn_varlen_func(...)`.\n\n### Local script breakdown\n\n`repro_g4_recovered_minus1_local.py` is a standalone local reproducer.\n\n- It reads the Qwen3 checkpoint path from `VLLM_POC_G4_MODEL` or the built-in\n  `/path/to/qwen3` placeholder\n- It creates `EngineCore` directly without any external helper dependency\n- It submits one fixed multi-request workload that preserves the same overlap\n  and speculative-decoding state needed for the bug\n- It writes:\n  - `request_payloads.json`\n  - `repro_config.json`\n  - `timeline.json`\n  - `responses.json`\n  - `error.txt`\n  - `recovered_chain_trace.jsonl`\n- `recovered_chain_trace.jsonl` is the key attribution artifact. It records the\n  recovered-token chain directly from the standalone reproducer\n\n### gRPC script breakdown\n\n`repro_g4_recovered_minus1_grpc.py` is a standalone public gRPC reproducer.\n\n- It reads the Qwen3 checkpoint path from `VLLM_POC_G4_MODEL` or the built-in\n  `/path/to/qwen3` placeholder\n- It starts a temporary `vllm.entrypoints.grpc_server` process\n- It sends only public `Generate` and `Abort` RPCs\n- It submits one fixed overlapping request sequence that preserves the same\n  speculative-decoding state needed for the bug\n- After the crash window, it sends one more public `Generate` probe request to\n  confirm that later gRPC requests also fail after the worker dies\n- It writes:\n  - `request_payloads.json`\n  - `timeline.json`\n  - `server_command.json`\n  - `responses.json`\n  - `post_crash_probe.json`\n  - `server.stdout.log`\n  - `server.stderr.log`\n\n## Observed result\n\nLocal repro typically ends with:\n\n- a recovered-token trace showing:\n  - `sample_recovered_tokens_return -\u003e recovered_token_ids[0] = 151936`\n  - `prepare_next_token_ids_padded -\u003e next_token_ids[0] = -1`\n  - `set_inputs_first_pass -\u003e input_ids_after[0] = -1`\n  - `embed_input_ids_out_of_range -\u003e input_ids[0] = -1`\n- `CUDA error: device-side assert triggered`\n- a fatal engine-side failure\n\ngRPC repro typically ends with:\n\n- the triggering gRPC requests failing with\n  `INTERNAL: EngineCore encountered an issue. See stack trace (above) for the root cause.`\n- server logs showing the worker dies with\n  `CUDA error: device-side assert triggered`\n- a later public probe request also failing after the worker is dead\n\nThis demonstrates that the issue is reachable through the public gRPC request surface, not only through a local reproducer.\n\n## Log snippets\n\n### Local recovered-chain trace\n\n```text\nsample_recovered_tokens_return:\n  recovered_token_ids = [151936, ...]\n  vocab_size = 151936\n\nprepare_next_token_ids_padded:\n  sampled_token_ids_head = [[151936, -1, -1, ...], ...]\n  next_token_ids = [-1, ...]\n\nset_inputs_first_pass:\n  input_ids_after = [-1, 0, 0, 0, ...]\n\nembed_input_ids_out_of_range:\n  input_ids = [-1, 0, 0, 0, ...]\n```\n\n### gRPC server log\n\n```text\ntorch.AcceleratorError: CUDA error: device-side assert triggered\n...\nvllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.\n...\nError in Generate for request post_crash_probe\nvllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.\n```\n\n## Root cause\n\nThis is a speculative-decoding state-handling bug, not an invalid frontend token-id input bug.\n\nThe root cause is that a recovered speculative token can become equal to `vocab_size`, then be selected as the live next token for a request, then be converted to `-1`, and that converted `-1` is still written back into live drafter input ids and later consumed by the drafting / embedding / attention path.\n\nFor the Qwen3 checkpoint used here:\n\n- `151936 == vocab_size`\n\nThis value should be described as the model `vocab_size` boundary value, not as a legal token id.\n\n## Attachments\n\nThe attached bundle for this report should contain:\n\n- `repro_g4_recovered_minus1_local.py`\n- `repro_g4_recovered_minus1_grpc.py`\n\nThese two standalone scripts are sufficient to reproduce the issue and its public gRPC reachability.\n\n## Fix\n\nA fix for this vulnerability has been merged in: https://github.com/vllm-project/vllm/pull/44744",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.17.1"
+            },
+            {
+              "fixed": "0.24.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/vllm/PYSEC-2026-3542.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-8wr5-jm2h-8r4f"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54234"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/44744"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/8a5cf1ccd65e8ac7635c402c1ec0b08988bc26ca"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/vllm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-8wr5-jm2h-8r4f"
+    }
+  ]
+}

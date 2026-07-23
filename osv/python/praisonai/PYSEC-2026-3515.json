@@ -1,0 +1,138 @@
+{
+  "id": "PYSEC-2026-3515",
+  "modified": "2026-07-23T15:00:20.931354192Z",
+  "published": "2026-07-23T11:41:42.974600Z",
+  "aliases": [
+    "CVE-2026-57146",
+    "GHSA-jxcw-qp4h-6jfq"
+  ],
+  "summary": "PraisonAI A2U incomplete authentication fix leaves current serve command unauthenticated by default",
+  "details": "## Summary\n\nThe published A2U advisory `GHSA-f292-66h9-fpmf` says unauthenticated A2U event streaming was fixed in `praisonai` `4.5.115`. Current head still exposes the same A2U subscription and event routes without authentication when the operator starts the documented CLI entrypoint:\n\n```text\npraisonai serve a2u --host 0.0.0.0 --port 8002\n```\n\nThe current CLI wrapper does not expose `--api-key`, does not install the common API-key middleware, and does not generate a token for A2U. It calls `create_a2u_routes(app)` directly. That helper only enforces auth if `A2U_AUTH_TOKEN` is already present; if the variable is missing, `_authenticate_request()` returns `None` and treats auth as disabled.\n\nThis is an incomplete-fix report for the published A2U issue, not a separate trust-model-only concern.\n\n## Technical Details\n\nThe Typer command for A2U accepts only `--host` and `--port`:\n\n```text\nsrc/praisonai/praisonai/cli/commands/serve.py:570-585\n```\n\nIt forwards only those values to the shared serve handler:\n\n```python\nargs = [\"a2u\", \"--host\", host, \"--port\", str(port)]\n```\n\nThe serve handler for A2U likewise accepts only `host` and `port`, then creates the app:\n\n```text\nsrc/praisonai/praisonai/cli/features/serve.py:802-817\n```\n\n`_create_a2u_app()` registers A2U routes directly:\n\n```text\nsrc/praisonai/praisonai/cli/features/serve.py:827-853\n```\n\nNo call to `_install_api_key_middleware(app, ...)` is made for the dedicated A2U server, unlike the unified server path.\n\nInside `create_a2u_routes()`, auth is opt-in:\n\n```text\nsrc/praisonai/praisonai/endpoints/a2u_server.py:245-253\n```\n\n```python\nauth_token = os.environ.get(\"A2U_AUTH_TOKEN\")\nif not auth_token:\n    # No token configured - auth disabled (development mode)\n    return None\n```\n\nThe route helper then registers the same sensitive endpoints from the public advisory:\n\n```text\nsrc/praisonai/praisonai/endpoints/a2u_server.py:391-409\n```\n\n### Why This Is Not Intended Behavior\n\nThe public advisory for `GHSA-f292-66h9-fpmf` describes unauthenticated `/a2u/info`, `/a2u/subscribe`, `/a2u/events/{stream_name}`, `/a2u/events/sub/{id}`, and `/a2u/health` as the vulnerability and lists `4.5.115` as patched.\n\nCurrent documentation also says PraisonAI API servers are now secure by default, bind to `127.0.0.1`, and generate a bearer token if no token is provided. The dedicated A2U command does not implement that secure-by-default behavior. It remains unauthenticated unless a different environment variable, `A2U_AUTH_TOKEN`, was set before startup.\n\nThis report does not claim that explicit local-only development mode is always a vulnerability. The issue is the mismatch between the published fixed version / secure-by-default posture and the current A2U CLI behavior, including external binding via `--host 0.0.0.0`.\n\n## PoV\n\nRun:\n\n```bash\npython3 poc/pov_poc.py \\\n  --repo /path/to/PraisonAI \\\n  --json\n```\n\nObserved current-head output:\n\n```json\n{\n  \"no_token\": {\n    \"info_status_no_auth\": 200,\n    \"subscribe_status_no_auth\": 200,\n    \"health_status_no_auth\": 200,\n    \"subscribe_body\": {\n      \"stream_name\": \"events\",\n      \"stream_url\": \"http://testserver/a2u/events/sub-d8ee868a5491\"\n    }\n  },\n  \"with_token\": {\n    \"info_status_no_auth\": 401,\n    \"subscribe_status_no_auth\": 401,\n    \"info_with_token\": 200,\n    \"subscribe_with_token\": 200\n  },\n  \"vulnerable_current_default\": true\n}\n```\n\nThe PoV is local-only. It uses a small Starlette response/route shim so it can invoke the registered A2U handlers without starting a network listener or installing dependencies. The control shows that the route-level token check works when `A2U_AUTH_TOKEN` is configured; the vulnerable behavior is that the current documented CLI path does not require or generate that token.\n\n## PoC\n\nThe PoV section above contains the local reproduction command, input, and decisive output.\n\n## Impact\n\nAn attacker who can reach a current A2U server started without `A2U_AUTH_TOKEN` can subscribe to agent event streams without credentials. The prior public advisory already classifies the exposed data as agent responses, tool calls, thinking/progress events, and stream metadata.\n\nIf operators rely on the published fixed version or the secure-by-default serve documentation, they may expose A2U on a network interface believing the unauthenticated stream issue is fixed.\n\n### Severity\n\nSuggested severity: High.\n\n## Suggested Fix\n\nRecommended:\n\n1. Make `praisonai serve a2u` secure by default in the same way as the documented API servers: generate a bearer token when none is configured, print it to stderr, and enforce it on all non-public A2U endpoints.\n2. Add `--api-key` / `--auth-token` support to the dedicated A2U command and pass the configured token into `create_a2u_routes()` or shared middleware.\n3. Fail closed for external binds such as `--host 0.0.0.0` unless authentication is enabled.\n4. Require auth on `/a2u/health` or remove subscription and stream counts from unauthenticated health responses.\n5. Add regression tests for `praisonai serve a2u` proving unauthenticated `/a2u/subscribe` returns `401` on current/fixed versions by default.\n\n## Affected Package/Versions\n\n- Repository: `MervinPraison/PraisonAI`\n- Ecosystem: `pip`\n- Package: `praisonai`\n- Component: A2U Agent-to-User event stream server\n- Current checkout validated: `2f9677abb2ea68eab864ee8b6a828fd0141612e1`\n- Current checkout tag state: `v4.6.57-4-g2f9677ab`\n- Public prior advisory: `GHSA-f292-66h9-fpmf`, fixed range claims `praisonai \u003c= 4.5.114`\n\nSuggested affected range:\n\n```text\npip:praisonai \u003e= 4.5.115, \u003c= 4.6.58\n```\n\nIf maintainers prefer to update the public advisory rather than create a new advisory, the important correction is that the fixed version/range should not mark the current `praisonai serve a2u` behavior as fixed.\n\n## Advisory History\n\nThis is intentionally adjacent to `GHSA-f292-66h9-fpmf`. The report-grade point is that current versions after the claimed patched version still reproduce the same default unauthenticated A2U behavior through the maintained CLI entrypoint.\n\nVisible PraisonAI advisories and prior submissions were checked. None cover A2U incomplete authentication after `GHSA-f292-66h9-fpmf`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.5.115"
+            },
+            {
+              "fixed": "4.6.61"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.5.115",
+        "4.5.117",
+        "4.5.118",
+        "4.5.119",
+        "4.5.120",
+        "4.5.121",
+        "4.5.122",
+        "4.5.123",
+        "4.5.124",
+        "4.5.125",
+        "4.5.126",
+        "4.5.127",
+        "4.5.128",
+        "4.5.129",
+        "4.5.130",
+        "4.5.131",
+        "4.5.132",
+        "4.5.133",
+        "4.5.134",
+        "4.5.135",
+        "4.5.136",
+        "4.5.137",
+        "4.5.139",
+        "4.5.140",
+        "4.5.143",
+        "4.5.144",
+        "4.5.145",
+        "4.5.149",
+        "4.6.10",
+        "4.6.11",
+        "4.6.12",
+        "4.6.13",
+        "4.6.14",
+        "4.6.15",
+        "4.6.16",
+        "4.6.18",
+        "4.6.19",
+        "4.6.20",
+        "4.6.21",
+        "4.6.22",
+        "4.6.23",
+        "4.6.24",
+        "4.6.25",
+        "4.6.26",
+        "4.6.27",
+        "4.6.28",
+        "4.6.29",
+        "4.6.30",
+        "4.6.31",
+        "4.6.32",
+        "4.6.33",
+        "4.6.34",
+        "4.6.35",
+        "4.6.36",
+        "4.6.37",
+        "4.6.38",
+        "4.6.39",
+        "4.6.40",
+        "4.6.41",
+        "4.6.42",
+        "4.6.43",
+        "4.6.44",
+        "4.6.45",
+        "4.6.46",
+        "4.6.47",
+        "4.6.48",
+        "4.6.50",
+        "4.6.51",
+        "4.6.52",
+        "4.6.53",
+        "4.6.54",
+        "4.6.55",
+        "4.6.56",
+        "4.6.57",
+        "4.6.58",
+        "4.6.59",
+        "4.6.60",
+        "4.6.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/praisonai/PYSEC-2026-3515.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-jxcw-qp4h-6jfq"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/praisonai"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-jxcw-qp4h-6jfq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-57146"
+    }
+  ]
+}
