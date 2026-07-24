@@ -1,0 +1,64 @@
+{
+  "id": "GHSA-ffpj-xv5c-p3gw",
+  "modified": "2026-07-24T17:01:28.162889718Z",
+  "published": "2026-07-24T16:55:55Z",
+  "aliases": [
+    "CVE-2026-59220"
+  ],
+  "summary": "Open WebUI: ReDoS in skill-mention regexes causes whole-instance DoS on default config",
+  "details": "## Summary\nTwo regexes in `backend/open_webui/utils/middleware.py` that parse `\u003c$skillId|label\u003e` skill-mention tags backtrack in O(n²) on input that contains `\u003c$` followed by a long run with no closing `\u003e`. Both run synchronously, on the asyncio event loop, on **every** chat completion with no feature gate. Because the default deployment is a single uvicorn worker, one such input pins a CPU core inside `re` and freezes the entire instance for all users until the worker is killed. Any authenticated user can trigger it with one chat message; it also fires accidentally on benign retrieved content (a RAG chunk or tool output) containing the pattern.\n\n## Affected versions\n`\u003e= 0.9.2, \u003c 0.10.0`. Fixed in **v0.10.0** (there is no 0.9.7 release).\n- `SKILL_MENTION_RE` (the extract pattern) has been O(n²) since **v0.9.2**; exploitable on 0.9.2–0.9.5 with a large input (hundreds of KB).\n- **v0.9.6** added a second, far more aggressive O(n²) in the strip pattern (introduced by the \"keep label as readable text\" change), so on 0.9.6 a small input is enough to hang the instance.\n\nBoth are fixed by the same patch.\n\n## Affected component\n`backend/open_webui/utils/middleware.py` (line numbers as of v0.9.6):\n\n```python\n# line 2223 — used by extract_skill_ids_from_messages(), called unconditionally (~line 2625)\nSKILL_MENTION_RE = re.compile(r'\u003c\\$([^|\u003e]+)\\|?[^\u003e]*\u003e')\n\n# line 2247 — used by strip_skill_mentions(), called unconditionally (line 2662)\nstrip_re = re.compile(r'\u003c\\$[^|\u003e]+\\|?([^\u003e]*)\u003e')\n```\n\n`extract_skill_ids_from_messages()` runs before the `if all_skill_ids:` block (that guard gates only skill *injection*, not the regex), and `strip_skill_mentions()` runs with no guard at all. Neither requires a skill to exist or any setting to be enabled. Both functions are plain synchronous calls inside the async `process_chat_payload` coroutine, so they block the event loop; with the default `UVICORN_WORKERS=1` (`backend/start.sh`) the whole instance stalls.\n\n## Root cause\n`[^|\u003e]` is a subset of `[^\u003e]`, so the quantifier pair `[^|\u003e]+ \\|? [^\u003e]*` is ambiguous: on input that never closes with `\u003e`, `[^|\u003e]+` greedily consumes the tail, `\u003e` fails, and the engine backtracks through every split point between `[^|\u003e]+` and `[^\u003e]*` — O(n) positions each doing O(n) work. Polynomial, not exponential, but more than enough to hang a single worker on a ~100 KB input.\n\n## Proof of concept\nStandalone (no Open WebUI required):\n\n```python\nimport re, time\nEXTRACT = re.compile(r'\u003c\\$([^|\u003e]+)\\|?[^\u003e]*\u003e')\nSTRIP   = re.compile(r'\u003c\\$[^|\u003e]+\\|?([^\u003e]*)\u003e')\nfor n in (8_000, 16_000, 32_000, 64_000):\n    s = '\u003c$' + ('a' * n)\n    for name, rx in (('extract', EXTRACT), ('strip', STRIP)):\n        t = time.perf_counter(); rx.search(s)\n        print(f'n={n:\u003e6} {name:\u003e7} = {(time.perf_counter()-t)*1000:8.1f} ms')\n```\n\nTime quadruples per doubling of `n` (textbook O(n²)); the strip pattern runs for ~6 seconds on a 64k blob and for minutes on a ~96 KB one.\n\nEnd-to-end against a live instance (default config):\n1. `docker run ghcr.io/open-webui/open-webui:v0.9.6` on defaults.\n2. Log in as any user (no admin or skill setup).\n3. Send a chat message containing `\u003c$` followed by 50k+ characters with no `\u003e`.\n4. One CPU core pegs in `re`; UI and API stop responding for every user until the worker is killed.\n\n## Patch\nRewrite the optional `|label` as a non-capturing optional group so the two quantifiers no longer overlap. Both patterns become linear; captures and substituted output are unchanged on well-formed `\u003c$id|label\u003e`, `\u003c$id|\u003e`, and bare `\u003c$id\u003e` mentions.\n\n```python\nSKILL_MENTION_RE = re.compile(r'\u003c\\$([^|\u003e]+)(?:\\|[^\u003e]*)?\u003e')\nstrip_re         = re.compile(r'\u003c\\$[^|\u003e]+(?:\\|([^\u003e]*))?\u003e')\n```\n\nAfter the patch the same hostile input returns in under 1 ms. Shipped in v0.10.0.\n\n## Credit\nReported by @Vlad-WKG, including a correct root-cause analysis and patch.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "open-webui",
+        "purl": "pkg:pypi/open-webui"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.9.2"
+            },
+            {
+              "fixed": "0.10.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9.2",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-ffpj-xv5c-p3gw/GHSA-ffpj-xv5c-p3gw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/security/advisories/GHSA-ffpj-xv5c-p3gw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59220"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/commit/61a26722155ec6ee1b629cf8dfcf975098c18331"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-webui/open-webui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/releases/tag/v0.10.0"
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "id": "GHSA-g9hv-x236-4qp3",
+  "modified": "2026-07-24T17:01:27.236404831Z",
+  "published": "2026-07-24T16:47:16Z",
+  "summary": "Russh: client wrong-length X25519 `clone_from_slice` panic (pre-auth DoS)",
+  "details": "### Summary\nA malicious SSH server can crash a `russh` client session with a single\nmalformed key-exchange reply, causing a pre-authentication Denial-of-Service\nbefore the server host key is verified. The embedding process itself stays\nup, but the connection is killed deterministically.\n\n### Details\nEvery *other* kex path in `russh` validates the peer ephemeral length before\ncloning:\n\n- `Curve25519Kex::server_dh` (`russh/src/kex/curve25519.rs:61-65`) checks\n  `if pubkey_len != 32 { return Err(crate::Error::Kex); }` before\n  `clone_from_slice`.\n- The hybrid ML-KEM, ECDH-NIST, and DH/GEX paths all validate lengths.\n\nOnly the client-side curve25519 `compute_shared_secret` is missing the check.\nThis asymmetric validation gap makes the bug easy to miss in code review: a\nmalicious *client* cannot panic a `russh` server this way (the server path\nchecks the length), but a malicious *server* can panic a `russh` client.\n\nIncriminated source code (repo-relative paths):\n\n- Vulnerable `compute_shared_secret`: `russh/src/kex/curve25519.rs:110-117` (panic at line 113)\n- Client-side entry point: `russh/src/client/kex.rs:266-277` (`KEX_ECDH_REPLY` → `Bytes::decode` → `compute_shared_secret`)\n- Server-side contrast (has the length check): `russh/src/kex/curve25519.rs:51-88` (`server_dh`)\n- Session spawn site: `russh/src/client/mod.rs` (`connect_stream` → `russh_util::runtime::spawn`)\n- Runtime wrapper: `russh-util/src/runtime.rs:37-48` (`spawn` wraps `tokio::spawn`; panic surfaces as `JoinError`)\n\n### PoC\nA standalone, self-contained Cargo PoC is provided in\n`vuln_poc/vuln_002_client_wronglen_x25519_panic/` in this repo. It installs a\nglobal panic hook that sets an `AtomicBool` if any panic fires, starts a\nmalicious raw SSH server on `127.0.0.1:0` that completes the SSH id and\n`KEXINIT` exchange, reads the client `KEX_ECDH_INIT`, and sends\n`KEX_ECDH_REPLY` with a 16-byte server ephemeral (instead of 32) and a fake\nsignature. It then calls `russh::client::connect` with `Preferred::kex` set\nto `curve25519-sha256` and a handler that accepts any server key (the check\nis never reached because the client panics first) and prints a clear verdict.\n\nBuild \u0026 run:\n\n```bash\ncd vuln_poc/vuln_002_client_wronglen_x25519_panic\ncargo run --release\n```\n\nExpected output (verdict line, from a successful reproduction):\n\n```\n[poc] panic captured: panicked at russh/src/kex/curve25519.rs:113:25:\n  copy_from_slice: source slice length (16) does not match destination slice length (32)\n[!] Vulnerability reproduced: russh client panicked in Curve25519Kex::compute_shared_secret\n  on a wrong-length (16-byte) server ephemeral before verifying the host key signature\n  (pre-auth client DoS).\n```\n\nThe malicious payload is the `f` field of `KEX_ECDH_REPLY`:\n\n```\nMSG_KEX_ECDH_REPLY (1 byte, value 0x1f)\n  string K_S            (server host key blob — any valid-looking bytes)\n  string f              (server ephemeral — 16 bytes of 0x00 instead of 32)\n  string signature      (fake; never verified by the client)\n```\n\nThe length prefix of `f` is `4` (u32 BE) = 16, followed by 16 bytes. The\n`russh` client decodes this into `exchange.server_ephemeral` (a `Vec\u003cu8\u003e` of\nlength 16) and passes it to `compute_shared_secret`, which panics on\n`clone_from_slice`.\n\n### Impact\n**What kind of vulnerability:** CWE-704 (incorrect type conversion / cast —\n`clone_from_slice` length mismatch) → deterministic panic → pre-authentication\nper-connection Denial-of-Service. The attacker does not need the server's\nprivate key; any network position that can deliver a malformed\n`KEX_ECDH_REPLY` (a rogue server, or a MitM before authentication) suffices.\n\n**Who is impacted:** any deployment that uses `russh::client::connect` (or\n`connect_stream`) to connect to an attacker-controlled or MitM-reachable SSH\nserver, and that negotiates `curve25519-sha256` (the default and\nmost-preferred kex algorithm in `russh`). A single malformed\n`KEX_ECDH_REPLY` kills the client session; the attack is deterministic and\nsingle-packet. The panic is isolated to the spawned session task\n(`tokio::spawn` catches it and surfaces a `JoinError`), so the embedding\nprocess keeps running — the impact is per-connection DoS, not process crash,\nunless the embedder installs a custom panic hook that calls\n`std::process::abort`.\n\n**Workaround:** until a fix is released, clients can reduce exposure by\ndisabling `curve25519-sha256` in the `Preferred::kex` list and preferring a\nkex algorithm whose peer-ephemeral length is validated (e.g. the ECDH-NIST\nor DH/GEX paths). This is a mitigation, not a fix.\n\n**Suggested fix (one-line length check, mirrors the existing server-side\n`server_dh` check):**\n\n```rust\n// russh/src/kex/curve25519.rs, at the top of compute_shared_secret:\nfn compute_shared_secret(\u0026mut self, remote_pubkey_: \u0026[u8]) -\u003e Result\u003c(), crate::Error\u003e {\n    if remote_pubkey_.len() != 32 {\n        return Err(crate::Error::Kex);\n    }\n    let local_secret = self.local_secret.take().ok_or(crate::Error::KexInit)?;\n    let mut remote_pubkey = MontgomeryPoint([0; 32]);\n    remote_pubkey.0.clone_from_slice(remote_pubkey_);\n    let shared = local_secret * remote_pubkey;\n    self.shared_secret = Some(shared);\n    Ok(())\n}\n```\n\nThis makes the client-side `compute_shared_secret` consistent with the\nexisting server-side `server_dh` check at `russh/src/kex/curve25519.rs:61-65`\nand with the other kex paths that already validate peer ephemeral lengths.\n\n[vuln_poc.zip](https://github.com/user-attachments/files/29255207/vuln_poc.zip)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.62.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.62.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-g9hv-x236-4qp3/GHSA-g9hv-x236-4qp3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-g9hv-x236-4qp3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/a7fc1eb5717264e31c3c5f7dd849b73989a08f3d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.62.4"
+    }
+  ]
+}
