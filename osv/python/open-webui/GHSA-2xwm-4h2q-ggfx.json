@@ -1,0 +1,64 @@
+{
+  "id": "GHSA-2xwm-4h2q-ggfx",
+  "modified": "2026-07-24T21:01:20.325572824Z",
+  "published": "2026-07-24T20:51:09Z",
+  "aliases": [
+    "CVE-2026-59212"
+  ],
+  "summary": "Open WebUI: Model meta.knowledge read-only file access can be upgraded to file write/delete",
+  "details": "## Summary\n\nCurrent `main` and `v0.9.6` still allow an authenticated user to turn read-only access to another user's file into write/delete access by attaching that file ID to an attacker-controlled workspace model.\n\nThis is an incomplete-fix variant of `GHSA-vjqm-6gcc-62cr`. The current fix adds `_verify_knowledge_file_access()`, but the validator only checks `has_access_to_file(file_id, \"read\", user)`. The file write/delete routes later trust `has_access_to_file(file_id, \"write\", user)`, and that function grants access through any writable model whose `meta.knowledge` contains the file ID.\n\nThe PoV includes a negative control showing the current validator rejects an inaccessible arbitrary file ID. The residual issue is narrower: a file ID that is readable only through a KB read grant is accepted into direct model file metadata, then the same model metadata satisfies later file write/delete checks.\n\n## Technical Details\n\n`backend/open_webui/routers/models.py::_verify_knowledge_file_access()` accepts model `meta.knowledge` file entries when the caller can read the file:\n\n```python\nif not await has_access_to_file(file_id, 'read', user, db=db):\n    raise HTTPException(...)\n```\n\n`backend/open_webui/utils/access_control/files.py::has_access_to_file()` then uses attacker-writable model metadata as a source for any requested access type:\n\n```python\nfor model in await Models.get_models_by_user_id(user.id, permission=access_type, db=db):\n    knowledge_items = getattr(model.meta, 'knowledge', None) or []\n    for item in knowledge_items:\n        if isinstance(item, dict) and item.get('type') == 'file' and item.get('id') == file.id:\n            return True\n```\n\nFor `access_type=\"write\"`, the attacker-owned model satisfies the model query, so the victim file becomes writable even though the attacker only had read access through the KB grant.\n\nThis crosses another user's integrity and availability boundary, not just the attacker's own account. Before model metadata is involved, the attacker can read the file through a KB grant but cannot write it. After the model metadata entry is accepted, the same file becomes writable/deletable.\n\nThe official docs distinguish attached knowledge permissions: knowledge-base collections may use explicit read grants, while individual files are owner/admin-only. This issue lets a read grant to a KB become direct write/delete authority over an individual file.\n\nThis is also consistent with the documented RBAC model: resource grants have separate `read` and `write` permissions, where write means the user can update or delete the resource. The exploit starts from a read-only KB grant and reaches file write/delete without a corresponding file owner/admin/write authorization.\n\nThe required Models workspace access is not root-equivalent in Open WebUI's documentation. The policy's root-equivalent warning applies to Tools/Functions code execution. This report does not use Tools/Functions, custom Python, admin actions, or a legacy-only path.\n\n## Impact\n\nAn authenticated non-admin user with Models workspace access and read-only access to a victim file through a knowledge-base grant can create/import/update a model that references the file, then rename, overwrite, or delete the victim user's file through write-gated file routes.\n\nConfirmed sinks in current head:\n\n- `POST /api/v1/files/{id}/rename`\n- `POST /api/v1/files/{id}/data/content/update`\n- `DELETE /api/v1/files/{id}`\n\nSuggested severity: High.\n\nSuggested CVSS:\n\n```text\nCVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:H\n```\n\nSuggested CWE:\n\n```text\nCWE-863: Incorrect Authorization\n```\n\nI am not claiming Critical severity because the attacker must be authenticated, must have Models workspace access, and must already have read-only access to the victim file through a KB grant. The High score is based on the post-condition: that limited read access becomes destructive cross-user file write/delete.\n\n## Appendix: AI Disclosure\n\n## Appendix: Local PoV\n\nThe PoV is local-only. It does not start a server, send network traffic, or use a real database. It loads and executes the current-head function bodies for:\n\n- `has_access_to_file()`\n- `_verify_knowledge_file_access()`\n- `delete_file_by_id()`\n\nRun from the harness root:\n\n```bash\nuv run python attached-evidence/poc/pov_openwebui_model_file_read_to_write.py\n```\n\nObserved output:\n\n```json\n{\n  \"confirmed\": true,\n  \"control_inaccessible_file_rejected_by_validator\": true,\n  \"control_read_allowed_via_kb_read_grant\": true,\n  \"control_write_allowed_before_model_laundering\": false,\n  \"model_metadata_validator_passed_with_read_only_access\": true,\n  \"write_allowed_after_attacker_owned_model_contains_file\": true,\n  \"delete_route_result\": {\n    \"message\": \"File deleted successfully\"\n  },\n  \"deleted_file_ids\": [\n    \"victim-file\"\n  ]\n}\n```\n\nThis demonstrates expected versus actual behavior:\n\n- Expected: a user with only read access through a KB grant cannot mutate the victim file.\n- Actual: after the read-only file ID is accepted into attacker-owned model metadata, the same user satisfies the file write/delete guard and deletes the victim file.\n\n## Appendix: Remediation\n\nRecommended defense-in-depth fix:\n\n1. In `_verify_knowledge_file_access()`, require direct file ownership or admin for `type: \"file\"` model knowledge entries. Do not accept indirect KB read access as sufficient authority to attach an individual file to a model.\n2. In `has_access_to_file()`, do not let the model `meta.knowledge` branch grant write access to files. Model-attached knowledge should be read-only unless the caller separately owns/administers the underlying file or has an explicit write-capable file authorization path.\n3. Add regression tests covering the KB-read control, the blocked model attach, and rename/update/delete denial for the victim file.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "open-webui",
+        "purl": "pkg:pypi/open-webui"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.9.6"
+            },
+            {
+              "fixed": "0.10.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9.6"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-2xwm-4h2q-ggfx/GHSA-2xwm-4h2q-ggfx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/security/advisories/GHSA-2xwm-4h2q-ggfx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59212"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/pull/26032"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/commit/17df0264929514599dbcb21c6578bcdfa204b04d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-webui/open-webui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-webui/open-webui/releases/tag/v0.10.0"
+    }
+  ]
+}
