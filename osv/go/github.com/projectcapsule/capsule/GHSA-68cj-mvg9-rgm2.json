@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-68cj-mvg9-rgm2",
+  "modified": "2026-07-31T17:00:21.818026578Z",
+  "published": "2026-07-31T16:53:25Z",
+  "aliases": [
+    "CVE-2026-65834"
+  ],
+  "summary": "Capsule: CapsuleConfiguration NodeMetadata regex fields lack webhook validation, allowing MustCompile panic on all Node admission requests",
+  "details": "### Summary\n\n`CapsuleConfiguration.Spec.NodeMetadata.ForbiddenLabels.Regex` and `ForbiddenAnnotations.Regex` are never validated by any admission webhook. A Cluster Admin can persist a malformed regex to etcd without being blocked. Once stored, every Node `CREATE`, `UPDATE`, or `PATCH` request triggers `regexp.MustCompile()` in `pkg/api/forbidden_list.go:36`, which **panics** and crashes the node admission webhook — causing a cluster-wide Denial of Service for all Node operations.\n\n### Root cause\n\n`internal/webhook/tenant/validation/` contains dedicated regex validators for every Tenant regex field (hostname, storageclass, ingressclass, containerregistry, etc.). `internal/webhook/cfg/` contains **no regex validator at all** — only `owners.go`, `serviceaccount.go`, and `warnings.go`.\n\nThe downstream consumer `internal/webhook/node/user_metadata.go` calls:\n```go\n// line 131\nmatched = forbiddenLabels.RegexMatch(label)\n// line 150\nmatched = forbiddenAnnotations.RegexMatch(annotation)\n```\n\nWhich routes to `pkg/api/forbidden_list.go:36`:\n```go\nfunc (in ForbiddenListSpec) RegexMatch(value string) (ok bool) {\n    if len(in.Regex) \u003e 0 {\n        ok = regexp.MustCompile(in.Regex).MatchString(value) // ← panics on invalid regex\n    }\n    return ok\n}\n```\n\nUnlike `regexp.Compile`, `regexp.MustCompile` panics instead of returning an error. Since no webhook validates the `CapsuleConfiguration` regex fields before storage, a malformed value reaches `MustCompile` on every Node admission request.\n\n### Comparison with existing CVEs\n\n`GHSA-f94q-w3w8-cj67` and `GHSA-gxjc-74v5-3vx3` affect individual Tenant fields — their validators existed but checked the wrong field. This issue is different: **no validator exists at all** for `CapsuleConfiguration` regex fields, and the blast radius is cluster-wide (all Nodes), not scoped to one tenant.\n\n### PoC\n\n```go\npackage main\n\nimport (\n    \"fmt\"\n    \"regexp\"\n)\n\ntype ForbiddenListSpec struct{ Regex string }\n\n// Exact copy of pkg/api/forbidden_list.go:34-38\nfunc (in ForbiddenListSpec) RegexMatch(value string) bool {\n    if len(in.Regex) \u003e 0 {\n        return regexp.MustCompile(in.Regex).MatchString(value)\n    }\n    return false\n}\n\nfunc main() {\n    // 1. cfg webhook has no validator → invalid regex stored in etcd\n    // (no webhook in internal/webhook/cfg/ checks regex fields)\n\n    // 2. Stored malformed regex loaded from CapsuleConfiguration\n    forbidden := ForbiddenListSpec{Regex: `[invalid-regex(`}\n\n    // 3. node/user_metadata.go:131 called on every Node admission request\n    defer func() {\n        if r := recover(); r != nil {\n            fmt.Printf(\"PANIC: %v\\n\", r)\n            // Output: PANIC: regexp: Compile(`[invalid-regex(`): error parsing regexp: missing closing ]\n        }\n    }()\n    forbidden.RegexMatch(\"kubernetes.io/hostname\")\n}\n```\n\nExpected output:\n```\nPANIC: regexp: Compile(`[invalid-regex(`): error parsing regexp: missing closing ]: `[invalid-regex(`\n```\n\n### Fix\n Add a `node_metadata_regex.go` handler to `internal/webhook/cfg/` following the same pattern as `forbidden_annotations_regex.go`:\n\n  ```go\n  package cfg\n\n  import (\n      \"context\"\n      \"regexp\"\n\n      \"sigs.k8s.io/controller-runtime/pkg/client\"\n      \"sigs.k8s.io/controller-runtime/pkg/webhook/admission\"\n\n      capsulev1beta2 \"github.com/projectcapsule/capsule/api/v1beta2\"\n      ad \"github.com/projectcapsule/capsule/pkg/runtime/admission\"\n      \"github.com/projectcapsule/capsule/pkg/runtime/events\"\n      \"github.com/projectcapsule/capsule/pkg/runtime/handlers\"\n  )\n\n  type nodeMetadataRegexHandler struct{}\n\n  func NodeMetadataRegexHandler() handlers.TypedHandler[*capsulev1beta2.CapsuleConfiguration] {\n      return \u0026nodeMetadataRegexHandler{}\n  }\n\n  func (h *nodeMetadataRegexHandler) OnCreate(\n      _ client.Client,\n      _ client.Reader,\n      cfg *capsulev1beta2.CapsuleConfiguration,\n      _ admission.Decoder,\n      _ events.EventRecorder,\n  ) handlers.Func {\n      return func(_ context.Context, req admission.Request) *admission.Response {\n          return h.validate(cfg, req)\n      }\n  }\n\n  func (h *nodeMetadataRegexHandler) OnDelete(\n      client.Client,\n      client.Reader,\n      *capsulev1beta2.CapsuleConfiguration,\n      admission.Decoder,\n      events.EventRecorder,\n  ) handlers.Func {\n      return func(context.Context, admission.Request) *admission.Response {\n          return nil\n      }\n  }\n\n  func (h *nodeMetadataRegexHandler) OnUpdate(\n      _ client.Client,\n      _ client.Reader,\n      cfg *capsulev1beta2.CapsuleConfiguration,\n      _ *capsulev1beta2.CapsuleConfiguration,\n      _ admission.Decoder,\n      _ events.EventRecorder,\n  ) handlers.Func {\n      return func(_ context.Context, req admission.Request) *admission.Response {\n          return h.validate(cfg, req)\n      }\n  }\n\n  func (h *nodeMetadataRegexHandler) validate(cfg *capsulev1beta2.CapsuleConfiguration, req admission.Request) *admission.Response {\n      if cfg.Spec.NodeMetadata == nil {\n          return nil\n      }\n\n      expressions := map[string]string{\n          \"labels\":      cfg.Spec.NodeMetadata.ForbiddenLabels.Regex,\n          \"annotations\": cfg.Spec.NodeMetadata.ForbiddenAnnotations.Regex,\n      }\n\n      for scope, expression := range expressions {\n          if expression == \"\" {\n              continue\n          }\n\n          if _, err := regexp.Compile(expression); err != nil {\n              return ad.Denyf(\n                  \"unable to compile regex %q for forbidden %s: %v\",\n                  expression,\n                  scope,\n                  err,\n              )\n          }\n      }\n\n      return nil\n  }\n\n```\n```\n  Step 2: Register the handler in cmd/controller/main.go:\n\n  route.ConfigValidation(\n      cfgvalidation.Handler(cfg,\n          cfgvalidation.WarningHandler(),\n          cfgvalidation.ServiceAccountHandler(),\n          cfgvalidation.OwnerHandler(),\n          cfgvalidation.NodeMetadataRegexHandler(), // ← ADD THIS LINE\n      ),\n  ),\n```\n\n\n### Impact\n\n A Cluster Admin (or compromised admin account) can update CapsuleConfiguration\n  with a malformed NodeMetadata regex (e.g., `[invalid-regex(`). The update is\n  accepted without validation and persisted to etcd. Once stored, every subsequent\n  Node admission request triggers `regexp.MustCompile()` with the invalid pattern,\n  causing the Capsule node webhook to panic.\n\n  **Affected operations (cluster-wide):**\n  - Node labeling, annotations, and taints (`kubectl label/annotate/taint node`)\n  - Cluster autoscaler operations (cannot register or remove nodes)\n  - Cloud provider node lifecycle management (metadata sync, status updates)\n  - Node maintenance workflows (cordon, drain, uncordon)\n\n  **Severity:**\n  This is a **cluster-wide Denial of Service** affecting all Node infrastructure\n  operations. Unlike tenant-scoped CVEs (GHSA-f94q-w3w8-cj67, GHSA-gxjc-74v5-3vx3)\n  that impact only Ingress or Namespace operations within a single tenant, this\n  vulnerability blocks the entire cluster's ability to manage nodes.\n\n  The cluster cannot scale, perform maintenance, or process any node metadata\n  changes until a Cluster Admin manually corrects the CapsuleConfiguration—requiring\n  direct kubectl access with valid YAML.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/projectcapsule/capsule",
+        "purl": "pkg:golang/github.com/projectcapsule/capsule"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.13.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.13.7",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-68cj-mvg9-rgm2/GHSA-68cj-mvg9-rgm2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/security/advisories/GHSA-68cj-mvg9-rgm2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-65834"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/projectcapsule/capsule"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/releases/tag/v0.13.8"
+    }
+  ]
+}

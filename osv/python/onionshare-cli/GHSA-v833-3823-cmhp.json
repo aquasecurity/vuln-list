@@ -1,0 +1,63 @@
+{
+  "id": "GHSA-v833-3823-cmhp",
+  "modified": "2026-07-31T16:45:48.884943483Z",
+  "published": "2026-07-31T16:27:59Z",
+  "aliases": [
+    "CVE-2026-54707"
+  ],
+  "summary": "OnionShare Receive mode writes uploaded files even when file uploads are disabled",
+  "details": "### Summary\nOnionShare CLI/Desktop 2.6.3 does not enforce the Receive mode `disable_files` setting at the file upload sink. When a Receive service is configured as a text-message-only endpoint (`--disable-files` / \"Disable uploading files\"), a remote sender who can reach the OnionShare service can still send a crafted multipart request containing `file[]`; OnionShare writes the uploaded bytes to disk before the route handler skips file accounting.\n\nThis affects the shipped `onionshare-cli` Python package and the desktop application because both use the same `onionshare_cli.web.receive_mode` request-streaming implementation.\n\n### Details\nTested repository: `https://github.com/onionshare/onionshare` at commit `8cc75e1d7e88bd31f7276733449d412bf71c8999`.\n\nAffected product evidence:\n- `cli/pyproject.toml` declares `onionshare_cli` version `2.6.3`.\n- `desktop/pyproject.toml` declares `onionshare` version `2.6.3` and depends on `onionshare_cli` from `../cli`.\n- `cli/setup.py` publishes `onionshare-cli` and includes `onionshare_cli.web` plus templates/static resources.\n- `desktop/setup.py` publishes `onionshare` and exposes both `onionshare` and `onionshare-cli` console scripts.\n\nReachable default/common paths:\n- CLI Receive mode is exposed through `--receive` (`cli/onionshare_cli/__init__.py:55-57`).\n- The `--disable-files` option is documented and stored in mode settings (`cli/onionshare_cli/__init__.py:156-160`, `cli/onionshare_cli/__init__.py:254-261`).\n- Desktop Receive mode exposes the same setting via the \"Disable uploading files\" checkbox and stores it as `receive.disable_files` (`desktop/onionshare/tab/mode/receive_mode/__init__.py:89-99`, `desktop/onionshare/tab/mode/receive_mode/__init__.py:246-254`).\n- User documentation says \"Disable uploading files\" should \"only allow submitting text messages, like for an anonymous contact form\" (`docs/source/features.rst:64`).\n- Advanced documentation lists `--disable-files` and `disable_files` as the option to disable receiving files (`docs/source/advanced.rst:162-163`, `docs/source/advanced.rst:455`).\n\nRoot cause:\n- The Receive template hides the file input when `disable_files` is set (`cli/onionshare_cli/resources/templates/receive.html:51-56`), but this is only UI-side.\n- The `/upload` route skips `request.files.getlist(\"file[]\")` and file accounting when `disable_files` is enabled (`cli/onionshare_cli/web/receive_mode.py:96-135`). However, by this point Werkzeug has already parsed the multipart body and invoked the custom stream factory.\n- `ReceiveModeRequest.__init__()` treats every `POST /upload` or `POST /upload-ajax` as an upload request and creates a receive directory regardless of `disable_files` (`cli/onionshare_cli/web/receive_mode.py:369-391`).\n- `ReceiveModeRequest._get_file_stream()` creates a writable `ReceiveModeFile` for each uploaded part without checking `self.web.settings.get(\"receive\", \"disable_files\")` (`cli/onionshare_cli/web/receive_mode.py:517-540`).\n- `ReceiveModeFile` opens `\u003creceive_mode_dir\u003e/\u003csecure_filename\u003e.part`, writes attacker-controlled bytes, then renames the `.part` file to the final filename (`cli/onionshare_cli/web/receive_mode.py:272-285`, `cli/onionshare_cli/web/receive_mode.py:320-346`).\n\nFalse-positive screening performed:\n- `secure_filename()` is used at `cli/onionshare_cli/web/receive_mode.py:111-113` and `cli/onionshare_cli/web/receive_mode.py:527-528`, so the confirmed issue is not path traversal; the file is written under the configured receive data directory.\n- The UI hiding the file input is bypassable by direct multipart POST.\n- Route-level `if not disable_files` only affects later accounting/status/webhook behavior; it does not prevent the stream sink from creating and writing the file.\n- Default non-public onion services require the sender to know the onion address and private key unless the user opts into public mode. This limits exposure but does not enforce the user-selected \"text only\" security policy for authorized senders or public contact-form deployments.\n- A control case with `disable_text=True` showed submitted text was not written as a message file, demonstrating the harness was exercising the settings boundary.\n\nAffected versions / patched versions:\n- Affected versions: unknown; confirmed in version `2.6.3` at commit `8cc75e1d7e88bd31f7276733449d412bf71c8999`. Earlier versions were not tested during this audit.\n- Patched versions: 2.6.4\n\nSeverity:\n\n Rationale: `AV:N` because the Receive endpoint is reached over the OnionShare HTTP service; `AC:L` because a crafted multipart POST is straightforward once the service is reachable; `PR:L` because the sender generally needs the OnionShare URL/private key unless the receiver intentionally runs public mode; `UI:N` because no further receiver interaction is required after service startup; `S:U` because the same local application writes the file; `C:N` because this PoC does not read data; `I:L` because the attacker writes unwanted files in a mode configured to reject files; `A:L` because the bypass can consume disk/storage despite the files-disabled policy, bounded by available disk and operator controls.\n\n### PoC\nThe following safe local proof uses only temporary directories and Flask's local test client. In this audit environment, several runtime dependencies were absent (`waitress`, `flask_compress`, `flask_socketio`, `unidecode`, `stem`, `qrcode`), so the harness stubbed those imports while executing the real `receive_mode` request parsing and file writing code. No external network traffic was sent and no real files outside temporary directories were modified.\n\nMaintainer reproduction from a clean checkout with normal dependencies can omit the import stubs and run the same test-client setup, or can start a local Receive service with `--disable-files` and submit a multipart request to `/upload-ajax`.\n\nPositive setup and trigger:\n```python\nimport os, tempfile, shutil\nfrom io import BytesIO\nfrom onionshare_cli.common import Common\nfrom onionshare_cli.settings import Settings\nfrom onionshare_cli.mode_settings import ModeSettings\nfrom onionshare_cli.web import Web\n\nbase = tempfile.mkdtemp(prefix='os-disable-files-poc-')\ndata_dir = os.path.join(base, 'receive-data')\nos.mkdir(data_dir)\n\ncommon = Common()\ncommon.settings = Settings(common)\nmode_settings = ModeSettings(common)\nweb = Web(common, False, mode_settings, 'receive')\nweb.app.testing = True\nweb.proxies = None\nweb.settings.set('receive', 'data_dir', data_dir)\nweb.settings.set('receive', 'disable_files', True)\n\nwith web.app.test_client() as c:\n    res = c.post(\n        '/upload-ajax',\n        buffered=True,\n        content_type='multipart/form-data',\n        data={'file[]': (BytesIO(b'DISABLE_FILES_BYPASS_MARKER'), 'audit.txt')},\n    )\n    print(res.status_code)\n    print(res.get_data(as_text=True))\n    for root, dirs, files in os.walk(data_dir):\n        for name in files:\n            path = os.path.join(root, name)\n            print(os.path.relpath(path, data_dir), open(path, 'rb').read().decode())\n\nshutil.rmtree(base)\n```\n\nObserved output from this environment after re-running the proof after drafting:\n```text\nMay 29, 06:13PM: Upload of total size 274.0 B is starting\n=\u003e 27.0 B audit.txt          positive_status: 200\npositive_response: {\"info_flashes\": [\"Nothing submitted or message was too long (\u003e 524288 characters)\"]}\npositive_written: [('2026-05-29/181347904165/audit.txt', 'DISABLE_FILES_BYPASS_MARKER')]\n```\n\nThe response says nothing/fileless was submitted, but the `audit.txt` file was created under the Receive data directory.\n\nNegative/control case:\n```python\nweb2.settings.set('receive', 'disable_text', True)\n# POST only a text field to /upload-ajax\n```\n\nObserved control output:\n```text\ncontrol_status: 200\ncontrol_response: {\"info_flashes\": [\"Nothing submitted\"]}\ncontrol_written_files: []\ncleanup_done: true\n```\n\nCleanup:\n- The PoC deletes all temporary directories with `shutil.rmtree(...)`; the audit run printed `cleanup_done: true`.\n\n### Impact\nA Receive service operator can configure OnionShare as a text-only submission endpoint (for example, an anonymous contact form) and still receive attacker-controlled files on disk. This bypasses the explicit user-selected restriction and can lead to unwanted file placement and disk consumption in a deployment where file uploads were intentionally disabled.\n\nThe response and GUI/history accounting can be misleading because the route skips file processing while the lower-level request stream has already written the file. This may delay detection by the operator.\n\nThe confirmed issue does not provide arbitrary path traversal because filenames are sanitized and writes occur under the configured Receive data directory.\n\n### Suggested remediation\nEnforce `disable_files` before any multipart file stream is written, not only in the route handler or template:\n\n- In `ReceiveModeRequest._get_file_stream()`, if `self.web.settings.get(\"receive\", \"disable_files\")` is true, reject the file part before creating `ReceiveModeFile`, or route it to a discard stream and mark the request as rejected.\n- Ensure `/upload` and `/upload-ajax` return an explicit error when files are submitted while files are disabled.\n- Avoid creating a receive subdirectory for a file-only request that is rejected by policy.\n- Add regression tests for both `/upload` and `/upload-ajax` proving no file appears under `receive.data_dir` when `receive.disable_files` is true.\n- Add a control regression test proving `disable_text` still prevents message-file creation.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "onionshare-cli",
+        "purl": "pkg:pypi/onionshare-cli"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.3",
+        "2.3.1",
+        "2.3.2",
+        "2.3.3",
+        "2.5",
+        "2.6",
+        "2.6.1",
+        "2.6.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-v833-3823-cmhp/GHSA-v833-3823-cmhp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/security/advisories/GHSA-v833-3823-cmhp"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/commit/a090e97193efc91fbeac9dace7793ea568b83cf5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/onionshare/onionshare"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/releases/tag/v2.6.4"
+    }
+  ]
+}

