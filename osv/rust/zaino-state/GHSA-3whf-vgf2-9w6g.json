@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-3whf-vgf2-9w6g",
+  "modified": "2026-07-31T20:00:18.581395365Z",
+  "published": "2026-07-31T19:49:35Z",
+  "summary": "zaino-state has a Non-Finalized State Reorg — No Cycle Detection or Depth Limit",
+  "details": "### Summary\n`NonFinalizedState::handle_reorg` is a recursive, unbounded async function that traverses parent blocks until it finds a common ancestor on the main chain. It has **no recursion depth limit** and **no cycle detection**. A malicious or buggy validator can serve a block whose `previous_block_hash` points back to itself (or forms a cycle with other blocks), causing `handle_reorg` to infinite-loop, consuming 100% CPU and never making sync progress. Additionally, `update()` contains an `.expect(\"empty snapshot impossible\")` that panics if the non-finalized snapshot becomes empty after trimming finalized blocks.\n\n### Details\n\n**Location:** `packages/zaino-state/src/chain_index/non_finalised_state.rs:443-489`\n\n```rust\nasync fn handle_reorg(\n    \u0026self,\n    working_snapshot: \u0026mut NonfinalizedBlockCacheSnapshot,\n    block: \u0026impl Block,\n) -\u003e Result\u003cIndexedBlock, SyncError\u003e {\n    let prev_block = match working_snapshot\n        .get_block_by_hash_bytes_in_serialized_order(block.prev_hash_bytes_serialized_order())\n        .cloned()\n    {\n        Some(prev_block) =\u003e {\n            if !working_snapshot\n                .heights_to_hashes\n                .values()\n                .any(|hash| hash == prev_block.hash())\n            {\n                Box::pin(self.handle_reorg(working_snapshot, \u0026prev_block)).await?  // \u003c-- LINE 459\n            } else {\n                prev_block\n            }\n        }\n        None =\u003e {\n            let prev_block = self\n                .source\n                .get_block(HashOrHeight::Hash(\n                    zebra_chain::block::Hash::from_bytes_in_serialized_order(\n                        block.prev_hash_bytes_serialized_order(),\n                    ),\n                ))\n                .await\n                .map_err(|e| { ... })?\n                .ok_or(SyncError::ValidatorConnectionError(...))?;\n            Box::pin(self.handle_reorg(working_snapshot, \u0026*prev_block)).await?  // \u003c-- LINE 483\n        }\n    };\n    let indexed_block = block.to_indexed_block(\u0026prev_block, self).await?;\n    working_snapshot.add_block_new_chaintip(indexed_block.clone());\n    Ok(indexed_block)\n}\n```\n\n**Infinite loop via self-referencing block:**\n1. A compromised validator serves a block `B` where `B.prev_hash == B.hash`.\n2. `handle_reorg` is called with `B`.\n3. `get_block_by_hash_bytes_in_serialized_order(B.prev_hash)` finds `B` itself in `working_snapshot.blocks`.\n4. Check: is `B.hash` in `working_snapshot.heights_to_hashes`? If `B` is a new chaintip not yet on the main chain, **no**.\n5. Recurse with `prev_block` = `B` (the exact same block).\n6. This repeats forever. The async recursion builds a new `Box::pin` future each iteration, consuming heap memory and CPU.\n\n**Stack exhaustion via deep reorg:**\nA deep reorg of \u003e1000 blocks would recurse \u003e1000 times. Each async recursion creates a new `Box::pin` future on the heap. While this won't exhaust the native stack immediately, it will allocate unbounded heap memory and CPU time, effectively DoS-ing the sync task.\n\n**`.expect(\"empty snapshot impossible\")` panic:**\n\n**Location:** `packages/zaino-state/src/chain_index/non_finalised_state.rs:543-548`\n\n```rust\nnew_snapshot.remove_finalized_blocks(finalized_height);\nlet best_block = \u0026new_snapshot\n    .blocks\n    .values()\n    .max_by_key(|block| block.chainwork())\n    .cloned()\n    .expect(\"empty snapshot impossible\"); // \u003c-- LINE 548\n```\n\nIf `finalized_height` is greater than or equal to all blocks in `new_snapshot.blocks`, `remove_finalized_blocks` retains only blocks at or above that height. If none exist, `new_snapshot.blocks` becomes empty. The `.expect()` then panics. While the comment claims this is \"impossible,\" defensive programming dictates it is reachable under corruption or edge-case sync conditions.\n\n### PoC\n\n1. Run a regtest.\n2. Serve a block where `header.previous_block_hash == block.hash()`.\n3. Zaino's `NonFinalizedState::sync` enters `handle_reorg` and infinite-loops.\n4. Sync never completes. CPU usage pegs to 100%. No new blocks are served to clients.\n\n### Fix\n\n1. **Add an explicit recursion depth limit** (e.g., max 1000 iterations) and return `SyncError::ReorgFailure` if exceeded:\n   ```rust\n   const MAX_REORG_DEPTH: usize = 1000;\n   ```\n2. **Track visited hashes** in a `HashSet\u003cBlockHash\u003e` during traversal to detect cycles and abort with an error.\n3. **Replace `.expect(\"empty snapshot impossible\")`** with a proper `Err(UpdateError::DatabaseHole)` or similar error return.\n\n### Additional Attack Vectors\n\n- **Deep reorg DoS:** A miner with significant hash power (or a compromised validator) triggers a deep reorg. Zaino spends excessive CPU and memory in `handle_reorg`, starving the async runtime and stalling response serving.\n- **Fork-choice manipulation:** By serving cyclic or very deep sidechains, an attacker can keep Zaino stuck in reorg handling indefinitely, preventing it from ever serving the real best chain.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zaino-state",
+        "purl": "pkg:cargo/zaino-state"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.4.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-3whf-vgf2-9w6g/GHSA-3whf-vgf2-9w6g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/zingolabs/zaino/security/advisories/GHSA-3whf-vgf2-9w6g"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zingolabs/zaino/pull/1172"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zingolabs/zaino/commit/428822509bc722eb9727681752686ede9bc87e77"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zingolabs/zaino/commit/d874295f1377bec7fd712ef75b364181b8c77d46"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zingolabs/zaino/commit/e05112aac54ec3cdb6da29fbc143ea710b32f009"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/zingolabs/zaino"
+    }
+  ]
+}

