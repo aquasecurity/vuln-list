@@ -1,0 +1,76 @@
+{
+  "id": "PYSEC-2026-3585",
+  "modified": "2026-08-04T14:30:27.765363418Z",
+  "published": "2026-08-04T11:34:45.886160Z",
+  "aliases": [
+    "CVE-2026-54706",
+    "GHSA-22p9-r2f5-22mf"
+  ],
+  "summary": "OnionShare follows symlinks in shared directories, allowing unintended disclosure of local files",
+  "details": "### Summary\nOnionShare CLI/Desktop 2.6.3 can follow symbolic links inside a selected Share or Website directory and serve the symlink target rather than limiting access to files physically contained in the selected directory. If a user shares a directory that contains attacker-supplied or otherwise untrusted symlinks, a remote recipient with access to the OnionShare service can read arbitrary local files readable by the OnionShare process that the symlink points to.\n\nThis affects the shipped `onionshare-cli` Python package and the desktop application because both call the same `onionshare_cli.web` file-indexing and streaming code.\n\n### Details\nTested repository: `https://github.com/onionshare/onionshare` at commit `8cc75e1d7e88bd31f7276733449d412bf71c8999`.\n\nAffected product evidence:\n- `cli/pyproject.toml` declares `onionshare_cli` version `2.6.3`.\n- `desktop/pyproject.toml` declares `onionshare` version `2.6.3` and depends on `onionshare_cli` from `../cli`.\n- `cli/setup.py` publishes `onionshare-cli` and includes `onionshare_cli.web` plus templates/static resources.\n- `desktop/setup.py` publishes `onionshare` and exposes both `onionshare` and `onionshare-cli` console scripts.\n\nReachable default/common paths:\n- CLI share mode is the default mode when no `--receive`, `--website`, or `--chat` flag is provided (`cli/onionshare_cli/__init__.py:234-241`) and accepts filesystem paths from CLI arguments (`cli/onionshare_cli/__init__.py:184-189`).\n- CLI website mode is exposed through `--website` (`cli/onionshare_cli/__init__.py:55-59`).\n- Desktop Website mode calls `self.web.website_mode.set_file_info(self.filenames)` before starting (`desktop/onionshare/tab/mode/website_mode/__init__.py:281-287`). Desktop Share mode calls `self.mode.web.share_mode.set_file_info(...)` before serving (`desktop/onionshare/tab/mode/share_mode/threads.py:42-49`).\n- Documentation describes Website mode as selecting files/folders and serving them over OnionShare (`docs/source/features.rst:109-115`).\n\nRoot cause:\n- `SendBaseModeWeb.set_file_info()` expands a single selected directory into immediate children and records `os.path.isfile()` entries without rejecting symlinks (`cli/onionshare_cli/web/send_base_mode.py:73-80`, `cli/onionshare_cli/web/send_base_mode.py:100-130`). On POSIX, `os.path.isfile()` follows a symlink to a regular file.\n- Website mode serves any mapped file path through `stream_individual_file()` (`cli/onionshare_cli/web/website_mode.py:71-97`). `stream_individual_file()` opens the mapped filesystem path directly (`cli/onionshare_cli/web/send_base_mode.py:199-313`, especially `open(file_to_download, \"rb\")` at line 237).\n- Share mode default `/download` can include a symlink target when a single selected folder is expanded into root entries and `ZipWriter.add_file()` calls `self.z.write(filename, ...)` without rejecting symlinks (`cli/onionshare_cli/web/share_mode.py:473-539`, `cli/onionshare_cli/web/share_mode.py:574-580`).\n- Share mode with `--no-autostop-sharing` enables individual file downloads (`cli/onionshare_cli/web/share_mode.py:122-125`) and reaches the same direct streaming sink (`cli/onionshare_cli/web/share_mode.py:430-447`).\n- A partial mitigation exists only for recursive ZIP directory traversal: `ZipWriter.add_dir()` skips `os.path.islink(full_filename)` (`cli/onionshare_cli/web/share_mode.py:582-600`). That mitigation does not cover Website mode, Share individual downloads, or Share ZIP generation for root-level symlinks after the single-folder expansion path.\n\nFalse-positive screening performed:\n- URL path traversal without a mapped entry returned 404; the issue is not raw `../` traversal but symlink following after a selected directory has been indexed.\n- Jinja/template escaping and CSP do not mitigate this because the sink is file read/streaming.\n- Share mode has a symlink skip in recursive ZIP addition, but local PoC confirmed sibling paths still dereference symlinks.\n- The default non-public onion service requires the recipient to know the onion address and private key unless the user opts into public mode; this limits exposure but does not prevent disclosure to an authorized recipient or to anyone with the URL/key.\n\nAffected versions / patched versions:\n- Affected versions: unknown; confirmed in version `2.6.3` at commit `8cc75e1d7e88bd31f7276733449d412bf71c8999`. Earlier versions were not tested during this audit.\n- Patched versions: 2.6.4\n\nSeverity:\n\n- Rationale: `AV:N` because the file is exposed over the OnionShare HTTP service; `AC:H` because exploitation requires the victim to share a directory containing an attacker-influenced or untrusted symlink to a sensitive local file; `PR:L` because the attacker generally needs the OnionShare URL/private key unless the user intentionally runs public mode; `UI:R` because the OnionShare user must select/start sharing the affected directory; `S:U` because the same local process reads and serves the file; `C:H` because the symlink can point at high-value readable local secrets; `I:N/A:N` because the confirmed impact is unintended read/disclosure.\n\n### PoC\nThe following safe local proof uses only temporary files and Flask's local test client. In this audit environment, several runtime dependencies were absent (`waitress`, `flask_compress`, `flask_socketio`, `unidecode`, `stem`, `qrcode`), so the harness stubbed those imports while executing the real `send_base_mode`, `website_mode`, and `share_mode` vulnerable code paths. No external network traffic was sent and no real secrets were read.\n\nMaintainer reproduction from a clean checkout with normal dependencies can omit the import stubs and run the same object/test-client setup, or can start OnionShare locally with a temporary directory containing the symlink.\n\nPositive setup and trigger:\n```python\nimport os, tempfile, shutil\nfrom onionshare_cli.common import Common\nfrom onionshare_cli.settings import Settings\nfrom onionshare_cli.mode_settings import ModeSettings\nfrom onionshare_cli.web import Web\n\nbase = tempfile.mkdtemp(prefix='os-symlink-final-poc-')\noutside = os.path.join(base, 'outside-secret.txt')\nroot = os.path.join(base, 'site')\nos.mkdir(root)\nopen(outside, 'w').write('OUTSIDE_SECRET_MARKER')\nos.symlink(outside, os.path.join(root, 'link.txt'))\n\ncommon = Common()\ncommon.settings = Settings(common)\n\nw = Web(common, False, ModeSettings(common), 'website')\nw.app.testing = True\nw.website_mode.set_file_info([root])\nwith w.app.test_client() as c:\n    print(c.get('/link.txt').status_code)\n    print(c.get('/link.txt').get_data(as_text=True))\n\ns = Web(common, False, ModeSettings(common), 'share')\ns.app.testing = True\ns.share_mode.set_file_info([root])\nwith s.app.test_client() as c:\n    print('OUTSIDE_SECRET_MARKER' in c.get('/download').get_data(as_text=True))\n\ns2 = Web(common, False, ModeSettings(common), 'share')\ns2.app.testing = True\ns2.settings.set('share', 'autostop_sharing', False)\ns2.share_mode.set_file_info([root])\nwith s2.app.test_client() as c:\n    print(c.get('/link.txt').status_code)\n    print(c.get('/link.txt').get_data(as_text=True))\n\nshutil.rmtree(base)\n```\n\nObserved output from this environment after re-running the proof after drafting:\n```text\nwebsite_mapped_link_is_symlink: True\nwebsite_positive_status: 200\nwebsite_positive_body: OUTSIDE_SECRET_MARKER\nwebsite_control_status: 404\nwebsite_control_contains_secret: False\nshare_zip_status: 200\nshare_zip_contains_secret: True\nshare_individual_status: 200\nshare_individual_body: OUTSIDE_SECRET_MARKER\ncleanup_done: true\n```\n\nNegative/control case:\n- Requesting `/missing.txt` in Website mode returned HTTP 404 and did not contain `OUTSIDE_SECRET_MARKER`, showing the proof is not a general path traversal or test harness artifact.\n- Recursive ZIP traversal has a partial control mitigation in `ZipWriter.add_dir()` (`cli/onionshare_cli/web/share_mode.py:593-596`), but the proven variants bypass that sibling mitigation through root-level single-folder expansion and direct file streaming.\n\nCleanup:\n- The PoC deletes the temporary directory with `shutil.rmtree(base)`; the audit run printed `cleanup_done: true`.\n\n### Impact\nA remote recipient of an OnionShare Share or Website service can obtain files outside the selected shared directory if that directory contains a symlink to a readable local file. This can disclose SSH keys, browser profile data, wallet files, documents, or other local secrets readable by the OnionShare process.\n\nThe most realistic attack is a malicious archive/project/export supplied to the OnionShare user that contains a symlink to a sensitive path. If the user extracts or otherwise obtains that directory and shares it with OnionShare, the recipient can request the symlink path through Website mode, Share individual-file mode, or receive it inside the default Share ZIP in the single-folder root-symlink case.\n\nThe issue is especially surprising because one ZIP code path already tries to skip symlinks recursively, which suggests symlink dereference outside the shared tree is not intended.\n\n### Suggested remediation\nReject symlinks and enforce canonical containment both when building the file map and immediately before opening/streaming/zipping a file:\n\n- In `SendBaseModeWeb.set_file_info()`, do not add paths where `os.path.islink(path)` is true.\n- Track selected root directories as canonical `Path.resolve()` values and require every served/zipped file's resolved path to remain under one of those roots.\n- Re-check the resolved path immediately before `open()` in `stream_individual_file()` and before `ZipWriter.add_file()` / `ZipWriter.add_dir()` to avoid symlink-swap/TOCTOU surprises.\n- Add regression tests for:\n  - Website mode serving a root-level symlink.\n  - Website mode serving a nested symlink.\n  - Share default `/download` ZIP for a single selected folder containing a symlink.\n  - Share `--no-autostop-sharing` individual-file symlink download.\n  - Existing recursive ZIP symlink skip behavior.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "onionshare-cli",
+        "purl": "pkg:pypi/onionshare-cli"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.3",
+        "2.3.1",
+        "2.3.2",
+        "2.3.3",
+        "2.5",
+        "2.6",
+        "2.6.1",
+        "2.6.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/onionshare-cli/PYSEC-2026-3585.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/security/advisories/GHSA-22p9-r2f5-22mf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/commit/48f31cfac077fcc9c04c67c2a6dbf87d956f5eec"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/onionshare/onionshare"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/onionshare/onionshare/releases/tag/v2.6.4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/onionshare-cli"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-22p9-r2f5-22mf"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54706"
+    }
+  ]
+}
