@@ -1,0 +1,118 @@
+{
+  "id": "GHSA-x677-9fxg-v5c5",
+  "modified": "2026-08-06T17:00:56.805830211Z",
+  "published": "2026-08-06T16:53:53Z",
+  "aliases": [
+    "CVE-2026-54763"
+  ],
+  "summary": "Traefik: Incomplete fix for CVE-2026-33433 + CVE-2026-39858 cross-cohort: headerField underscore-variant identity spoofing in BasicAuth / DigestAuth / ForwardAuth",
+  "details": "## Summary\n\nThere is a high severity vulnerability in Traefik's BasicAuth, DigestAuth, and ForwardAuth\nmiddlewares. The fix for CVE-2026-33433 stripped canonical-cased spoofed identity headers\n(e.g. `X-Auth-User`) before writing Traefik's own value, but did not account for\nunderscore-variant header names (e.g. `X_Auth_User`), which many backends normalize\nidentically to the dashed form. An attacker able to reach a protected route could inject\nan underscore-variant header that survives Traefik's stripping and reaches the backend\nalongside — or, on the unauthenticated ForwardAuth `authResponseHeaders` path, instead of\n— the value Traefik intended to set, spoofing identity or authorization context. This is\nfixed by setting the new `allowHeadersWithUnderscores: false` entry point option, which\nstrips all headers with underscores in their names before routing.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.51\n- https://github.com/traefik/traefik/releases/tag/v3.6.22\n- https://github.com/traefik/traefik/releases/tag/v3.7.6\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n# Incomplete fix for CVE-2026-33433 + CVE-2026-39858 cross-cohort: `headerField` underscore-variant identity spoofing in BasicAuth / DigestAuth / ForwardAuth\n\n## Summary\n\nThe fix for CVE-2026-33433 (GHSA-qr99-7898-vr7c, \"BasicAuth/DigestAuth Identity Spoofing via Non-Canonical headerField\", patched in v2.11.42 / v3.6.12 / v3.7.0-ea.3) added `req.Header.Del(headerField)` before the literal-key writeback in `pkg/middlewares/auth/basic_auth.go` and `pkg/middlewares/auth/digest_auth.go`. Go's `Header.Del` calls `textproto.CanonicalMIMEHeaderKey` which canonicalizes ASCII CASE and treats `-` as a word separator — so the fix correctly strips canonical-cased attacker headers (`X-Auth-User`, `x-auth-user`, `X-AUTH-USER`, etc.).\n\nHowever, `textproto.CanonicalMIMEHeaderKey` does **NOT** treat `_` as a separator. Attacker-supplied **underscore-variant** headers such as `X_Auth_User` survive `Header.Del(\"X-Auth-User\")` intact and are forwarded to the backend alongside Traefik's own writeback. Many common backends (CGI/WSGI per RFC 3875, PHP `$_SERVER`, nginx with `underscores_in_headers on`, Tomcat / Java EE servlet containers, ASGI/WSGI frameworks) normalize `_` ↔ `-` equivalently or expose both forms to application code that may read the attacker's value.\n\nThis is the **direct cross-cohort sibling** of the threat model the maintainer accepted in **CVE-2026-39858** (GHSA-5m6w-wvh7-57vm, \"Forwarded alias spoofing pre-auth decision bypass\"), which fixed the underscore-variant of the X-Forwarded-* family via `isManagedXHeader` in `pkg/middlewares/forwardedheaders/forwarded_header.go`. The CVE-2026-39858 advisory body states verbatim:\n\n\u003e \"When the backend normalizes underscore and dash header forms equivalently, an attacker can inject spoofed trust context — such as a trusted scheme or host — through the alias headers and bypass authentication on protected routes without valid credentials.\"\n\nThe same threat model applies to the operator-configurable `headerField` (BasicAuth, DigestAuth) and `authResponseHeaders` (ForwardAuth, ingress-nginx snippet provider), but the underscore-handling primitive (`isManagedXHeader`) was not extended to those middlewares. I verified the bypass end-to-end on `traefik:v3.6.14` (the latest patched release containing both fixes) using a default-recommended canonical `headerField: \"X-Auth-User\"` config and reproduced the bypass with a single `curl -H \"X_Auth_User: superadmin\" ...` request alongside valid BasicAuth credentials.\n\nThe defect is present in four code paths at HEAD `eec68dce064f843b4317c4393aaea81b6dea31d6`:\n\n1. `pkg/middlewares/auth/basic_auth.go:101-105` — BasicAuth `headerField`\n2. `pkg/middlewares/auth/digest_auth.go:99-103` — DigestAuth `headerField`\n3. `pkg/middlewares/auth/forward.go:304-310` — ForwardAuth `authResponseHeaders` per-name writeback\n4. `pkg/middlewares/ingressnginx/snippet/snippet.go:480-486` — Ingress-NGINX snippet `authResponseHeaders` per-name writeback\n\nThe ForwardAuth instance (#3) is particularly notable: the attacker does NOT need credentials. The `authResponseHeaders` mechanism is intended to copy identity headers from the trusted auth server only; the underscore-variant bypass lets an unauthenticated attacker pre-inject the same identity header before any auth happens.\n\nThe fast proxy at `pkg/proxy/fast/proxy.go:139` explicitly calls `DisableNormalizing()` on the outgoing fasthttp request, guaranteeing that the underscore-variant header reaches the backend wire verbatim. The standard `httputil.ReverseProxy` path at `pkg/proxy/httputil/proxy.go:55` likewise copies `req.Header` keys as-is during the wire write.\n\n## Affected versions\n\n- `traefik` v3.6.x ≤ 3.6.14, v3.7.x ≤ 3.7.0-rc.2, v2.11.x ≤ 2.11.43, and all earlier versions sharing the same auth middleware architecture.\n\nThe defect is present at HEAD post-CVE-2026-33433 fix (the fix added the `Del` line but the literal-key write defect-class survives for underscore variants).\n\n## Root cause\n\nIn `pkg/middlewares/auth/basic_auth.go` at HEAD `eec68dc`:\n\n```go\nif b.headerField != \"\" {\n    // TODO Deprecated we should add the header with canonical key.\n    req.Header.Del(b.headerField)\n    req.Header[b.headerField] = []string{user}\n}\n```\n\nThe TODO comment shows the maintainer is aware of the literal-key write problem in general (canonical-key write would solve the case-canonicalization issue more cleanly than the current `Del` + literal-write pair). The comment does not acknowledge the underscore-variant survival corollary.\n\n`pkg/middlewares/auth/digest_auth.go:99-103` and the two ForwardAuth paths follow the same `Del` + literal-write pattern. Each is independently exploitable; the underlying primitive defect is shared.\n\nThe maintainer's gold-standard primitive for handling this exact threat class is `pkg/middlewares/forwardedheaders/forwarded_header.go:53-66`:\n\n```go\nfunc isManagedXHeader(key string) bool {\n    if len(key) == 0 || key[0] != 'X' { return false }\n    if _, ok := XHeadersSet[key]; ok { return true }\n    if strings.IndexByte(key, '_') \u003c 0 { return false }\n    canonical := http.CanonicalHeaderKey(strings.ReplaceAll(key, \"_\", \"-\"))\n    _, ok := XHeadersSet[canonical]\n    return ok\n}\n```\n\nThis treats `_` ↔ `-` equivalence as a security requirement. It is reachable only via the static `XHeadersSet` membership check, which contains exclusively the X-Forwarded-* family + X-Real-Ip. Operator-configurable identity headers are out of scope of this primitive.\n\n## Proof of concept\n\nVerified on `traefik:v3.6.14` (the patched version, post-CVE-2026-33433 and post-CVE-2026-39858) using Docker compose. Full reproducer at https://github.com/\u003cattacker-repo\u003e/traefik-ht1a-poc; commands below are verbatim.\n\n### Setup\n\n```yaml\n# docker-compose.yml\nservices:\n  traefik:\n    image: traefik:v3.6.14\n    command:\n      - --providers.file.filename=/etc/traefik/dynamic.yml\n      - --entrypoints.web.address=:80\n    ports:\n      - \"8080:80\"\n    volumes:\n      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro\n  echo:\n    image: mendhak/http-https-echo:36\n    environment:\n      - HTTP_PORT=8888\n```\n\n```yaml\n# traefik/dynamic.yml — canonical headerField, recommended operator config\nhttp:\n  routers:\n    protected:\n      rule: \"PathPrefix(`/`)\"\n      service: echo\n      middlewares: [basic-auth]\n  services:\n    echo:\n      loadBalancer:\n        servers: [{url: \"http://echo:8888\"}]\n  middlewares:\n    basic-auth:\n      basicAuth:\n        users:\n          - 'alice:$2b$05$FhDfYidZdDPuQjovYqcTAe22wHpQ/cILC7Tr2yAD6vLlvZh/Q45PC'   # alice:secret123\n        headerField: \"X-Auth-User\"\n```\n\n`docker compose up -d`.\n\n### Test 1 (control — CVE-2026-33433 fix works for canonical case)\n\n```bash\n$ curl -s -u alice:secret123 -H \"X-Auth-User: superadmin\" http://localhost:8080/\n{\n  ...\n  \"x-auth-user\": \"alice\",\n  ...\n}\n```\n\nThe attacker's canonical `X-Auth-User: superadmin` was correctly stripped by Traefik's `Del`; the backend receives only Traefik's authenticated-user writeback `alice`.\n\n### Test 2 (HT-1A bypass — underscore variant survives)\n\n```bash\n$ curl -s -u alice:secret123 -H \"X_Auth_User: superadmin\" http://localhost:8080/\n{\n  ...\n  \"x-auth-user\": \"alice\",\n  \"x_auth_user\": \"superadmin\",\n  ...\n}\n```\n\nThe underscore-variant `x_auth_user: superadmin` reached the backend intact, despite the `Del(\"X-Auth-User\")` having executed. The backend sees both forms.\n\n### Test 3 (double-send — same result)\n\n```bash\n$ curl -s -u alice:secret123 \\\n    -H \"X-Auth-User: superadmin\" \\\n    -H \"X_Auth_User: superadmin\" \\\n    http://localhost:8080/\n{\n  ...\n  \"x-auth-user\": \"alice\",       # Traefik's writeback\n  \"x_auth_user\": \"superadmin\",  # attacker's underscore — survived Del\n  ...\n}\n```\n\nThe canonical attacker header is stripped (Test 1 behavior). The underscore variant is forwarded.\n\n### Backend impact\n\nThe PoC's echo backend (`mendhak/http-https-echo`, Node.js) preserves both forms with the lowercase normalization Node.js applies. Application code reading `req.headers[\"x-auth-user\"]` sees `alice`. Application code reading `req.headers[\"x_auth_user\"]` sees `superadmin`.\n\nFor backends that normalize `_` ↔ `-` equivalently — meaning the attacker's value wins:\n\n- **CGI / WSGI / PHP `$_SERVER`** (RFC 3875 §4.1.18 — header name uppercased with `-` replaced by `_`): both `X-Auth-User` and `X_Auth_User` map to `HTTP_X_AUTH_USER`. The last-set wins per the WSGI server's iteration order; many servers (gunicorn, uwsgi without `--disable-logging`, waitress) preserve both. Note: Apache + mod_php with default `HttpProtocolOptions Strict` filters underscore-headers from `$_SERVER` (this PoC's PHP backend test demonstrated the filter); Apache + mod_python, Apache + mod_wsgi without the strict mode, nginx + uwsgi, nginx + gunicorn, nginx + FastCGI, and standalone WSGI servers do NOT filter.\n- **nginx with `underscores_in_headers on`** (https://nginx.org/en/docs/http/ngx_http_core_module.html#underscores_in_headers): preserves underscore-variant headers and forwards them to upstream as separate values. Upstream application logic that does case-insensitive + underscore-insensitive matching (common pattern in security-sensitive code) merges them.\n- **Tomcat / Java EE servlet containers**: `HttpServletRequest.getHeader(name)` is case-insensitive; underscore handling is container-specific. Many normalize.\n- **Application middleware** (WAFs, log aggregators, security gateways, identity-aware proxies) that normalize header names before applying security policy: both forms collapse to the same authorization decision input.\n\n## Severity\n\nI propose **HIGH CVSS 7.5** for the BasicAuth / DigestAuth case and **CRITICAL CVSS 9.1** for the ForwardAuth `authResponseHeaders` case (the latter requires no credentials).\n\n**CVSS 3.1 vector (BasicAuth / DigestAuth)**: `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N=7.5` — one step above CVE-2026-33433 (which the maintainer scored MEDIUM 5.1 because it required misconfigured non-canonical `headerField`). HT-1A works against the canonical / recommended `headerField` configuration, broader operational scope.\n\n**CVSS 3.1 vector (ForwardAuth `authResponseHeaders`)**: `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N=9.1` — parallel to CVE-2026-39858 (HIGH 7.5) but achieves spoofing without credentials because the `authResponseHeaders` mechanism trusts headers exclusively from the auth server and the underscore variant defeats that trust boundary.\n\nCWEs:\n- CWE-290 (Authentication Bypass by Spoofing)\n- CWE-178 (Improper Handling of Case Sensitivity) — analogous to CVE-2026-29054\n- CWE-345 (Insufficient Verification of Data Authenticity) — same as CVE-2026-35051\n\n## Suggested fix\n\nTwo equivalent approaches:\n\n**1. Extend `Header.Del` to handle underscore variants** at the four call sites. Replace:\n\n```go\nreq.Header.Del(b.headerField)\nreq.Header[b.headerField] = []string{user}\n```\n\nwith:\n\n```go\ncanonical := http.CanonicalHeaderKey(b.headerField)\n// Strip canonical AND underscore-variant of the canonical key.\nfor key := range req.Header {\n    if key == canonical || strings.EqualFold(strings.ReplaceAll(key, \"_\", \"-\"), canonical) {\n        delete(req.Header, key)\n    }\n}\nreq.Header.Set(canonical, user)  // canonical-key write\n```\n\nThis pairs the headerField primitive with the same `_` ↔ `-` equivalence that `isManagedXHeader` enforces for X-Forwarded-*.\n\n**2. Generalize the existing `isManagedXHeader` primitive** into a `stripHeaderAndVariants(headers http.Header, name string)` helper in the `forwardedheaders` package and call it from `basic_auth.go`, `digest_auth.go`, `forward.go`, and `snippet.go`. Reusing the existing gold-standard primitive is the cleanest fix and minimizes future drift.\n\nEither approach should also resolve the `// TODO Deprecated we should add the header with canonical key.` debt at `basic_auth.go:102` and `digest_auth.go:100` by writing to the canonical key (`Header.Set(canonical, user)`) instead of the literal `b.headerField`.\n\n## Why this is a Pattern-8 sibling, not a new CVE class\n\nThe combination of:\n\n1. CVE-2026-33433's fix scope (case-canonicalization for `headerField`)\n2. CVE-2026-39858's fix scope (underscore-variant for `XHeadersSet`)\n3. The defective primitive remaining at HEAD (the `Del` + literal-write pair at four call sites)\n\nestablishes that the maintainer accepts the threat model and has architectural primitives to fix it — but did not cross the two cohorts. The \"primitive depth-audit\" of the CVE-2026-33433 fix (reading the actual `Header.Del` implementation against the documented threat model and Go's canonicalization semantics) reveals the gap.\n\nI confirmed there is no public PoC mentioning underscore-variant siblings of CVE-2026-33433 (WebSearched 2026-05-23). The fix-flurry from the April 2026 security release batch addressed the X-Forwarded family but not the headerField family.\n\n## Credit\n\nMatteo Panzeri (GitHub `matte1782`). CVE credit requested.\n\n## AI-assistance disclosure\n\nStatic analysis, hypothesis writing, and hostile-review confirmation were assisted by Anthropic Claude (Opus 4.7). Live PoC reproduction, code-citation verification, and submission decision were made by the human author.\n\n\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.51"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.50",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-x677-9fxg-v5c5/GHSA-x677-9fxg-v5c5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.6.22"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.6.21",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-x677-9fxg-v5c5/GHSA-x677-9fxg-v5c5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.7.0"
+            },
+            {
+              "fixed": "3.7.6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.7.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-x677-9fxg-v5c5/GHSA-x677-9fxg-v5c5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-x677-9fxg-v5c5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54763"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/pull/13262"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/commit/108a5264473a2cbc8f12d6d691a3c6553cdf2c1b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.51"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.6.22"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.6"
+    }
+  ]
+}
