@@ -1,0 +1,51 @@
+{
+  "id": "GHSA-945v-v9p3-v5xw",
+  "modified": "2026-08-05T20:15:26.566621335Z",
+  "published": "2026-08-05T20:03:14Z",
+  "summary": "rclone local `--metadata` applies attacker-controlled mode/uid - setuid binary planted from an untrusted remote",
+  "details": "### Summary\nWhen writing an object with metadata, the local backend applies the source-supplied `mode`, `uid`, and `gid` verbatim: it parses `mode` as an octal integer and passes it straight into `os.Chmod(o.path, os.FileMode(umode))`, and passes `uid`/`gid` straight into `os.Chown`. The value is never masked to permission bits, so any value with Go's `ModeSetuid` (1\u003c\u003c23) or `ModeSetgid` (1\u003c\u003c22) bit set causes the setuid/setgid bit to be applied. Because both the file content and its metadata come from the (attacker-controlled) source remote, an attacker stores a binary of their choosing with `mode = 40000755` (and `uid = 0`); when the victim runs `rclone copy -M \u003cremote\u003e: /dest`, rclone writes the attacker's binary and makes it setuid. If the victim runs rclone as root (typical for system backup/restore), the `uid=0` chown plus setuid produces a root-owned setuid binary with attacker content — any local user then escalates to root. When rclone runs as a non-root service user, the planted setuid binary is owned by that user, giving any local user that user's privileges (lateral escalation / persistent backdoor).\n\n### Details\n`backend/local/metadata.go`, `writeMetadataToFile()`:\n```go\nuid, hasUID := o.parseMetadataInt(m, \"uid\", 10)\ngid, hasGID := o.parseMetadataInt(m, \"gid\", 10)\nif hasUID {\n    ...\n    err = os.Chown(o.path, uid, gid)        // source-controlled owner, no same-uid guard\n}\nmode, hasMode := o.parseMetadataInt(m, \"mode\", 8)\nif hasMode \u0026\u0026 mode \u003e= 0 {\n    umode := uint(mode)\n    if umode \u003c= math.MaxUint32 {\n        err = os.Chmod(o.path, os.FileMode(umode))   // \u003c-- raw value; ModeSetuid/ModeSetgid NOT masked off\n    }\n}\n```\n`os.Chmod`/`os.FileMode` honor `ModeSetuid`/`ModeSetgid`/`ModeSticky`. There is no `\u0026^ (os.ModeSetuid|os.ModeSetgid)` mask and no check that the source is trusted, so an attacker-chosen `mode` string sets those bits on the freshly written, attacker-controlled file. (Note: a legitimate local source reports `mode` in unix `st_mode` layout e.g. `0106755`, whose bit 1\u003c\u003c23 is unset, so honest copies happen to drop setuid — but the attacker supplies the Go-`FileMode` layout `40000755` directly, which sets it.)\n\n### PoC\n1) Get the official stable binary:\n```\ncurl -fsSLO https://downloads.rclone.org/v1.74.3/rclone-v1.74.3-linux-amd64.zip\nunzip -j rclone-v1.74.3-linux-amd64.zip '*/rclone' -d .      # ./rclone -\u003e v1.74.3\n```\n2) Create a payload (the attacker-controlled binary content) and copy it with the malicious `mode` metadata:\n```\nmkdir -p msrc mdst \u0026\u0026 cp /bin/true msrc/payload\n./rclone copy -M --metadata-set mode=40000755 msrc mdst       # 40000755 = Go FileMode setuid|0755\n```\n3) Observe — the destination file is now setuid:\n```\nstat -c '%A %a' mdst/payload\n-rwsr-xr-x 4755                                               # 's' = setuid bit SET on attacker binary\n```\nVariants: `mode=20000755` → setgid (`-rwxr-sr-x`); `mode=60000755` → both (`-rwsr-sr-x`). With rclone run as root and the source object also carrying `uid=0`/`gid=0`, the file is chown'd root:root, yielding a root-owned setuid binary executable by any local user.\n\n\n### Impact\nA victim performing a metadata-preserving copy/restore (`-M`) from an untrusted or compromised remote installs an attacker-chosen executable with the setuid/setgid bit set. Run as root (system backup/restore, the common case for `--metadata`), this is a root-owned setuid root backdoor executable by any local user → local privilege escalation to root. Run as a non-root user, it is a setuid backdoor for that service account. The companion `uid`/`gid` application lets a root-run transfer also reassign ownership of written files arbitrarily.\n\n### Remediation\nMask special bits before applying mode from metadata — `os.Chmod(o.path, os.FileMode(umode).Perm())` (or `umode \u0026 0o777`) — and do not honor setuid/setgid/sticky from source metadata; gate `uid`/`gid`/setuid application behind an explicit opt-in (e.g. `--local-metadata-set-ownership`) that is off by default, and document that `-M` from untrusted remotes must not restore privileged bits. Regression test: copying an object with `mode=40000755`/`uid=0` must produce a non-setuid, caller-owned file unless the opt-in is set.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.74.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.74.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-945v-v9p3-v5xw/GHSA-945v-v9p3-v5xw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-945v-v9p3-v5xw"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/e58f09739a35774ca82b5211d2377ac0f2051500"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.74.4"
+    }
+  ]
+}

