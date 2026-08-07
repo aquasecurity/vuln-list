@@ -1,0 +1,171 @@
+{
+  "id": "GHSA-hmq2-w58f-27jc",
+  "modified": "2026-08-07T16:00:19.643720725Z",
+  "published": "2026-08-07T15:45:39Z",
+  "summary": "GitPython: Arbitrary Git Repository Creation Outside the Working Tree via Unvalidated .gitmodules Submodule Name in GitPython",
+  "details": "### Summary\nGitPython computes the on-disk location of a submodule's separate Git directory (`.git/modules/\u003cname\u003e`) from the submodule's `.gitmodules` section name with no validation. Because that name is fully attacker-controlled content of a cloned repository, a malicious repository can set a submodule name to a traversal string (e.g. `../../../../home/victim/.something`) and cause GitPython to create and initialize a full Git repository at an attacker-chosen filesystem path outside the intended clone directory. The only precondition is that a victim clones the malicious repository with GitPython and runs submodule initialization (`submodule_update(init=True)` / `sm.update(init=True)`), a very common and often automatic step. Core Git itself already blocks this exact attack class (CVE-2018-11235), but GitPython's independent reimplementation never adopted an equivalent check.\n\n### Details\n`src/GitPython/git/objects/submodule/util.py` `sm_name()` strips the `submodule \"` / `\"` wrapper from a `.gitmodules` `[submodule \"...\"]` header and returns the result unchecked. `Submodule.iter_items()` in `src/GitPython/git/objects/submodule/base.py` reads this via `sm_name(sms)` and assigns it to `sm._name`; unlike the submodule `path`, `name` is never used for a tree lookup, so it is never implicitly validated. `Submodule._module_abspath()` then builds `osp.join(parent_repo.git_dir, \"modules\", name)` - `os.path.join` does not normalize `../` sequences. `Submodule._clone_repo()` passes this value straight to `os.makedirs()` and to `git clone --separate-git-dir=\u003cmodule_abspath\u003e`, creating and populating a full Git repository (objects, refs, hooks, config) at the escaped path. Attack prerequisite: attacker controls a repository the victim clones and initializes submodules for.\n\n### PoC\n1. Environment: Docker image built `FROM python:3.11-slim`, with `git` installed via `apt-get install -y git` (Debian bookworm packaged version, described in the advisory as \"git 2.x\"; the host-side verification separately used system git `2.34.1`, but no exact version is pinned for the git binary inside this Docker image). GitPython is installed inside the container via `pip install /src/GitPython` from this repository's own source, which the advisory states resolved to the officially released `GitPython==3.1.57` and `gitdb==4.0.12`.\n2. Configuration / preconditions: None beyond what's described - the victim must clone the attacker's repository with GitPython and run submodule initialization (`repo.submodules` + `sm.update(init=True)`, equivalent to `git submodule update --init`).\n3. Commands run (quoted verbatim from the advisory's \"Confirmed test run\" section):\n```bash\n$ docker build -f GHSA/testing/Dockerfile -t ghsa-gitpython-poc .\n$ docker run --rm ghsa-gitpython-poc\n```\n(Per the Dockerfile, `docker run` executes `/work/run_all.sh`, which in turn runs `build_attacker_repo.sh`, then `poc_gitpython.py`, then `poc_control_realgit.sh`.)\n4. Full source of the PoC script (`GHSA/testing/poc_gitpython.py`), verbatim:\n```python\n\"\"\"GHSA-001 PoC: GitPython side.\n\nClones the attacker repo and runs the equivalent of\n`git submodule update --init` via GitPython, then checks whether a git\nrepository was created outside the clone directory.\n\"\"\"\nimport os\nimport shutil\n\nimport git\n\nCLONE_DIR = '/work/victim_clone/repo'\nESCAPE_TARGET = '/tmp/gitpython_poc_escaped_root'\n\n\ndef main():\n    shutil.rmtree(os.path.dirname(CLONE_DIR), ignore_errors=True)\n    shutil.rmtree(ESCAPE_TARGET, ignore_errors=True)\n    os.makedirs(os.path.dirname(CLONE_DIR), exist_ok=True)\n\n    print(f'GitPython version: {git.__version__}')\n    repo = git.Repo.clone_from('/work/attacker_repo', CLONE_DIR)\n    print('Cloned into:', repo.working_tree_dir)\n\n    sms = list(repo.submodules)\n    for sm in sms:\n        print('  submodule name:', repr(sm.name))\n        print('  submodule path:', repr(sm.path))\n\n    print('escape_target exists before update:', os.path.exists(ESCAPE_TARGET))\n\n    for sm in sms:\n        try:\n            sm.update(init=True)\n        except Exception as e:\n            print('sm.update raised:', repr(e))\n\n    exists = os.path.exists(ESCAPE_TARGET)\n    print('escape_target exists after update:', exists)\n    if exists:\n        print('escape_target contents:', os.listdir(ESCAPE_TARGET))\n\n    print('POC_RESULT=VULNERABLE' if exists else 'POC_RESULT=SAFE')\n\n\nif __name__ == '__main__':\n    main()\n```\n5. Exact captured terminal output (verbatim, from the original advisory's \"Confirmed test run (Docker, released package)\" section):\n```\n=== GitPython PoC (vulnerable path) ===\nGitPython version: 3.1.57\nCloned into: /work/victim_clone/repo\n  submodule name: '../../../../../../tmp/gitpython_poc_escaped_root/modules_dir'\n  submodule path: 'legit_dir'\nescape_target exists before update: False\nescape_target exists after update: True\nescape_target contents: ['modules_dir']\nPOC_RESULT=VULNERABLE\n\n=== Control: real git CLI on identical repo ===\nwarning: ignoring suspicious submodule name: ../../../../../../tmp/gitpython_poc_escaped_root/modules_dir\nwarning: ignoring suspicious submodule name: ../../../../../../tmp/gitpython_poc_escaped_root/modules_dir\nfatal: No url found for submodule path 'legit_dir' in .gitmodules\nCONTROL_RESULT=SAFE (real git correctly refused)\n```\n6. Payload: the attacker rewrites the `.gitmodules` section header from `[submodule \"legit_dir\"]` to `[submodule \"../../../../../../tmp/gitpython_poc_escaped_root/modules_dir\"]` (built by `build_attacker_repo.sh`, part of the harness in `GHSA/testing/`). The malicious part is the `../../../../../../` traversal sequence embedded in the submodule *name* (not the tree-validated `path`), which becomes the on-disk target for the submodule's separate git directory.\n7. Expected vs. observed: A safe implementation (as demonstrated by the real `git` CLI control run) rejects the submodule name with \"ignoring suspicious submodule name\" and refuses to create anything outside the repository. GitPython instead created the escape-target directory and a fully-initialized Git repository at `/tmp/gitpython_poc_escaped_root/modules_dir`, confirmed by `escape_target exists after update: True` and its listed contents.\n8. Security impact demonstrated: arbitrary filesystem directory and Git-repository creation at an attacker-chosen absolute path outside the victim's intended clone directory, populated with attacker-controlled content sourced from the submodule's own (also attacker-controlled) `url`.\n\n### Impact\nPath traversal (CWE-22) / external control of file path (CWE-73) leading to arbitrary directory and Git-repository creation outside the intended clone directory. Integrity impact is High (attacker chooses destination path and, via the submodule URL, much of the written content); Confidentiality impact is None (only creation was demonstrated); Availability impact is Low-Medium (disk-exhaustion potential). No authentication is required; the attacker only needs to control a repository the victim clones and initializes submodules for - a routine, often fully-automatic operation in CI pipelines, IDE integrations, and dependency-management tooling.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.58"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.57",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-hmq2-w58f-27jc/GHSA-hmq2-w58f-27jc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-hmq2-w58f-27jc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2202"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/4299c990e1ca21896f9485277caf7bb0ae5b404c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/e4b8e7d026ca6abb4cf604f8e77093432ce23c06"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.58"
+    }
+  ]
+}
