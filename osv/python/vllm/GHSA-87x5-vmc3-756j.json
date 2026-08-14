@@ -1,0 +1,75 @@
+{
+  "id": "GHSA-87x5-vmc3-756j",
+  "modified": "2026-08-13T21:00:13.455601301Z",
+  "published": "2026-08-13T18:40:06Z",
+  "aliases": [
+    "CVE-2026-73559"
+  ],
+  "summary": "vLLM: Completion prompt lists fan out into unbounded engine requests",
+  "details": "## Summary\n\nThe `/v1/completions` request model accepts `prompt` as a list of text prompts or a list of token-id prompts without any outer prompt-count bound. The serving path turns each element into a separate engine input, creates one engine generator per element, merges all generators, and allocates a response slot per prompt. An authenticated API client can therefore turn one request into an attacker-chosen number of backend subrequests before any aggregate request-count budget is enforced.\n\n## Technical Details\n\n`CompletionRequest.prompt` allows both list-shaped prompt inputs and scalar prompts:\n\n```python\n# vllm/entrypoints/openai/completion/protocol.py\nprompt: (\n    list[Annotated[int, Field(ge=0)]]\n    | list[list[Annotated[int, Field(ge=0)]]]\n    | str\n    | list[str]\n    | None\n) = None\n```\n\nThe validator only requires some prompt-like input to be present:\n\n```python\ndef validate_prompt_and_prompt_embeds(cls, data):\n    prompt = data.get(\"prompt\")\n    prompt_embeds = data.get(\"prompt_embeds\")\n    ...\n    if prompt_is_empty and embeds_is_empty:\n        raise VLLMValidationError(...)\n```\n\nThe renderer then expands list-shaped prompts as a sequence. `prompt_to_seq()` wraps a scalar string or a single token-id list, but returns a `list[str]` or `list[list[int]]` unchanged:\n\n```python\n# vllm/renderers/inputs/preprocess.py\ndef prompt_to_seq(prompt_or_prompts):\n    if isinstance(prompt_or_prompts, (dict, str, bytes)) or (\n        len(prompt_or_prompts) \u003e 0 and is_list_of(prompt_or_prompts, int)\n    ):\n        return [prompt_or_prompts]\n\n    return prompt_or_prompts\n```\n\n`OnlineRenderer.preprocess_completion()` appends that whole sequence, and the renderer processes every element:\n\n```python\n# vllm/renderers/online_renderer.py\nprompts = list[SingletonPrompt | bytes]()\nif prompt_input is not None:\n    prompts.extend(prompt_to_seq(prompt_input))\n...\nparsed_prompts = [\n    prompt if isinstance(prompt, bytes) else parse_model_prompt(model_config, prompt)\n    for prompt in prompts\n]\nreturn await renderer.render_cmpl_async(parsed_prompts, tok_params, ...)\n```\n\nFinally, completion serving creates one backend generator and one response slot per rendered prompt:\n\n```python\n# vllm/entrypoints/openai/completion/serving.py\ngenerators: list[AsyncGenerator[RequestOutput, None]] = []\nfor i, engine_input in enumerate(engine_inputs):\n    ...\n    generator = self.engine_client.generate(...)\n    generators.append(generator)\n\nresult_generator = merge_async_iterators(*generators)\nnum_prompts = len(engine_inputs)\n...\nfinal_res_batch: list[RequestOutput | None] = [None] * num_prompts\n```\n\nThe violated invariant is that one HTTP request should have a bounded backend request count. Current code enforces per-prompt token and sampling limits, but not the number of prompts in the outer completion request.\n\n## PoV\n\nA minimal oversized request keeps normal generation parameters small but supplies a large outer prompt list:\n\n```json\n{\n  \"model\": \"served-model\",\n  \"prompt\": [\"x\", \"x\", \"x\"],\n  \"max_tokens\": 1,\n  \"n\": 1\n}\n```\n\nScaling the `prompt` array to tens or hundreds of thousands of short entries makes the server allocate, preprocess, schedule, merge, and buffer one subrequest per entry. The same applies to token-id prompt lists:\n\n```json\n{\n  \"model\": \"served-model\",\n  \"prompt\": [[1], [1], [1]],\n  \"max_tokens\": 1,\n  \"n\": 1\n}\n```\n\nThe intended negative control is a scalar prompt:\n\n```json\n{\n  \"model\": \"served-model\",\n  \"prompt\": \"x\",\n  \"max_tokens\": 1,\n  \"n\": 1\n}\n```\n\nThe scalar string is wrapped as one prompt; the list form is not bounded and fans out by list length.\n\n\n## Impact\n\nAn authenticated API client can make one `/v1/completions` request consume CPU, memory, async task scheduling, engine request slots, and response buffering proportional to an attacker-chosen outer prompt list. This can starve or disrupt other tenants sharing the same vLLM server. The report does not claim unauthenticated access, confidentiality impact, integrity impact, code execution, or impact where `/v1/completions` is not reachable by untrusted or semi-trusted clients.\n\n## Suggested Fix\n\nReject oversized prompt lists before renderer preprocessing. Add an outer prompt-count limit to `CompletionRequest.prompt` when the prompt is `list[str]` or `list[list[int]]`, and consider making the limit configurable in the same style as the batch-chat and sampling-list bounds. The check should run before `OnlineRenderer.preprocess_completion()` expands the prompt sequence, so oversized requests do not allocate parsed prompt lists, async render/tokenization tasks, engine generators, or response result slots.\n\nRegression coverage should include a scalar prompt, a bounded prompt list, an oversized `list[str]`, and an oversized `list[list[int]]`. The oversized requests should fail with a controlled validation error before any backend generator is created.\n\n## Affected Package/Versions\n\nPackage ecosystem: pip\n\nPackage name: `vllm`\n\nAffected range confirmed by source proof: `\u003e=0.19.0, \u003c=0.24.0`; current `main` at `cbe9c40f998f13975b967773ac7e7920e115387f` remains affected.\n\nPatched versions: unknown.\n\nLatest release checked: `v0.24.0`, published on 2026-06-29.\n\n## GitHub Advisory Metadata\n\nPackage ecosystem: pip\n\nPackage name: `vllm`\n\nVulnerable version range: `\u003e=0.19.0, \u003c=0.24.0`\n\nPatched versions: unknown\n\n## Advisory History\n\nPublic issue and PR searches for `CompletionRequest prompt list`, `\"prompt\" \"list[str]\" \"completion\"`, and `\"CompletionRequest\" \"max_length\"` did not find an existing report or fix for this exact path.\n\nThe closest published advisory is `GHSA-3mwp-wvh9-7528`, \"OOM Denial of Service via Unbounded `n` Parameter in OpenAI API Server\", patched in `0.19.0`. This report is distinct because it keeps `n=1` and uses the `/v1/completions` `prompt` outer list to create one engine request per prompt. The fix invariant is an outer prompt-count and aggregate request budget, not only a generated-sequence-count cap.\n\nThe closest public PR is `vllm-project/vllm#45390`, which covers multiple DoS fixes including `GHSA-83mh-6mwq-3hg9` for `BatchChatCompletionRequest.messages`. That PR adds an outer bound to batch chat conversations, but its diff does not touch `vllm/entrypoints/openai/completion/protocol.py` or `vllm/entrypoints/openai/completion/serving.py`.\n\nPrior local/private report families checked included pooling/rerank batch fanout, derender token-id postprocessing, explicit `truncation_side` tokenizer-limit bypass, Python disaggregated generate prompt-length bypass, and priority scheduling. Those reports differ by endpoint, attacker-controlled field, sink, and fix surface.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.19.0"
+            },
+            {
+              "fixed": "0.26.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.19.0",
+        "0.19.1",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-87x5-vmc3-756j/GHSA-87x5-vmc3-756j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-87x5-vmc3-756j"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73559"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/47845"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/675f4295cdfe0d870471c2b51bfeca3a68a9569e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.26.0"
+    }
+  ]
+}
