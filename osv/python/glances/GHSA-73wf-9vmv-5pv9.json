@@ -1,0 +1,59 @@
+{
+  "id": "GHSA-73wf-9vmv-5pv9",
+  "modified": "2026-08-17T17:30:07.219454108Z",
+  "published": "2026-08-17T17:20:24Z",
+  "aliases": [
+    "CVE-2026-62982"
+  ],
+  "summary": "Glances: Incomplete fix of CVE-2026-32608: action-template sanitizer is bypassed by nested stat values (process 'cmdline') → OS command injection",
+  "details": "## Summary\nCVE-2026-32608 (\"Command Injection via Process Names in Action Command Templates\") was fixed (commit `5680a5d`) by adding `_sanitize_mustache_dict`, which replaces the shell operators `\u0026\u0026`, `|`, `\u003e\u003e`, `\u003e` with spaces in the values rendered into action command templates.\n\nThe sanitizer only processes **top-level string** values (`if isinstance(v, str)`). Attacker-controlled **nested** values — most notably a process's **`cmdline`, which Glances exposes as a `list`** and which is fully attacker-controlled via argv — are passed through **unsanitized**. Because the Mustache renderer (`chevron`) does **not** HTML-escape the pipe character `|`, a `|` embedded in such a nested value survives into the rendered command and is then interpreted by `secure_popen` (which still interprets `\u0026\u0026`/`|`/`\u003e` by default, `allow_operators=True`), re-introducing the exact command injection the CVE was meant to close.\n\n## Details\nThe fix (`glances/actions.py`):\n```python\n_SHELL_OPERATORS = ('\u0026\u0026', '|', '\u003e\u003e', '\u003e')                     # line 25\n\ndef _sanitize_mustache_dict(mustache_dict):                   # line 28\n    ...\n    for k, v in mustache_dict.items():\n        if isinstance(v, str):                                # line 40  \u003c-- ONLY top-level strings\n            for op in _SHELL_OPERATORS:\n                v = v.replace(op, ' ')\n            safe[k] = v\n        else:\n            safe[k] = v                                       # nested list/dict passed VERBATIM\n    return safe\n```\nRender + sink (`glances/actions.py:104-111`):\n```python\nsafe_dict = _sanitize_mustache_dict(mustache_dict)\ncmd_full  = chevron.render(cmd, safe_dict)                    # chevron does NOT escape '|'\n...\nret = secure_popen(cmd_full)                                 # secure_popen(cmd, allow_operators=True)\n```\n`secure_popen` (`glances/secure.py:17`, default `allow_operators=True`) splits the command by `\u0026\u0026`, then `__secure_popen` interprets `|` (pipe to a new process) and `\u003e` (write output to a file). A surviving `|` therefore launches an attacker-named second process.\n\n**The attacker-controlled nested value — `cmdline`.** The action `mustache_dict` is the per-item plugin stat (`glances/plugins/plugin/model.py:931` `mustache_dict = item`, then `:943` `self.actions.run(..., mustache_dict=mustache_dict)`). For the processlist plugin, each `item` contains `cmdline`, a **list** of the process arguments, set by the attacker simply by launching a process with chosen argv. The sanitizer's `isinstance(v, str)` test skips the list, so its elements reach `chevron.render` unmodified.\n\n**Why the operator survives render.** `chevron`/Mustache HTML-escapes `\u0026 \u003c \u003e \" '` for `{{var}}` (so `\u003e` and `\u0026\u0026` are neutralized) but **does not escape `|`**. A pipe in the (unsanitized) nested value therefore reaches `secure_popen` intact and is interpreted.\n\n**Parent-fix attribution (verified against the real diff of commit `5680a5d` / CVE-2026-32608):** that fix added exactly `_SHELL_OPERATORS`, `_sanitize_mustache_dict`, and the `_sanitize_mustache_dict(mustache_dict)` call — and the sanitizer's docstring explicitly claims to neutralize \"user-controllable data (process names, container names, mount points, etc.)\". It does so only for top-level strings; the list/dict case (`else: safe[k] = v`) was left unsanitized. This is therefore a genuine incomplete-fix gap, not a re-report of the patched (top-level string) vector.\n\n## Proof of Concept\nLab-only, harmless (touches a marker file; non-destructive). Runs the real `glances` chain (`_sanitize_mustache_dict` → `chevron.render` → `secure_popen`) — see `poc/glances_nested_mustache_poc.py`.\n\nAttacker process argv (the only attacker input): `cmdline = ['x', '|touch /tmp/glances_poc_marker', '#']`.\nAdmin action template (renders the offending process's cmdline): `echo ALERT {{#cmdline}}{{.}} {{/cmdline}}`.\n\nObserved (confirmed on develop HEAD `92156d0`/4.5.6 and verified code-identical on v4.5.5):\n```\ncmdline after sanitizer : ['x', '|touch /tmp/glances_poc_marker', '#']   \u003c- pipe survives\ncmd_full -\u003e secure_popen : 'echo ALERT x |touch /tmp/glances_poc_marker # '\n[VULNERABLE] marker created -\u003e /tmp/glances_poc_marker  (command injection executed)\n```\nReplacing `touch /tmp/...` with any command yields arbitrary execution in the Glances process context.\n\n## Preconditions (stated honestly)\n- A configured alert **action** whose command template **renders a nested stat field** (e.g. the process `cmdline` via a `{{#cmdline}}…{{/cmdline}}` section). Templates that render only **flat string** fields (`{{name}}`, `{{value}}`, `{{username}}`, `{{mnt_point}}`) are **not** affected — those values *are* sanitized.\n- Glances running with privilege to enumerate the attacker's process (typically **root** in server/agent monitoring deployments) → privilege boundary crossed (`S:C`).\n\n## Impact\nA local unprivileged user gains OS command execution in the Glances security context (commonly root) — the same impact and threat model as the parent CVE-2026-32608, re-enabled for any action template that renders a nested stat field. The injection is reliable once the (admin-set) template references such a field.\n\n## Suggested fix\n- Sanitize **recursively** — apply the operator stripping to strings inside lists and dicts, not only top-level `str` values.\n- And/or build the templated action as an argument list and run it via `secure_popen(..., allow_operators=False)` / `shell=False` without operator interpretation.\n- And/or also strip the pipe `|` (and treat all `_SHELL_OPERATORS`) on every rendered string regardless of nesting; do not rely on Mustache HTML-escaping (it does not escape `|`).\n\n## Credit\nTa Duc Thien",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "glances",
+        "purl": "pkg:pypi/glances"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.5.2"
+            },
+            {
+              "fixed": "4.5.6"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.5.2",
+        "4.5.3",
+        "4.5.4",
+        "4.5.5"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-73wf-9vmv-5pv9/GHSA-73wf-9vmv-5pv9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/security/advisories/GHSA-73wf-9vmv-5pv9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/commit/ea4cf2f54f0d961e24aa0b24fff9584bab39db93"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nicolargo/glances"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nicolargo/glances/releases/tag/v4.5.6"
+    }
+  ]
+}
