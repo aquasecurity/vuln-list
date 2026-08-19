@@ -1,0 +1,96 @@
+{
+  "id": "PYSEC-2026-3682",
+  "modified": "2026-08-19T12:45:08.259199851Z",
+  "published": "2026-08-19T11:56:28.745844Z",
+  "aliases": [
+    "CVE-2026-73974",
+    "GHSA-rh9c-rqvg-f7pr"
+  ],
+  "summary": "linuxfabrik-lib: Arbitrary root file read via live --test argument (lib.lftest) across sudoers-whitelisted plugins (LPE)",
+  "details": "## Summary\nEvery Linuxfabrik check plugin that supports the shared `--test` argument (routed through `lib.lftest.test()`) will, when `--test` is supplied, treat the first CSV element as a filesystem path and read its full contents as the plugin's simulated STDOUT — running as root when the plugin is invoked through the shipped `nagios`/`icinga` sudoers allowlist. `--test` is a **live production argument** (centrally mapped to `argparse.SUPPRESS`, so it is hidden from `--help` but still accepted on the command line), not a build-time-only gate. This yields an arbitrary root file-read primitive (full disclosure on `deb-updates`; filtered disclosure / existence-and-readability oracle on ~22 other whitelisted plugins), i.e. local privilege escalation from the `nagios` account to root.\n\n## Root Cause\n- `lib.lftest.test(args)` (`lftest.py` lines 659-664): `stdout = args[0]`; `if stdout and os.path.isfile(stdout): _, stdout = disk.read_file(stdout)`. Element[1] (stderr channel) is read the same way. There is **no path confinement** on the supplied path.\n- `check-plugins/deb-updates/deb-updates`: `--test` is registered with `type=lib.args.csv` (lines 78-82). When supplied, control flows to `stdout, _, retc = lib.lftest.test(args.TEST)` (line 143), bypassing the apt path (`if args.TEST is None:` at 121). Each returned line is stored as a `package` row and, under the default `--query='1'` (`WHERE 1`, matches all rows), every row is printed via `'\\n* '.join([row['package'] ...])` → `lib.base.oao(...)`.\n- The same `--test`/`lib.lftest.test()` mechanism exists identically on ~22 whitelisted plugins (e.g. `docker-info`), each performing a root `open()`/read of the attacker-named path. Disclosure degree varies by each plugin's downstream parser: full (`deb-updates`), filtered (`docker-info` echoes lines containing `warning:`/`error:`; `openvpn-client-list` echoes `CLIENT_LIST` lines), or existence/readability oracle (JSON parsers).\n\n## Impact\nAn attacker controlling the low-privilege `nagios`/`icinga` account (the documented threat model for the shipped sudoers file — same precondition as CVE-2026-52817) obtains the full contents of any root-readable file via `deb-updates` (e.g. `/etc/shadow`, `/root/.ssh/id_*`, TLS keys, cloud credentials), plus a fleet-wide root file existence/readability oracle and filtered content leak via the other plugins → local privilege escalation to root.\n\n## Proof of Concept\nFull disclosure (deb-updates):\n```\nsudo /usr/lib64/nagios/plugins/deb-updates --test=/etc/shadow,,0\n```\nFiltered disclosure / oracle (docker-info, target routed to the stderr channel that gets echoed):\n```\nsudo /usr/lib64/nagios/plugins/docker-info --test=\"dummy,/etc/shadow,0\"\n```\n\n## Attack Chain\n1. **Entry:** `sudo /usr/lib64/nagios/plugins/deb-updates --test=/etc/shadow,,0`\n   - **Action:** the nagios user invokes the whitelisted plugin as root with a `--test` CSV whose element[0] is the target path and retc=0.\n   - **Guard:** sudoers (Debian.sudoers:3) lists the binary only; `--test` is not gated to test builds.\n   - **Bypass proof:** CONTRIBUTING.md documents `--test` as centrally mapped to `argparse.SUPPRESS` — hidden from `--help` but still accepted on the command line; `lib.args.csv` splits `/etc/shadow,,0` into `['/etc/shadow','','0']`.\n2. **Sink:** `lib.lftest.test(args.TEST)` (deb-updates:143) reads element[0] as a file, as root.\n   - **Guard:** none — no path confinement on element[0].\n   - **Bypass proof (from lib source):** `lftest.py:661-664`: `stdout = args[0]; if stdout and os.path.isfile(stdout): _, stdout = disk.read_file(stdout)` — element[0], if it exists on disk, is opened and its contents returned as stdout. `retc=0` (element[2]) so there is no early `cu()` abort.\n3. **Store + query:** each line → `lib.db_sqlite.insert(conn, {'package': item}, ...)`; default `QUERY='1'` → `SELECT * FROM deb_updates WHERE 1`.\n   - **Guard:** `--only-critical` or a restrictive `--query` would filter, but both default to permissive (`ONLY_CRITICAL=False`, `QUERY='1'`).\n   - **Bypass proof:** attacker passes neither → all rows selected.\n4. **Disclosure:** `msg += '\\n* '.join([row['package'] for row in result])` → `lib.base.oao(...)` → stdout.\n   - **Guard:** none.\n   - **Bypass proof:** with `len(result) \u003e 0` the branch prints every row (every file line).\n5. **Impact:** full contents of any root-readable file disclosed to the nagios user → root. On the ~22 other `--test` plugins the same primitive yields a filtered leak / universal root file existence-and-readability oracle.\n\n## Bypass Evidence\n- `lib.lftest.test()` file-read behavior verified directly from linuxfabrik-lib source (`lftest.py:659-664`, `disk.read_file(stdout)` when `os.path.isfile(stdout)`).\n- `--test` registration (`type=lib.args.csv`) and the `stdout, _, retc = lib.lftest.test(args.TEST)` call verified on the latest release tag **v6.0.0** at `check-plugins/deb-updates/deb-updates:143` (GitHub contents API); default `QUERY='1'` confirmed.\n- No path-confinement guard exists on the `--test` path element in either the plugin or `lib.lftest`.\n\n## Affected Versions\n`\u003c= 6.0.0` (latest release; `--test`/`lib.lftest.test()` flow present on tag v6.0.0). Not covered by any existing advisory (none reference `--test` or arbitrary file read).\n\n## Suggested Fix\nCompile `--test` out of production builds (or gate it behind an explicit build/dev flag so it is not accepted at runtime), OR confine the `--test` path element(s) to a dedicated fixtures directory via `realpath()` + containment check before `disk.read_file()`. As defense-in-depth, constrain the sudoers entries to specific argument values so `--test` cannot be supplied to a root-run plugin.\n\n---\nReported by **zx (Jace)**",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "linuxfabrik-lib",
+        "purl": "pkg:pypi/linuxfabrik-lib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "6.1.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.0.0.0",
+        "2.0.0.7",
+        "2.1.0.0",
+        "2.1.0.4",
+        "2.1.1.15",
+        "2.1.1.5",
+        "2.1.1.7",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.4.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.1",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.4.1",
+        "4.0.0",
+        "4.0.1",
+        "4.0.2",
+        "4.1.0",
+        "4.2.0",
+        "4.3.0",
+        "4.4.0",
+        "5.0.0",
+        "5.1.0",
+        "6.0.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/linuxfabrik-lib/PYSEC-2026-3682.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Linuxfabrik/monitoring-plugins/security/advisories/GHSA-rh9c-rqvg-f7pr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Linuxfabrik/lib/commit/d665042c55fae83a295ebc0023e8b77f6c473a28"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Linuxfabrik/lib/releases/tag/v6.1.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Linuxfabrik/monitoring-plugins"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/linuxfabrik-lib"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-rh9c-rqvg-f7pr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73974"
+    }
+  ]
+}
