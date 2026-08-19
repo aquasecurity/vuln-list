@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-pxmc-2ffp-8j67",
+  "modified": "2026-08-18T21:00:07.812954392Z",
+  "published": "2026-08-18T20:51:48Z",
+  "aliases": [
+    "CVE-2026-71417"
+  ],
+  "summary": "Lemur: Any user can revoke arbitrary certificates at the CA by uploading a duplicate record and revoking it",
+  "details": "## Summary\n\nRepo under test: https://github.com/Netflix/lemur\n\n`PUT /api/1/certificates/\u003cid\u003e/revoke` authorizes the caller against the *Lemur database row* (creator == current user, or `CertificatePermission` over the row's roles) rather than the underlying CA-side certificate identity. Separately, `POST /api/1/certificates/upload` lets any user passing `StrictRolePermission` create a new `Certificate` row while freely supplying `body`, `authority` (resolved by id/name with no `AuthorityPermission` check) and `external_id`; there is no uniqueness constraint on `body`, `serial`, or `external_id`.\n\nAn attacker can therefore read a target certificate's public `body`, `authority.id`, and `external_id` via `GET /certificates/\u003cid\u003e`, upload a duplicate row, and revoke that duplicate. The creator-bypass skips `CertificatePermission`, the empty-endpoints check passes because the duplicate has none, and `service.revoke()` then revokes at the CA using the attacker-supplied `body` (ACME) or `external_id` (DigiCert/Entrust/Google CA/CFSSL) under the authority's stored CA credentials — revoking the real production certificate.\n\n## Affected route\n\n`POST /api/1/certificates/upload` → `PUT /api/1/certificates/\u003cdup_id\u003e/revoke`\n\n## Affected code\n\n- [`lemur/certificates/views.py:651`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/views.py#L651) — only `StrictRolePermission().can()` gates upload; no `AuthorityPermission` check\n- [`lemur/certificates/schemas.py:391`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/schemas.py#L391) — `CertificateUploadInputSchema` accepts caller-supplied `authority` and `external_id`\n- [`lemur/schemas.py:107`](https://github.com/Netflix/lemur/blob/main/lemur/schemas.py#L107) — `AssociatedAuthoritySchema` resolves any authority by id/name with no permission check\n- [`lemur/certificates/service.py:489`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/service.py#L489) — `upload()` binds the caller-supplied authority onto the new row\n- [`lemur/certificates/models.py:119`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/models.py#L119) — only `name` is unique; `body`/`serial`/`external_id` are not, and `get_or_increase_name()` auto-suffixes on collision\n- [`lemur/certificates/views.py:1677`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/views.py#L1677) — `if g.current_user != cert.user: ... CertificatePermission ...` — creator of the duplicate row bypasses the owner check\n- [`lemur/certificates/views.py:1687`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/views.py#L1687) — `if cert.endpoints: ...` — duplicate row has no endpoints, so the deployed-cert safeguard is bypassed\n- [`lemur/certificates/service.py:1120`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/service.py#L1120) — `plugin = plugins.get(certificate.authority.plugin_name); plugin.revoke_certificate(certificate, reason)`\n- [`lemur/plugins/lemur_acme/acme_handlers.py:268`](https://github.com/Netflix/lemur/blob/main/lemur/plugins/lemur_acme/acme_handlers.py#L268) — ACME revokes by `certificate.body`\n- [`lemur/plugins/lemur_digicert/plugin.py:477`](https://github.com/Netflix/lemur/blob/main/lemur/plugins/lemur_digicert/plugin.py#L477), [`lemur/plugins/lemur_entrust/plugin.py:321`](https://github.com/Netflix/lemur/blob/main/lemur/plugins/lemur_entrust/plugin.py#L321) — commercial CAs revoke by `certificate.external_id`\n- [`lemur/certificates/schemas.py:290`](https://github.com/Netflix/lemur/blob/main/lemur/certificates/schemas.py#L290) — `CertificateOutputSchema` exposes `external_id`, `body`, `authority` to any authenticated user\n\n## Impact\n\nA low-privileged authenticated insider (or holder of a stolen non-admin token/API key) can revoke any certificate managed by Lemur — including high-value certificates they do not own and certificates currently attached to live endpoints — directly at the issuing CA. Iterating over `GET /certificates` yields fleet-wide revocation (mass DoS of TLS endpoints) without ever passing an `AuthorityPermission` or `CertificatePermission` check on the victim certificate. This is exactly the \"Revocation as DoS vector\" scenario flagged in the threat model and additionally defeats the built-in \"cannot revoke while attached to endpoint\" safeguard.\n\n## Root cause\n\nRevocation authority is bound to ownership of the Lemur DB row, not to the CA-side certificate identity. Because upload allows creating a second row that aliases the same CA-side certificate (same `body` / `external_id` / `authority`) without any uniqueness constraint or `AuthorityPermission` check, the attacker can manufacture a row they own and then exercise the creator-bypass on revoke. The endpoint-attached guard inspects only the duplicate row's `cert.endpoints`, which is empty.\n\n## Validated evidence\n\nStatic path trace, confirmed by code inspection (validation status: `CONFIRMED`):\n\n- Upload is gated only by `StrictRolePermission` (default-open to any non-read-only user) and accepts attacker-chosen `authority` + `external_id` + `body` without an `AuthorityPermission` check.\n- `Certificate.body` / `external_id` have no uniqueness constraint, so a duplicate row is created.\n- The revoke endpoint short-circuits the owner check when caller is the row creator, and the endpoint-attached guard inspects only the duplicate row.\n- Issuer plugins revoke at the CA using `body` / `external_id` taken from the duplicate row under the authority's stored CA credentials.\n\n## Proof of concept / reproducer\n\nStatus: reconstructed from source report (static control-flow trace; not executed against a live CA — revoking at a real CA is destructive).\n\nPreconditions: attacker is an authenticated Lemur user holding any role other than `read-only`. `\u003cVICTIM_CERT_ID\u003e` is any certificate id readable via `GET /api/1/certificates`.\n\n```bash\n# 1. Read the victim's body / authority / external_id (exposed to any authenticated user)\ncurl -sS \"\u003cTARGET_BASE_URL\u003e/api/1/certificates/\u003cVICTIM_CERT_ID\u003e\" \\\n  -H \"Authorization: Bearer \u003cAUTH_TOKEN\u003e\" \\\n  | jq '{body, external_id, authority: .authority.id}'\n\n# 2. Upload a duplicate row aliasing the same CA-side certificate\ncurl -sS -X POST \"\u003cTARGET_BASE_URL\u003e/api/1/certificates/upload\" \\\n  -H \"Authorization: Bearer \u003cAUTH_TOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n        \"name\": \"victim-dup\",\n        \"owner\": \"attacker@example.com\",\n        \"body\": \"\u003cVICTIM_BODY_PEM\u003e\",\n        \"authority\": {\"id\": \u003cVICTIM_AUTHORITY_ID\u003e},\n        \"externalId\": \"\u003cVICTIM_EXTERNAL_ID\u003e\"\n      }'\n# → returns {\"id\": \u003cDUP_ID\u003e, ...}; attacker is now cert.user of \u003cDUP_ID\u003e\n\n# 3. Revoke the duplicate — issuer plugin revokes at the CA by body/external_id\ncurl -sS -X PUT \"\u003cTARGET_BASE_URL\u003e/api/1/certificates/\u003cDUP_ID\u003e/revoke\" \\\n  -H \"Authorization: Bearer \u003cAUTH_TOKEN\u003e\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"crlReason\": \"unspecified\"}'\n```\n\nStatic-trace validation command from the source report:\n\n```bash\ngrep -n 'StrictRolePermission' lemur/certificates/views.py | grep -v Authority\ngrep -n 'cert.authority = kwargs.get' lemur/certificates/service.py\ngrep -n 'g.current_user != cert.user' lemur/certificates/views.py\ngrep -n 'certificate.external_id\\|certificate.body' \\\n  lemur/plugins/lemur_acme/acme_handlers.py \\\n  lemur/plugins/lemur_digicert/plugin.py \\\n  lemur/plugins/lemur_entrust/plugin.py\n```\n\nSource artifact: `audit/harnesses/public-repo-threat-model-harness/results/netflix-lemur-100run-mythos-20260627T051129Z/findings.jsonl` (run_050, finding cluster `lemur-revoke-via-duplicate`, 2/100 runs).\n\n## Suggested fix\n\nDecouple CA-side revocation authority from Lemur row ownership:\n\n1. On `POST /certificates/upload`, if `authority` is supplied enforce `AuthorityPermission` for that authority, and reject/ignore caller-supplied `external_id`.\n2. Before calling `plugin.revoke_certificate`, look up all `Certificate` rows sharing the same `(authority_id, serial)` or `body` and require `CertificatePermission` on every match (and run the endpoint-attached check against all matches).\n3. Consider a DB uniqueness constraint or dedup on `(authority_id, serial)` so a second row for the same CA-issued certificate cannot be created.\n4. Stop exposing `external_id` in `CertificateOutputSchema` to non-owners.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lemur",
+        "purl": "pkg:pypi/lemur"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.0",
+        "0.2.1",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.8.1",
+        "1.8.2",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-pxmc-2ffp-8j67/GHSA-pxmc-2ffp-8j67.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/security/advisories/GHSA-pxmc-2ffp-8j67"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/commit/851389ae737a6d6bf16c1f9ca64a2ce56c1cc5c6"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Netflix/lemur"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Netflix/lemur/releases/tag/v1.9.3"
+    }
+  ]
+}
