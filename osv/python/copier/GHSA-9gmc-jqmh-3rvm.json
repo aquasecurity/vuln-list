@@ -1,0 +1,80 @@
+{
+  "id": "GHSA-9gmc-jqmh-3rvm",
+  "modified": "2026-08-19T19:30:07.619021167Z",
+  "published": "2026-08-19T19:16:54Z",
+  "aliases": [
+    "CVE-2026-53951"
+  ],
+  "summary": "Copier has a trust-prefix bypass via path traversal that runs tasks unprompted",
+  "details": "# Copier: trust-prefix bypass via path traversal runs tasks unprompted\n\n### Summary\n\nIn copier `\u003e= 9.5.0, \u003c= 9.15.1`, the `trust` setting's prefix match\n(`copier/_settings.py`) compares the template URL against a trusted prefix with\na raw `str.startswith` and **no path normalization**, while the URL *is*\nnormalized when the template is actually fetched (`Path.resolve()` for local\npaths; libcurl dot-segment removal for `https`). A template reference that\ntextually starts with a trusted prefix but contains `..`\n(e.g. `https://github.com/trusted-org/../attacker-org/repo.git`) is therefore\ngranted trust yet resolves to a different, attacker-controlled template, whose\n`tasks` / `migrations` / `jinja_extensions` then run **without the `--trust`\nprompt** — arbitrary command execution. Likely **CWE-22 (Improper Limitation of\na Pathname)** in the trust check leading to **CWE-94 (code execution)**.\n\n### Details\n\n`trust` lets users mark template locations as trusted so copier skips the\nunsafe-feature gate. A trailing `/` makes an entry a **prefix** match\n(`docs/settings.md`: *\"Locations ending with `/` will be matched as prefixes,\ntrusting all templates from that location\"*).\n\n`copier/_settings.py:141-146` (tag `v9.15.1`):\n\n```python\n    return any(\n        repository.startswith(_normalize(t))\n        if t.endswith(\"/\")\n        else repository == _normalize(t)\n        for t in trust\n    )\n```\n\n`_normalize` only expands `~`; it does **not** touch `..` or collapse segments —\n`copier/_settings.py:149-152` (tag `v9.15.1`):\n\n```python\ndef _normalize(url: str) -\u003e str:\n    if url.startswith(\"~\"):  # Only expand on str to avoid messing with URLs\n        url = expanduser(url)  # noqa: PTH111\n    return url\n```\n\nThis decision gates code execution — `copier/_main.py:293` (tag `v9.15.1`):\n\n```python\n        if self.unsafe or is_trusted_repository(self.settings.trust, self.template.url):\n            return  # skip the unsafe-feature check entirely\n```\n\nThe chain: the trust comparison sees the **raw** URL, so\n`\"https://github.com/safeorg/../evilorg/t.git\".startswith(\"https://github.com/safeorg/\")`\nis `True`; but the value copier hands to `git`/`pathlib` is **normalized**, so\nthe template actually loaded is `evilorg/t` (a different, attacker-owned org).\nTrust is granted to a location the user never trusted, and `_check_unsafe`\nreturns early, so the malicious template's tasks execute with no prompt.\n\nThis is most acute on `copier update`, which reads `_src_path` from the\nproject's `.copier-answers.yml` (`copier/_subproject.py`) — i.e. an attacker who\nhands you a project controls the URL that the trust check is applied to.\n\nIn-repo asymmetry that confirms the omission: copier consistently resolves\npaths *everywhere else* it makes a security decision — `Path.resolve()` plus\n`is_relative_to(...)` guards in `_render_template`, `template_copy_root`, and\n`_external_data` — but not in the trust comparison.\n\n### PoC\n\nSelf-contained standalone script; runs against a clean, pinned PyPI install via\nthe real `copier` CLI only. **Static by default** (`copier copy --pretend`\nreaches the trust decision but does not execute tasks); `--prove-exec` is an\nopt-in supplementary run that fires an inert marker (`echo` + `touch`). The full\n`poc.py` accompanies this report.\n\nBuild and run:\n\n```bash\npython -m venv venv \u0026\u0026 . venv/bin/activate\npip install \"copier==9.15.1\"\npython poc.py                # static proof (default)\npython poc.py --prove-exec   # also fire the inert marker\n```\n\nObserved output (`copier 9.15.1`):\n\n```\n== version proof ==\n  copier == 9.15.1\n  module : .../site-packages/copier/__init__.py\n\n== inputs ==\n  trusted prefix (settings.yml): /tmp/copier_trust_poc_XXXX/trusted_templates/\n  control src (canonical)      : /tmp/copier_trust_poc_XXXX/attacker/evil_template\n  exploit src (traversal)      : /tmp/copier_trust_poc_XXXX/trusted_templates/../attacker/evil_template\n  both resolve to the SAME dir : True\n  exploit startswith trusted/  : True\n  minimal delta                : exploit = '/tmp/copier_trust_poc_XXXX/trusted_templates/..' + '/attacker/evil_template'\n\n== static proof (copier copy --pretend; payload NOT executed) ==\n  control (canonical, untrusted): exit=4  -\u003e BLOCKED (UnsafeTemplateError)\n  exploit (trusted-prefix /..)  : exit=0  -\u003e TRUSTED, task reached\n  marker on disk after --pretend: False (expected False: --pretend does not run tasks)\n\n  --- copier's own output for the exploit (note the task it WOULD run) ---\n  | Copying from template version None\n  |     create  hello.txt\n  |  \u003e Running task 1 of 1: echo COPIER-TRUST-BYPASS-RCE-MARKER \u0026\u0026 touch COPIER_RCE_PROOF\n\n== VERDICT ==\n  BYPASS CONFIRMED: identical template is refused by canonical path\n  (exit 4) yet granted trust via '\u003ctrusted\u003e/..' traversal (exit 0),\n  so its tasks run with no --trust prompt.\n\n== --prove-exec: running the exploit for real (inert marker) ==\n  | COPIER-TRUST-BYPASS-RCE-MARKER\n  |  \u003e Running task 1 of 1: echo COPIER-TRUST-BYPASS-RCE-MARKER \u0026\u0026 touch COPIER_RCE_PROOF\n  exit=0  marker file 'COPIER_RCE_PROOF' created: True\n  -\u003e ARBITRARY COMMAND EXECUTED via a 'trusted' template, no --trust\n```\n\nThe exploit is the same template as the control plus the minimal delta\n`\u003ctrusted_prefix\u003e/..`. Deterministic: same input → same result. The PoC uses a\nlocal trusted prefix for a self-contained, network-free run; the `https` case is\nidentical because git normalizes `..` before the request — e.g.\n`git ls-remote \"https://github.com/copier-org/../pallets/flask.git\"` emits\n`warning: redirecting to https://github.com/pallets/flask.git/` and returns\n`pallets/flask`'s refs, a different org than the trusted `copier-org/`.\n\n### Impact\n\nA user who has configured a trusted **prefix** (a trailing-`/` entry in\n`trust`, a documented feature) no longer gets the unsafe-feature prompt for a\ntemplate that merely *appears* to live under that prefix. Any party who can\ninfluence the template URL — most realistically the author of a project the\nvictim runs `copier update` on, since `_src_path` comes from that project's\n`.copier-answers.yml` — can host the real template under a different\norg/location reached via `..` and have its `tasks`/`migrations`/\n`jinja_extensions` execute arbitrary commands with no prompt. It fires on a\ndefault, modern git for both local paths and `https`.\n\nProposed severity: **High**, comparable to the project's prior unsafe-template\nadvisory (GHSA-3xw7-v6cj-5q8h). Proposed CVSS v4 vector (maintainer to finalize;\n`AT:P` reflects the required trusted-prefix configuration):\n`CVSS:4.0/AV:L/AC:L/AT:P/PR:N/UI:P/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H`. Conservative\nvariant if you scope impact to the user account only (no host escape claim):\ndrop `SC/SI/SA` to `N`.\n\n### Recommended fix\n\nNormalize **both** sides before comparing, instead of raw `startswith`. For\nlocal entries, compare resolved absolute paths (`Path(t).resolve()` vs\n`Path(repository).resolve()`) using segment containment / `is_relative_to`, the\npattern already used in `_render_template` and `template_copy_root`. For URL\nentries, parse the URL and reject or collapse `..`/`.`/empty path segments\nbefore the prefix test. As defense-in-depth, reject any `_src_path` read from an\nanswers file that contains `..` segments after the scheme/host, since\nlegitimate template URLs never need them.\n\n### References\n\n- CWE-22 — https://cwe.mitre.org/data/definitions/22.html\n- CWE-94 — https://cwe.mitre.org/data/definitions/94.html\n- Affected source (tag `v9.15.1`): `copier/_settings.py:141-146` (prefix match),\n  `copier/_settings.py:149-152` (`_normalize`), `copier/_main.py:293` (trust gate).\n- Documented prefix behavior: `docs/settings.md` (\"Locations ending with `/`\n  will be matched as prefixes\").\n- `https` `..` normalization: libcurl removes dot segments by default\n  (`CURLOPT_PATH_AS_IS` defaults to off) — https://curl.se/libcurl/c/CURLOPT_PATH_AS_IS.html\n- Novelty: distinct from copier's published advisories, which concern filesystem\n  read/write traversal in rendered output; this is an authorization bypass in\n  the `trust` setting's URL matching. The flawed match is identical between\n  released `v9.15.1` and current `master` HEAD, and unchanged since the\n  trust-prefix feature was introduced in `v9.5.0` (originally `copier/settings.py`,\n  commit `71358ed`; renamed to `copier/_settings.py` in the v9.12.0 refactor).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "copier",
+        "purl": "pkg:pypi/copier"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "9.5.0"
+            },
+            {
+              "fixed": "9.15.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "9.10.0",
+        "9.10.1",
+        "9.10.2",
+        "9.10.3",
+        "9.11.0",
+        "9.11.1",
+        "9.11.2",
+        "9.11.3",
+        "9.12.0",
+        "9.13.0",
+        "9.13.1",
+        "9.14.0",
+        "9.14.1",
+        "9.14.2",
+        "9.14.3",
+        "9.15.0",
+        "9.15.1",
+        "9.5.0",
+        "9.6.0",
+        "9.7.0",
+        "9.7.1",
+        "9.8.0",
+        "9.9.0",
+        "9.9.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 9.15.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-9gmc-jqmh-3rvm/GHSA-9gmc-jqmh-3rvm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/copier-org/copier/security/advisories/GHSA-9gmc-jqmh-3rvm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-53951"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/copier-org/copier"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/copier-org/copier/releases/tag/v9.15.2"
+    }
+  ]
+}

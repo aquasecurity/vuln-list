@@ -1,0 +1,49 @@
+{
+  "id": "GHSA-vjhx-2cqw-3q6q",
+  "modified": "2026-08-19T19:30:07.561205933Z",
+  "published": "2026-08-19T19:16:35Z",
+  "aliases": [
+    "CVE-2026-53941"
+  ],
+  "summary": "Uprobe gadgets: unprivileged container's ld.so.cache causes high CPU utilization and container startup DoS",
+  "details": "## Summary\n\nAn unprivileged container can block all other containers from starting on the\nsame host by placing a crafted `/etc/ld.so.cache` file in its filesystem. When\nInspektor Gadget attaches any uprobe-based gadget, it parses this file in the\ncontainer startup path. A malicious cache causes ~53 seconds of CPU burn,\nduring which Docker cannot start any other container. No special capabilities\nare required.\n\n## Severity\n\nTo be assessed — Availability impact, no confidentiality or integrity impact.\n\n## Affected Versions\n\nAll versions of Inspektor Gadget that support uprobe-based gadgets (trace_malloc, trace_open, trace_ssl, trace_grpc, etc.).\n\n## Description\n\nWhen Inspektor Gadget attaches uprobe-based gadgets to containers, it resolves library paths by parsing the container's `/etc/ld.so.cache` file (`pkg/uprobetracer/ldcache_parser.go`). This file is fully controlled by the container.\n\nThe parser has three vulnerabilities:\n\n1. **Quadratic string building** (`pkg/uprobetracer/bytes.go:36-44`): The `readStringFromBytes` function concatenates one byte at a time (`res += string(data[i])`), which is O(n²) in Go due to string immutability. With a 16MB cache file containing large regions without null terminators, this causes massive CPU and memory churn.\n\n2. **Insufficient entry count validation** (`pkg/uprobetracer/ldcache_parser.go:120`): The `EntryCount` field is read directly from the untrusted file. While a per-entry bounds check prevents out-of-bounds access, the loop still iterates up to `(fileSize - headerSize) / entrySize ≈ 700,000` times, calling `readStringFromBytes` on each iteration.\n\n3. **Integer overflow in format detection** (`pkg/uprobetracer/ldcache_parser.go:174`): The `cache1Len` computation uses uint32 arithmetic (`ldCache1Size + cache1.EntryCount*ldCache1EntrySize`). With a crafted `EntryCount`, this overflows and produces a small value, causing the parser to misidentify the cache format.\n\nCombined, these cause ~53 seconds of CPU burn per container attachment when a crafted 16MB `/etc/ld.so.cache` is present.\n\n## Impact\n\n- **Container runtime DoS**: IG uses fanotify hooks (`pkg/container-hook`) to pause container startup until uprobe attachment completes. While IG is blocked processing the malicious cache, this pause is held, and Docker serializes container starts — meaning no other container can start on the host until IG finishes. This effectively causes a denial of service on the entire container runtime, not just on IG itself.\n- **Container startup delay**: When any uprobe-based gadget is running (trace_malloc, trace_ssl, etc.), starting a container with a crafted ld.so.cache delays startup by ~1 minute.\n- **Monitoring degradation**: The IG daemon is blocked processing the malicious cache, potentially missing events from other containers.\n- **Amplification**: Multiple containers with crafted caches can be started simultaneously to amplify the effect.\n- **No special privileges required**: Any container can include a crafted `/etc/ld.so.cache` in its image, mount one via a volume, or overwrite it at runtime before IG starts a uprobe gadget. In this last case, IG inspects all already-running containers when the gadget starts — this still burns CPU but does not block other containers from starting (since the fanotify pause only applies to new container starts).\n\n## Root Cause Analysis\n\nIn `pkg/uprobetracer/ldcache_parser.go`, the function `readCacheFormat2` is called with the full file content:\n\n```go\nfor i := uint32(0); i \u003c ldCache.EntryCount; i++ {\n    entryOffset := ldEntriesOffset + i*ldCache2EntrySize\n    if uint32(len(data)) \u003c= entryOffset+ldCache2EntrySize {\n        return nil  // bounds check stops iteration\n    }\n    // ... reads entry ...\n    key := readStringFromBytes(data, keyOffset)    // O(n²) per call\n    value := readStringFromBytes(data, valueOffset) // O(n²) per call\n}\n```\n\nThe per-entry bounds check correctly prevents out-of-bounds access, but:\n- The loop iterates ~700K times (limited by file size, not EntryCount)\n- Each `readStringFromBytes` call uses quadratic string concatenation\n\nIn `pkg/uprobetracer/bytes.go`:\n\n```go\nfunc readStringFromBytes(data []byte, startPos uint32) string {\n    res := \"\"\n    for i := startPos; i \u003c uint32(len(data)); i++ {\n        if data[i] == 0 {\n            return res\n        }\n        res += string(data[i])  // O(n²) — allocates new string each iteration\n    }\n    return \"\"\n}\n```\n\n## Note on Slice Bounds Checks\n\nThe code also performs slice accesses without proper bounds checks (e.g.,\n`data[:len(cache2Header)]` when `data` may be shorter than 20 bytes, and\n`ldCacheFile[:len(cache1Header)]` when the file may be shorter than 11 bytes).\n\nIn practice, a malicious container **cannot currently trigger a panic** from these\nmissing checks. This is because Go's `io.ReadAll` (used to read the file) always\nreturns slices with `cap \u003e= 512` due to its initial buffer allocation\n(`make([]byte, 0, 512)` in Go's standard library). In Go, `s[:n]` only panics\nwhen `n \u003e cap(s)`, not when `n \u003e len(s)`. Since both header lengths (11 and 20)\nare well below 512, the slice expressions succeed — they simply read zero bytes\nbeyond `len`, which don't match any valid header magic.\n\nHowever, this relies on an **undocumented implementation detail** of `io.ReadAll`\nwhich could change in future Go versions. The bounds checks are still necessary\nfor correctness and defense in depth.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/inspektor-gadget/inspektor-gadget",
+        "purl": "pkg:golang/github.com/inspektor-gadget/inspektor-gadget"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.27.0"
+            },
+            {
+              "fixed": "0.53.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-vjhx-2cqw-3q6q/GHSA-vjhx-2cqw-3q6q.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/inspektor-gadget/inspektor-gadget/security/advisories/GHSA-vjhx-2cqw-3q6q"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/inspektor-gadget/inspektor-gadget"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/inspektor-gadget/inspektor-gadget/releases/tag/v0.53.1"
+    }
+  ]
+}
