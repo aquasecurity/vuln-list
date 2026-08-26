@@ -1,0 +1,106 @@
+{
+  "id": "GHSA-ppx3-28rw-8fpf",
+  "modified": "2026-08-26T00:39:16.305180976Z",
+  "published": "2026-08-25T15:52:30Z",
+  "aliases": [
+    "CVE-2026-12210"
+  ],
+  "summary": "utcp-gql SSRF: CVE-2026-44661 fix not applied to the GraphQL and WebSocket plugins",
+  "details": "### Summary\n\nThe fix for CVE-2026-44661 (commit `5b16e43`) added the `ensure_secure_url()` / `is_secure_url()` helpers and wired them into the three HTTP-family plugins, but it did not reach the GraphQL or WebSocket plugins. The GraphQL plugin (`utcp-gql`) still uses the `startswith` prefix check that the fix explicitly replaced, so `http://127.0.0.1.attacker.example` and `http://localhost.evil.com` pass it. The WebSocket plugin (`utcp-websocket`) performs no URL validation at all, even though its own docstrings state it enforces \"WSS or localhost only.\" Both plugins reach the same SSRF that CVE-2026-44661 was filed for, and because both attach the call template's configured auth headers to the outbound connection, the SSRF can also leak API keys and OAuth tokens to an attacker-controlled host.\n\n### Details\n\nIn the CVE-2026-44661 fix (commit `5b16e43` (\"fix(http): block SSRF via attacker-controlled OpenAPI servers[0].url\")), two things in it pointed at sibling issues. The commit message says the change is \"replacing the duplicated prefix check\", and the new `utcp_http/_security.py` docstring names the exact bug:\n\n\u003e URLs whose hostname *starts* with `localhost` / `127.0.0.1` but isn't actually loopback (e.g. `http://localhost.evil.com`, `http://127.0.0.1.attacker.example`). The earlier `startswith` check let these through.\n\nThe word \"duplicated\" says the vulnerable check existed in more than one place. The fix only updated the three HTTP-family plugins (`http`, `streamable_http`, `sse`). The other communication-protocol plugins were also inspected.\n\n**GraphQL plugin (`utcp-gql`).** `plugins/communication_protocols/gql/src/utcp_gql/gql_communication_protocol.py` still has the pre-fix check at line 43:\n\n```python\ndef _enforce_https_or_localhost(self, url: str) -\u003e None:\n    if not (\n        url.startswith(\"https://\")\n        or url.startswith(\"http://localhost\")\n        or url.startswith(\"http://127.0.0.1\")\n    ):\n        raise ValueError(\"Security error: URL must use HTTPS or start with ...\")\n```\n\nIt is called on `manual_call_template.url` in `register_manual` (line 102) and on `tool_call_template.url` in `call_tool` (line 181). The URL then goes into `AIOHTTPTransport(url=...)` and a live GraphQL request.\n\n`\"http://127.0.0.1.attacker.example/graphql\".startswith(\"http://127.0.0.1\")` is `True`, so the check passes. If the attacker controls DNS for `attacker.example`, that hostname resolves to any address they choose, including `169.254.169.254`, `127.0.0.1`, or an internal `192.168.x.x` host, and the GraphQL client sends a plain-HTTP request there. `http://localhost.evil.com/graphql` behaves the same way. This is the exact prefix bypass CVE-2026-44661 was filed for.\n\n**WebSocket plugin (`utcp-websocket`).** `plugins/communication_protocols/websocket/src/utcp_websocket/websocket_communication_protocol.py`. The module and class docstrings state:\n\n\u003e \"Security enforcement (WSS or localhost only)\"\n\u003e \"Enforces security by requiring WSS or localhost connections\"\n\u003e \"Security validation of connection URLs\"\n\nThere is no such validation in the code. `_get_connection()`, the only connection path (used by `register_manual`, `call_tool`, and `call_tool_streaming`), calls:\n\n```python\nws = await session.ws_connect(call_template.url, headers=headers, ...)   # line 197\n```\n\nwith no scheme or host check. Any URL in a `WebSocketCallTemplate` connects, including `ws://169.254.169.254/`, `ws://127.0.0.1:\u003cinternal-port\u003e/`, or any internal hostname.\n\n**Credential exposure.** Both plugins build connection headers in `_prepare_headers()`, which attaches the configured auth: `ApiKeyAuth` as a header, `BasicAuth` as an `Authorization: Basic` header, and `OAuth2Auth` as an `Authorization: Bearer` token. When the bypass is used to force a plain-HTTP or plain-WS connection to an attacker-resolved host, those credentials are sent to the attacker.\n\nThis is the threat model CVE-2026-44661 already established: a UTCP client ingests tool manuals, and a malicious manual is attacker-influenced. The GraphQL and WebSocket plugins consume the same kind of call template, with the same `url` field, at the same trust level as the HTTP plugins that were fixed.\n\nAffected packages: `utcp-gql` and `utcp-websocket`, both at the current release `1.1.0`. Neither plugin has been modified since 2025-11-30, so both are unpatched on `main`.\n\n### PoC\n\nThe discrepancy is directly observable. With `utcp-gql` and `utcp-http` installed:\n\n```python\nfrom utcp_gql.gql_communication_protocol import GraphQLCommunicationProtocol\nfrom utcp_http._security import is_secure_url\n\nbypass = \"http://127.0.0.1.attacker.example/graphql\"\n\n# The fixed HTTP plugin rejects the bypass URL:\nprint(\"utcp_http is_secure_url:\", is_secure_url(bypass))   # -\u003e False\n\n# The GraphQL plugin accepts it (no exception is raised):\nGraphQLCommunicationProtocol()._enforce_https_or_localhost(bypass)\nprint(\"utcp_gql  _enforce_https_or_localhost: ACCEPTED\")\n```\n\nEnd to end: a UTCP client that registers a manual declaring a GraphQL tool with `url: \"http://127.0.0.1.\u003cattacker-domain\u003e/graphql\"`, where that domain resolves to an internal target, issues the request to that internal service. For WebSocket, a manual declaring a tool with `url: \"ws://169.254.169.254/\"` connects with no check at all. To confirm the request lands, point the URL at a listener you control on a host the client can reach but the attacker cannot, or at the client's own loopback.\n\n### Impact\n\nServer-Side Request Forgery (CWE-918), the same class and trust boundary as CVE-2026-44661. An attacker who can get a UTCP client to register a malicious manual can:\n\n- Make the client send GraphQL requests (GraphQL plugin) or open WebSocket connections (WebSocket plugin) to internal services and cloud metadata endpoints it would not otherwise reach.\n- Force plain-HTTP / plain-WS connections to an attacker-resolved host, defeating the \"HTTPS or loopback only\" guarantee both plugins are meant to provide.\n- Receive the call template's configured credentials (API key, Basic auth, OAuth Bearer token), because those headers are attached to the forged request.\n\nSuggested fix. The correct helper already exists in the codebase. Promote `is_secure_url` / `ensure_secure_url` from `utcp_http` into a shared module (or replicate the `urlparse`-based hostname logic), then replace `_enforce_https_or_localhost` in the GraphQL plugin with it, and add an equivalent check in the WebSocket plugin's `_get_connection` before `ws_connect`, adapted for the `ws` and `wss` schemes. This is the same centralization commit `5b16e43` already applied to the three HTTP plugins; it just needs to cover the remaining two transports.\n\n## Patched\n\n- `utcp-gql` 1.1.1 replaces the broken `_enforce_https_or_localhost`\n  prefix check with hostname-based `ensure_secure_url`, applied at\n  both `register_manual` and `call_tool`. The underlying aiohttp\n  session is also patched after `connect()` to refuse 3xx responses,\n  closing the post-validation redirect SSRF on the GraphQL endpoint.\n- `utcp-websocket` 1.1.1 introduces `ensure_secure_ws_url` (the\n  WebSocket-scheme companion of `ensure_secure_url`) and enforces it\n  in both the `WebSocketCallTemplate` Pydantic field validator and\n  `_get_connection`. `ws_connect` is called with `allow_redirects=False`.\n  The OAuth2 token-fetch path uses the same redirect-safe helper\n  introduced in `utcp-http` 1.1.4.\n\nBoth plugins duplicate `_security.py` from `utcp-http` (rather than\nadding a cross-plugin runtime dependency); keep the copies in sync\nwhen changing validator behaviour.\n\nUpgrade to `utcp-gql \u003e= 1.1.1` and/or `utcp-websocket \u003e= 1.1.1`. No\nworkaround in earlier versions.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "utcp-gql",
+        "purl": "pkg:pypi/utcp-gql"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.1.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.2",
+        "1.1.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.1.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-ppx3-28rw-8fpf/GHSA-ppx3-28rw-8fpf.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "utcp-websocket",
+        "purl": "pkg:pypi/utcp-websocket"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.1.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0",
+        "1.1.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.1.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-ppx3-28rw-8fpf/GHSA-ppx3-28rw-8fpf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp/security/advisories/GHSA-ppx3-28rw-8fpf"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-12210"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gola-leya/cve_submit/issues/1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp/issues/86"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp/commit/fc3268e2a62e1181f91a63faf0a9bcee7639db29"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vuldb.com/cve/CVE-2026-12210"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vuldb.com/submit/832542"
+    },
+    {
+      "type": "WEB",
+      "url": "https://vuldb.com/vuln/370852"
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "id": "GHSA-hvfh-5mj3-5f3j",
+  "modified": "2026-08-26T01:18:35.303406245Z",
+  "published": "2026-08-25T19:21:40Z",
+  "aliases": [
+    "CVE-2026-45019"
+  ],
+  "summary": "Chainlist has SSRF via MCP SSE and streamable-http transports that allows unauthenticated internal network access",
+  "details": "### Am I affected?\n\nOnly if your deployment sets `features.mcp.enabled = true` in `.chainlit/config.toml`. **MCP has been disabled by default since v2.7.0**, so most Chainlit deployments are not affected. No authentication is required: `/mcp` is reachable by any client that can open a session.\n\n### Summary\n\nWhen MCP is enabled (`features.mcp.enabled = true`), the `POST /mcp` endpoint for `sse` and `streamable-http` transports accepts a user-controlled `url` and optional `headers` dictionary without any validation. An unauthenticated attacker can force the Chainlit server to make outbound HTTP requests to arbitrary URLs — including internal network services and cloud metadata endpoints — with attacker-controlled HTTP headers such as `Authorization` and `Cookie`.\n\n\n### Affected / patched versions\n\n| | |\n|---|---|\n| CVE | CVE-2026-45019 |\n| Affected — URL-based SSRF | `\u003e=2.4.0rc0, \u003c2.12.0` (sink present since MCP support was introduced, PR #1977) |\n| Affected — attacker-controlled header forwarding (amplifies the above) | `\u003e=2.6.4, \u003c2.12.0` (added in PR #2292) |\n| Patched | **2.12.0** (releasing 2026-08-25) |\n\n### Details\n\nThe Pydantic request models in `backend/chainlit/types.py` define `url` as a bare `str` with no scheme check, no private IP filtering, and no allowlist. When `clientType` is `\"sse\"` or `\"streamable-http\"`, the handler in `backend/chainlit/server.py` passes the URL and headers directly to the MCP SDK's `sse_client()` or `streamablehttp_client()`, which make outbound HTTP requests from the server.\n\nThe SSE URL sink has existed since MCP support was first introduced in v2.4.0rc0 (PR #1977). PR #2292 (merged 2025-07-30, released in v2.6.4) added `streamable-http` support and introduced attacker-controlled `headers` forwarding for both transports. This amplified the SSRF from a simple URL-based request to one where the attacker can set arbitrary HTTP headers like `Authorization` and `Cookie`.\n\nThis is a blind SSRF: the server makes the outbound request, but the response is consumed internally by the MCP client and never returned to the attacker. In cloud environments, an attacker could probe metadata endpoints (e.g., 169.254.169.254).\n\n**Vulnerable code:** `backend/chainlit/server.py` — `connect_mcp` handler\n**Sink:** `backend/chainlit/server.py` — `sse_client` / `streamablehttp_client`\n\n### PoC\n\nTested against Chainlit 2.11.0 with `features.mcp.enabled = true` and a local TCP listener.\n\n1. Start a listener to capture the server-side request:\n\n```bash\nnc -l 4445\n```\n\n2. Establish a Socket.IO session and trigger the SSRF:\n\n```bash\nEIO_SID=$(curl -s 'http://TARGET:8000/ws/socket.io/?EIO=4\u0026transport=polling' \\\n  | python3 -c \"import sys,json; print(json.loads(sys.stdin.read()[1:])['sid'])\")\n\ncurl -s -X POST \\\n  \"http://TARGET:8000/ws/socket.io/?EIO=4\u0026transport=polling\u0026sid=$EIO_SID\" \\\n  -d '40{\"sessionId\":\"ssrf\",\"userEnv\":\"{}\",\"clientType\":\"webapp\"}'\n\ncurl -s -X POST 'http://TARGET:8000/mcp' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"sessionId\": \"ssrf\",\n    \"clientType\": \"streamable-http\",\n    \"name\": \"probe\",\n    \"url\": \"http://127.0.0.1:4445/internal-admin\",\n    \"headers\": {\n      \"Authorization\": \"Bearer attacker-controlled-token\",\n      \"X-Internal-Secret\": \"exfiltrated\",\n      \"Cookie\": \"session=hijacked\"\n    }\n  }'\n```\n\n3. The listener captures the server-side request with all attacker-controlled headers:\n\n```\nPOST /internal-admin HTTP/1.1\nHost: 127.0.0.1:4445\nAuthorization: Bearer attacker-controlled-token\nX-Internal-Secret: exfiltrated\nCookie: session=hijacked\n```\n\n### Impact\n\n**High.** An unauthenticated attacker can force the Chainlit server to make HTTP requests to arbitrary internal or external services, with fully attacker-controlled headers.\n\nAlthough this is a blind SSRF — the response body is never returned to the attacker — the vulnerable versions apply no allowlist to either the destination URL or the headers. Full control over both is enough to issue **state-changing, authenticated requests to internal APIs**: the PoC above is itself a POST carrying a forged `Authorization` header. Write operations against internal services do not require reading the response to have effect, so this goes beyond passive reconnaissance. The same primitive also enables internal service discovery, port scanning, and probing cloud metadata endpoints (e.g., AWS IMDSv1 at 169.254.169.254). Any Chainlit deployment with MCP enabled is affected.\n\n### Fix\n\nChainlit 2.12.0 introduces an opt-in, allowlist-based model for user-provided SSE / streamable-http connections:\n\n- User-provided MCP connections now require explicit opt-in via `features.mcp.user_servers.enabled = true`, plus a non-empty `allowed_urls` allowlist. The default is deny-all — no outbound URL is permitted unless explicitly listed.\n- URLs are validated: http/https only, with scheme/host/port/path-prefix matching against the allowlist. Requests with `.`/`..` path segments, encoded separators (`%2e`, `%2f`, `%5c`), double-encoded sequences (`%25`), backslashes, or non-ASCII characters in the path are rejected.\n- Restricted headers are stripped from user-supplied headers before the request is sent: `Cookie`, `Host`, `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`, `Proxy-Authorization`, `X-HTTP-Method-Override`, `X-Original-URL`, `X-Rewrite-URL`, and hop-by-hop headers. `Authorization` is deliberately still forwarded — for user-provided servers, passing a caller-supplied credential to the allowlisted target is the point of the feature, and the destination is now constrained by `allowed_urls`.\n- Named (developer-configured) server URLs and headers are no longer returned to the browser, on either the success or the error path, and `GET /project/settings` no longer discloses `allowed_urls`.\n\nDuring remediation the maintainers also identified and closed two ways an allowlist could otherwise be bypassed once introduced. Neither adds to the pre-fix impact described above, since the vulnerable versions had no allowlist to bypass in the first place — they are hardening measures for the new allowlist:\n\n- HTTP redirects are no longer followed on MCP transports. The underlying SDK hardcoded `follow_redirects=True`, so only the first hop of a request would ever have been checked against an allowlist.\n- Every outgoing transport request is now re-checked against the connection's grant, not just the initial URL. The MCP SSE protocol takes its POST target from the server's `endpoint` event, and the SDK validates only scheme and host on that event, so an allowlisted server could otherwise redirect subsequent writes elsewhere on the same host.\n\nA companion advisory (CVE-2026-45018) covers the corresponding fix for command injection via the stdio transport.\n\n### Workarounds\n\nIf you cannot upgrade immediately:\n\n- Set `features.mcp.enabled = false` in `.chainlit/config.toml`. This fully prevents exploitation of this issue (and of the companion stdio command-injection issue, CVE-2026-45018).\n- Restrict outbound network egress from the host running Chainlit (e.g., firewall rules blocking access to internal address ranges and the cloud metadata endpoint).\n- Configure authentication (register an auth callback) so that `/mcp` requires an authenticated session. This does not eliminate the SSRF for authenticated users, but removes the unauthenticated attack path.\n\n### Upgrading to 2.12.0\n\n\u003e **Breaking change.** 2.12.0 changes how MCP servers are configured. If `.chainlit/config.toml` still uses the legacy `[features.mcp.sse]`, `[features.mcp.stdio]`, or `[features.mcp.streamable-http]` sections, or the `allowed_executables` setting, the application will fail to start **once MCP is enabled**, until you migrate to the new `[[features.mcp.servers]]` / `allowed_urls` configuration. See the migration guide in `CHANGELOG.md` before upgrading. Deployments with `features.mcp.enabled = false` are not affected by this startup check.\n\n### Residual risk after upgrading\n\n- On deployments with no authentication configured, `/mcp` remains reachable anonymously after upgrading, because `get_current_user` returns `None` when no auth callback is registered. Where `features.mcp.user_servers.enabled = true`, an anonymous client can therefore still drive outbound requests to any URL on the `allowed_urls` allowlist, with an `Authorization` header of its own choosing.\n- There is no private-IP or IP-literal blocking. The allowlist is hostname-based, so a DNS name that resolves to a loopback, link-local, or cloud metadata address is not rejected. Closing this without introducing a TOCTOU window requires resolve-then-pin validation, which is deliberately deferred rather than shipped as a partial mitigation.\n- Header filtering in 2.12.0 is a denylist, not an allowlist. An allowlist model is the intended future direction.\n\n### Credits\n\nVipin \u003cvipin@spl.team\u003e\nSPL \u003csecurity@spl.team\u003e",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "chainlit",
+        "purl": "pkg:pypi/chainlit"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.4.0rc0"
+            },
+            {
+              "fixed": "2.12.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.11.1",
+        "2.4.0",
+        "2.4.0rc0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.201",
+        "2.4.3",
+        "2.4.301",
+        "2.4.302",
+        "2.4.400",
+        "2.5.5",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.6.3",
+        "2.6.4",
+        "2.6.5",
+        "2.6.6",
+        "2.6.7",
+        "2.6.8",
+        "2.6.9",
+        "2.7.0",
+        "2.7.1",
+        "2.7.1.1",
+        "2.7.2",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4",
+        "2.8.5",
+        "2.9.0",
+        "2.9.1",
+        "2.9.2",
+        "2.9.3",
+        "2.9.4",
+        "2.9.5",
+        "2.9.6"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-hvfh-5mj3-5f3j/GHSA-hvfh-5mj3-5f3j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/security/advisories/GHSA-hvfh-5mj3-5f3j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/commit/0565fd0eccb915fce159929598b053ed79f6e0c9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Chainlit/chainlit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/blob/2.12.0/docs/security-advisory-2026-mcp.md#spl-2026-002--ssrf-via-mcp-streamable-http--sse"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Chainlit/chainlit/releases/tag/2.12.0"
+    }
+  ]
+}
