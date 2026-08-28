@@ -1,0 +1,92 @@
+{
+  "id": "GHSA-x626-fcwx-f5pc",
+  "modified": "2026-08-28T20:45:07.156899381Z",
+  "published": "2026-08-28T20:28:19Z",
+  "aliases": [
+    "CVE-2026-55761"
+  ],
+  "summary": "Portainer has Unauthenticated Restore Endpoint that Allows Admin Takeover on Uninitialized Instances",
+  "details": "## Summary\nPortainer supports restoring an instance from a backup archive via the /api/restore endpoint. This endpoint is intentionally unauthenticated to allow restoring before the first admin account is created, and remains accessible for the five-minute initialization window that opens each time Portainer starts. Any unauthenticated attacker with network access to a Portainer instance that has not yet been initialised can exploit this window to replace the Portainer database with a crafted archive containing attacker-controlled credentials and gain full administrative access. The same unauthenticated setup window also exposes the administrator-account-creation endpoint (`/api/users/admin/init`), which an attacker can call to create the first administrator directly; the fix gates both endpoints.\n\nThe attack requires the instance to be uninitialized, reachable by the attacker, and within the five-minute window. Once that window expires without initialization, Portainer locks its API and requires a restart to re-enable setup — each restart opens a fresh window. No credentials, session tokens, or local access are required.\n\n## Severity\n**High**\n\nThe endpoint requires no authentication and no user interaction, but successful exploitation depends on three conditions holding simultaneously: the instance must be uninitialized, reachable from the attacker's network, and within the five-minute setup window that Portainer enforces before locking the instance pending a restart. Once those conditions are met, the attack itself is straightforward — no specialized tooling or elevated privileges are needed. The vulnerable system impact is limited by the precondition: a brand new instance carries no confidential data, no existing users, and no running workloads, so the direct integrity and availability impact is low. The severity is driven entirely by the subsequent-system chain — Portainer CE is typically bound to a Docker socket that grants root-equivalent access to the host, and the compromised admin account inherits credentials and API access for every Docker host, Kubernetes cluster, and edge agent registered in the instance.\n\n## Affected Versions\n\nThe unauthenticated initialization path has been present since the backup/restore feature was introduced.\n\nFixes are included in the following releases:\n\n| Branch       | First vulnerable | Fixed in   |\n|--------------|------------------|------------|\n| 2.39.x (LTS) | 2.39.0           | **2.39.4** |\n| 2.43.x (STS) | all prior        | **2.43.0** |\n\nPortainer releases prior to 2.39.0 are end-of-life and will not receive a fix. This includes the 2.33.x LTS line. Users on end-of-life versions should upgrade to a supported branch.\n\n## Workarounds\nAdministrators who cannot immediately upgrade can reduce exposure by:\n\n- **Provision the administrator account at deploy time.** Start any network-reachable instance with `--admin-password` or `--admin-password-file`, supplying a pre-set administrator password. The admin account then exists from first boot, so the instance is never in the uninitialised state that the restore and admin-init endpoints depend on — there is no setup window for an attacker to race. This is the most effective workaround for new, internet- or network-facing deployments. Instances on genuinely trusted networks (air-gapped or isolated private LANs) don't require it.\n- **Restrict network access to Portainer before completing initial setup.** Use firewall rules, VPC security groups, or a reverse proxy to prevent untrusted networks from reaching the Portainer API while the instance is uninitialised. Remove the restriction once an admin account has been created and initial setup is complete.\n- **Complete initial setup immediately after deployment.** The initialization endpoints stop accepting requests once the instance has an administrator account. Minimising the uninitialised window limits the exploitation opportunity.\n- **Audit existing deployments for unauthorised admin accounts.** If a deployment may have been accessible before setup was completed, review the admin account list and rotate all credentials.\n\nNone of these replace the fix.\n\n## Affected Code\nThe vulnerability is in `api/http/handler/backup/handler.go` and `api/http/handler/backup/restore.go`. The handler registers the restore endpoint with `bouncer.PublicAccess`, bypassing all authentication middleware:\n\n```go\n// api/http/handler/backup/handler.go — NewHandler\nh.Handle(\"/restore\", bouncer.PublicAccess(httperror.LoggerHandler(h.restore))).Methods(http.MethodPost)\n```\n\nThe restore handler then checks only whether the instance has been initialised before proceeding:\n\n```go\n// api/http/handler/backup/restore.go — restore\nfunc (h *Handler) restore(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {\n    initialized, err := h.adminMonitor.WasInitialized()\n    if err != nil {\n        return httperror.InternalServerError(\"Failed to check system initialization\", err)\n    }\n    if initialized {\n        return httperror.BadRequest(\"Cannot restore already initialized instance\", errors.New(\"system already initialized\"))\n    }\n    h.adminMonitor.Stop()\n    // Proceeds to restore the archive unconditionally\n```\n\nThe fix introduces a one-time setup token that gates the public initialization endpoints — both administrator account creation (`/api/users/admin/init`) and restore (`/api/restore`) — while an instance is uninitialised. On startup, when no administrator account exists and no admin password was supplied through configuration, Portainer generates a cryptographically random token and writes it to the server logs. The restore and admin-init handlers reject any request that does not present this token in an `X-Setup-Token` header, returning `403 Forbidden`. Deployments that provision the administrator password at deploy time (`--admin-password` / `--admin-password-file`) require no token; the requirement can be pinned to an operator-chosen value (`--setup-token`) or disabled on trusted networks (`--no-setup-token`). The same change is backported to `release/2.39` for the 2.39.4 release.\n\n## Impact\n- **Full administrative access to Portainer.** The attacker replaces the database with one containing their own admin credentials and can then authenticate as a full administrator with no legitimate-user involvement.\n- **Host-level compromise.** Portainer CE typically runs with access to the Docker socket (`/var/run/docker.sock`); an attacker with Portainer admin access can use container creation APIs to mount the host filesystem and execute commands as root.\n- **Access to all managed environments.** The compromised Portainer admin account has credentials and API access for every Docker host, Kubernetes cluster, and edge agent registered in that instance, including any stored registry credentials, environment variables, and secrets.\n- **Persistence across credential changes.** Because the attacker controls the database, they can re-insert admin credentials or maintain secondary accounts even if a legitimate user later resets the primary password via the UI.\n\n## Timeline\n- 2026-05-07: Reported privately by **um3b0shi**.\n- 2026-06-04: Fix merged to `develop`.\n- 2026-06-24: 2.43.0 (STS) released with the fix.\n- 2026-06-25: 2.39.4 (LTS) released with the backported fix.\n\n## Credit\n- **um3b0shi** — discovered and reported the unauthenticated admin takeover via the `/api/restore` endpoint. Coverage of the companion administrator-account-creation endpoint (`/api/users/admin/init`) was added by the Portainer team as part of the fix.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.39.0"
+            },
+            {
+              "fixed": "2.39.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-x626-fcwx-f5pc/GHSA-x626-fcwx-f5pc.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/portainer/portainer",
+        "purl": "pkg:golang/github.com/portainer/portainer"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.40.0"
+            },
+            {
+              "fixed": "2.43.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/08/GHSA-x626-fcwx-f5pc/GHSA-x626-fcwx-f5pc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/security/advisories/GHSA-x626-fcwx-f5pc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-55761"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/issues/2770"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/commit/49f19107cf9a3540cbe406c9eb7f24390e1af02b"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/commit/d2b56efcb4e43c4168bb6688eee9f6bf22867312"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/portainer/portainer"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.39.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/portainer/portainer/releases/tag/2.43.0"
+    }
+  ]
+}
