@@ -1,0 +1,208 @@
+{
+  "id": "GHSA-2m8g-3cmr-wg3w",
+  "modified": "2026-09-01T19:30:08.633330828Z",
+  "published": "2026-09-01T19:24:51Z",
+  "aliases": [
+    "CVE-2026-73228"
+  ],
+  "summary": "Django REST framework: Potential bypass of Django `DATA_UPLOAD_MAX_MEMORY_SIZE` when parsing oversized JSON and urlencoded request bodies via DRF `request.data`",
+  "details": "## Summary\n\nWhile investigating Django REST Framework's request parsing behavior, I identified that DRF's high-level `request.data` parsing appears to bypass Django's configured `DATA_UPLOAD_MAX_MEMORY_SIZE` protection for `application/json` and `application/x-www-form-urlencoded` request bodies.\n\nIn the tested configurations, Django correctly raises `RequestDataTooBig` when applications access `request.body` or Django's native `request.POST`, but DRF successfully parses the same oversized payloads through `request.data`.\n\nThis behavior appears to occur because DRF passes the underlying `HttpRequest` object directly to parsers, which consume the request stream through Django's lower-level streaming interface rather than the guarded `request.body` path.\n\nI am reporting this privately because I am unsure whether this behavior is considered part of DRF's intended security boundary, but it appears to bypass a documented Django request-size protection for common DRF request parsing paths and may have availability implications.\n\n\n# What I Verified\n\nI verified the behavior locally using the following combinations:\n\n* Django **6.0.7** + DRF **3.17.1** → **Affected**\n* Django **6.0.7** + DRF **current upstream main** → **Affected**\n\nFor both versions, the observed behavior was:\n\n```\nDjango request.body\n→ RequestDataTooBig\n\nDjango request.POST (application/x-www-form-urlencoded)\n→ RequestDataTooBig\n\nDjango request.read()\n→ Reads the entire oversized request body\n\nDRF request.data\n→ Successfully parses oversized JSON and urlencoded request bodies\n```\n\nI also confirmed that:\n\n* `multipart/form-data` remains protected because DRF delegates multipart parsing to Django's multipart parser.\n* The behavior reproduces on both direct WSGI and ASGI servers without a reverse proxy or external request-size middleware.\n\n\n# Technical Details\n\nThe relevant execution flow is:\n\n```\nAPIView\n\n↓\n\nrest_framework.request.Request\n\n↓\n\nrequest.data\n\n↓\n\nRequest._load_data_and_files()\n\n↓\n\nRequest._parse()\n\n↓\n\nRequest._load_stream()\n\n↓\n\nself._stream = self._request\n\n↓\n\nJSONParser.parse(...)\nor\nFormParser.parse(...)\n\n↓\n\nstream.read() / json.load(...)\n```\n\nThe important implementation detail is that DRF assigns the original Django `HttpRequest` object as the parser stream.\n\nUnlike `request.body` and Django's native form parsing, consuming the stream through `HttpRequest.read()` does not trigger Django's `RequestDataTooBig` protection.\n\nAs a result, DRF's built-in parsers successfully consume oversized request bodies that Django itself would reject through its higher-level request interfaces.\n\n\n# Reproduction Steps\n\n## Environment\n\nPython 3.13\n\nDjango 6.0.7\n\nDjango REST Framework 3.17.1 (also reproduced on current upstream main)\n\nConfigure:\n\n```python\nDATA_UPLOAD_MAX_MEMORY_SIZE = 10\n```\n\nCreate a simple DRF API view:\n\n```python\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\n\nclass DemoView(APIView):\n    def post(self, request):\n        return Response(request.data)\n```\n\nStart the application.\n\nSend an oversized JSON request:\n\n```\nPOST /demo\nContent-Type: application/json\nContent-Length: \u003e10 bytes\n```\n\nExample:\n\n```json\n{\n  \"value\": \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA...\"\n}\n```\n\nObserved:\n\n```\nHTTP 200\n\nJSON successfully parsed\n```\n\nNow compare against:\n\n```python\nrequest.body\n```\n\nObserved:\n\n```\nRequestDataTooBig\n```\n\nLikewise, compare against:\n\n```python\nrequest.POST\n```\n\nusing\n\n```\napplication/x-www-form-urlencoded\n```\n\nObserved:\n\n```\nRequestDataTooBig\n```\n\nThis demonstrates different enforcement depending on which request API is used.\n\n\n# Root Cause\n\nDjango documents `HttpRequest.read()` as a streaming interface.\n\nDRF exposes `request.data` as the primary high-level request parsing API.\n\nCurrently, DRF forwards the raw Django request stream directly to parsers before any request-size validation equivalent to Django's `request.body` path occurs.\n\nConsequently:\n\n* JSONParser\n* FormParser\n\nfully consume oversized request bodies despite Django's configured request-size limit.\n\n\n# Security Impact\n\nThis does **not** appear to introduce:\n\n* Authentication bypass\n* Authorization bypass\n* Remote code execution\n* Information disclosure\n* Integrity compromise\n\nHowever, it may reduce the effectiveness of deployments relying on Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` to limit request-body resource consumption.\n\nPotential consequences include:\n\n* Additional memory allocation during JSON parsing\n* Additional CPU usage while decoding large JSON payloads\n* Increased resource consumption when handling oversized request bodies\n* Reduced effectiveness of Django's configured request-size protection for DRF endpoints using `request.data`\n\nThe practical impact depends on deployment configuration, including:\n\n* upstream request-size limits\n* reverse proxy configuration\n* authentication\n* rate limiting\n* endpoint exposure\n\n\n# Memory Observations\n\nDuring local testing I observed successful parsing of oversized request bodies despite the configured limit.\n\nRepresentative measurements showed significantly increased memory allocation while parsing large JSON and urlencoded payloads.\n\nI intentionally did **not** perform destructive concurrency testing or attempt to exhaust system resources.\n\n\n# Scope\n\nConfirmed affected:\n\n* application/json\n* application/x-www-form-urlencoded\n\nConfirmed not affected:\n\n* multipart/form-data\n\n\n# Suggested Fix Direction\n\nOne possible approach would be for DRF to enforce Django's configured `DATA_UPLOAD_MAX_MEMORY_SIZE` before handing the raw request stream to parsers that fully materialize request bodies in memory.\n\nThis would preserve Django's configured request-size protection for the common `request.data` API without requiring broader changes to Django's documented streaming interface.\n\n\n# Versions Tested\n\nAffected:\n\n* Django 6.0.7 + DRF 3.17.1\n* Django 6.0.7 + DRF current upstream main\n\nI did not perform a complete historical version bisect.\n\n\n# Disclosure\n\nI have not publicly disclosed this behavior.\n\nI am submitting it privately in accordance with the project's security policy because I am unsure whether maintainers consider this part of DRF's intended security boundary.\n\n# Note:\n\n**Thank you for taking the time to review this report.**\n\nIf you determine that this behavior should be addressed, I would be happy to help investigate further, develop a fix, add regression tests, and submit a patch if you'd find that helpful.\n\nI have experience as a **Python/Django software engineer, security researcher, and open-source contributor**, and I'd be glad to contribute if you think that would be useful.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djangorestframework",
+        "purl": "pkg:pypi/djangorestframework"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.17.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.1.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.16",
+        "2.1.17",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.2.3",
+        "2.2.4",
+        "2.2.5",
+        "2.2.6",
+        "2.2.7",
+        "2.3.0",
+        "2.3.1",
+        "2.3.10",
+        "2.3.11",
+        "2.3.12",
+        "2.3.13",
+        "2.3.14",
+        "2.3.2",
+        "2.3.3",
+        "2.3.4",
+        "2.3.5",
+        "2.3.6",
+        "2.3.7",
+        "2.3.8",
+        "2.3.9",
+        "2.4.0",
+        "2.4.1",
+        "2.4.2",
+        "2.4.3",
+        "2.4.4",
+        "2.4.5",
+        "2.4.6",
+        "2.4.7",
+        "2.4.8",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.11.0",
+        "3.11.1",
+        "3.11.2",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.13.0",
+        "3.13.1",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.16.0",
+        "3.16.1",
+        "3.17.0",
+        "3.17.1",
+        "3.2.0",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.4.6",
+        "3.4.7",
+        "3.5.0",
+        "3.5.1",
+        "3.5.2",
+        "3.5.3",
+        "3.5.4",
+        "3.6.0",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.7.0",
+        "3.7.1",
+        "3.7.2",
+        "3.7.3",
+        "3.7.4",
+        "3.7.5",
+        "3.7.6",
+        "3.7.7",
+        "3.8.0",
+        "3.8.1",
+        "3.8.2",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-2m8g-3cmr-wg3w/GHSA-2m8g-3cmr-wg3w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/security/advisories/GHSA-2m8g-3cmr-wg3w"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73228"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/pull/10013"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/commit/2912dc98042f78e27636551fc22eeaf10f725fdd"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/commit/82ef7b7e4e0a73ba5c489b465fae7e76d948da4e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/encode/django-rest-framework"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/releases/tag/3.17.2"
+    }
+  ]
+}
