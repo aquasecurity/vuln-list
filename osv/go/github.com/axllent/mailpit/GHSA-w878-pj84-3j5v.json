@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-w878-pj84-3j5v",
+  "modified": "2026-09-03T00:30:04.440566163Z",
+  "published": "2026-09-02T23:42:25Z",
+  "aliases": [
+    "CVE-2026-67445"
+  ],
+  "summary": "Mailpit: SMTP command parser buffers unbounded command lines before syntax rejection",
+  "details": "## Summary\n\nMailpit's SMTP server reads each command line with an unbounded `bufio.Reader.ReadString('\\n')` before parsing the command or enforcing any protocol length limit. A remote SMTP client can send an oversized single command line and force Mailpit to allocate attacker-controlled memory before the server returns a syntax error or times out, even though RFC 5321 limits SMTP command lines to 512 octets including CRLF.\n\n## Technical Details\n\nMailpit enables SMTP by default. `config/config.go` sets `SMTPListen = \"[::]:1025\"`, and `cmd/root.go` calls `smtpd.Listen()` during normal startup. The SMTP server configures recipient and message DATA size limits in `internal/smtpd/main.go`, including the default 50 MiB `MaxMessageSize`, but those limits do not apply to command lines.\n\nThe vulnerable path is in the SMTP command loop. `internal/smtpd/smtpd.go` calls `s.readLine()` for every command before parsing the verb or arguments:\n\n```go\nline, err := s.readLine()\nif err != nil {\n    if netErr, ok := err.(net.Error); ok \u0026\u0026 netErr.Timeout() {\n        s.writef(\"421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded\", s.srv.Hostname, s.srv.AppName)\n    }\n    break\n}\n\nverb, args := s.parseLine(line)\n```\n\n`readLine()` then buffers until newline without a maximum length:\n\n```go\nfunc (s *session) readLine() (string, error) {\n    if s.srv.Timeout \u003e 0 {\n        _ = s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))\n    }\n\n    line, err := s.br.ReadString('\\n')\n    if err != nil {\n        return \"\", err\n    }\n    line = strings.TrimSpace(line)\n    return line, err\n}\n```\n\nThis violates the SMTP command-line invariant before later validation can help. Address length validation in `extractAndValidateAddress()` runs only after the entire command line has already been buffered and parsed. The DATA reader has a separate `srv.MaxSize` check, but the issue is pre-DATA command input.\n\n## PoV\n\nThe following bounded test exercises the same command reader with a normal `NOOP` control and an 8 MiB oversized command line:\n\n```go\npackage smtpd\n\nimport (\n    \"bufio\"\n    \"bytes\"\n    \"strings\"\n    \"testing\"\n)\n\nfunc TestUnboundedSMTPCommandLinePoV(t *testing.T) {\n    short := \"NOOP\\r\\n\"\n    shortSession := session{srv: \u0026Server{}, br: bufio.NewReader(strings.NewReader(short))}\n    shortLine, err := shortSession.readLine()\n    if err != nil {\n        t.Fatalf(\"short control readLine failed: %v\", err)\n    }\n    t.Logf(\"short control: accepted len=%d command=%q\", len(shortLine), shortLine)\n\n    oversizedLen := 8 * 1024 * 1024\n    oversized := strings.Repeat(\"X\", oversizedLen) + \"\\r\\n\"\n    oversizedSession := session{srv: \u0026Server{}, br: bufio.NewReader(bytes.NewBufferString(oversized))}\n    oversizedLine, err := oversizedSession.readLine()\n    if err != nil {\n        t.Fatalf(\"oversized readLine failed: %v\", err)\n    }\n    t.Logf(\"oversized command: accepted len=%d; RFC 5321 command-line limit is 512 octets including CRLF\", len(oversizedLine))\n\n    if len(oversizedLine) != oversizedLen {\n        t.Fatalf(\"readLine length = %d, want %d\", len(oversizedLine), oversizedLen)\n    }\n    if len(oversizedLine) \u003c= 512 {\n        t.Fatalf(\"oversized command did not exceed SMTP command-line limit\")\n    }\n}\n```\n\n## PoC\n\nFrom a Mailpit checkout, save the PoV above as `internal/smtpd/smtp_command_line_pov_test.go` and run:\n\n```fish\ndocker run --rm -v \"$PWD:/src\" -w /src golang:1.25 go test ./internal/smtpd -run TestUnboundedSMTPCommandLinePoV -v\n```\n\nOn current `develop` commit `cd7661fd5b23cce1e218b583b21e157cfa612051`, the test prints:\n\n```text\n=== RUN   TestUnboundedSMTPCommandLinePoV\n    smtp_command_line_pov_test.go:17: short control: accepted len=4 command=\"NOOP\"\n    smtp_command_line_pov_test.go:26: oversized command: accepted len=8388608; RFC 5321 command-line limit is 512 octets including CRLF\n--- PASS: TestUnboundedSMTPCommandLinePoV (0.01s)\nPASS\nok  \tgithub.com/axllent/mailpit/internal/smtpd\t0.017s\n```\n\nThe same test against release `v1.30.3` commit `6acf5b8f942ab0e007b1227d31dfb3c3303e8d13` prints:\n\n```text\n=== RUN   TestUnboundedSMTPCommandLinePoV\n    smtp_command_line_pov_test.go:17: short control: accepted len=4 command=\"NOOP\"\n    smtp_command_line_pov_test.go:26: oversized command: accepted len=8388608; RFC 5321 command-line limit is 512 octets including CRLF\n--- PASS: TestUnboundedSMTPCommandLinePoV (0.02s)\nPASS\nok  \tgithub.com/axllent/mailpit/internal/smtpd\t0.020s\n```\n\nThe `NOOP` control shows the normal reader path. The oversized case shows the parser accepting an 8 MiB command line into memory instead of rejecting at the SMTP command-line limit.\n\n## Impact\n\nAn unauthenticated remote client that can reach Mailpit's SMTP listener can force heap allocation proportional to a single command line before any SMTP command is parsed. Repeating the input across concurrent connections can consume process memory and degrade or deny Mailpit service availability. This is distinct from message DATA size handling: the default `MaxMessageSize` cap is enforced after `DATA`, while the command-line reader is reached before DATA and before `MAIL FROM SIZE=` handling.\n\nSuggested advisory metadata: CWE-400 (Uncontrolled Resource Consumption). Conservative CVSS 3.1 vector: `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`, base score 7.5 (High). If a deployment explicitly binds SMTP to trusted loopback-only clients, environmental severity may be lower; the project default is a network SMTP listener on `[::]:1025`.\n\n## Suggested Fix\n\nBound SMTP command-line reads before buffering the full line. For ordinary SMTP commands, reject input exceeding RFC 5321's 512-octet command-line limit including CRLF, returning a `500 5.5.2`-style command-line-too-long response before allocating the entire attacker-controlled line. Apply the same pre-parse bound to AUTH continuation lines because `handleAuthLogin()`, `handleAuthPlain()`, and `handleAuthCramMD5()` also call `readLine()`. Consider adding a similar POP3 command-line cap in `internal/pop3/server.go`, where the optional POP3 server also uses `ReadString('\\n')` for commands.\n\nRegression tests should cover a normal short command, an over-limit command line, and over-limit AUTH continuation input. They should assert that the over-limit cases fail without returning the oversized string to command parsing.\n\n## Affected Package/Versions\n\nConfirmed affected:\n\n- Current `develop`: `cd7661fd5b23cce1e218b583b21e157cfa612051`\n- Latest release: `v1.30.3`, tag commit `6acf5b8f942ab0e007b1227d31dfb3c3303e8d13`, published 2026-06-27\n\nNo fixed version was identified during this review.\n\n## Advisory History\n\nThe closest published Mailpit advisory is `GHSA-fpxj-m5q8-fphw`, which covers unauthenticated memory exhaustion through unlimited SMTP DATA and `/api/v1/send` body sizes. This report is different: it targets the pre-DATA SMTP command-line reader before `srv.MaxSize`, `MAIL FROM SIZE=`, or DATA handling applies.\n\nOther published Mailpit advisories checked were `GHSA-28pq-6qxg-wg5r` for HTTP JSON body limits, `GHSA-54wq-72mp-cq7c` for SMTP header injection, `GHSA-w4vj-r5pg-3722` for proxy CSS map concurrency, `GHSA-qx5x-85p8-vg4j` for dump path traversal, the SSRF/link-check/proxy advisories `GHSA-8v65-47jx-7mfr`, `GHSA-mpf7-p9x7-96r3`, `GHSA-6jxm-fv7w-rw5j`, `GHSA-j3fj-qppj-fmmc`, `GHSA-w4mc-hhc6-xp28`, and `GHSA-524m-q5m7-79mm` for CSWSH. None of these describe unbounded SMTP command-line buffering.\n\nPublic Mailpit issue searches for `SMTP command line too long ReadString`, `SMTP 512 octets command line`, `SMTP memory DoS command line`, and `ReadString smtpd` found no matching issue. Public commit searches for `ReadString smtpd`, `command line too long`, and `MaxMessageSize smtp` found no matching fix. No prior submitted, ready-for-review, or completed-but-unsubmitted Mailpit report available in the review materials matched this root cause.\n\n## References\n\n- RFC 5321 section 4.5.3.1.4, command-line length limit: https://www.rfc-editor.org/rfc/rfc5321#section-4.5.3.1.4\n- Mailpit security policy: https://github.com/axllent/mailpit/security/policy\n- `GHSA-fpxj-m5q8-fphw`: https://github.com/axllent/mailpit/security/advisories/GHSA-fpxj-m5q8-fphw\n- `GHSA-28pq-6qxg-wg5r`: https://github.com/axllent/mailpit/security/advisories/GHSA-28pq-6qxg-wg5r\n- `GHSA-54wq-72mp-cq7c`: https://github.com/axllent/mailpit/security/advisories/GHSA-54wq-72mp-cq7c",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/axllent/mailpit",
+        "purl": "pkg:golang/github.com/axllent/mailpit"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.30.4"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.30.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w878-pj84-3j5v/GHSA-w878-pj84-3j5v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/security/advisories/GHSA-w878-pj84-3j5v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-67445"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/commit/993bed95b3c74d95231af93bd0e0d4c3d5b4db4d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/axllent/mailpit"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/axllent/mailpit/releases/tag/v1.30.4"
+    }
+  ]
+}
