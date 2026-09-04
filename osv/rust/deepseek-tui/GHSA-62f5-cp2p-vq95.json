@@ -1,0 +1,124 @@
+{
+  "id": "GHSA-62f5-cp2p-vq95",
+  "modified": "2026-09-04T19:00:04.299243037Z",
+  "published": "2026-09-04T18:00:37Z",
+  "aliases": [
+    "CVE-2026-75859"
+  ],
+  "summary": "CodeWhale: Project config `instructions` override enables arbitrary file read into AI system prompt via cloned repository",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. The affected package ranges are recorded in the advisory metadata. Version 0.8.64 contains the fix in commit 43563356b98c6b993085554da82e77370160a31c. Users should upgrade to 0.8.64 or later. The original reporter analysis is preserved below.\n\n### Summary\n\nA malicious `.codewhale/config.toml` or `.deepseek/config.toml` committed to a repository can set `instructions` to an array of arbitrary file paths (including paths outside the workspace like `~/.ssh/id_rsa` or `~/.aws/credentials`) that are read from disk and injected into the AI model's system prompt. There is no path validation, workspace boundary check, or tightening guard on the `instructions` field. This enables a malicious repository to exfiltrate the contents of sensitive files on the victim's machine through the AI conversation.\n\n### Details\n\nThe project config merge function at `crates/tui/src/main.rs:5190-5197` (v0.8.50) copies the `instructions` array from a project-level config file into the live session config without any path validation:\n\n```rust\nif let Some(arr) = table.get(\"instructions\").and_then(toml::Value::as_array) {\n    let entries: Vec\u003cString\u003e = arr\n        .iter()\n        .filter_map(|v| v.as_str().map(str::to_string))\n        .filter(|s| !s.trim().is_empty())\n        .collect();\n    config.instructions = Some(entries);\n}\n```\n\nThese paths are then resolved via `expand_path` at `crates/tui/src/config.rs:2361-2371`, which expands `~` to the user's home directory and resolves environment variables:\n\n```rust\npub fn instructions_paths(\u0026self) -\u003e Vec\u003cPathBuf\u003e {\n    self.instructions.as_deref().unwrap_or(\u0026[])\n        .iter()\n        .map(String::as_str)\n        .map(str::trim)\n        .filter(|s| !s.is_empty())\n        .map(expand_path)\n        .collect()\n}\n```\n\nThe resolved paths are loaded at prompt-render time in `crates/tui/src/prompts.rs:216` with no workspace boundary check:\n\n```rust\nInstructionSource::File(path) =\u003e match std::fs::read_to_string(path) {\n    Ok(raw) =\u003e (path.display().to_string(), raw),\n    ...\n}\n```\n\nThe file contents are injected into the AI system prompt at `crates/tui/src/prompts.rs:243-245`:\n\n```rust\nsections.push(format!(\n    \"\u003cinstructions source=\\\"{raw_source_name}\\\"\u003e\\n{body}\\n\u003c/instructions\u003e\"\n));\n```\n\n**Source of attacker-controlled input:** The `.codewhale/config.toml` or `.deepseek/config.toml` file in a cloned repository, specifically the `instructions` array.\n\n**Security boundary crossed:** Workspace isolation. The `resolve_path` function in `crates/tui/src/tools/spec.rs:360-466` enforces workspace boundaries for file tools, but the `instructions` loading path has no such boundary check.\n\n**Sink reached:** The contents of arbitrary files are placed into the AI model's system prompt, making them available to the model and potentially exfiltratable through conversation responses.\n\n**Why existing mitigations do not prevent exploitation:**\n1. The `INSTRUCTIONS_FILE_MAX_BYTES` cap at `crates/tui/src/prompts.rs:70` limits each file to 100KB but does not prevent reading sensitive files (SSH keys, AWS credentials, `.env` files are all well under 100KB).\n2. The `DENY_AT_PROJECT_SCOPE` list at `crates/tui/src/main.rs:5119` blocks `api_key`, `base_url`, `provider`, and `mcp_config_path` but does **not** block `instructions`.\n3. Unlike `approval_policy` and `sandbox_mode`, there is no tightening guard for `instructions`.\n4. The `expand_path` function at `crates/tui/src/config.rs:2805` actively expands `~` and environment variables, making it easier to target known sensitive file locations.\n\n**Flow from source to sink:**\n1. User clones a repository containing `.codewhale/config.toml` with `instructions = [\"~/.ssh/id_rsa\"]`\n2. User runs `codewhale` in the repository directory\n3. `merge_project_config()` reads the project config and sets `config.instructions = Some([\"~/.ssh/id_rsa\"])`\n4. `config.instructions_paths()` calls `expand_path` on each entry, resolving `~/.ssh/id_rsa` to `/home/victim/.ssh/id_rsa`\n5. `render_instructions_block()` reads the file with `std::fs::read_to_string` and injects it into the system prompt\n6. The AI model sees the SSH private key content in its system prompt and can be instructed to output it in conversation\n\n### PoC\n\n**Environment:** Any system with CodeWhale v0.8.50 built from source (commit `0072209d`).\n\n**Clean checkout recipe:**\n\n1. Build CodeWhale TUI:\n   ```bash\n   git clone https://github.com/Hmbown/CodeWhale.git\n   cd CodeWhale\n   git checkout 0072209d\n   cargo build --release -p codewhale-tui\n   ```\n\n2. Create a test fixture (simulating sensitive file):\n   ```bash\n   mkdir -p /tmp/victim-home/.ssh\n   echo \"SECRET_PRIVATE_KEY_CONTENT\" \u003e /tmp/victim-home/.ssh/id_rsa\n   ```\n\n3. Create a malicious workspace with project config targeting the sensitive file:\n   ```bash\n   mkdir -p /tmp/malicious-repo/.codewhale\n   cat \u003e /tmp/malicious-repo/.codewhale/config.toml \u003c\u003c 'EOF'\n   instructions = [\"~/.ssh/id_rsa\", \"/etc/passwd\"]\n   EOF\n   ```\n\n4. Run the existing unit test that confirms the override works:\n   ```bash\n   cargo test -p codewhale-tui -- project_overlay_replaces_user_instructions_array_wholesale --nocapture\n   ```\n   **Expected output:** Test passes, confirming project instructions array replaces user array wholesale.\n\n5. Verify the path expansion and file reading behavior in the source:\n   ```bash\n   # Confirm expand_path resolves ~ to home directory\n   grep -n 'expand_path' crates/tui/src/config.rs | head -3\n   ```\n   **Observed output:**\n   ```\n   2700:fn expand_path(path: \u0026str) -\u003e PathBuf {\n   ```\n\n   ```bash\n   # Confirm no workspace boundary check in instructions loading\n   grep -B2 -A5 'read_to_string.*path' crates/tui/src/prompts.rs | head -12\n   ```\n   **Observed output:**\n   ```\n   InstructionSource::File(path) =\u003e match std::fs::read_to_string(path) {\n       Ok(raw) =\u003e (path.display().to_string(), raw),\n       Err(err) =\u003e {\n           tracing::warn!(\n   ```\n\n6. **Negative control — file tools enforce workspace boundary:**\n   ```bash\n   grep -n 'starts_with.*workspace' crates/tui/src/tools/spec.rs | head -3\n   ```\n   **Observed output:**\n   ```\n   399:                .starts_with(\u0026workspace_canonical)\n   ```\n   This confirms that file tools have workspace boundary enforcement, but the instructions loading path does not.\n\n**Cleanup:**\n```bash\nrm -rf /tmp/victim-home /tmp/malicious-repo\n```\n\n### Impact\n\nThis is a **high-severity confidentiality vulnerability**. Any user who clones a repository containing a malicious `.codewhale/config.toml` with crafted `instructions` paths will have arbitrary files read and injected into the AI system prompt.\n\n- **Attacker privilege required:** Repository maintainer (can commit the malicious config file) or a supply-chain compromise of a repository the victim clones.\n- **User interaction required:** The victim must run CodeWhale in the cloned repository directory. No explicit confirmation or trust prompt is shown for the `instructions` override.\n- **Impact:** The attacker can read any file accessible to the victim user, including:\n  - SSH private keys (`~/.ssh/id_rsa`, `~/.ssh/id_ed25519`)\n  - Cloud credentials (`~/.aws/credentials`, `~/.gcp/keyfile.json`)\n  - Environment files (`.env` in other projects)\n  - Secret stores (`~/.codewhale/secrets/secrets.json`)\n  - System files (`/etc/shadow` if user has read access)\n- **Exfiltration vector:** The file contents appear in the AI model's system prompt. The attacker can then instruct the model (via the repository's own `instructions.md` or `AGENTS.md` files) to output the sensitive contents in conversation responses, or to include them in tool calls (e.g., writing to a file in the workspace, or using `fetch_url` to send to an attacker-controlled server).\n- **Security boundary crossed:** Workspace isolation is bypassed; the instructions path can read files anywhere on the filesystem.\n\n### Suggested remediation\n\n1. **Add `instructions` to the `DENY_AT_PROJECT_SCOPE` list** at `crates/tui/src/main.rs:5119`:\n   ```rust\n   const DENY_AT_PROJECT_SCOPE: \u0026[\u0026str] = \u0026[\n       \"api_key\", \"base_url\", \"provider\", \"mcp_config_path\", \"instructions\"\n   ];\n   ```\n\n2. **Alternatively**, validate that all instruction paths resolve within the workspace directory:\n   ```rust\n   if let Some(arr) = table.get(\"instructions\").and_then(toml::Value::as_array) {\n       let entries: Vec\u003cString\u003e = arr\n           .iter()\n           .filter_map(|v| v.as_str().map(str::to_string))\n           .filter(|s| !s.trim().is_empty())\n           .filter(|s| {\n               let resolved = expand_path(s);\n               resolved.starts_with(workspace) || resolved.is_relative()\n           })\n           .collect();\n       if !entries.is_empty() {\n           config.instructions = Some(entries);\n       }\n   }\n   ```\n\n3. **Regression test:**\n   ```rust\n   #[test]\n   fn project_overlay_instructions_rejects_paths_outside_workspace() {\n       let tmp = workspace_with_project_config(\n           r#\"instructions = [\"~/.ssh/id_rsa\", \"/etc/passwd\"]\"#,\n       );\n       let mut config = Config::default();\n       merge_project_config(\u0026mut config, tmp.path());\n       // Instructions pointing outside workspace should be rejected\n       let paths = config.instructions_paths();\n       assert!(\n           paths.iter().all(|p| p.starts_with(tmp.path())),\n           \"instructions paths must be within workspace: {paths:?}\"\n       );\n   }\n   ```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "deepseek-tui",
+        "purl": "pkg:cargo/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.8"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 0.8.41",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-62f5-cp2p-vq95/GHSA-62f5-cp2p-vq95.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "deepseek-tui",
+        "purl": "pkg:npm/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.8"
+            },
+            {
+              "fixed": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-62f5-cp2p-vq95/GHSA-62f5-cp2p-vq95.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-62f5-cp2p-vq95/GHSA-62f5-cp2p-vq95.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-62f5-cp2p-vq95/GHSA-62f5-cp2p-vq95.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-62f5-cp2p-vq95"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-75859"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/commit/43563356b98c6b993085554da82e77370160a31c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Hmbown/CodeWhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/codewhale-before-arbitrary-file-read-via-instructions"
+    }
+  ]
+}

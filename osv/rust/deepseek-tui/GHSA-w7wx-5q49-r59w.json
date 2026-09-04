@@ -1,0 +1,126 @@
+{
+  "id": "GHSA-w7wx-5q49-r59w",
+  "modified": "2026-09-04T17:45:04.713494148Z",
+  "published": "2026-09-04T17:34:55Z",
+  "aliases": [
+    "CVE-2026-75914"
+  ],
+  "summary": "CodeWhale: image_analyze follows workspace symlinks, leaking external file bytes",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. The affected package ranges are recorded in the advisory metadata. Version 0.8.64 contains the fix in commit 26de44a8bd5051f8f944ea60b2c37ae1d2b7d25e. Users should upgrade to 0.8.64 or later. The original reporter analysis is preserved below.\n\n### Summary\n\nimage_analyze follows workspace symlinks and leaks outside-workspace file bytes to the vision endpoint\n\nThe image_analyze tool resolves its image_path with a bare context.workspace.join instead of routing through ToolContext::resolve_path. The pre-join lexical check rejects absolute paths, Windows prefixes, and parent-dir components but never canonicalizes, so a symlink inside the workspace whose name ends in an image extension and whose target sits outside the workspace is read transparently. The tool has ReadOnly capability and the trait default makes it auto-approved, so the bypass executes with no user prompt.\n\n### Details\n\nIn `crates/tui/src/vision/tools.rs` (v0.8.37, lines 104-123):\n\n```rust\nasync fn execute(\u0026self, input: Value, context: \u0026ToolContext) -\u003e Result\u003cToolResult, ToolError\u003e {\n    let image_path = required_str(\u0026input, \"image_path\")?;\n    let prompt = input\n        .get(\"prompt\")\n        .and_then(|v| v.as_str())\n        .unwrap_or(\"Describe this image in detail.\");\n\n    let image_path_buf = Path::new(image_path);\n    if image_path_buf.components().any(|c| {\n        matches!(\n            c,\n            Component::Prefix(_) | Component::RootDir | Component::ParentDir\n        )\n    }) {\n        return Err(ToolError::execution_failed(\n            \"image_path must be a relative path within the workspace and cannot escape it.\",\n        ));\n    }\n    let resolved_path = context.workspace.join(image_path_buf);\n    let (image_data, mime_type) = Self::read_image_file(\u0026resolved_path).await?;\n```\n\n`read_image_file` (lines 31-39) is a `tokio::fs::read(path)` call which follows symlinks. The bytes are then base64-encoded and embedded as `data:\u003cmime\u003e;base64,\u003cbytes\u003e` in the chat-completion payload that is POSTed to `${base_url}/chat/completions` with the user's Authorization header.\n\nThe lexical guard rejects `../etc/passwd`, `/etc/passwd`, and `C:\\Windows\\...`, but a symlink such as `workspace/screenshot.png -\u003e /etc/passwd` produces components `[Normal(\"screenshot.png\")]`. None of `Prefix`, `RootDir`, or `ParentDir` match, so the check passes and the symlink is followed at read time.\n\nThe peer file-reading tools all use the central resolver instead. For example, `crates/tui/src/tools/image_ocr.rs:60-65`:\n\n```rust\nlet path_str = required_str(\u0026input, \"path\")?;\nlet image_path = context.resolve_path(path_str)?;\n```\n\n`resolve_path` in `crates/tui/src/tools/spec.rs:342-449` canonicalizes the candidate and rejects results whose canonical form does not start with the canonical workspace path:\n\n```rust\nif candidate.exists() {\n    let canonical = candidate.canonicalize().map_err(...)?;\n    if !canonical.starts_with(\u0026workspace_canonical)\n        \u0026\u0026 !self.is_trusted_external_path(\u0026canonical)\n    {\n        return Err(ToolError::PathEscape { path: canonical });\n    }\n    ...\n}\n```\n\nIn the same symlink scenario, `image_ocr`, `pandoc_convert`, `read_file`, `apply_patch`, `rlm_open`, and `fim` all return `ToolError::PathEscape` because the canonical target falls outside the workspace. `image_analyze` is the lone caller that skips this check.\n\nThe tool declares `ToolCapability::ReadOnly` and does not override `approval_requirement()`. The trait default (`crates/tui/src/tools/spec.rs:612-620`) resolves ReadOnly to `ApprovalRequirement::Auto`. The engine then sets `approval_required = spec.approval_requirement() != ApprovalRequirement::Auto`, which is `false` for this tool (`crates/tui/src/core/engine/turn_loop.rs:1159-1184`). The model can invoke `image_analyze` on any turn without a user prompt.\n\nThe recent commit `2326220 fix(vision): reject rooted image paths on windows` (2026-05-12) tightened the lexical guard to catch Windows drive prefixes, but the original review missed that the underlying problem is that this site never used `resolve_path` in the first place.\n\n### PoC\n\nA standalone Cargo test reproduces the read-through. Save as `crates/tui/tests/image_analyze_symlink_escape.rs`:\n\n```rust\nuse deepseek_tui::config::VisionModelConfig;\nuse deepseek_tui::tools::spec::{ToolContext, ToolSpec};\nuse deepseek_tui::vision::tools::ImageAnalyzeTool;\nuse serde_json::json;\nuse std::fs;\nuse tempfile::tempdir;\n\n#[tokio::test]\n#[cfg(unix)]\nasync fn image_analyze_follows_workspace_symlink_outside_workspace() {\n    let outer = tempdir().unwrap();\n    let workspace = outer.path().join(\"workspace\");\n    let outside = outer.path().join(\"outside\");\n    fs::create_dir_all(\u0026workspace).unwrap();\n    fs::create_dir_all(\u0026outside).unwrap();\n\n    // A file that the workspace boundary should keep the tool from reading.\n    let secret = outside.join(\"secret.txt\");\n    fs::write(\u0026secret, b\"OUTSIDE-WORKSPACE-SECRET-MARKER\").unwrap();\n\n    // Pre-existing symlink in the workspace with an image extension.\n    std::os::unix::fs::symlink(\u0026secret, workspace.join(\"screenshot.png\")).unwrap();\n\n    let ctx = ToolContext::new(workspace);\n    let tool = ImageAnalyzeTool::new(VisionModelConfig {\n        model: \"test\".into(),\n        api_key: Some(\"test\".into()),\n        base_url: Some(\"http://127.0.0.1:1/v1\".into()),\n    });\n\n    // The execute call will fail at the HTTP layer because the mock endpoint\n    // is unreachable, but read_image_file has already been called. Reach the\n    // file-read step by asserting that the failure is the HTTP error, not a\n    // PathEscape error from the resolver.\n    let err = tool\n        .execute(json!({\"image_path\": \"screenshot.png\"}), \u0026ctx)\n        .await\n        .expect_err(\"expected HTTP failure after symlink read\");\n    let msg = format!(\"{err:?}\");\n    assert!(\n        !msg.contains(\"PathEscape\"),\n        \"symlink should have been refused before read; got {msg}\"\n    );\n    // To prove the bytes actually left the process, point base_url at a\n    // capturing wiremock instance and assert that the OUTSIDE-WORKSPACE-SECRET-MARKER\n    // substring appears in the captured base64-decoded request body.\n}\n```\n\nFor comparison, the same workspace exercised via `read_file` returns `ToolError::PathEscape`:\n\n```rust\n#[tokio::test]\n#[cfg(unix)]\nasync fn read_file_refuses_workspace_symlink_outside_workspace() {\n    use deepseek_tui::tools::file::ReadFileTool;\n    let outer = tempdir().unwrap();\n    let workspace = outer.path().join(\"workspace\");\n    let outside = outer.path().join(\"outside\");\n    fs::create_dir_all(\u0026workspace).unwrap();\n    fs::create_dir_all(\u0026outside).unwrap();\n    fs::write(outside.join(\"secret.txt\"), b\"X\").unwrap();\n    std::os::unix::fs::symlink(outside.join(\"secret.txt\"), workspace.join(\"link.txt\")).unwrap();\n\n    let ctx = ToolContext::new(workspace);\n    let err = ReadFileTool\n        .execute(json!({\"path\": \"link.txt\"}), \u0026ctx)\n        .await\n        .expect_err(\"expected PathEscape\");\n    assert!(format!(\"{err:?}\").contains(\"PathEscape\"));\n}\n```\n\nThe fix is one line on `crates/tui/src/vision/tools.rs:122`:\n\n```rust\n- let resolved_path = context.workspace.join(image_path_buf);\n+ let resolved_path = context.resolve_path(image_path)?;\n```\n\n`resolve_path` already handles the pre-join lexical checks (so the existing `Path::new(image_path).components().any(...)` block can also be removed), canonicalizes through symlinks, and re-checks workspace containment. The behavior the lexical guard already promises (path stays inside the workspace) is then actually delivered.\n\n### Impact\n\nA workspace symlink whose name ends in `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, or `.bmp` and whose target sits outside the workspace becomes a read primitive that the model can invoke without an approval prompt. The file bytes are base64-encoded into the `image_url.url` field of the chat-completion payload and POSTed to the configured vision endpoint along with the user's bearer token. Three exposure channels follow from a single invocation: the vision provider receives every byte of the target file in plaintext (most providers retain request bodies for abuse review or model training), any TLS-terminating corporate proxy on the egress path captures the same bytes, and any transparent middlebox with MITM visibility logs the payload. The preconditions are everyday workspace shapes: cloned repositories that ship symlinks to shared media (CI artifact bundles, photo libraries, design assets), a developer who staged an external file via `ln -s`, or a `git clone` with `core.symlinks=true` against a repository that includes such a link. Because the tool is auto-approved, a prompt-injection delivered through a poisoned README, fetched web page, or MCP server output can issue `{\"image_path\": \"screenshot.png\"}` and the bytes leave the machine on the same turn without any visible UI cue. The fix is identical to the pattern used by every other file-reading tool in this codebase, so the gap is a missed `resolve_path` call rather than a design tradeoff.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "deepseek-tui",
+        "purl": "pkg:cargo/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.32"
+            },
+            {
+              "last_affected": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w7wx-5q49-r59w/GHSA-w7wx-5q49-r59w.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "deepseek-tui",
+        "purl": "pkg:npm/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.32"
+            },
+            {
+              "fixed": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w7wx-5q49-r59w/GHSA-w7wx-5q49-r59w.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w7wx-5q49-r59w/GHSA-w7wx-5q49-r59w.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w7wx-5q49-r59w/GHSA-w7wx-5q49-r59w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-w7wx-5q49-r59w"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-75914"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/commit/26de44a8bd5051f8f944ea60b2c37ae1d2b7d25e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Hmbown/CodeWhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/codewhale-before-path-traversal-via-image-analyze-symlink"
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "id": "GHSA-c6mw-8xh8-gpq6",
+  "modified": "2026-09-04T19:00:05.323654775Z",
+  "published": "2026-09-04T18:11:45Z",
+  "aliases": [
+    "CVE-2026-75912"
+  ],
+  "summary": "CodeWhale: Argument Injection in `git_blame` Tool Allows Arbitrary File Read Without Approval",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. The affected package ranges are recorded in the advisory metadata. Version 0.8.64 contains the fix in commit 9a34b5034d29f05d1f28fa61b04719ca6a741020. Users should upgrade to 0.8.64 or later. The original reporter analysis is preserved below.\n\n# Argument Injection in `git_blame` Tool Allows Arbitrary File Read Without Approval\n\n## Overview\n\nThe `git_blame` tool in DeepSeek-TUI passes the model-supplied `rev` parameter unvalidated into the argv of `git blame`. `git blame` accepts `--contents=\u003cfile\u003e`, which causes it to use the file's contents in place of the working tree and echo each line verbatim in the blame output. A `rev` value of `--contents=/path/to/secret` therefore exfiltrates the targeted file's contents into the tool result, which is returned to the model and displayed in the chat transcript.\n\nThe tool is registered with `ApprovalRequirement::Auto` and declares `ToolCapability::ReadOnly`. The read is in-scope for the capability label, but the *target* of the read is not the user expects `git_blame` to read files inside the workspace, not arbitrary paths on the host.\n\nThis is a sibling of the `git_show` argument-injection vulnerability filed separately, sharing the same root cause (missing `--end-of-options` sentinel and unvalidated `rev`).\n\n## Impact\n\nArbitrary file read at the privilege of the user running DeepSeek-TUI, via malicious repository content combined with prompt injection (the threat model already documented in CVE-2026-45311).\n\nReachable as the invoking user:\n\n- `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, and other private keys\n- `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.netrc`\n- `.env` files anywhere in the filesystem\n- Any project file outside the workspace the tool would normally restrict to\n\nThe leaked contents land in the model's context. The same model that obeyed the prompt-injection in step one can be instructed to forward the leak via `fetch_url` (network-policy permitting), summarize it in chat, or write it into a tool output the attacker can later retrieve.\n\n## Technical Details\n\n### Root Cause\n\n`crates/tui/src/tools/git_history.rs`:\n\n```rust\n// L314-316\nfn approval_requirement(\u0026self) -\u003e ApprovalRequirement {\n    ApprovalRequirement::Auto\n}\n\n// L322-358 (excerpt)\nasync fn execute(\u0026self, input: Value, context: \u0026ToolContext) -\u003e Result\u003cToolResult, ToolError\u003e {\n    let path_str = required_str(\u0026input, \"path\")?;\n    let resolved_path = context.resolve_path(path_str)?;   // path is bounded to workspace\n    ...\n    let rev = optional_str(\u0026input, \"rev\").unwrap_or(\"HEAD\");   // rev is NOT bounded\n    ...\n    let mut args = vec![\n        \"blame\".to_string(),\n        \"--date=iso\".to_string(),\n        format!(\"-L{start_line},{end_line}\"),\n    ];\n    if porcelain { args.push(\"--line-porcelain\".to_string()); }\n    args.push(rev.to_string());            // unvalidated, no sentinel\n    args.push(\"--\".to_string());\n    args.push(pathspec.display().to_string());\n    ...\n}\n```\n\n`path` correctly flows through `context.resolve_path`, which enforces workspace containment (`spec.rs:342`). `rev` does not and the `--` separator after `rev` only ends pathspec parsing, it does not stop option parsing of `rev` itself.\n\nThe JSON schema for `rev` (L283-285) is `{\"type\": \"string\"}` with no constraints.\n\n### Why `--contents` Works\n\n`git blame --contents=\u003cfile\u003e -- \u003cpathspec\u003e` blames the working tree path *as if its contents were the supplied file*. Each line of the supplied file appears verbatim in the porcelain or human-readable output, prefixed with the attribution marker `00000000 (External file (--contents) \u003cdate\u003e N)`. The full line content is preserved.\n\nTwo secondary primitives in the same parser also leak data, with smaller\nyield:\n\n- `--ignore-revs-file=\u003cfile\u003e` : surfaces parse errors that disclose partial content when the file is not a valid revs list.\n- `-S \u003cfile\u003e`, `--reverse \u003crev1\u003e..\u003crev2\u003e` : not directly exploitable for read but expand the option surface that argv injection can reach.\n\n## Proof of Concept\n\nArgv assembled by the tool with input\n`{\"path\": \"a.txt\", \"rev\": \"--contents=/home/a/.ssh/id_rsa\"}`:\n\n```\ngit blame --date=iso -L1,200 --contents=/home/a/.ssh/id_rsa -- a.txt\n```\n\nReproduced against system `git` as a non-root user:\n\n```\n$ id\nuid=1001(a) gid=1001(a) groups=1001(a)\n\n$ echo \"PRIVATEKEYDATA\" \u003e /home/a/.ssh/id_rsa\n$ chmod 600 /home/a/.ssh/id_rsa\n\n$ git blame --date=iso -L1,5 \"--contents=/home/a/.ssh/id_rsa\" -- a.txt\n00000000 (External file (--contents) 2026-05-19 07:05:51 -0400 1) PRIVATEKEYDATA\n```\n\nA non-readable target (`/etc/shadow`, owned by root with mode 0640) returns `Permission denied`, confirming the read is bounded by uid as expected; this is not a privilege boundary bypass, it is the desktop user's own filesystem view being exposed past the workspace boundary the tool's `path` argument otherwise enforces.\n\nEnd-to-end exploitation is identical to the `git_show` companion: malicious repo → `AGENTS.md` injection → model calls `git_blame` with the crafted `rev` → auto-approval → leaked content returned in tool output and consumed by the model.\n\n## Remediation\n\nSame shape as the `git_show` fix:\n\n```rust\nargs.push(\"--end-of-options\".to_string());\nargs.push(rev.to_string());\nargs.push(\"--\".to_string());\nargs.push(pathspec.display().to_string());\n```\n\nPlus a leading-hyphen rejection on `rev`. A regression test should pin both `rev = \"--contents=/etc/passwd\"` and `rev = \"--ignore-revs-file=/etc/passwd\"` as rejected inputs.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "deepseek-tui",
+        "purl": "pkg:cargo/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.3.27"
+            },
+            {
+              "last_affected": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-c6mw-8xh8-gpq6/GHSA-c6mw-8xh8-gpq6.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "deepseek-tui",
+        "purl": "pkg:npm/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.3.27"
+            },
+            {
+              "fixed": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-c6mw-8xh8-gpq6/GHSA-c6mw-8xh8-gpq6.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-c6mw-8xh8-gpq6/GHSA-c6mw-8xh8-gpq6.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-c6mw-8xh8-gpq6/GHSA-c6mw-8xh8-gpq6.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-c6mw-8xh8-gpq6"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-75912"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/commit/9a34b5034d29f05d1f28fa61b04719ca6a741020"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Hmbown/CodeWhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/codewhale-before-argument-injection-via-git-blame"
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "id": "GHSA-7j5w-7r7x-9v27",
+  "modified": "2026-09-04T19:00:04.282032993Z",
+  "published": "2026-09-04T18:02:37Z",
+  "aliases": [
+    "CVE-2026-75913"
+  ],
+  "summary": "CodeWhale: Argument Injection in `git_show` Tool Allows Arbitrary File Write Without Approval",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. The affected package ranges are recorded in the advisory metadata. Version 0.8.64 contains the fix in commit 9a34b5034d29f05d1f28fa61b04719ca6a741020. Users should upgrade to 0.8.64 or later. The original reporter analysis is preserved below.\n\n# Argument Injection in `git_show` Tool Allows Arbitrary File Write Without Approval\n\n## Overview\n\nThe `git_show` tool in DeepSeek-TUI executes `git show` with the model-supplied `rev` parameter passed unvalidated into the argv. `git show` honours the `--output=\u003cpath\u003e` option, so a `rev` value beginning with `--output=` is interpreted as a flag rather than a revision. The tool is registered with `ApprovalRequirement::Auto` and declares `ToolCapability::ReadOnly`, so the write happens without a user prompt and contradicts the capability the catalog advertises to the model and the user.\n\nThis is the same vulnerability class as GHSA-72w5-pf8h-xfp4 (CVE-2026-45374): an auto-approved tool produces an effect outside the boundary the user consented to.\n\n## Impact\n\nA malicious repository combined with prompt injection, the threat model already documented in CVE-2026-45311 (auto-loaded `AGENTS.md` is treated as instructions by the model) yields an unprompted arbitrary file write at the privilege of the user running DeepSeek-TUI.\n\nUseful targets reachable as the invoking user:\n\n- `~/.ssh/authorized_keys`\n- `~/.bashrc`, `~/.zshrc`, `~/.profile`\n- `~/.gitconfig` (chainable into RCE via `core.editor`)\n- `~/.config/**`, `~/.aws/credentials`, project source files\n\nThe written content is the `git show` rendering of HEAD commit hash, author/date header, indented commit message, and (when `patch=true`) diff hunks. The commit subject, body, author identity, and diff text are entirely attacker-controlled because the attacker owns the repository HEAD. The leading `commit \u003chash\u003e` line prevents clean overwrite of formats that reject unknown tokens, but is silently ignorable in files parsed as comments-or-text (crontab, dotfiles consumed by tolerant readers) and is irrelevant for the destructive/DoS sub-case (clobbering `~/.ssh/authorized_keys` locks the user out; clobbering a project file corrupts source).\n\n## Technical Details\n\n### Root Cause\n\n`crates/tui/src/tools/git_history.rs`:\n\n```rust\n// L196-198\nfn approval_requirement(\u0026self) -\u003e ApprovalRequirement {\n    ApprovalRequirement::Auto\n}\n\n// L204-228 (excerpt)\nasync fn execute(\u0026self, input: Value, context: \u0026ToolContext) -\u003e Result\u003cToolResult, ToolError\u003e {\n    let rev = required_str(\u0026input, \"rev\")?;\n    ...\n    let mut args = vec![\n        \"show\".to_string(),\n        \"--no-color\".to_string(),\n        \"--no-ext-diff\".to_string(),\n    ];\n    if patch { args.push(format!(\"--unified={unified}\")); }\n    else     { args.push(\"--no-patch\".to_string()); }\n    if stat  { args.push(\"--stat\".to_string()); }\n    args.push(rev.to_string());        // unvalidated, no `--end-of-options` sentinel\n    ...\n}\n```\n\nThe JSON schema for `rev` is `{\"type\": \"string\"}` (L161-164) with no `pattern`, no enum, and no length cap. `required_str` performs no semantic validation. The argv has no `--end-of-options` separator between the trailing options and `rev`, so git's option parser keeps consuming flags from `rev`.\n\nThe same pattern in `git_blame` (L322-388) is tracked in a separate advisory.\n\n### Why `--output` Works\n\n`git show` shares its option parser with `git log` / `git diff`, which expose `--output=\u003cfile\u003e`. The implementation opens the path with `O_WRONLY | O_CREAT | O_TRUNC` and writes the formatted output there. No permission check beyond the filesystem's own running as the user is sufficient to clobber anything the user owns.\n\n## Proof of Concept\n\nThe vulnerable argv assembled by the tool when invoked with\n`{\"rev\": \"--output=/home/victim/.bashrc\"}` is equivalent to:\n\n```\ngit show --no-color --no-ext-diff --no-patch --stat --output=/home/victim/.bashrc\n```\n\nReproduced against system `git` as a non-root user:\n\n```\n$ id\nuid=1001(lowtest) gid=1001(lowtest) groups=1001(lowtest)\n\n$ cd /tmp/lp \u0026\u0026 git init -q\n$ echo a \u003e a.txt \u0026\u0026 git add a.txt\n$ git -c user.email=a@b -c user.name=a commit -q -m \"lol\"\n\n$ git show --no-color --no-patch \"--output=/home/lowtest/.bashrc_clobbered\" HEAD\n$ ls -la /home/lowtest/.bashrc_clobbered\n-rw-rw-r-- 1 lowtest lowtest 128 May 19 07:05 /home/lowtest/.bashrc_clobbered\n```\n\nEnd-to-end exploitation path:\n\n- Attacker publishes a repository whose `AGENTS.md` instructs the model to call `git_show` with `rev` set to a crafted `--output=` string targeting a file in the victim's home directory. The same auto-load pathway documented in CVE-2026-45311 applies.\n- Victim opens the repository in DeepSeek-TUI and issues any prompt that exercises the agent loop.\n- The model issues the tool call. Because `approval_requirement()` returns `Auto`, no approval UI is shown.\n- `git show --output=\u003cpath\u003e` overwrites the target file with attacker-controlled commit metadata and diff text.\n\n## Remediation\n\nTwo changes in `crates/tui/src/tools/git_history.rs`:\n\nInsert an end-of-options sentinel before `rev` so git stops parsing flags:\n\n   ```rust\n   args.push(\"--end-of-options\".to_string());\n   args.push(rev.to_string());\n   ```\n\nReject `rev` values that begin with `-` (or restrict to a revision-shape\n   regex `^[A-Za-z0-9._/^~@:{}-]+$` after the leading character check):\n\n   ```rust\n   if rev.starts_with('-') {\n       return Err(ToolError::invalid_input(\"rev must not start with '-'\"));\n   }\n   ```\n\nA regression test mirroring `run_tests_requires_user_approval` (`test_runner.rs:197`) should assert that `rev = \"--output=/tmp/x\"` is rejected.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "deepseek-tui",
+        "purl": "pkg:cargo/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.3.27"
+            },
+            {
+              "last_affected": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7j5w-7r7x-9v27/GHSA-7j5w-7r7x-9v27.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "deepseek-tui",
+        "purl": "pkg:npm/deepseek-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.3.27"
+            },
+            {
+              "fixed": "0.8.41"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7j5w-7r7x-9v27/GHSA-7j5w-7r7x-9v27.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7j5w-7r7x-9v27/GHSA-7j5w-7r7x-9v27.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.8.41"
+            },
+            {
+              "fixed": "0.8.64"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7j5w-7r7x-9v27/GHSA-7j5w-7r7x-9v27.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-7j5w-7r7x-9v27"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-75913"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Hmbown/CodeWhale/commit/9a34b5034d29f05d1f28fa61b04719ca6a741020"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Hmbown/CodeWhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/codewhale-before-argument-injection-via-git-show"
+    }
+  ]
+}
