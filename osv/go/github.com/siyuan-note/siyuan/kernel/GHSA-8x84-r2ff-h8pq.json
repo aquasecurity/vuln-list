@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-8x84-r2ff-h8pq",
+  "modified": "2026-09-03T23:15:10.447380979Z",
+  "published": "2026-09-03T23:02:12Z",
+  "aliases": [
+    "CVE-2026-72801"
+  ],
+  "summary": "SiYuan: Encrypted-notebook key-derivation material and wrapped notebook keys disclosed to anonymous readers, enabling offline master-password cracking",
+  "details": "**CVE:** This vulnerability corresponds to [CVE-2026-72801](https://nvd.nist.gov/vuln/detail/CVE-2026-72801).\n\n### Summary\n\nTwo `CheckAuth`-only endpoints disclose the complete offline attack material for the encrypted-notebook master password, plus the wrapped per-notebook key needed to use it. Both are reachable by the publish `RoleReader` token and by the anonymous account when `Publish.Auth.Enable` is `false`. An unauthenticated remote client can retrieve the Argon2id salt and cost parameters, a verifier that confirms a correct password offline, and the encrypted per-notebook data key reducing the security of every encrypted notebook to the master password's resistance to offline GPU cracking.\n\n### Details\n\n**(1) `POST /api/system/getConf` leaks `NotebookCrypto`.**\n\n`getConf` → `GetMaskedConf()` marshals the full configuration including `NotebookCrypto *conf.NotebookCrypto` (JSON tag `notebookCrypto`, not `-`, so it survives the deep copy). For non-administrators `HideConfSecret()` is applied, which nulls a dozen secret-bearing fields like AI, MCPOAuth, Api, Flashcard, Publish, Repo, Sync, Secrets, Variables, System paths but contains **no reference to `NotebookCrypto`**. `FilterConfByPublishIgnore()` for readers only touches `UILayout`.\n\nThe reader therefore receives:\n\n| Field | What it is |\n|---|---|\n| `MasterSalt` | global Argon2id salt |\n| `KDFParams` | Argon2id memory/time/parallelism cost |\n| `KEKVerifier` + `VerifierNonce` | AES-GCM-encrypted fixed magic, the in-code comment states it exists for offline master-password verification |\n| `KEKMAC` | HMAC-SHA256 of the KEK |\n\nEither `KEKVerifier` or `KEKMAC` is a self-contained offline oracle:\n\n```\nKEK = Argon2id(guess, MasterSalt, KDFParams)\ncorrect if AES-GCM-decrypt(KEKVerifier, VerifierNonce) == magic\n        or HMAC(KEK) == KEKMAC\n```\n\nNo server round-trips are required, so there is no rate limiting, lockout, or logging on guesses, and the work is fully GPU-parallelisable.\n\n**(2) `POST /api/notebook/getNotebookConf` leaks the wrapped data key.**\n\n`box.GetConf()` returns the full `BoxConf` including `BoxCrypt.WrappedDEK`, the per-notebook data-encryption key wrapped under the KEK via AES-GCM together with `WrapNonce`. `getNotebookInfo` is the same class. Once (1) yields the master password, the attacker derives the KEK, decrypts `WrappedDEK` to recover the real data-encryption key, and decrypts every `.sy` file in that notebook.\n\n**Why this matters beyond the at-rest threat model.** Storing verifier and KDF material alongside the ciphertext is reasonable against a *local* attacker who already has filesystem access. Serving `MasterSalt` + `KDFParams` + `KEKVerifier` + `WrappedDEK` to an *anonymous remote reader* converts that at-rest assumption into a remote pre-authentication cracking opportunity.\n\n**Guarded-sibling asymmetry.** `HideConfSecret` nulls a dozen secret fields but omits `NotebookCrypto`. `lsNotebooks` filters notebook visibility for readers, while `getNotebookConf` and `getNotebookInfo` apply no reader filter at all.\n\nVerified at `origin/master` (`eef105683`): handler bodies as described; `HideConfSecret` contains zero `NotebookCrypto` matches; `FilterConfByPublishIgnore` touches only `UILayout`; all relevant struct JSON tags are non-`-`; all three routes are registered `CheckAuth` without `CheckAdminRole`.\n\n### Proof of Concept\n\nPrecondition: publish mode enabled (default port 6808) with at least one encrypted notebook configured; anonymous when `Publish.Auth.Enable` is `false`, otherwise any publish reader account.\n\n**1. Retrieve the key-derivation material as an anonymous reader:**\n```\nPOST http://127.0.0.1:6808/api/system/getConf\n{}\n```\nThe response's `notebookCrypto` object contains `MasterSalt`, `KDFParams`, `KEKVerifier`, `VerifierNonce`, and `KEKMAC` while the same response has the other secret fields (Api, Repo, Sync, Publish, System paths) correctly blanked, demonstrating the omission.\n\n**2. Retrieve the wrapped notebook key:**\n```\nPOST http://127.0.0.1:6808/api/notebook/getNotebookConf\n{\"notebook\":\"\u003cNOTEBOOK_ID\u003e\"}\n```\nThe response contains `BoxCrypt.WrappedDEK` and `WrapNonce`.\n\n**3. Offline:** candidate passwords are verified locally against `KEKVerifier`/`KEKMAC` using `MasterSalt` and `KDFParams`, with no further server interaction. A recovered password yields the KEK, which unwraps `WrappedDEK` to the notebook's data-encryption key.\n\n*Verification status:* the leak paths are confirmed by code inspection at `origin/master`. A live end-to-end demonstration requires a build from HEAD with an encrypted notebook enabled; the test instance available predates the encrypted-notebook feature, so no runtime reproduction is claimed here.\n\n### Impact\n\nAn unauthenticated remote client (publish mode with auth disabled) or any publish `RoleReader` obtains everything needed to mount an unlimited, unthrottled, GPU-parallel offline attack on the encrypted-notebook master password, plus the wrapped data key to decrypt notebook contents once the password is recovered. The confidentiality of every encrypted notebook then rests solely on master-password entropy against an offline attacker, rather than on the password remaining unknown to remote parties. No rate limiting or detection applies, because guessing occurs entirely off-server.\n\n### Suggested fix\n\n- In `HideConfSecret`, replace `NotebookCrypto` with a minimal `{enabled: bool}` for non-administrators the frontend only needs the enabled flag for the lock UI stripping `MasterSalt`, `KDFParams`, `KEKVerifier`, `VerifierNonce`, and `KEKMAC`.\n- Apply reader filtering to `getNotebookConf` and `getNotebookInfo` so `BoxCrypt` (including `WrappedDEK` and `WrapNonce`) is omitted for non-administrator roles.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260724102025-3bc014c7dc32"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-8x84-r2ff-h8pq/GHSA-8x84-r2ff-h8pq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-8x84-r2ff-h8pq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-72801"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/siyuan-before-information-disclosure-via-encryption-key-material"
+    }
+  ]
+}

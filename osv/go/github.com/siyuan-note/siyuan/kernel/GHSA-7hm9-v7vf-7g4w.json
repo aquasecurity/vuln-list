@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-7hm9-v7vf-7g4w",
+  "modified": "2026-09-03T20:45:04.585154261Z",
+  "published": "2026-09-03T20:34:12Z",
+  "aliases": [
+    "CVE-2026-69086"
+  ],
+  "summary": "SiYuan: Path Traversal via unvalidated avID in RenderAttributeView/AV read endpoints : reader-reachable cross-scope attribute-view disclosure",
+  "details": "**CVE:** This vulnerability corresponds to [CVE-2026-69086](https://nvd.nist.gov/vuln/detail/CVE-2026-69086).\n\n### Summary\n\nFour attribute-view read endpoints build a filesystem path from a caller-controlled `id`/`avID` and read it without confining the result to the attribute-view storage directory (`DataDir/storage/av/`). On the load (file-exists) code path there is no boundary check, so an `avID` containing `../` segments escapes `storage/av/` and causes the kernel to read a `.json` file elsewhere in the workspace.\n\nThe endpoints require only `CheckAuth`, which the publish service's `RoleReader` token satisfies; when `Publish.Auth.Enable` is `false` the publish proxy uses the anonymous account, making the surface reachable with no credentials.\n\n### Details\n\nAffected endpoints (all gated by `CheckAuth` only, no `CheckAdminRole`):\n\n- `POST /api/av/renderAttributeView` \u0026nbsp;→ `arg[\"id\"]`\n- `POST /api/av/getAttributeViewKeysByID` → `arg[\"avID\"]`\n- `POST /api/av/getAttributeViewKeys` \u0026nbsp;→ `arg[\"id\"]`\n- `POST /api/av/getCurrentAttrViewImages` → `arg[\"id\"]`\n\nIn `model.RenderAttributeView` (`model/attribute_view_render.go`), the only identifier guard `ast.IsNodeIDPattern(avID)` sits **inside** the `if !filelock.IsExist(existPath)` (create) branch:\n\n```go\nexistPath = GetAttributeViewDataPath(avID)      // path built from avID, no check\nif !filelock.IsExist(existPath) {               // NOT-EXIST / CREATE branch\n    if !createIfNotExist {\n        return // NotFound\n    }\n    if !ast.IsNodeIDPattern(avID) {             // \u003c-- ONLY id guard, create branch only\n        return ErrInvalidID\n    }\n    // ... create ...\n}\nattrView, err = av.ParseAttributeView(avID)     // LOAD runs unconditionally\n```\n\nWhen the traversal `avID` resolves to a file that already exists, the `!filelock.IsExist(...)` condition is `false`, the entire block (including the line with `ast.IsNodeIDPattern`) is skipped, and control falls straight through to `av.ParseAttributeView(avID)`. That function rebuilds the path via `filepath.Join(DataDir, \"storage\", \"av\", avID+\".json\")` and calls `filelock.ReadFile` with no `filepath.Rel` / `IsSubPath` / `..` rejection:\n\n```go\n// av.ParseAttributeView -\u003e attributeViewDataPathByBox / GetAttributeViewDataPath\navJSONPath = filepath.Join(DataDir, \"storage\", \"av\", avID+\".json\")  // no boundary check\n// -\u003e parseAttributeViewByPathInBox(avJSONPath, boxID)\ndata, _ = filelock.ReadFile(avJSONPath)                             // SINK\n```\n\n`filepath.Join` cleans the path but does **not** reject `..` segments, so it provides no containment. The three `getAttributeView*` endpoints call `ParseAttributeView` with no create branch at all, so they never even reach the `ast.IsNodeIDPattern` check same defect, same auth tier.\n\nThe root cause is that identifier validation is placed on a single code branch rather than confining the load to the AV base directory, so the load path reads a caller-controlled location.\n\n### PoC\n\n**Precondition:** publish mode enabled (default port `6808`); reachable by a `RoleReader` publish token, or anonymously when `Publish.Auth.Enable` is `false`.\n\nA request to `/api/av/renderAttributeView` with an `id` composed of `../` path segments that resolves to an existing `.json` file outside `DataDir/storage/av/` causes that file to be read and parsed instead of being rejected, because the identifier validation is only reached on the not-exist/create branch.\n\nI have withheld the exact encoded `id` value from this draft to avoid publishing a live traversal against internet-exposed publish instances. I'm happy to provide the precise value and a screenshot privately in this thread on request.\n\n### Impact\n\nAn authenticated publish `RoleReader` or an anonymous client when publish auth is disabled can cause the kernel to read `.json` files outside the attribute-view directory. Because the loaded file is unmarshalled into the attribute-view structure, the reliable primitives are:\n\n1. Disclosure of attribute-view (database) content from other scopes/notebooks the reader is not authorized to see.\n2. A `.json`-path existence oracle for arbitrary workspace locations.\n\nFiles not conforming to the AV schema are read but reflect little content, and the `.json` suffix is force-appended, so this is **not** a general arbitrary-file read. No admin role, CSRF token, or write permission is required.\n\n### Suggested fix\n\nValidate `avID` with `ast.IsNodeIDPattern` before path construction on **all** branches (move it ahead of `FindAttributeViewPath` / `GetAttributeViewDataPath`), or preferably, so every caller inherits it confine at the sink: in `attributeViewDataPathByBox` / `GetAttributeViewDataPath`, compute the joined path and reject it unless `filepath.Rel(avBaseDir, cleaned)` stays within `avBaseDir` (no leading `..`). Sink-side confinement also covers the three `getAttributeView*` endpoints that never reach the create-branch guard.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260720151813-0f5a0e7c67b0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7hm9-v7vf-7g4w/GHSA-7hm9-v7vf-7g4w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-7hm9-v7vf-7g4w"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-69086"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/siyuan-before-path-traversal-via-unvalidated-avid"
+    }
+  ]
+}
