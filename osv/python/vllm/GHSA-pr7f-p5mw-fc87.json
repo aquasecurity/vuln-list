@@ -1,0 +1,70 @@
+{
+  "id": "GHSA-pr7f-p5mw-fc87",
+  "modified": "2026-09-04T21:45:03.911328559Z",
+  "published": "2026-09-04T21:39:02Z",
+  "aliases": [
+    "CVE-2026-73557"
+  ],
+  "summary": " vLLM: Incomplete CVE-2025-62164 remediation can be bypassed by concurrent prompt parts",
+  "details": "## Executive Summary\n\nThe follow-up protection for CVE-2025-62164 is incomplete at vLLM revision `26587f9519e22a5c4549ead7595ad9ca3229c4fd`. It wraps serialized prompt-embedding reconstruction and dense conversion in `torch.sparse.check_sparse_tensor_invariants()`, but PyTorch 2.11.0 implements that context with save/enable/restore operations over process-global state. Two prompt-embedding parts in one `/v1/chat/completions` request are gathered concurrently on the event loop's default executor. When one context exits before the other loads its tensor, it can restore the global flag to `False` while the second part remains inside its guard.\n\nIn a deterministic run against hash-verified source from the affected revision, the actual target loader rejected an invalid sparse payload as a negative control. The frozen chat tracker then scheduled benign and malicious parts on distinct `asyncio_0` and `asyncio_1` threads. The benign context exited, the malicious loader observed the invariant flag disabled, and `torch.load(weights_only=True)` reconstructed indices `[[10], [10]]` for a declared shape of `[3, 3]`. The run intercepted the target's `to_dense()` call before it operated on the invalid tensor.\n\nThis primary trigger requires `--enable-prompt-embeds`, which is default-off, but it does **not** require `renderer_num_workers \u003e 1`, a multimodal model, or `--enable-mm-embeds`. API authentication is optional in the stock server: middleware is installed only when CLI or environment API keys are supplied.\n\nThe lab proves bypass of the follow-up guard, invalid sparse reconstruction, and guarded-sink reachability. Crash and memory-corruption consequences are conditional on the behavior documented by the published CVE.\n\n## Background\n\nCVE-2025-62164 / [GHSA-mrw7-hf4f-83pf](https://github.com/vllm-project/vllm/security/advisories/GHSA-mrw7-hf4f-83pf) concerns client-controlled serialized `prompt_embeds` reaching `torch.load(weights_only=True)` and an invalid sparse tensor reaching `to_dense()`. The advisory attributes memory corruption, denial of service, and potential code execution to that historical unsafe operation.\n\nThe remediation chronology matters for duplicate handling:\n\n- PR [#27204](https://github.com/vllm-project/vllm/pull/27204), merge commit [`58fab50d82838d5014f4a14d991fdb9352c9c84b`](https://github.com/vllm-project/vllm/commit/58fab50d82838d5014f4a14d991fdb9352c9c84b) on 2025-10-22, introduced the default-off `enable_prompt_embeds` gate. It did not add the sparse-invariant context.\n- Commit [`84e23d103d3483f944780d0d42bcf0993fd27e3a`](https://github.com/vllm-project/vllm/commit/84e23d103d3483f944780d0d42bcf0993fd27e3a) on 2025-12-15, titled `additional protection for CVE-2025-62164 (#30649)`, added the process-global sparse-invariant context around load, type check, and dense conversion.\n- Refactor commit [`f0a1c8453ad1c664c8a04c83fe545195fcd556eb`](https://github.com/vllm-project/vllm/commit/f0a1c8453ad1c664c8a04c83fe545195fcd556eb) on 2026-01-31 moved the guarded loader into `vllm/renderers/embed_utils.py` while preserving the same context.\n- Chat content-part commit [`14043dfecd35dd2f12b4d51eb9fa166184a0ca0f`](https://github.com/vllm-project/vllm/commit/14043dfecd35dd2f12b4d51eb9fa166184a0ca0f) on 2026-05-01 introduced `prompt_embeds` chat parts and the concurrent one-request schedule described here.\n\nThis report therefore does not present the malformed sparse payload or `to_dense()` sink as new. It reports a distinct concurrency root cause and trigger: unsynchronized save/enable/restore of the process-global follow-up guard, reachable through the later multi-part chat scheduler.\n\nThe affected revision pins PyTorch 2.11.0 in `pyproject.toml:10`.\n\n## Vulnerability Details\n\nThe target's `safe_load_prompt_embeds` performs the guarded operation in `vllm/renderers/embed_utils.py:16-39`:\n\n```python\nwith torch.sparse.check_sparse_tensor_invariants():\n    tensor = torch.load(\n        BytesIO(pybase64.b64decode(embed, validate=True)),\n        weights_only=True,\n        map_location=torch.device(\"cpu\"),\n    )\n    if not isinstance(tensor, torch.Tensor):\n        raise VLLMValidationError(...)\n    tensor = tensor.to_dense()\n```\n\nThe context is not request-local. With the global flag initially disabled, we can describe the verified interleaving:\n\n1. Benign part A enters, saves `False`, and enables the flag.\n2. Malicious part B enters, saves `True`, and leaves the flag enabled.\n3. A completes its load and exits, restoring its saved `False` value.\n4. B remains lexically inside its context but observes the actual global flag as `False`.\n5. B's `torch.load(..., weights_only=True)` reconstructs the malformed sparse tensor.\n6. The target reaches `tensor.to_dense()` before later rank, hidden-size, and dtype checks.\n\n`weights_only=True` constrains deserialization types; it does not compensate for a sparse invariant check that another request has disabled.\n\nThe complete stock actor-to-sink chain, traced in the affected source, is:\n\n`POST /v1/chat/completions` (`vllm/entrypoints/openai/chat_completion/api_router.py:41-61`) -\u003e `OpenAIServingChat.create_chat_completion` -\u003e `_create_chat_completion` -\u003e `render_chat_request` (`vllm/entrypoints/openai/chat_completion/serving.py:206-280`) -\u003e `OnlineRenderer.render_chat` (`vllm/renderers/online_renderer.py:95-190`) -\u003e `preprocess_chat` (`vllm/renderers/online_renderer.py:335-380`) -\u003e `BaseRenderer.render_chat_async` (`vllm/renderers/base.py:1070-1105`) -\u003e `HfRenderer.render_messages_async` (`vllm/renderers/hf.py:1049-1085`) -\u003e `parse_chat_messages_async` (`vllm/entrypoints/chat_utils.py:1911-1945`) -\u003e content-part `parse_prompt_embeds` and `_load_prompt_embeds_async` (`vllm/entrypoints/chat_utils.py:1099-1120`) -\u003e `AsyncMultiModalItemTracker.resolve_items` (`vllm/entrypoints/chat_utils.py:818-835`) -\u003e `asyncio.gather` of both prompt parts -\u003e `safe_load_prompt_embeds_async` -\u003e `make_async` -\u003e `loop.run_in_executor(executor=None, ...)` (`vllm/utils/async_utils.py:28-45`) -\u003e guarded `torch.load` -\u003e `to_dense()`.\n\nThe prompt async helper is created without an explicit executor, so it uses the event loop's default executor. This path is separate from the renderer's configurable pool. The deterministic scheduler run observed the two parts on distinct default-executor threads while leaving `renderer_num_workers` at its default of one.\n\n`prompt_embeds` bypasses multimodal processing, and the tracker explicitly permits it when `is_multimodal_model=False` (`vllm/entrypoints/chat_utils.py:793-837`). Consequently, the primary trigger needs neither a multimodal model nor `enable_mm_embeds`.\n\nThe source also states that async wrappers must be thread-safe (`vllm/utils/async_utils.py:28-38`), while a target test acknowledges that the sparse flag is not thread-local and concurrent users can leak state (`tests/renderers/test_sparse_tensor_validation.py:58-61`).\n\n## Exploitability Analysis\n\nThe following evidence labels separate what was demonstrated from what remains conditional:\n\n| Label | Claim |\n| --- | --- |\n| **Verified by run** | PyTorch 2.11.0 rejects the identical invalid payload through the actual target loader without the race. |\n| **Verified by run** | The hash-verified frozen tracker schedules two prompt parts on distinct default-executor threads, races the flag to `False`, reconstructs the invalid sparse tensor, and reaches the target `to_dense()` call while the interception prevents execution. |\n| **Traced in source** | A client can supply multiple `prompt_embeds` content parts through the stock `/v1/chat/completions` route and the function chain above. |\n| **Traced in source** | `enable_prompt_embeds` defaults to `False` (`vllm/config/model.py:255-260`), so the operator must opt in. `enable_mm_embeds` and non-default renderer workers are not preconditions for this path. |\n| **Traced in source** | `api_key` defaults to `None` (`vllm/entrypoints/openai/cli_args.py:264`), and authentication middleware is installed only when a CLI or environment key is present (`vllm/entrypoints/openai/api_server.py:306-310`). With a configured key, the attacker must authenticate; without one, the stock route has no API-key middleware. |\n| **Unrun** | A live HTTP/GPU server, real-world race win rate, unsafe dense conversion, process crash, memory corruption, and reliable code execution. |\n\nThe feature is documented for trusted users, which narrows intended exposure. It is not a memory-safety boundary: a user authorized to submit embedding inputs should not be able to disable a process-wide invariant for concurrent work.\n\nThe current run proves the same invalid sparse object can cross the guard and reach the historical sink. If executing that sink retains the behavior described in CVE-2025-62164 for the deployed PyTorch build, denial of service or memory corruption may follow. This is a conditional impact statement, not a reproduced outcome. Reliable RCE is not claimed.\n\nThe opt-in feature, scheduling requirement, and absence of a measured live win rate support **Medium/P2** despite the serious historical sink class. No additional deployment assumptions are required for the one-request scheduler beyond stock default-executor concurrency being available.\n\n## Remediation\n\nThe immediate fix is one shared process-wide lock around every use of this process-global sparse guard. The lock must cover invariant enabling, deserialization, tensor type validation, and dense conversion:\n\n```python\nwith shared_sparse_load_lock:\n    with torch.sparse.check_sparse_tensor_invariants():\n        tensor = torch.load(..., weights_only=True, map_location=\"cpu\")\n        validate_tensor_type(tensor)\n        tensor = tensor.to_dense()\n```\n\nEvery prompt, image, and audio loader that manipulates the same global flag must use the same lock. A lock only around `torch.load`, separate per-loader locks, or a lock omitted from the chat helper would leave overlapping save/restore sequences possible.\n\nThe stronger design is to avoid mutable process-global validation state in concurrent request code. Prefer a PyTorch per-call invariant check if one is available, or reconstruct and validate serialized embeddings inside a deliberately serialized boundary before any sparse operation.\n\nRegression coverage should:\n\n- Preserve the actual-target negative control using the identical malformed payload.\n- Force A-enter, B-enter, A-exit, B-load and assert B remains protected.\n- Execute the multi-part chat tracker with the event loop's default executor and `renderer_num_workers=1`.\n- Cover cross-loader overlap so later prompt, image, or audio changes cannot bypass a shared fix.\n- Assert the global flag is restored after success and exceptions.\n- Reject invalid tensors before any dense conversion.\n\nUntil a fix is deployed, leaving `enable_prompt_embeds` disabled removes this stock source path.\n\n## Summary\n\nThe affected vLLM revision uses a process-global PyTorch context as the follow-up protection for CVE-2025-62164. A later chat feature causes two prompt-embedding parts from one request to run concurrently on the default executor. One context can restore the flag to `False` while the other is still guarded, allowing the historical malformed sparse payload class to reach the historical `to_dense()` sink. The new issue is the concurrent guard bypass and shipped trigger, not the payload or sink. Runtime validation proves the bypass and safe sink reachability on PyTorch 2.11.0; historical crash and memory-corruption effects remain conditional, and RCE was not tested or claimed.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.21.0"
+            },
+            {
+              "fixed": "0.26.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-pr7f-p5mw-fc87/GHSA-pr7f-p5mw-fc87.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-pr7f-p5mw-fc87"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73557"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/48583"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/793cf79c89d4049124e756915468ac30318f2e50"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.26.0"
+    }
+  ]
+}
