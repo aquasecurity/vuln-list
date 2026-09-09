@@ -1,0 +1,184 @@
+{
+  "id": "GHSA-8mcc-hrx5-hvxc",
+  "modified": "2026-09-08T19:00:06.914140693Z",
+  "published": "2026-09-08T18:41:52Z",
+  "aliases": [
+    "CVE-2026-78677",
+    "PYSEC-2026-3787"
+  ],
+  "summary": "GitPython: clone_from()/clone() omit --separate-git-dir from unsafe_git_clone_options, enabling arbitrary git-directory creation outside the destination",
+  "details": "- **CWE:** CWE-73 (External Control of File Name or Path) / CWE-22 (Path Traversal, in the \"escapes intended base directory\" sense)\n- **Affected component:** `git/repo/base.py`, `Repo.unsafe_git_clone_options` (class attribute, lines 153-165) and `Repo._clone()` (lines 1477-1520), reached via the public `Repo.clone_from()` (line 1626) and `Repo.clone()` (line 1567) APIs.\n- **Affected version:** GitPython at HEAD (`9729ed3b948f2bde09f1f188c5311e172212b67e`, 2026-08-05, VERSION `3.1.58`)\n\n## Reachability\n`Repo.clone_from(url, to_path, **kwargs)` (and `Repo.clone()`) forward arbitrary keyword arguments to the underlying `git clone` invocation. Before forwarding, GitPython builds a candidate option list from the kwargs (`Git._option_candidates`) and checks it against a denylist, `Repo.unsafe_git_clone_options`, via `Git.check_unsafe_options()` — *unless* the caller passes `allow_unsafe_options=True`. This denylist mechanism is exactly the guard that the last ~16 published GHSAs against this repo (2026-07-12 → 2026-08-05) have repeatedly found incomplete or bypassable for other options (`--template`, `--upload-pack`, `--config`, `--exec`, `--output`, `--index-output`, `--pathspec-from-file`, etc.).\n\n`git clone` also accepts `--separate-git-dir=\u003cpath\u003e`, which redirects the repository's entire `.git` metadata directory to an **arbitrary, caller-controlled filesystem path**, leaving only a gitlink text file (`gitdir: \u003cpath\u003e`) at the intended destination. This is the exact same primitive already recognized as unsafe by GitPython's own code: `Repo.unsafe_git_init_options` (line 145-150) blocks `--separate-git-dir` for `Repo.init()`, with the comment *\"Redirects the repository metadata to a caller-controlled path\"*. The `Repo._clone()`/`clone()`/`clone_from()` docstring (line 1450-1452) is even more explicit:\n\n```\n:param allow_unsafe_options:\n    Allow unsafe options to be used, such as ``--template`` and\n    ``--separate-git-dir``.\n```\n\ni.e. the maintainers' own documentation states that `allow_unsafe_options=False` (the default) is supposed to block `--separate-git-dir` for clone. But **`Repo.unsafe_git_clone_options` does not contain it**:\n\n```python\nunsafe_git_clone_options = [\n    \"--upload-pack\",\n    \"-u\",\n    \"--config\",\n    \"-c\",\n    \"--template\",\n    \"--bundle-uri\",\n]\n```\n\nSo any application that forwards a `separate_git_dir` (or `separate-git-dir`) kwarg into `Repo.clone_from()` / `Repo.clone()` — e.g. a CI/build service, a Git-hosting proxy, or any tool that exposes a subset of clone options to a client, the exact threat model already accepted for the sibling `--template`/`--upload-pack`/`--config` entries in this same list — gets **no protection at all** for `--separate-git-dir`, even with the default `allow_unsafe_options=False`.\n\n## Root cause\nParity gap between two sibling denylists that guard the same underlying primitive (arbitrary redirection of git metadata storage): `unsafe_git_init_options` correctly lists `--separate-git-dir`; `unsafe_git_clone_options`, covering the same option on a different git subcommand that also accepts it, does not — despite the function's own docstring claiming otherwise. This is the same \"denylist omits an equally-dangerous sibling option\" pattern already responsible for `GHSA-539m-9xh6-q6rr` (`archive` denylist missing `--add-file`/`--add-virtual-file`) and `GHSA-6p8h-3wgx-97gf` (`clone` denylist missing `--template`, since fixed).\n\n## Exploit path\n1. Attacker-controlled input reaches a `separate_git_dir=...` (or equivalently `\"separate-git-dir\"`) keyword argument passed into `Repo.clone_from()` / `Repo.clone()` by the host application, with `allow_unsafe_options` left at its default `False`.\n2. `Git._option_candidates()` renders this as `--separate-git-dir` and `Git.check_unsafe_options()` checks it against `Repo.unsafe_git_clone_options` — no match, no `UnsafeOptionError` raised.\n3. `Git.transform_kwargs()` renders the same kwarg into the real command line as `--separate-git-dir=\u003cattacker path\u003e` and GitPython executes `git clone -v --separate-git-dir=\u003cattacker path\u003e -- \u003curl\u003e \u003cdest\u003e` via `subprocess` (no shell).\n4. `git` itself creates the full repository metadata tree (`config`, `description`, `HEAD`, `hooks/`, `index`, `objects/`, `refs/`, `packed-refs`, `logs/`) at the attacker-specified path — which can be **any path outside the intended clone destination** that the process has permission to create — and leaves a gitlink file at the intended destination pointing to it.\n\n## Impact\nArbitrary directory/file creation at a path fully controlled by the attacker (bounded only by filesystem permissions of the process running GitPython), matching the impact class of the already-published, High-severity `GHSA-hmq2-w58f-27jc` (\"Arbitrary Git Repository Creation Outside the Working Tree\", CVSS 8.2). Concretely:\n- Planting a git repository structure (including a `hooks/` directory) at an attacker-chosen location outside the sandboxed clone destination the calling application intended to confine the operation to.\n- If the attacker-chosen path collides with an existing directory the process can write into (e.g. another repository's `.git`, a shared cache path, a predictable temp location), the clone silently populates/overwrites `config`, `HEAD`, `hooks/*`, `refs/*`, `packed-refs`, and `index` there — an integrity violation of a resource outside the intended destination.\n- Combined with any later operation that runs `git` against that redirected/colliding directory (common in CI/build systems that reuse or predict working-directory layouts), this can escalate to hook execution, matching the RCE class already accepted for `--template` in `GHSA-9rj7-rf2p-w77r`.\n\n## Preconditions\n- The calling application forwards a caller-influenced value into a `separate_git_dir` kwarg of `Repo.clone_from()`/`Repo.clone()` (or into the `multi_options` list as a raw `--separate-git-dir=...` token) without itself validating/rejecting it, and does not pass `allow_unsafe_options=True` intentionally. This is the identical trust model GitPython's own denylist already defends for `--template`/`--upload-pack`/`--config`/`--bundle-uri` on the very same code path — i.e. this option was clearly meant to be covered by the same guard and was simply omitted.\n- No authentication/role requirement inside GitPython itself; the vulnerable code runs the moment the host application calls the API with the option present.\n\n## Evidence\n- `git/repo/base.py:145-151` — `unsafe_git_init_options` includes `\"--separate-git-dir\"` with the comment \"Redirects the repository metadata to a caller-controlled path\".\n- `git/repo/base.py:153-165` — `unsafe_git_clone_options` (the list actually enforced on `_clone`) does **not** include `\"--separate-git-dir\"`.\n- `git/repo/base.py:1450-1452` — docstring of `clone_from`/`clone` explicitly documents `--separate-git-dir` as one of the options `allow_unsafe_options` is supposed to gate.\n- `git/repo/base.py:1495-1518` — `_clone()` special-cases `separate_git_dir` only to `Git.polish_url()` it (path normalization for URL-like values), then runs it through `Git.check_unsafe_options(options=..., unsafe_options=cls.unsafe_git_clone_options)` — which, per the list above, does not flag it.\n- PoC (`gitpython-001-poc.py`, embedded below) run against this exact checkout confirms the option reaches the real `git clone` subprocess unguarded and creates a full git directory outside the destination path, with `allow_unsafe_options` at its default `False`.\n\n## False-positive check (adversarial re-read)\n- **Is there a value-level check that would still stop this?** No — `check_unsafe_options` only inspects option *names* (via `_canonicalize_option_name`) against the denylist; it performs no filesystem/path validation on `separate_git_dir`'s value, and no other guard in `_clone()` touches this kwarg besides the `Git.polish_url()` normalization (which does not reject arbitrary paths).\n- **Is `--separate-git-dir` perhaps a no-op or safely sandboxed for `clone` specifically (unlike `init`)?** No — confirmed empirically: the option reaches the real `git` binary unmodified and git honors it exactly as documented, writing the full metadata tree to the given path.\n- **Could this be the exact bug already covered by one of the 26 published GHSAs?** Checked all 26 entries in `_known-advisories.json` (Filter 0): `GHSA-9rj7-rf2p-w77r` covers `--template` in `Repo.init`; `GHSA-6p8h-3wgx-97gf` covers `--template` in clone (already fixed, present in `unsafe_git_clone_options`); `GHSA-hmq2-w58f-27jc` covers arbitrary repo creation via unvalidated **`.gitmodules` submodule names** (a different code path — `Submodule`, not `Repo.clone_from()` kwargs). None reference `--separate-git-dir` on the clone path. This is a distinct, currently-unpatched gap.\n- **Does this require an unrealistic precondition?** The precondition (host app forwards a kwarg into `clone_from`/`clone`) is identical to the precondition already accepted by the maintainers for the sibling entries in the same list (`--template`, `--upload-pack`, `--config`, `--bundle-uri`) — i.e. it is the same threat model the guard exists to cover, just missing one entry.\n- Verdict: no concrete blocker found. **CONFIRMED.**\n\n## Remediation\nAdd `\"--separate-git-dir\"` (and its `-` alias if git ever adds one — currently there is none) to `Repo.unsafe_git_clone_options` in `git/repo/base.py`, matching `unsafe_git_init_options`. Since `Repo._clone()` already special-cases `separate_git_dir` for `Git.polish_url()` normalization, the fix is a one-line addition to the existing list, consistent with how `GHSA-6p8h-3wgx-97gf` added `--template` to the same list.\n\n## Confidence\nHigh. Root cause is a one-line, unambiguous omission the maintainers' own docstring contradicts; PoC reproduces cleanly and deterministically against the current HEAD; no plausible false-positive path found.\n\n\n## Proof-of-Concept source (`gitpython-001-poc.py`)\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nGITPYTHON-001 PoC: Repo.clone_from(separate_git_dir=...) is not in\nunsafe_git_clone_options, so it reaches `git clone` unguarded and writes a\nfull git directory (config, hooks/, objects/, refs/, ...) to an\nattacker-controlled path OUTSIDE the intended destination directory, with\nallow_unsafe_options left at its default of False.\n\nRun against the GitPython source tree under test, e.g.:\n  PYTHONPATH=\"\u003crepo\u003e:\u003crepo\u003e/gitdb:\u003crepo\u003e/smmap\" python3 gitpython-001-poc.py \u003cworkdir\u003e\n\nBenign: only writes/reads inside the given workdir. No destructive/exfiltrating\npayload. Exits non-zero and prints \"NOT VULNERABLE\" if the guard blocks the option\nor the write does not escape the destination directory.\n\"\"\"\nimport os\nimport sys\nimport subprocess\n\n\ndef main():\n    workdir = sys.argv[1] if len(sys.argv) \u003e 1 else \"/tmp/gitpython-001-poc\"\n    src = os.path.join(workdir, \"src\")\n    dest = os.path.join(workdir, \"dest\")\n    sentinel_dir = os.path.join(workdir, \"OUTSIDE_SENTINEL\")\n    target_gitdir = os.path.join(sentinel_dir, \"redirected.git\")\n\n    for p in (src, dest, sentinel_dir):\n        os.makedirs(p, exist_ok=True)\n\n    # Minimal benign source repo to clone from.\n    subprocess.run([\"git\", \"init\", \"-q\", \"-b\", \"main\", src], check=True)\n    subprocess.run([\"git\", \"-C\", src, \"config\", \"user.email\", \"test@example.com\"], check=True)\n    subprocess.run([\"git\", \"-C\", src, \"config\", \"user.name\", \"Test\"], check=True)\n    with open(os.path.join(src, \"file.txt\"), \"w\") as f:\n        f.write(\"hello\\n\")\n    subprocess.run([\"git\", \"-C\", src, \"add\", \"file.txt\"], check=True)\n    subprocess.run([\"git\", \"-C\", src, \"commit\", \"-q\", \"-m\", \"init\"], check=True)\n\n    import git  # gitpython under test\n\n    print(\"unsafe_git_clone_options =\", git.Repo.unsafe_git_clone_options)\n    assert \"--separate-git-dir\" not in git.Repo.unsafe_git_clone_options, (\n        \"guard now includes --separate-git-dir; PoC no longer applicable, target patched\"\n    )\n\n    try:\n        repo = git.Repo.clone_from(src, dest, separate_git_dir=target_gitdir)\n    except git.exc.UnsafeOptionError as e:\n        print(\"NOT VULNERABLE: blocked by UnsafeOptionError:\", e)\n        sys.exit(1)\n\n    wrote_outside = os.path.isdir(os.path.join(target_gitdir, \"hooks\")) and os.path.isfile(\n        os.path.join(target_gitdir, \"config\")\n    )\n    gitlink_points_outside = False\n    with open(os.path.join(dest, \".git\")) as f:\n        gitlink = f.read().strip()\n        gitlink_points_outside = target_gitdir in gitlink\n\n    print(\"repo.git_dir =\", repo.git_dir)\n    print(\"wrote git directory outside dest (sentinel) =\", wrote_outside)\n    print(\"dest/.git gitlink points outside dest =\", gitlink_points_outside)\n\n    if wrote_outside and gitlink_points_outside:\n        print(\"VULNERABLE: git directory created at attacker-controlled path \"\n              f\"outside the clone destination: {target_gitdir}\")\n        sys.exit(0)\n    else:\n        print(\"NOT VULNERABLE: sentinel not observed\")\n        sys.exit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.59"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.58",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-8mcc-hrx5-hvxc/GHSA-8mcc-hrx5-hvxc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-8mcc-hrx5-hvxc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-78677"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2210"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/b68afff45af0f49e79a3e2d2162018986b37ad5d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.59"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/gitpython/PYSEC-2026-3787.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/gitpython-before-path-traversal-via-separate-git-dir"
+    }
+  ]
+}

