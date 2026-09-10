@@ -1,0 +1,164 @@
+{
+  "id": "PYSEC-2026-3934",
+  "modified": "2026-09-10T12:15:15.566777999Z",
+  "published": "2026-09-10T09:45:00.831333Z",
+  "aliases": [
+    "CVE-2026-73560",
+    "GHSA-4hhp-h66f-j5j7"
+  ],
+  "summary": "vLLM: SSRF + arbitrary local file read in MiMoV2OmniMultiModalProcessor `_fetch_image` and audio loader bypass MediaConnector protections",
+  "details": "### Summary\n\n`vllm/transformers_utils/processors/mimo_v2_omni.py` — the multimodal processor for `MiMoV2OmniForCausalLM` — issues `requests.get(...)` directly on user-supplied image and audio URL strings and `Image.open(...)` on user-supplied local paths, **without** the SSRF / `allowed_local_media_path` checks that `vllm.multimodal.utils.MediaConnector` was hardened with in **GHSA-qh4c-xf7m-gxfc**, **GHSA-v359-jj2v-j536**, and **GHSA-pf3h-qjgv-vcpr**.\n\nThis is the same bug class as those three published advisories, in a code path the patches missed. When a user passes a URL or local-file string through `multi_modal_data` (e.g. `LLM.generate(multi_modal_data={\"image\": \"http://...\"})`), the processor takes the unsanitized string and dispatches it without any URL-scheme allowlist, network-target allowlist, size cap, or local-path allowlist.\n\n### Details\n\n**File:** `vllm/transformers_utils/processors/mimo_v2_omni.py` (current `main`)\n\n**Sink 1 — image SSRF + local-file read (`_fetch_image`, lines 231–249):**\n\n```python\ndef _fetch_image(src: Any) -\u003e Image.Image:\n    if isinstance(src, Image.Image):\n        return _to_rgb(src)\n    if isinstance(src, bytes):\n        return _to_rgb(copy.deepcopy(Image.open(BytesIO(src))))\n    if isinstance(src, str):\n        if src.startswith((\"http://\", \"https://\")):\n            r = requests.get(src, timeout=30)              # SSRF: no allowlist, follows redirects\n            r.raise_for_status()\n            return _to_rgb(copy.deepcopy(Image.open(BytesIO(r.content))))\n        if src.startswith(\"file://\"):\n            return _to_rgb(Image.open(src[7:]))            # arbitrary local file read\n        if src.startswith(\"data:image\"):\n            ...\n        return _to_rgb(Image.open(src))                    # fallback also opens local files\n    raise ValueError(f\"Unrecognized image source: {type(src)}\")\n```\n\n**Sink 2 — audio SSRF (around line 471):**\n\n```python\nelif audio.startswith((\"http://\", \"https://\")):\n    r = requests.get(audio, timeout=30)                    # SSRF: same pattern\n    r.raise_for_status()\n    file_obj = io.BytesIO(r.content)\n```\n\n**Reachability.** `_fetch_image` is invoked from `MiMoVLProcessor.process_image`:\n\n```python\ndef process_image(self, image: ImageInput) -\u003e torch.Tensor:\n    kw = self._resolve_img_kw(image)\n    src = image.image\n    if isinstance(src, (str, bytes)):\n        src = _fetch_image(src)\n    ...\n```\n\n`MiMoVLProcessor` is wrapped by `MiMoV2OmniMultiModalProcessor` and registered for the `MiMoV2OmniForCausalLM` model architecture (`vllm/model_executor/models/mimo_v2_omni.py:1169`). Whenever a user passes a string into `multi_modal_data[\"image\"]` (or `[\"audio\"]`) for this model, the unsanitized URL/path reaches the sink.\n\n**Comparison to the recent fixes.** The remediation pattern adopted in the three earlier advisories was to route every external resource fetch through `MediaConnector`, which checks `allowed_local_media_path` and applies SSRF protection before issuing the network request. `chat_utils.py` (lines 838, 902, 924, 963, 1053, 1081) already uses `self._connector.fetch_image / fetch_audio / fetch_video`. The model processor in `mimo_v2_omni.py` was added later and skipped the connector — it calls `requests.get` and `Image.open` directly. Result: the public OpenAI chat-completion path is protected, but library use (`LLM.generate(multi_modal_data=...)`), batch processing, and any other path that lets a string reach the processor receive no protection.\n\n### Impact\n\n1. **SSRF — internal-network probing / cloud-metadata theft.** Standard `requests.get` follows redirects and accepts any URL. An attacker who controls a `multi_modal_data` value can:\n   - read AWS / GCP / Azure instance metadata (e.g. `http://169.254.169.254/latest/meta-data/iam/security-credentials/`),\n   - probe internal services on the vLLM host (`http://127.0.0.1:\u003cport\u003e`, `http://10.x.y.z`),\n   - exfiltrate via DNS / HTTP timing oracles even when the body is rejected by `Image.open`.\n2. **Arbitrary local file read** via `file://path` (line 242) and the unguarded fallback `Image.open(src)` (line 248). Any file readable by the vLLM process is reachable through the model pipeline; with suitable formats this exposes `/etc/passwd`, `~/.aws/credentials`, etc.\n3. **Server-side traffic generation / amplification** by hammering arbitrary URLs from the vLLM host, with a 30-second timeout per request.\n\n### Suggested remediation\n\nReplace direct `requests.get` and bare `Image.open` paths with `MediaConnector.fetch_image` / `fetch_audio_async` (or pass the inputs through `MediaConnector` before they reach the processor):\n\n```python\n# vllm/transformers_utils/processors/mimo_v2_omni.py\nfrom vllm.multimodal.utils import MediaConnector\n\n_connector = MediaConnector()\n\ndef _fetch_image(src):\n    if isinstance(src, Image.Image):\n        return _to_rgb(src)\n    if isinstance(src, bytes):\n        return _to_rgb(copy.deepcopy(Image.open(BytesIO(src))))\n    if isinstance(src, str):\n        return _to_rgb(_connector.fetch_image(src))   # delegates to the hardened path\n    raise ValueError(f\"Unrecognized image source: {type(src)}\")\n```\n\nSame change for the audio loader at line 471. This re-uses the SSRF allowlist, `allowed_local_media_path` policy, and size caps that the previous patches added.\n\nAlternative: forbid `str` `src` from reaching the processor and require all multi-modal pre-processing to go through `chat_utils.py` / `MediaConnector` before hitting the model. Larger surface change, but completes the architectural fix.\n\n### Discovery\n\nStatic review on `vllm@main` (HEAD as of 2026-04-30) — found by triaging the file list against the three recent SSRF advisories: the `mimo_v2_omni.py` processor, added after those fixes, reintroduced the same bypass class.\n\n### Reporter\n\nIevgen Bondarenko — `sactransport2000@gmail.com` — GitHub `@ibondarenko1`",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.26.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/vllm/PYSEC-2026-3934.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-4hhp-h66f-j5j7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73560"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/43117"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/54503ecec0f3ac31e5ecfc5f28652e4cc42307b5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.26.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/vllm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-4hhp-h66f-j5j7"
+    }
+  ]
+}
