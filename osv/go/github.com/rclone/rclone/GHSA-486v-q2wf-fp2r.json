@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-486v-q2wf-fp2r",
+  "modified": "2026-09-10T23:15:04.353259531Z",
+  "published": "2026-09-10T23:02:53Z",
+  "aliases": [
+    "CVE-2026-88013"
+  ],
+  "summary": "rclone: http backend forwards custom/auth headers to a different host on redirect",
+  "details": "## Vulnerability Details\n\n**File**: `backend/http/http.go`\n**Lines**: 285 (client construction — no `CheckRedirect`), 505-510 (`addHeaders`, writes configured secret headers onto every request), 533-534 / 700-701 / 782-785 (`f.httpClient.Do(req)` used by List/stat/download)\n\n### Root Cause\nThe `http` backend lets a user attach arbitrary secret headers to every request via `--http-headers`/`headers=` (documented for authentication: `'\"Cookie\",\"name=value\",\"Authorization\",\"xxx\"'`). The backend's HTTP client is built with `fshttp.NewClient(ctx)`, which never sets `http.Client.CheckRedirect`, so it falls back to Go's stdlib default redirect policy.\n\nGo's default policy only strips four header names (`Authorization`, `Www-Authenticate`, `Cookie`, `Cookie2`), and only when the redirect target's *host* differs from the original — every other configured header is copied to the redirect target unconditionally, regardless of host or scheme. Even the four protected names survive a same-host `https://` → `http://` downgrade, since Go only checks host equality, not scheme.\n\nAny redirect response from the configured remote — whether from server compromise, an open redirect, a CDN/mirror failover to a different domain, or a malicious server from the start — causes rclone to resend every configured secret header (and, for a scheme downgrade, `Authorization`/`Cookie` in cleartext) to the new destination.\n\nThis is the exact vulnerability class already fixed for the `s3` backend (`9328763`/`7543a7a`, GHSA-8mxv-9xhp-86h4 and the `webdav` backend (`59b513b`, GHSA-h4mf-4v27-hggj, wiring `rest.RefuseHTTPSDowngradeRedirectFn`). `backend/http` was not touched by either fix.\n\n### Vulnerable Code\n```go\n// backend/http/http.go:285\nclient := fshttp.NewClient(ctx)   // no CheckRedirect set\n...\nf.httpClient = client             // used by readDir / NewObject / Object.Open\n```\n```go\n// backend/http/http.go:505-510\nfunc addHeaders(req *http.Request, opt *Options) {\n\tfor i := 0; i \u003c len(opt.Headers); i += 2 {\n\t\tkey := opt.Headers[i]\n\t\tvalue := opt.Headers[i+1]\n\t\treq.Header.Add(key, value)\n\t}\n}\n```\n\n### Attack Scenario\n1. User configures an `http` remote: `url=https://good.example.com/files/`, `headers=X-Api-Key,SECRET-TOKEN`.\n2. At some point `good.example.com` returns a redirect whose `Location` points at a different host (compromise, open redirect, CDN change, or malice from the start).\n3. User runs any operation (`ls`, `cat`, `copy`, `mount`, `serve`) against the remote.\n4. rclone follows the redirect with the default client and resends `X-Api-Key: SECRET-TOKEN` to the new, untrusted destination.\n5. The attacker's server captures the secret from the incoming request.\n\n### Impact\nExfiltration of API keys / bearer tokens / session cookies configured for one host, to any host the (trusted-at-configuration-time) remote later redirects to. All operations on the `http` backend (list, stat, download, mount, serve) are affected. No special rclone privileges or unusual user interaction are needed beyond a normal sync/list/copy once the redirect exists.\n\n### Dynamic Confirmation\nBuilt rclone from source at `cfdc9d0` (current master, `v1.76.0-DEV`) and configured:\n```ini\n[testhttp]\ntype = http\nurl = http://127.0.0.1:9090/\nheaders = X-Api-Key,SUPER-SECRET-TOKEN-abc123\n```\nServer A (port 9090, the \"configured\" host) 302-redirects every request to Server B (port 9091, a different host). Running `rclone cat testhttp:file.txt` caused Server B — which was never configured with any credential — to receive:\n```\nHeader: X-Api-Key: SUPER-SECRET-TOKEN-abc123\nHeader: Referer: http://127.0.0.1:9090/file.txt\n```\nrclone printed Server B's response body as if it were the real file, confirming the full stat→redirect→download round trip leaks the header and trusts the redirect target.\n\n### Vulnerable Code / Fix\nA minimal fix (implemented, tested, and verified to close the leak while preserving redirect functionality) wires the client to `rest.RefuseHTTPSDowngradeRedirectFn` (already used by `webdav`) and strips the configured `opt.Headers` on any cross-host redirect:\n\n```go\nclient := fshttp.NewClient(ctx)\nclient.CheckRedirect = redirectCheckFn(opt)\n...\nfunc redirectCheckFn(opt *Options) func(req *http.Request, via []*http.Request) error {\n\treturn func(req *http.Request, via []*http.Request) error {\n\t\tif err := rest.RefuseHTTPSDowngradeRedirectFn(req, via); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif len(via) \u003e 0 \u0026\u0026 req.URL.Host != via[0].URL.Host {\n\t\t\tfor i := 0; i \u003c len(opt.Headers); i += 2 {\n\t\t\t\treq.Header.Del(opt.Headers[i])\n\t\t\t}\n\t\t}\n\t\treturn nil\n\t}\n}\n```\n\nA regression test (`TestRedirectStripsHeadersOnHostChange`) was added to `backend/http/http_internal_test.go`, confirmed to fail without the fix and pass with it. Full `backend/http` and `lib/rest` test suites pass with the fix applied. I have a fix branch ready to push to a private fork once this report is acknowledged.\n\n### Verification\nDynamically confirmed on rclone master @ `cfdc9d0` (post `v1.75.0`) in a local test harness — see \"Dynamic Confirmation\" above. Fix verified to eliminate the leak via the same harness (secret header absent from Server B after the fix; functionality — file download via redirect — unaffected).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.49.0"
+            },
+            {
+              "fixed": "1.75.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.75.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-486v-q2wf-fp2r/GHSA-486v-q2wf-fp2r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-486v-q2wf-fp2r"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88013"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/22859b7e696cea3c563c6ba04c6b7f91f74456b4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/79fbc0842f74e02cb84f0e3e7261d169983c8831"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/925fb4fb21eb25e75cd1b64fdd17ded857784bfc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.75.1"
+    }
+  ]
+}

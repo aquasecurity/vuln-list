@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-7ghq-v6jf-g56c",
+  "modified": "2026-09-10T20:45:04.262434372Z",
+  "published": "2026-09-10T20:27:16Z",
+  "aliases": [
+    "CVE-2026-88012"
+  ],
+  "summary": "Traefik: respondingTimeouts.readTimeout is not applied to HTTP/3, leaving slow-body uploads unbounded",
+  "details": "## Summary\n\nThere is a medium severity vulnerability in Traefik's HTTP/3 entry points: the `respondingTimeouts` settings were not applied to the HTTP/3 request path. `readTimeout` in particular is on by default at 60s and is documented as bounding the time to read the entire request including its body, but it is enforced as a deadline on the TCP connection, which cannot reach a QUIC stream, and Traefik's HTTP/3 server was constructed with no timeout of any kind. An unauthenticated client that trickles a request body therefore holds a request open for as long as it chooses, and with it one upstream connection per request, at negligible cost to itself. Backends with bounded connection pools are the practical pressure point.\n\nThe HTTP/3 path lost these timeouts in v2.8.2, when a quic-go API change removed the embedded `http.Server` that had carried them; every release from v2.8.2 onward is affected, and releases before v2.8.2 are not. Traefik v2.8.2 through v2.10.x and v3.0 through v3.6 are affected and are no longer maintained: they will not receive a patch on their own line, and the remedy for their users is to upgrade to v2.11.56 or v3.7.12.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.56\n- https://github.com/traefik/traefik/releases/tag/v3.7.12\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n## Summary\n\n`entryPoints.\u003cname\u003e.transport.respondingTimeouts.readTimeout` is documented as:\n\n\u003e \"Set the timeouts for incoming requests to the Traefik instance. This is the maximum\n\u003e duration for reading the entire request, **including the body**.\" — **Default: 60s**\n\nIt is **on by default** and it works over HTTP/1.1 and HTTP/2. It has **no effect on\nHTTP/3**.\n\nThe consequence is not that a hardening option was left unset. It is that every Traefik\ndeployment with `http3` enabled carries a 60-second bound that the operator has every\nreason to believe is in force, and which is silently absent on that protocol. A single\nclient trickling one body byte every few seconds holds a request open indefinitely, and\nwith it one upstream connection per request.\n\n`readTimeout` is applied as a deadline on the **TCP connection**. HTTP/3 does not have\none, and Traefik's HTTP/3 server is constructed with no timeout of any kind.\n\n## Steps to reproduce\n\nNo containers, VMs or cloud services — the official release binary, `curl`, `openssl`,\nand a 68-line Python standard-library backend. Everything is attached.\n\n```sh\nbash reproduce.sh                 # readTimeout 5s, ~40 seconds\nMODE=default bash reproduce.sh    # the stock 60s default, ~4 minutes\n```\n\nBy hand:\n\n**1. Static config** (`conf/traefik.yml`, complete and unredacted). Note there is no\n`respondingTimeouts` block at all — this is the documented 60s default:\n\n```yaml\nglobal:\n  checkNewVersion: false\n  sendAnonymousUsage: false\n\nlog:\n  level: DEBUG\n\nentryPoints:\n  websecure:\n    address: \":8443\"\n    http3:\n      advertisedPort: 8443\n\nproviders:\n  file:\n    filename: conf/dynamic.yml\n\napi:\n  dashboard: false\n```\n\n**2. Dynamic config** (`conf/dynamic.yml`):\n\n```yaml\nhttp:\n  routers:\n    backend-router:\n      rule: \"PathPrefix(`/`)\"\n      service: backend-svc\n      entryPoints: [websecure]\n      tls: {}\n  services:\n    backend-svc:\n      loadBalancer:\n        servers:\n          - url: \"http://127.0.0.1:8080\"\ntls:\n  certificates:\n    - certFile: cert.pem\n      keyFile: key.pem\n```\n\n**3. A self-signed cert**, so no CA install and no sudo:\n\n```sh\nopenssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 30 -nodes \\\n    -subj \"/CN=localhost\" -addext \"subjectAltName=DNS:localhost,IP:127.0.0.1\"\n```\n\n**4. A backend that reads the request body** before responding, as a real HTTP/1.1 server\ndoes (`backend.py`, standard library only). This matters: a backend that answers the\nrequest headers alone lets Traefik release the upstream connection immediately, which\nhides the behaviour entirely.\n\n```sh\npython3 backend.py 8080 \u0026\n./traefik --configFile=conf/traefik.yml\n```\n\n**5. The same slow upload over each protocol.** The hold must exceed the timeout under\ntest, so 92 seconds against the 60-second default:\n\n```sh\n{ for i in $(seq 1 23); do printf 'x'; sleep 4; done; } | \\\n    curl -v -k -T - --http1.1     https://localhost:8443/\n\n{ for i in $(seq 1 23); do printf 'x'; sleep 4; done; } | \\\n    curl -v -k -T - --http3-only  https://localhost:8443/\n```\n\n## Result\n\nTraefik **v3.7.10** (`langres`, go1.26.5), official\n`traefik_v3.7.10_linux_amd64.tar.gz`, sha256\n`01811bb12d44f17280550f425f5e3128d6c325f2665c09e67a651ca535f490ce`.\n\nUpstream connection lifetime measured at the backend — the client's view only shows the\n*absence* of a server action, which proves nothing on its own:\n\n| config | hold | HTTP/1.1 (control) | HTTP/3 |\n|---|---|---|---|\n| **stock — documented 60s default** | 92 s | **59.99 s** — released at the documented default | **92.94 s** — held for the entire window |\n| `readTimeout: 5s` | 30 s | **4.99 s** | **30.98 s** |\n\nThe HTTP/1.1 column is the control and it is the point of the exercise: the timeout is\ndemonstrably live on this exact binary, releasing the upstream at its configured value.\nThe HTTP/3 request, in the same run against the same instance with the same setting, ran\nto completion with the upstream pinned throughout. Traefik returned `499` on the aborted\nHTTP/1.1 arm and took no action at all on HTTP/3 — no `RST_STREAM`, no\n`H3_REQUEST_INCOMPLETE`, no connection close.\n\nThe setting is not being silently discarded: Traefik's own DEBUG log prints the loaded\nstatic configuration including `\"respondingTimeouts\":{\"idleTimeout\":\"3m0s\",\"readTimeout\":\"5s\"}`.\nFull `curl -v` output, backend logs and Traefik DEBUG logs for every arm are in\n`evidence/`.\n\n## Cause\n\n**`readTimeout` is a TCP connection deadline** —\n`pkg/server/server_entrypoint_tcp.go:273`:\n\n```go\nif e.transportConfiguration.RespondingTimeouts.ReadTimeout \u003e 0 {\n    err := writeCloser.SetReadDeadline(time.Now().Add(time.Duration(e.transportConfiguration.RespondingTimeouts.ReadTimeout)))\n```\n\nA deadline on a TCP connection cannot reach a QUIC stream.\n\n**And the HTTP/3 server is given no timeout of any kind** —\n`pkg/server/server_entrypoint_tcp_http3.go:65`:\n\n```go\nh3.Server = \u0026http3.Server{\n    Addr:      config.GetAddress(),\n    Port:      config.HTTP3.AdvertisedPort,\n    Handler:   httpsServer.Server.(*http.Server).Handler,\n    TLSConfig: \u0026tls.Config{GetConfigForClient: h3.getTLSConfigForClient},\n    QUICConfig: \u0026quic.Config{\n        Allow0RTT: false,\n    },\n    ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {\n```\n\nIt reuses the HTTPS server's **handler** and inherits none of its timeouts. There is\ntherefore no duration control on the HTTP/3 request path at all — not `readTimeout`, not\n`idleTimeout`, nothing.\n\nNote that this cannot be fixed by passing a field through: quic-go's `http3.Server`\nexposes no request-read deadline. The remedy has to be enforced around the request body\ninside the handler, or upstream in quic-go.\n\n## Suggested remedy\n\nIn preference order:\n\n1. **Enforce `readTimeout` on the HTTP/3 path in the handler.** Traefik already passes the\n   HTTPS server's handler to `http3.Server`, so when `RespondingTimeouts.ReadTimeout \u003e 0`\n   it can wrap `r.Body` for HTTP/3 requests in a reader that enforces the deadline.\n2. Add a request-read deadline upstream in quic-go's `http3.Server` and pass it through.\n3. **At minimum, document it.** See below — the current documentation does not tell an\n   operator this.\n\n### A sketch of option 1\n\nOffered as a description of the shape, **not as a patch**. I have not built or tested this\nagainst Traefik, and I am not going to present untested code as though I had. If a working,\ntested patch would be useful, say so and I will prepare one properly and verify it against\nthe reproducer above.\n\nWhere the HTTP/3 handler is wired up — `server_entrypoint_tcp_http3.go`, around the\n`http3.Server` construction — the handler passed in could be wrapped so that, when\n`ReadTimeout` is configured, an HTTP/3 request body carries the same deadline the TCP path\ngets from `SetReadDeadline`:\n\n```go\n// Roughly: for HTTP/3 requests only, and only when the timeout is set.\nif readTimeout \u003e 0 \u0026\u0026 r.ProtoMajor == 3 \u0026\u0026 r.Body != nil {\n    r.Body = deadlineBody(r.Body, readTimeout)\n}\n```\n\nThe part worth knowing, because it is what makes the approach work rather than merely\nlook tidy: **closing the request body cancels the QUIC stream read.** In quic-go,\n`http3`'s body `Close()` calls `str.CancelRead(...)`, which unblocks a `Read` that is\nalready parked waiting on the client. So a timer that closes the body on expiry bounds\nboth a client that trickles *and* a client that simply stops sending — the latter being\nthe case a wrapper that only checks the clock on each returning `Read` would miss\nentirely.\n\nReturning `os.ErrDeadlineExceeded` from the wrapped `Read` keeps the failure classified as\na timeout rather than a client abort, which matters for whatever status code and logging\nyou decide is right.\n\nTwo design questions I would not want to answer on your behalf: whether HTTP/3 should reuse\n`respondingTimeouts.readTimeout` or get its own setting, and whether enforcement belongs in\nthe handler wrapper or somewhere closer to the entrypoint. Both are your call.\n\n## A documentation issue, separately\n\nTwo things in the docs are worth correcting regardless of how the code question is\nresolved.\n\n**1. The `readTimeout` description carries no protocol qualification.** It says \"the\nmaximum duration for reading the entire request, including the body\", which is exactly\nwhat an operator relies on. The entrypoint page does note that respondingTimeouts have\n\"no effect for UDP entryPoints\", but that does not cover this case: HTTP/3 here is served\non an **HTTP** entrypoint with an `http3:` block, not on a Traefik **UDP entrypoint**,\nwhich is a separate feature for UDP routers. An operator who adds `http3:` to their\nexisting HTTPS entrypoint has not created a UDP entrypoint and has no reason to read that\ncaveat as applying to them.\n\n**2. `SECURITY.md`'s supported-versions table is stale.** It lists `3.6.x` as supported\nand `\u003c 3.6.x` as unsupported, while 3.7.10 is the current release. Anyone checking whether\ntheir version is in scope before reporting gets a confusing answer.\n\n## Impact\n\nEach held request occupies one upstream connection for as long as the client chooses, at\nnegligible cost to the client, and the same client can open many. Backends with bounded\nconnection pools are the practical pressure point.\n\nI have **not** measured a concurrency ceiling on Traefik itself, so I am not asserting\none. If that number matters to your assessment, tell me and I will measure it.\n\n## LLM (\"AI\") use disclosure\n\nNot required by your policy, but stated because it is true and you should be able to\nweigh it. I am a penetration tester, not a Go developer. The finding, the attack concept\nand the decision to measure the upstream leg rather than the client are mine. An LLM\ncoding assistant (Claude) built the test harness, ran the matrix, and located the two\nsource citations; I verified those by hand against the `v3.7.10` tag and ran the\nreproducer myself. I am a human and I will be the one replying in this thread.\n\n## Disclosure\n\nBishop Fox operates a 90-day disclosure policy, starting the day this is submitted, with\nextensions where a fix is in progress. Tell me what you would prefer and I will work to\nit.\n\n## Environment\n\n- Traefik v3.7.10, official `traefik_v3.7.10_linux_amd64.tar.gz`,\n  sha256 `01811bb12d44f17280550f425f5e3128d6c325f2665c09e67a651ca535f490ce`\n- Kali GNU/Linux (WSL2), kernel 6.6.114.1\n- curl 8.19.0 with ngtcp2 1.21.0 / nghttp3 1.15.0### Summary\n_Short summary of the problem. Make the impact and severity as clear as possible. For example: An unsafe deserialization vulnerability allows any unauthenticated user to execute arbitrary code on the server._\n\n### Details\n_Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._\n\n### PoC\n_Complete instructions, including specific configuration details, to reproduce the vulnerability._\n\n### Impact\n_What kind of vulnerability is it? Who is impacted?_\n\n\n\u003c/details\u003e\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.8.2"
+            },
+            {
+              "fixed": "2.11.56"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7ghq-v6jf-g56c/GHSA-7ghq-v6jf-g56c.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.7.12"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7ghq-v6jf-g56c/GHSA-7ghq-v6jf-g56c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-7ghq-v6jf-g56c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88012"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/pull/13717"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/commit/a8d0bc425859dde7481a6c9a324e610b81d754d0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.56"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.12"
+    }
+  ]
+}

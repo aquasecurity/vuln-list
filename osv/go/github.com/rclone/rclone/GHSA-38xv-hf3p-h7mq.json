@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-38xv-hf3p-h7mq",
+  "modified": "2026-09-10T23:00:05.150672570Z",
+  "published": "2026-09-10T22:45:36Z",
+  "aliases": [
+    "CVE-2026-88046"
+  ],
+  "summary": "rclone: source object names can escape the configured root on upload",
+  "details": "### Summary\n\nMultiple backends, when given a specially crafted object to copy, can escape the backend confinement.\n\n| Backend | Keep/Close | Per-backend severity |\n|---|---|---|\n| sftp | Medium | Real filesystem escape, fires under default encoding. |\n| smb | Low-Medium | Escapes to a different SMB share the credential can reach. |\n| ftp | Low | Real, leading-`..` overshoot PoC is partly neutralized by encoding; escape bounded to at/below the login base. |\n| webdav | Low | Server-side ACLs are the real boundary. |\n| b2 | Low | Same-account sibling **bucket** crossing on a flat keyspace. |\n| swift | Low | Same, container. |\n| qingstor | Low | Same. |\n| oracleobjectstorage | Low | Same. |\n| internetarchive | Low | IA items are owner-writable only; confined to user's own items. |\n| storj | Low | Can retarget a different bucket in the same access grant. |\n| filelu | Low | Confined to the user's own account. |\n| shade | Low | Confined to the user's own drive. |\n| sia | Low | siad API password already grants full-daemon access. |\n\n## Root cause\n\nrclone core does **not** sanitize `..` in a source object's `Remote()` - verified: nothing in `fs/march`, `fs/sync`, `fs/list`, or `fs/operations` rejects `..` segments before the name reaches the destination backend's `Put`/`Update`/`Mkdir`. Confinement is therefore each backend's responsibility, and these backends join `root + remote` without a check.\n\nThis divides into two classes:\n\n- **Bucket based backends** - `bucket.Split(path.Join(f.root, rootRelativePath))`:\n  - `backend/b2/b2.go:404`, `backend/swift/swift.go:464`, `backend/qingstor/qingstor.go:198`, `backend/oracleobjectstorage/oracleobjectstorage.go:245`, `backend/internetarchive/internetarchive.go:1016`, `backend/smb/smb.go:885`, `backend/storj/fs.go:289`.\n  - `path.Join` collapses `..` on the standard (ASCII) form **before** encoding is applied (e.g. `FromStandardPath(path.Join(...))` at `backend/b2/b2.go:1641`), so `EncodeDot` never gets the chance to neutralize the `..`.\n  - `lib/bucket.Join` does **not** clean paths (keeps `..` as a literal key segment); `path.Join` does. `backend/s3`, `backend/azureblob`, `backend/googlecloudstorage` already use `bucket.Join` and are therefore not affected.\n\n- **Path based backends** - `path.Join(root, remote)` onto a real path:\n  - sftp: `remotePath = path.Join(f.absRoot, f.opt.Enc.FromStandardPath(remote))` (`backend/sftp/sftp.go:2497`). Default encoding is `encoder.Display` (== `Standard`), and `FromStandardPath` short-circuits to a pass-through in that mode, so `..` survives; `f.absRoot` is absolute, so `path.Join(\"/home/user/root\", \"../../../../etc/passwd\")` -\u003e `/etc/passwd`.\n  - webdav: `filePath` at `backend/webdav/webdav.go:426-432`.\n  - ftp: `path.Join(f.root, remote)` at ~14 sites (e.g. `backend/ftp/ftp.go:1247`).\n  - filelu, shade, sia: analogous joins.\n\n### Precondition that limits reachability\n\nFor any of these to fire, a **source** must hand rclone a `Remote()` containing raw `..`. That is only possible when:\n\n1. the source is a **flat-keyspace object store** (not a filesystem - a local/sftp/smb source cannot represent `../../x` as one directory entry), **and**\n2. the offending key was written with **native, non-rclone tooling** - rclone's own writer applies `EncodeDot` and rewrites a `..` segment to fullwidth `．．`, so you cannot create such a key *through rclone*.\n\nrclone's source-side listing does pass a natively-planted raw `..` key through unchanged (verified for b2: `remote := file.Name[len(prefix):]` after `ToStandardPath`, `backend/b2/b2.go:858,867`). The reports never establish this precondition; it is the same omission across every member of the class.\n\n### Example attack\n\n```bash\n# Step 1 - attacker, using NATIVE S3 tooling (NOT rclone) on a source the victim ingests from:\naws s3api put-object --bucket shared-drop --key '../../victim-backups/pwned.txt' --body evil.txt\n\n# Step 2 - victim's ordinary ingest:\nrclone copy s3-drop:shared-drop b2:victim-uploads/incoming\n# path.Join(\"victim-uploads/incoming\", \"../../victim-backups/pwned.txt\") = \"victim-backups/pwned.txt\"\n# -\u003e lands in the victim's victim-backups bucket instead of under incoming/\n```\n\nThe blast radius is the victim's **own** account (a bucket/share/path the configured credential already reaches) - integrity misdirection, not a cross-tenant or confidentiality breach. sftp/smb are the exception in *reach* (server filesystem / other share), still bounded by the login's own permissions.\n\n## Precedent\n\nThis is the same class as the already-fixed local backend advisory [https://github.com/rclone/rclone/security/advisories/GHSA-7p4m-qxvv-g567](GHSA-7p4m-qxvv-g567), which added `(*Fs).localPath` returning `errPathEscapes` for names resolving outside the root (`backend/local/local.go:819-826`). That fix was justified because the destination was the operator's own OS filesystem; the same reasoning extends (at lower severity) to sftp/smb.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.75.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-38xv-hf3p-h7mq/GHSA-38xv-hf3p-h7mq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-38xv-hf3p-h7mq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88046"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/57842c5ee4e1407eda06a414a36510cce2db4252"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.75.1"
+    }
+  ]
+}

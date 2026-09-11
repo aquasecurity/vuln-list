@@ -1,0 +1,62 @@
+{
+  "id": "GHSA-f8g7-2xjc-7mfh",
+  "modified": "2026-09-10T23:00:05.151061190Z",
+  "published": "2026-09-10T22:51:34Z",
+  "aliases": [
+    "CVE-2026-88016"
+  ],
+  "summary": "rclone: Directory metadata (chmod/chown/chtimes) applied through a planted symlink in rclone local --links escapes the destination",
+  "details": "## Summary\nWith `-l/--links`, rclone's local backend recreates a source `.rclonelink` object as a real symlink at the destination **verbatim** (preserved by design for faithful backups). Directory-metadata application, however, does **not** go through the `os.Root` sandbox and does **not** use NOFOLLOW syscalls. A local `Directory` always has `translatedLink=false`, so when the destination path already exists as a planted symlink, rclone applies `chmod`/`chown`/`chtimes` **through** that symlink to a target **outside** the destination tree. An attacker who controls the source contents (malicious/compromised remote, shared bucket) obtains attacker-valued `chmod`/`chown`/`chtimes` of an arbitrary path outside the backup destination.\n\n## Root Cause\n- `MkdirMetadata` (`backend/local/local.go:895`) calls `f.lstat` (=`os.Lstat`, local.go:465) on the destination path. On a pre-planted symlink, `os.Lstat` succeeds, so the `errors.Is(err, os.ErrNotExist)` branch (local.go:896) that would create a real directory via the `os.Root`-guarded `f.Mkdir` is **not** taken. Instead a `Directory` is built directly on the symlink path.\n- `writeMetadataToFile` runs raw `os.Chown` (`backend/local/metadata.go:131`) and `os.Chmod` (`metadata.go:158`); `setTimes` runs raw `os.Chtimes` (`backend/local/local.go:1318`).\n- The CVE-2024-52522 NOFOLLOW fix (`os.Lchown`/`lChmod`/`lChtimes`) is gated on `if o.translatedLink` (metadata.go:128/150, local.go:1315). A `Directory` (`newDirectory`→`newObject` with no `.rclonelink` suffix) is never `translatedLink`, so it always takes the raw *following* branch. The CVE-2026-54572 `os.Root` fix covers only content **writes**, not metadata syscalls.\n\n## Impact\nAttacker-controlled `chmod`/`chown`/`chtimes` (values taken from the source directory's mode/uid/gid/mtime) applied to any file or directory **outside** the destination. `chtimes` (mtime) escape works with just `--links` and default flags; `chmod`/`chown` escape additionally needs `--metadata`. When rclone runs as root with `--metadata` and a source `uid=0`, the `chown` primitive reaches the CVE-2024-52522 privilege-escalation ceiling (take ownership of an out-of-tree path).\n\n## Proof of Concept\n```\nmkdir -p /src /dest\n# run 1: source object pwn.rclonelink whose body = /home/victim/secret.d\nprintf '/home/victim/secret.d' \u003e /src/pwn.rclonelink\nrclone sync --links /src /dest              # plants /dest/pwn -\u003e /home/victim/secret.d\n# attacker swaps source pwn to a real directory with chosen metadata:\nrm /src/pwn.rclonelink ; mkdir -p /src/pwn/keep ; chmod 777 /src/pwn\nrclone sync --links --metadata /src /dest   # MkdirMetadata sees /dest/pwn exists (symlink) -\u003e\n                                            # chmod 0777 applied THROUGH it to /home/victim/secret.d\nls -ld /home/victim/secret.d                # =\u003e drwxrwxrwx  (outside dir, attacker-chosen mode)\n```\nA single-run PoC is achievable against directory-based object sources (drive/onedrive-class) that satisfy both `ReadDirMetadata` and `CanHaveEmptyDirectories` and can present `pwn.rclonelink` and `pwn/` simultaneously. Local→local uses the two-run backup model (same repeated-backup model as CVE-2024-52522 and CVE-2026-54572). Verified end-to-end against the real `fs/sync.Sync` engine on HEAD: the two-run backup backdated the outside target's mtime and chmod'd it 0777 while os.Root correctly blocked the content-copy of `pwn/keep` — isolating the metadata gap.\n\n## Attack Chain\n1. **Entry.** Victim runs `rclone copy`/`sync --links [--metadata] \u003cuntrusted-remote\u003e: /dest`. Attacker controls source contents.\n   - Guard: none — `--links` copying an untrusted remote is a documented, supported operation.\n2. **Plant symlink.** Source serves `pwn.rclonelink` with body = absolute outside path; rclone recreates `dst/pwn` → outside.\n   - Guard: `Fs.symlink` routes creation through `os.Root.Symlink` (local.go:~1552).\n   - Bypass proof: `os.Root` creates the link **verbatim by design** (commit 1154afe); the upstream `os.Root` fix's test `TestSymlinkEscapeWriteThroughBlocked` confirms only write-*through* is refused, the link is planted.\n3. **Deferred dir-metadata fires after transfers.** Source presents non-empty dir `pwn`; `setDelayedDirModTimes` (sync.go:1002) runs strictly after `stopTransfers()` (sync.go:988) — after the symlink is planted.\n   - Guard: `MkdirMetadata` would create a real dir via os.Root-guarded `f.Mkdir` (local.go:897) inside its `errors.Is(err, os.ErrNotExist)` branch.\n   - Bypass proof: `os.Lstat` (local.go:465) on the existing symlink returns success, so the `ErrNotExist` branch (local.go:896) is NOT taken; `f.Mkdir`/os.Root never runs. Empirically `os.IsNotExist(err)=false` for the planted symlink.\n4. **Sink follows the symlink.** `CopyDirMetadata`→`MkdirMetadata`→`writeMetadataToFile` runs `os.Chown`/`os.Chmod` (metadata.go:131/158); `DirSetModTime`→`setTimes` runs `os.Chtimes` (local.go:1318) — all on `o.path=\"dst/pwn\"` with `translatedLink=false`.\n   - Guard: CVE-2024-52522 NOFOLLOW branch (`os.Lchown`/`lChmod`/`lChtimes`).\n   - Bypass proof: that branch is gated on `if o.translatedLink` (metadata.go:128/150, local.go:1315); a `Directory` always has `translatedLink=false`, so the raw following branch runs. POSIX-confirmed: `chmod 777`/`touch` on a symlink path change the *target's* mode/mtime.\n5. **Impact.** `chmod`/`chown`/`chtimes` on an attacker-chosen path outside the destination, with attacker-controlled values.\n\n## Bypass Evidence\n- `if o.translatedLink` gates verified verbatim on v1.75.0 at metadata.go:128/150 and local.go:1315; `os.Chown`/`os.Chmod`/`os.Chtimes` on the else branch at metadata.go:131/158 and local.go:1318.\n- `newDirectory`→`newObject` (local.go:581/589/596) never sets the `.rclonelink` suffix → `translatedLink=false` for all directories.\n- `MkdirMetadata` skip branch: `os.Lstat` succeeds on planted symlink → `errors.Is(err, os.ErrNotExist)` false at local.go:896 → guarded `f.Mkdir` skipped.\n- Real `fs/sync.Sync` E2E on HEAD: `TestDirMetadataThroughPlantedSymlink` (outside dir → 0777), `TestDirSetModTimeThroughPlantedSymlink` (mtime set, default-on), `TestE2E_TwoRunBackup` (backdated outside target while content-copy blocked by os.Root). All PASS. Control `TestControl_ContentWriteBlocked` confirms harness fidelity.\n\n## Affected Versions\n`\u003c= 1.75.0`. Vulnerable code present on latest release tag v1.75.0 and HEAD (5629f26); `git log v1.75.0..HEAD -- backend/local/metadata.go backend/local/local.go` is empty (no post-release fix).\n\n## Suggested Fix\nRoute directory metadata through `os.Root` when `TranslateSymlinks` is set (use `fchmodat(AT_SYMLINK_NOFOLLOW)`/`Lchown`/`UtimesNanoAt(AT_SYMLINK_NOFOLLOW)` on the `rel` path within the root), and/or extend `MkdirMetadata` to detect that the pre-existing destination path is a symlink and refuse to apply following-metadata — mirroring the CVE-2024-52522 NOFOLLOW branch that currently exists only for `translatedLink` objects.\n\n---\nReported by **zx (Jace)** — GitHub: @manus-use",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rclone/rclone",
+        "purl": "pkg:golang/github.com/rclone/rclone"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.75.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.75.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-f8g7-2xjc-7mfh/GHSA-f8g7-2xjc-7mfh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/security/advisories/GHSA-f8g7-2xjc-7mfh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88016"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/17b0c03338a857bcb0a68d2d4c82ddbdec3f7893"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/commit/a7ab39d3d1958afa1446982c1dc4e4a73a887e3e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rclone/rclone"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rclone/rclone/releases/tag/v1.75.1"
+    }
+  ]
+}

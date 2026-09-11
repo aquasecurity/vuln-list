@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-qqjf-53cj-pwvv",
+  "modified": "2026-09-10T23:15:04.352847272Z",
+  "published": "2026-09-10T23:04:06Z",
+  "aliases": [
+    "CVE-2026-88007"
+  ],
+  "summary": "Traefik HTTP/3 Backend NTLM Connection Reuse",
+  "details": "## Summary\n\nTraefik's HTTP/3 request path did not initialize the connection-scoped backend transport holder that isolates connection-bound NTLM and Negotiate (Kerberos) authentication on the HTTP/1.1 and HTTP/2 paths. The HTTP/3 entrypoint reuses the HTTPS handler chain and reaches the same backend round-tripper, but its `ConnContext` never called `service.AddTransportOnContext`, so `kerberosRoundTripper` fell back to the shared backend transport instead of a per-frontend-connection pool. On a route served over HTTP/3 to a backend that binds identity to a persistent connection via NTLM or Negotiate, an unrelated HTTP/3 client could be assigned a backend connection already authenticated as a victim and inherit that identity, reading victim-only data and performing actions as the victim without presenting the victim's credentials. Affected deployments require HTTP/3 enabled on the entrypoint, a backend using connection-bound NTLM/Negotiate authentication, and backend keep-alive; deployments using ordinary per-request authentication are not affected.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.57\n- https://github.com/traefik/traefik/releases/tag/v3.7.13\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n\u003cdetails\u003e\n\u003csummary\u003eOriginal Description\u003c/summary\u003e\n\n## Traefik HTTP/3 Backend NTLM Connection Reuse\n\n### Summary\nTraefik's HTTP/3 request path does not initialize the connection-scoped backend transport state that Traefik uses to isolate connection-bound NTLM and Negotiate authentication for HTTP/1.1 and HTTP/2. When a backend keeps authenticated identity on a persistent HTTP/1.1 TCP connection, an unrelated HTTP/3 client can reuse a victim-authenticated backend connection and inherit that backend identity.\n\nIn the attached reproduction, the HTTPS/HTTP/1.1 control case behaves correctly and isolates the attacker, but the HTTP/3 case allows a second unauthenticated client to read victim-only data and execute a state-changing request as `actor=victim`.\n\nValidated target:\n- Repository: `traefik/traefik`\n- Commit: `f2d0794417e4d06343e6e7c4722143f5b34bee45`\n- Validation time: `2026-08-25T06:48:02Z`\n- Commit time: `2026-08-24T08:26:06Z`\n- Patched status: not evaluated\n\n### Details\nThe issue is caused by a protocol-parity gap between the normal TCP HTTP entrypoint path and the HTTP/3 entrypoint path.\n\nFor HTTP/1.1 and HTTP/2, Traefik explicitly creates a connection-scoped holder that can later store a dedicated RoundTripper for NTLM or Negotiate:\n\n```go\n// pkg/server/server_entrypoint_tcp.go:691-703\nvar connContext multipleConnContext\nconnContext.AddConnContextFunc(func(ctx context.Context, c net.Conn) context.Context {\n\t// This adds an empty struct in order to store a RoundTripper in the ConnContext in case of Kerberos or NTLM.\n\tctx = service.AddTransportOnContext(ctx)\n\n\tif tlsConn, ok := c.(*tls.Conn); ok {\n\t\tif tlsConnWithOptionsName, ok := tlsConn.NetConn().(tcp.TLSConn); ok {\n\t\t\treturn tcp.AddTLSOptionsNameInContext(ctx, tlsConnWithOptionsName.TLSOptionsName)\n\t\t}\n\t}\n\n\treturn ctx\n})\n```\n\nThat helper installs the per-connection holder, and `kerberosRoundTripper` depends on it. If the holder is absent, it falls back to the shared original backend transport. If NTLM or Negotiate is detected, it stores a dedicated cloned RoundTripper into that holder so future requests stay on the authenticated backend connection:\n\n```go\n// pkg/server/service/transport.go:374-402\nfunc AddTransportOnContext(ctx context.Context) context.Context {\n\treturn context.WithValue(ctx, transportKey, \u0026stickyRoundTripper{})\n}\n\ntype kerberosRoundTripper struct {\n\tnew                  func() http.RoundTripper\n\tOriginalRoundTripper http.RoundTripper\n}\n\nfunc (k *kerberosRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {\n\tvalue, ok := request.Context().Value(transportKey).(*stickyRoundTripper)\n\tif !ok {\n\t\treturn k.OriginalRoundTripper.RoundTrip(request)\n\t}\n\n\tif value.RoundTripper != nil {\n\t\treturn value.RoundTripper.RoundTrip(request)\n\t}\n\n\tresp, err := k.OriginalRoundTripper.RoundTrip(request)\n\n\t// If we found that we are authenticating with Kerberos (Negotiate) or NTLM.\n\t// We put a dedicated roundTripper in the ConnContext.\n\t// This will stick the next calls to the same connection with the backend.\n\tif err == nil \u0026\u0026 containsNTLMorNegotiate(resp.Header.Values(\"WWW-Authenticate\")) {\n\t\tvalue.RoundTripper = k.new()\n\t}\n\treturn resp, err\n}\n```\n\nFor HTTP/3, the server reuses the normal HTTPS handler chain, but its `ConnContext` only propagates the TLS options name and does not call `service.AddTransportOnContext`:\n\n```go\n// pkg/server/server_entrypoint_tcp_http3.go:65-80\nh3.Server = \u0026http3.Server{\n\tAddr:      config.GetAddress(),\n\tPort:      config.HTTP3.AdvertisedPort,\n\tHandler:   httpsServer.Server.(*http.Server).Handler,\n\tTLSConfig: \u0026tls.Config{GetConfigForClient: h3.getTLSConfigForClient},\n\tQUICConfig: \u0026quic.Config{\n\t\tAllow0RTT: false,\n\t},\n\tConnContext: func(ctx context.Context, c *quic.Conn) context.Context {\n\t\ttlsOptionsName, err := h3.getTLSOptionsName(c)\n\t\tif err != nil {\n\t\t\tlog.Error().Msgf(\"Error getting TLS options name for client: %v\", err)\n\t\t\treturn ctx\n\t\t}\n\t\treturn tcp.AddTLSOptionsNameInContext(ctx, tlsOptionsName)\n\t},\n}\n```\n\nThis means HTTP/3 requests reach the same reverse-proxy and backend transport logic as HTTPS, but without the connection-scoped transport holder that NTLM and Negotiate isolation relies on.\n\nIn practice, the flow is:\n1. A victim authenticates through Traefik to a backend that binds identity to the backend TCP connection using NTLM or Negotiate.\n2. Because the HTTP/3 request context does not contain `transportKey`, `kerberosRoundTripper` uses the shared `OriginalRoundTripper`.\n3. No frontend-connection-specific dedicated backend pool is installed for that HTTP/3 client.\n4. A second unrelated HTTP/3 client can be assigned the same backend TCP connection after the victim has authenticated it.\n5. That second client inherits the victim's backend identity without sending the victim's credentials.\n\nThe attached verifier demonstrates both the negative control and the exploit path:\n- HTTPS/HTTP/1.1 control case: the attacker uses a separate frontend connection and correctly receives `401`\n- HTTP/3 exploit case: the attacker uses a separate HTTP/3 client with no `Authorization` header, reads `resource=secret actor=victim`, executes `action=transfer actor=victim to=attacker amount=5000`, and hits the same backend TCP connection identifier as the victim\n\n### PoC\n\nSee the reproduction materials at:\nhttps://gist.github.com/OneZ3r0/41da8e8b79ebbe444a94f8a2a3a30895\n\nThe gist can also be downloaded as a ZIP archive.\n\nFiles included in this gist:\n- `run.sh`\n- `Dockerfile`\n- `.dockerignore`\n- `go.mod`\n- `go.sum`\n- `verify.go`\n\nThe package is intentionally kept as a single-container reproduction:\n1. `run.sh` builds a local image for the pinned target commit\n2. the Dockerfile builds both Traefik and the verifier during image build\n3. the container runs the verifier directly as its entrypoint\n4. the verifier starts a synthetic backend, launches Traefik, runs the HTTPS/HTTP/1.1 control case, then runs the HTTP/3 exploit case\n\nRun:\n\n```bash\n./run.sh\n```\n\n`run.sh` defaults to the validated commit above. To override it explicitly:\n\n```bash\nPRODUCT_COMMIT=f2d0794417e4d06343e6e7c4722143f5b34bee45 ./run.sh\n```\n\nExpected terminal result:\n\n```text\nREPRODUCED: HTTP/1.1 isolates the authenticated backend connection, but HTTP/3 reuses the victim-authenticated backend connection for a different client and executes an unauthorized state-changing request as the victim.\n```\n\nImportant observed behavior from the PoC:\n- the HTTP/1.1 control case succeeds only if a fresh attacker connection receives `401`\n- the HTTP/3 exploit case succeeds only if the attacker reads victim-only data without sending `Authorization`\n- the HTTP/3 exploit case succeeds only if the attacker performs `/transfer?to=attacker\u0026amount=5000` as `actor=victim`\n- the HTTP/3 exploit case succeeds only if the attacker uses the same backend TCP connection identifier as the victim\n\nEnvironment notes:\n- Docker is required\n- the build fetches the target Traefik source from GitHub\n- no production credentials or external NTLM service are required; the verifier includes a synthetic NTLM-like backend specifically to demonstrate connection-bound identity reuse\n\n### Impact\nThis is a cross-client authorization bypass affecting deployments that expose HTTP/3 routes to backends using connection-bound NTLM or Negotiate authentication with persistent backend connection reuse.\n\nIn the verified reproduction, an unauthenticated second client can:\n- read victim-only data\n- perform a state-changing action as the victim\n- reuse a backend TCP connection that has already been authenticated as the victim\n\nAttack prerequisites:\n- HTTP/3 enabled on the Traefik entrypoint\n- a routed backend using connection-bound NTLM or Negotiate authentication\n- backend keep-alive and backend connection reuse enabled\n- the attacker can reach the same route as the victim\n\nDeployments using ordinary per-request authentication are not affected by this specific issue.\n\n\u003c/details\u003e\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v3",
+        "purl": "pkg:golang/github.com/traefik/traefik/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.7.13"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-qqjf-53cj-pwvv/GHSA-qqjf-53cj-pwvv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/traefik/traefik/v2",
+        "purl": "pkg:golang/github.com/traefik/traefik/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.11.0"
+            },
+            {
+              "fixed": "2.11.57"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-qqjf-53cj-pwvv/GHSA-qqjf-53cj-pwvv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/security/advisories/GHSA-qqjf-53cj-pwvv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88007"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/pull/13812"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/commit/ff39c47d7459dec9cd8de63c1a4e7aa7315bdc1c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/traefik/traefik"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v2.11.57"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/traefik/traefik/releases/tag/v3.7.13"
+    }
+  ]
+}
