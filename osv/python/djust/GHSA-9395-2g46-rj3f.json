@@ -1,0 +1,120 @@
+{
+  "id": "GHSA-9395-2g46-rj3f",
+  "modified": "2026-09-17T20:45:06.036936261Z",
+  "published": "2026-09-17T20:31:43Z",
+  "summary": "djust: Six template-layer defects emit attacker-controlled markup unescaped (XSS)",
+  "details": "Five independent defects in djust's template auto-escaping cause attacker-controlled input to be rendered as live markup where Django escapes it. All four are present in shipped 1.1.0 and are fixed in 1.1.1.\n\nThey share one shape: **a filter or grant that escapes nothing itself and relies on the render-time auto-escape, which something downstream then removes.** They are grouped into a single advisory because the mitigation is identical — upgrade to 1.1.1 — and because no single one of them is meaningfully actionable in isolation.\n\n## 1. `linenumbers` never escaped its input (#2291)\n\n```\n{{ p|linenumbers|safe }}   with p = '\u003cimg src=x onerror=alert(1)\u003e'\n  djust   '1. \u003cimg src=x onerror=alert(1)\u003e'      \u003c- executes\n  django  '1. \u0026lt;img src=x onerror=alert(1)\u0026gt;'\n```\n\nThe filter deferred all escaping to render time; a trailing `|safe` suppressed exactly that. The exposure is wider than the `|safe` form: **any downstream filter that reads the output as markup is affected**, including `{{ p|linenumbers|truncatechars_html:\"5\" }}`, which contains no `|safe` at all.\n\n## 2. `escape` was a no-op (#2281)\n\n```\n{{ p|escape|safe }}\n  djust   '\u003cimg src=x onerror=alert(1)\u003e'          \u003c- executes\n  django  '\u0026amp;lt;img src=x onerror=alert(1)\u0026amp;gt;'\n```\n\nDjango's `escape` is eager (`conditional_escape`, returning `SafeString`). djust's returned its input unchanged and let the render site escape it — indistinguishable for `{{ p|escape }}` alone, wrong for every chain. The security cell is `{{ p|escape|safe }}`: an idiom that reads as \"escape it, then it is safe to emit\" — which is what Django's semantics make true — was a bare `|safe` on attacker input. A sweep of every length-2 and length-3 chain containing `escape` found **104** live-markup cells.\n\n## 3. `unordered_list` / `safeseq` handed a string back under a safe grant (#2274)\n\nBoth carry an unconditional \"emit without escaping\" grant, earned because they escape every item they emit. Given a **string** rather than a sequence they emitted nothing and returned the input verbatim under that same grant, making `{{ hostile|safeseq }}` an exact synonym for `|safe` with no `mark_safe` anywhere in the template.\n\n## 4. A safety grant outlived the value it was granted for (#2300)\n\n**No filter chain and no `|safe` anywhere; a bare `{{ p }}` is the whole reproducer.**\n\nSafe context keys accumulated on the view and were never revoked, so a key marked safe once stayed safe for the lifetime of the view — which spans **every event on a WebSocket connection**:\n\n```python\nrender 1:  p = mark_safe('\u003cb\u003etrusted\u003c/b\u003e')     -\u003e  '\u003cb\u003etrusted\u003c/b\u003e'   correct\nrender 2:  p = '\u003cimg src=x onerror=alert(1)\u003e'  -\u003e  executes\n```\n\nA view that renders trusted markup into a variable and later renders user input into the same variable emits it live.\n\n## 5. A custom tag handler's return was emitted raw — including djust's own `{% render_slot %}` (#2379)\n\n**Reachable with no `|safe`, no `mark_safe`, and no application code: using component slots is enough.**\n\nDjango's `SimpleNode.render` runs `conditional_escape` over a `simple_tag`'s return\nunless it carries `__html__`. djust inserted the return verbatim, so a handler as\nordinary as `return f\"Hello {name}\"` emitted attacker markup live.\n\nOf the 221 handlers djust registers, one echoes a context value unescaped —\n`render_slot`, the framework's own function-component/slot tag:\n\n```\n{% render_slot p %}     p = '\u003cimg src=x onerror=alert(1)\u003e'\n\n  djust   '\u003cimg src=x onerror=alert(1)\u003e'          \u003c- executes\n  django  '\u0026lt;img src=x onerror=alert(1)\u0026gt;'\n```\n\nTogether with defect 3 this is one of the two classes reachable without the\napplication writing anything unusual.\n\n## 6. `linebreaks` / `linebreaksbr` — and `|safe` was the only spelling that worked (#2284)\n\n`linebreaks` emits `\u003cp\u003e`/`\u003cbr\u003e` but neither escaped its content nor reported its\noutput safe. The plain spelling therefore escaped the filter's **own** tags and\nprinted a literal `\u003cp\u003e` on the page, so `|safe` was the only form that rendered\nat all — and that form emitted the content live:\n\n```\n{{ bio|linebreaks }}         renders literal '\u003cp\u003e' text        (visibly broken)\n{{ bio|linebreaks|safe }}    '\u003cimg src=x onerror=alert(1)\u003e'    \u003c- executes\n```\n\nBecause the broken spelling is the one a developer discards, the vulnerable\nspelling is the one that ships. Any application rendering user-entered text with\nparagraph breaks is written that way.\n\n## Impact\n\nStored or reflected XSS in any djust application that renders untrusted input through the affected filters, or that reuses a context variable which was previously marked safe. Exploitation requires no special configuration. Defects 3, 4 and 5 require no unusual template construct at all — defect 5 needs only that the application use component slots, and defect 6's vulnerable spelling is the only one that renders correctly.\n\n## Patches\n\nFixed in **1.1.1**, and in **1.2.0** (`main`).\n\n1.1.1 re-implements each fix against 1.1.0's own code rather than back-porting `main`'s, which depends on a value-level safety model 1.1.0 does not have. Three consequences are documented in the 1.1.1 CHANGELOG and are all in the **over-escaping** direction: `{{ p|escape|F }}` double-escapes for a plain following filter `F`; `{% render_slot slot.content %}` over-escapes; and a `mark_safe`d value passed through `|escape` is escaped rather than passed through.\n\n**Not fixed in 1.1.1**, and tracked separately: application-written tag handlers that return attacker data as a plain `str` (only djust's own `render_slot` is covered by defect 5), and a `{% with %}`/`{% for %}` bind inheriting a safety grant it never earned. Both are fixed in 1.2.0.\n\n## Workarounds\n\nNone complete. Before upgrading, avoid `|safe` after any filter in a chain, avoid `safeseq`/`unordered_list` on values that may be strings, and avoid reusing a context variable for both `mark_safe` content and untrusted input.\n\n## Credit\n\nFound during an internal Django-parity audit by a registry-wide differential that compares djust's escaping capabilities against Django's across every filter chain, rather than by inspection.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djust",
+        "purl": "pkg:pypi/djust"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.1.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "1.0.0",
+        "1.0.0rc1",
+        "1.0.0rc10",
+        "1.0.0rc11",
+        "1.0.0rc12",
+        "1.0.0rc13",
+        "1.0.0rc14",
+        "1.0.0rc15",
+        "1.0.0rc16",
+        "1.0.0rc17",
+        "1.0.0rc18",
+        "1.0.0rc2",
+        "1.0.0rc3",
+        "1.0.0rc4",
+        "1.0.0rc6",
+        "1.0.0rc7",
+        "1.0.0rc8",
+        "1.0.0rc9",
+        "1.0.1",
+        "1.0.1rc1",
+        "1.0.2",
+        "1.0.2rc1",
+        "1.0.2rc2",
+        "1.0.2rc3",
+        "1.0.3",
+        "1.0.3rc1",
+        "1.0.3rc2",
+        "1.0.4",
+        "1.0.4rc1",
+        "1.0.5",
+        "1.0.5rc1",
+        "1.0.5rc2",
+        "1.0.5rc3",
+        "1.0.5rc4",
+        "1.0.5rc5",
+        "1.0.6",
+        "1.0.7",
+        "1.0.8",
+        "1.1.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.1.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-9395-2g46-rj3f/GHSA-9395-2g46-rj3f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/security/advisories/GHSA-9395-2g46-rj3f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/djust-org/djust"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/releases/tag/v1.1.1"
+    }
+  ]
+}

