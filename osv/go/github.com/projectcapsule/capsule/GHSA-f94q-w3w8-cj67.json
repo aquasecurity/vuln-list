@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-f94q-w3w8-cj67",
+  "modified": "2026-09-18T17:30:08.600045247Z",
+  "published": "2026-09-18T17:14:43Z",
+  "aliases": [
+    "CVE-2026-61795"
+  ],
+  "summary": "Capsule: hostnameRegexHandler.OnUpdate validates stale (old) Tenant regex, allowing invalid AllowedHostnames regex to bypass webhook validation",
+  "details": "### Summary\n\nA parameter order bug in `internal/webhook/tenant/validation/hostname_regex.go` causes the `hostnameRegexHandler.OnUpdate` webhook to validate the **old** Tenant object's `AllowedHostnames.Regex` instead of the **new** one being submitted. This allows an invalid (malformed) regex to bypass admission validation and be persisted to etcd, causing a Denial of Service for all Ingress operations within the affected tenant.\n\n### Details\n\nThe `TypedHandler[T]` interface defines `OnUpdate` as:\n\n```go\n// handlers.go\nOnUpdate(c client.Client, reader client.Reader, obj T, old T, decoder admission.Decoder, recorder events.EventRecorder) Func\n//                                               ^^^ NEW  ^^^ OLD\n```\n\nThe dispatcher in `handler.go:93` calls:\n```go\nhndl.OnUpdate(c, reader, tnt, old, decoder, recorder)\n//                        ^^^ NEW  ^^^ OLD\n```\n\nHowever, `hostnameRegexHandler.OnUpdate` in `hostname_regex.go` declares its parameters in **reversed order**:\n\n```go\n// hostname_regex.go (BUGGY)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    old *capsulev1beta2.Tenant,   // ← receives NEW tenant (mislabeled as old)\n    tnt *capsulev1beta2.Tenant,   // ← receives OLD tenant (mislabeled as tnt)\n    ...\n) handlers.Func {\n    return func(...) *admission.Response {\n        if err := h.validate(tnt, req); err != nil { // ← validates OLD, not NEW\n            return err\n        }\n        return nil\n    }\n}\n```\n\nAll 11 other handlers in the same package declare `(tnt, old)` correctly. `hostname_regex.go` is the only one with the swap.\n\nAs a result, when a Cluster Admin updates `Tenant.Spec.IngressOptions.AllowedHostnames.Regex` to a malformed value, the webhook compiles the **previous valid regex** and returns `Allow`. The malformed regex is then written to etcd.\n\nSubsequently, every Ingress `CREATE` or `UPDATE` in that tenant triggers `validate_hostnames.go:160`:\n\n```go\nmatched, _ = regexp.MatchString(allowedRegex, currentHostname)\n```\n\n`regexp.MatchString` with an invalid pattern returns `(false, error)`. The error is silently ignored, `matched` is `false`, and **every hostname is rejected** — blocking all Ingress operations in the tenant until the Tenant object is manually corrected by an admin.\n\n### PoC\n\n```\n//go:build ignore\n// Standalone reproducer for hostname_regex.go argument swap bug in Capsule\n// No external deps - shows the bug logic using only stdlib\n\npackage main\n\nimport (\n\t\"fmt\"\n\t\"regexp\"\n)\n\n// Simulating the Tenant spec structure\ntype AllowedHostnames struct {\n\tRegex string\n}\n\ntype IngressOptions struct {\n\tAllowedHostnames *AllowedHostnames\n}\n\ntype TenantSpec struct {\n\tIngressOptions IngressOptions\n}\n\ntype Tenant struct {\n\tName string\n\tSpec TenantSpec\n}\n\n// =========================================================\n// BUGGY implementation (hostname_regex.go as-is)\n// OnUpdate(_, _, old *Tenant, tnt *Tenant) → validates OLD\n// =========================================================\nfunc hostnameValidate(tnt *Tenant) error {\n\tif tnt.Spec.IngressOptions.AllowedHostnames == nil {\n\t\treturn nil\n\t}\n\tif len(tnt.Spec.IngressOptions.AllowedHostnames.Regex) == 0 {\n\t\treturn nil\n\t}\n\t_, err := regexp.Compile(tnt.Spec.IngressOptions.AllowedHostnames.Regex)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"Deny: unable to compile allowedHostnames allowedRegex\")\n\t}\n\treturn nil\n}\n\n// Dispatcher calls: OnUpdate(c, reader, newTenant, oldTenant, ...)\n// Interface says:   OnUpdate(c, reader, obj[NEW], old[OLD], ...)\n//\n// BUGGY handler receives: (old, tnt) meaning:\n//   3rd param (labeled \"old\") = actually NEW\n//   4th param (labeled \"tnt\") = actually OLD\n// Then calls h.validate(tnt) = validates the OLD tenant\nfunc buggyOnUpdate(newTenant, oldTenant *Tenant) error {\n\t// BUG: parameters are SWAPPED vs the interface contract\n\told := newTenant // dispatcher's \"new\" arrives as \"old\" in this function\n\ttnt := oldTenant // dispatcher's \"old\" arrives as \"tnt\" in this function\n\t_ = old          // unused in the real code too\n\treturn hostnameValidate(tnt) // validates OLD, not NEW\n}\n\n// CORRECT implementation (what it should be)\nfunc correctOnUpdate(newTenant, oldTenant *Tenant) error {\n\t_ = oldTenant\n\treturn hostnameValidate(newTenant) // validates NEW\n}\n\n// Simulate ingress hostname validation AFTER bad regex is stored\nfunc validateIngressHostname(tenant *Tenant, hostname string) bool {\n\tif tenant.Spec.IngressOptions.AllowedHostnames == nil {\n\t\treturn true\n\t}\n\tallowedRegex := tenant.Spec.IngressOptions.AllowedHostnames.Regex\n\tif len(allowedRegex) == 0 {\n\t\treturn true\n\t}\n\t// This is validate_hostnames.go:160 - error is IGNORED\n\tmatched, _ := regexp.MatchString(allowedRegex, hostname)\n\treturn matched\n}\n\nfunc main() {\n\tfmt.Println(\"=== Capsule Bug Reproducer: hostname_regex.go argument swap ===\")\n\tfmt.Println()\n\n\toldTenant := \u0026Tenant{\n\t\tName: \"demo-tenant\",\n\t\tSpec: TenantSpec{\n\t\t\tIngressOptions: IngressOptions{\n\t\t\t\tAllowedHostnames: \u0026AllowedHostnames{\n\t\t\t\t\tRegex: `^[\\w.-]+\\.example\\.com$`, // valid regex\n\t\t\t\t},\n\t\t\t},\n\t\t},\n\t}\n\n\t// Attacker (cluster admin) sets an INVALID regex in the new spec\n\tnewTenant := \u0026Tenant{\n\t\tName: \"demo-tenant\",\n\t\tSpec: TenantSpec{\n\t\t\tIngressOptions: IngressOptions{\n\t\t\t\tAllowedHostnames: \u0026AllowedHostnames{\n\t\t\t\t\tRegex: `[invalid-regex(`, // INVALID regex\n\t\t\t\t},\n\t\t\t},\n\t\t},\n\t}\n\n\tfmt.Printf(\"Old tenant regex: %q (valid)\\n\", oldTenant.Spec.IngressOptions.AllowedHostnames.Regex)\n\tfmt.Printf(\"New tenant regex: %q (INVALID)\\n\", newTenant.Spec.IngressOptions.AllowedHostnames.Regex)\n\tfmt.Println()\n\n\t// Step 1: Webhook runs OnUpdate\n\tfmt.Println(\"--- Step 1: Webhook OnUpdate ---\")\n\n\terr := buggyOnUpdate(newTenant, oldTenant)\n\tif err != nil {\n\t\tfmt.Printf(\"[BUGGY]   Webhook DENIES update: %v\\n\", err)\n\t} else {\n\t\tfmt.Println(\"[BUGGY]   Webhook ALLOWS update (validates OLD regex) ← WRONG\")\n\t}\n\n\terr = correctOnUpdate(newTenant, oldTenant)\n\tif err != nil {\n\t\tfmt.Printf(\"[CORRECT] Webhook DENIES update: %v ← EXPECTED\\n\", err)\n\t} else {\n\t\tfmt.Println(\"[CORRECT] Webhook ALLOWS update\")\n\t}\n\n\t// Step 2: Invalid regex now stored in etcd - simulate ingress validation\n\tfmt.Println()\n\tfmt.Println(\"--- Step 2: Ingress creation after bad regex stored ---\")\n\tstoredTenant := newTenant // bad regex is now in etcd\n\n\thostnames := []string{\n\t\t\"app.example.com\",\n\t\t\"api.example.com\",\n\t\t\"evil.attacker.com\",\n\t}\n\n\tfor _, h := range hostnames {\n\t\tallowed := validateIngressHostname(storedTenant, h)\n\t\tfmt.Printf(\"  Ingress hostname %q → allowed=%v\", h, allowed)\n\t\tif !allowed {\n\t\t\tfmt.Print(\"  ← BLOCKED (DoS: invalid regex causes all hostnames to fail)\")\n\t\t}\n\t\tfmt.Println()\n\t}\n\n\tfmt.Println()\n\tfmt.Println(\"=== Result ===\")\n\tfmt.Println(\"Invalid regex bypasses webhook validation and gets stored.\")\n\tfmt.Println(\"All subsequent Ingress create/update in this tenant are BLOCKED.\")\n\tfmt.Println(\"CWE-697: Incorrect Comparison — wrong Tenant object is validated.\")\n}\n```\n\n\n\n\n```go\n// Simulates the buggy webhook behaviour\noldTenant := \u0026Tenant{AllowedRegex: `^[\\w-]+\\.example\\.com$`} // valid\nnewTenant := \u0026Tenant{AllowedRegex: `[invalid-regex(`}         // malformed\n\n// Buggy OnUpdate: validates oldTenant (valid) → ALLOW\n// Correct OnUpdate: validates newTenant (invalid) → DENY\n\n// After malformed regex is stored, all ingress hostnames are rejected:\nmatched, _ := regexp.MatchString(`[invalid-regex(`, \"app.example.com\")\n// matched = false, error ignored → Ingress blocked\n```\n\n### Fix\n\nSwap the parameter names in `hostname_regex.go` to match the interface contract:\n\n```go\n// BEFORE (buggy)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    old *capsulev1beta2.Tenant,\n    tnt *capsulev1beta2.Tenant,\n    ...\n\n// AFTER (fixed)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    tnt *capsulev1beta2.Tenant,\n    old *capsulev1beta2.Tenant,\n    ...\n```\n\n### Impact\n\nA Cluster Admin (or a compromised admin account) can — intentionally or via a typo — set a malformed `AllowedHostnames.Regex` on any Tenant. The webhook silently accepts the update. All users in the affected tenant are subsequently unable to create or update any Ingress resource until an admin manually corrects the Tenant spec. This constitutes a targeted Denial of Service against the tenant's ingress layer.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/projectcapsule/capsule",
+        "purl": "pkg:golang/github.com/projectcapsule/capsule"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.13.0"
+            },
+            {
+              "fixed": "0.13.7"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-f94q-w3w8-cj67/GHSA-f94q-w3w8-cj67.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/security/advisories/GHSA-f94q-w3w8-cj67"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/pull/1983"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/commit/8d89d6865df6f41c7faa22fc9e807a57b01bfd0e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/projectcapsule/capsule"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/projectcapsule/capsule/releases/tag/v0.13.7"
+    }
+  ]
+}
