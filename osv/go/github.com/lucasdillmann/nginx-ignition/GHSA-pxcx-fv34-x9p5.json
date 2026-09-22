@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-pxcx-fv34-x9p5",
+  "modified": "2026-09-21T22:00:06.555593917Z",
+  "published": "2026-09-21T21:54:42Z",
+  "aliases": [
+    "CVE-2026-61628"
+  ],
+  "summary": " nginx ignition has Unauthenticated Admin Account Creation via Onboarding Race Condition",
+  "details": "## Summary\n\n`POST /api/users/onboarding/finish` is registered as **anonymous (unauthenticated)** and creates a user with **full ReadWrite admin permissions**. Because the handler uses a check-then-act (TOCTOU) pattern between the \"onboarding already completed?\" check and the user-creation write, with no atomic guard, a remote unauthenticated attacker who can reach an instance in its pre-onboarding state can create an administrator account for themselves — and concurrent requests can create multiple admin accounts in a single race.\n\n## Affected component\n\n- Endpoint: `POST /api/users/onboarding/finish`\n- Route registration: `api/user/routes.go:49` → `authorizer.AllowAnonymous(http.MethodPost, \"/api/users/onboarding/finish\")`\n- Handler: `api/user/onboarding_finish_handler.go`\n\n## Technical details\n\nThe route is explicitly allowed without authentication:\n\n```go\n// api/user/routes.go:48-49\nauthorizer.AllowAnonymous(http.MethodGet,  \"/api/users/onboarding/status\")\nauthorizer.AllowAnonymous(http.MethodPost, \"/api/users/onboarding/finish\")\n```\n\nThe handler reads the onboarding state, returns 403 if already finished, and otherwise creates a user with every permission set to ReadWrite:\n\n```go\n// api/user/onboarding_finish_handler.go\nfunc (h onboardingFinishHandler) handle(ctx *gin.Context) {\n    alreadyFinished, err := h.commands.OnboardingCompleted(ctx.Request.Context())  // (1) CHECK\n    if err != nil { panic(err) }\n    if alreadyFinished {\n        ctx.Status(http.StatusForbidden)\n        return\n    }\n\n    requestPayload := \u0026userRequestDTO{}\n    if err = ctx.BindJSON(requestPayload); err != nil { panic(err) }\n\n    domainModel := converter.Wrap(ctx.Request.Context(), toDomain, requestPayload)\n    domainModel.ID = uuid.New()\n    domainModel.Enabled = true\n    domainModel.Permissions = user.Permissions{        // full admin\n        Hosts:        user.ReadWriteAccessLevel,\n        Streams:      user.ReadWriteAccessLevel,\n        Certificates: user.ReadWriteAccessLevel,\n        Integrations: user.ReadWriteAccessLevel,\n        AccessLists:  user.ReadWriteAccessLevel,\n        Settings:     user.ReadWriteAccessLevel,\n        Users:        user.ReadWriteAccessLevel,\n        NginxServer:  user.ReadWriteAccessLevel,\n        Caches:       user.ReadWriteAccessLevel,\n        // ...all remaining permissions ReadWrite/ReadOnly\n    }\n\n    if err = h.commands.Save(ctx.Request.Context(), domainModel, nil); err != nil {  // (2) ACT\n        panic(err)\n    }\n    // ...authenticates and returns a JWT for the new admin\n}\n```\n\nThe gap between **(1)** `OnboardingCompleted()` and **(2)** `Save()` is not protected by a lock, transaction, or unique constraint. Two or more requests can each pass the `alreadyFinished == false` check before any of them commits, so every racing request proceeds to create an admin user and receive a valid admin JWT.\n\n## Preconditions (stated honestly)\n\nThis is exploitable when the instance is in a **pre-onboarding state**:\n\n1. **Fresh deployment** — the time window between the service coming online and the legitimate operator completing onboarding. During this window any unauthenticated party who can reach the instance can register the first/an additional admin. The race lets an attacker slip an admin account in *alongside* the operator's, so the operator's onboarding appears to succeed normally while the attacker silently holds admin.\n2. **State reset** — if onboarding state can return to \"not completed\" (e.g. all users removed), the endpoint reopens and becomes a repeatable unauthenticated admin-creation primitive.\n\nThe single-request path is a setup-window exposure; the **race** is what turns \"first legitimate admin\" into \"attacker also gets admin,\" and what allows multiple admin accounts to be minted from one burst.\n\n## Proof of concept\n\nAgainst an instance that has not yet completed onboarding:\n\n```bash\n# Fire concurrent onboarding-finish requests; multiple admin accounts are created,\n# each returning a valid admin JWT, despite the single-admin intent.\nfor i in $(seq 1 20); do\n  curl -s -X POST http://TARGET/api/users/onboarding/finish \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"username\":\"attacker'\"$i\"'\",\"password\":\"P@ssw0rd123!\"}' \\\n    -o /dev/null -w \"%{http_code}\\n\" \u0026\ndone\nwait\n# Multiple 200 responses (each with a login token) instead of exactly one 200 + N×403.\n```\n\nEach `200` response body contains a `userLoginResponseDTO` with a JWT granting full admin access (Hosts/Streams/Certificates/Settings/Users/NginxServer/AccessLists/Caches = ReadWrite). The attacker then has complete control of the nginx-ignition instance and the nginx server it manages.\n\n## Impact\n\n- **Unauthenticated administrative account takeover** of a fresh (or reset) instance.\n- Full admin enables every downstream capability: creating hosts/routes, editing global and per-route nginx configuration, managing access lists and certificates, and controlling the nginx server process. (The config surface is itself injectable — see the related nginx-configuration-injection issues — so admin here is a path to SSRF / arbitrary nginx directives.)\n- The TOCTOU race additionally allows minting multiple admin accounts from a single concurrent burst, aiding persistence/stealth.\n\n## Remediation\n\n1. Make onboarding completion atomic: enforce a database-level unique constraint (e.g. \"at most one onboarding user\" / single-row guard) so concurrent creates collide, or wrap the check-and-create in a single transaction / mutex.\n2. Re-check `OnboardingCompleted()` inside the same transaction that performs the insert, and abort on conflict.\n3. Consider requiring a one-time setup token (printed to server logs / env at first boot) for the initial admin creation, eliminating the unauthenticated window entirely.\n\n---\n*Finding ID: GM-4607*",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/lucasdillmann/nginx-ignition",
+        "purl": "pkg:golang/github.com/lucasdillmann/nginx-ignition"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260621194639-0586b4e55ab"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-pxcx-fv34-x9p5/GHSA-pxcx-fv34-x9p5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/lucasdillmann/nginx-ignition/security/advisories/GHSA-pxcx-fv34-x9p5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-61628"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lucasdillmann/nginx-ignition/pull/131"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lucasdillmann/nginx-ignition/commit/0586b4e55ab780676d3553a2592979dfa2fb0183"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/lucasdillmann/nginx-ignition"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/lucasdillmann/nginx-ignition/releases/tag/2.41.1"
+    }
+  ]
+}
