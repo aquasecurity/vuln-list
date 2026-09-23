@@ -1,0 +1,138 @@
+{
+  "id": "GHSA-p6hp-93wp-fh6p",
+  "modified": "2026-09-22T21:00:10.905771231Z",
+  "published": "2026-09-22T20:35:21Z",
+  "aliases": [
+    "CVE-2026-77262"
+  ],
+  "summary": "MCP Atlassian: Path Traversal / Arbitrary File Read in confluence_upload_attachment MCP tool (incomplete fix of GHSA-xjgw-4wvw-rgm4)",
+  "details": "## Summary\n\n`mcp-atlassian` exposes an MCP tool `confluence_upload_attachment` whose `file_path` argument is passed directly to `open(file_path, \"rb\")` without any path validation. An attacker able to invoke the tool can read arbitrary files readable by the server process and exfiltrate them into a multipart upload directed at an attacker-controlled Confluence host. In the default `streamable-http` transport the server binds `0.0.0.0` with no built-in authentication, making this remotely exploitable without credentials.\n\nThis is the **read-side symmetric twin** of GHSA-xjgw-4wvw-rgm4 / CVE-2026-27825 (fixed in v0.17.0). The v0.17.0 patch only covered the download/write path; the upload path that reads local files was left unguarded.\n\n## Details\n\n### Vulnerable sink\n`src/mcp_atlassian/confluence/attachments.py:477`\n```python\nwith open(file_path, \"rb\") as fp:\n    files = {\"file\": (filename, fp, content_type)}\n    response = self.confluence.session.post(url, files=files, ...)\n```\n`file_path` is attacker-controlled end-to-end.\n\n### Taint source\n`src/mcp_atlassian/servers/confluence.py:1290-1369`, tool definition at `:1307`:\n```python\nfile_path: Annotated[str, Field(description=\"Absolute path to the file to upload\")]\n```\nNo Pydantic `pattern=`, no validator, no `validate_safe_path()` call.\n\n### Call chain\n1. MCP client invokes `confluence_upload_attachment(page_id, file_path, ...)`\n2. Server handler forwards to `ConfluenceFetcher.upload_attachment(file_path)`\n3. `_upload_attachment_direct(file_path)` calls `open(file_path, \"rb\")`\n4. File bytes are streamed in the multipart body of `POST /wiki/rest/api/content/{page_id}/child/attachment` to the configured Confluence base URL — which the attacker also controls (they provided `CONFLUENCE_URL` via env/config or target a server they already control).\n\n### Asymmetry with the patched download path\n- `attachments.py:223` (download) — calls `validate_safe_path(local_path)` before `open(..., \"wb\")`\n- `attachments.py:272` (download) — calls `validate_safe_path(local_path)` before `open(..., \"wb\")`\n- `attachments.py:477` (upload) — **no validation**\n\nThe `check_write_access` decorator does not help: it only gates `READ_ONLY_MODE` (default `false`) and is unrelated to filesystem path safety.\n\n### Default exposure\n`src/mcp_atlassian/__init__.py:151` and `:360` — default transport is `streamable-http` binding `HOST=0.0.0.0` with no auth layer. Any network-reachable attacker can call MCP tools directly.\n\n## Severity\n\n**Primary (default `streamable-http` deployment)**\n- Vector: `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N`\n- Score: **9.3 Critical**\n- Rationale: network-reachable, unauthenticated, scope-changed because files outside the MCP server's intended resource boundary (Confluence attachments) are exfiltrated.\n\n**Alternative (stdio-only deployment, conservative)**\n- Vector: `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N`\n- Score: **6.6 High**\n- Rationale: local attacker controlling the MCP client context.\n\nMaintainer should pick the vector that reflects the documented default deployment.\n\n## CWE\nCWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')\n\n## Affected\n- Product: `sooperset/mcp-atlassian`\n- Affected versions: **\u003e= 0.17.0, \u003c= HEAD (`d8bc78698a63cb6b321c7ca796d6329d448f7f6d`)**\n- Note: v0.17.0 is the fix commit for GHSA-xjgw-4wvw-rgm4 but only addressed the write-side. This read-side twin has existed since that release and remains unpatched on `main`.\n- Patched versions: **none at time of disclosure**\n\n## Proof of Concept\n\nFully reproduced twice end-to-end against a local stdlib HTTP stub acting as the Confluence API, driven by a real MCP stdio client (`mcp.ClientSession` + `stdio_client`) spawning the unmodified `mcp-atlassian` server at HEAD.\n\n### Permalinks (commit-pinned)\n- Sink: https://github.com/sooperset/mcp-atlassian/blob/d8bc78698a63cb6b321c7ca796d6329d448f7f6d/src/mcp_atlassian/confluence/attachments.py#L477\n- Source (tool def): https://github.com/sooperset/mcp-atlassian/blob/d8bc78698a63cb6b321c7ca796d6329d448f7f6d/src/mcp_atlassian/servers/confluence.py#L1307\n- Safe download comparison: https://github.com/sooperset/mcp-atlassian/blob/d8bc78698a63cb6b321c7ca796d6329d448f7f6d/src/mcp_atlassian/confluence/attachments.py#L223\n- Default transport bind: https://github.com/sooperset/mcp-atlassian/blob/d8bc78698a63cb6b321c7ca796d6329d448f7f6d/src/mcp_atlassian/__init__.py#L151\n\n### Reproduction\n1. Start mock Confluence stub: `python mock_confluence.py` (binds `127.0.0.1:8443`, logs all multipart bodies)\n2. Launch MCP client against real `mcp-atlassian` server over stdio with `CONFLUENCE_URL=http://127.0.0.1:8443`\n3. Call tool:\n```json\n{\n  \"name\": \"confluence_upload_attachment\",\n  \"arguments\": {\n    \"page_id\": \"123456\",\n    \"file_path\": \"/etc/passwd\",\n    \"comment\": \"poc\"\n  }\n}\n```\n\n### Run 1 — `/etc/passwd`\n- MCP response: `isError=False`, `{\"message\": \"Attachment uploaded successfully\"}`\n- Stub captured 3339-byte multipart body containing: `root:x:0:0:root:/root:/bin/bash` (and full passwd contents)\n\n### Run 2 — `/etc/hostname`\n- MCP response: `isError=False`, same success envelope\n- Stub captured 380-byte body containing: `ang3l-pc`\n\nBoth runs used unmodified server code at commit `d8bc78698a63cb6b321c7ca796d6329d448f7f6d`. PoC artifacts (`mock_confluence.py`, `mcp_client.py`, `poc_run1.sh`, `poc_run2.sh`, `asymmetry.txt`, `ENVIRONMENT.md`) available on request to maintainers via this advisory thread.\n\n## Impact\n- Arbitrary file read of anything readable by the server process UID: `/etc/passwd`, `/etc/shadow` (if running as root in container), `~/.aws/credentials`, `~/.ssh/id_rsa`, `.env` files, kube service-account tokens at `/var/run/secrets/kubernetes.io/serviceaccount/token`, application source, database dumps, private keys.\n- Exfiltration is covert: file bytes transit to the attacker's configured Confluence host inside a normal-looking multipart upload. No error surface; the tool returns success.\n- In the default `streamable-http` 0.0.0.0 deployment, no credentials are required.\n- Chains trivially with any AI agent that exposes this MCP server to untrusted prompt input — a prompt-injected assistant can be coerced into calling the tool with a sensitive path.\n\n## Relationship to GHSA-xjgw-4wvw-rgm4 (CVE-2026-27825)\nGHSA-xjgw-4wvw-rgm4 (CVSS 9.1, fixed in v0.17.0) addressed an **arbitrary file write** in the same `attachments.py` module: attacker-controlled paths reaching `open(..., \"wb\")` on the download side. The fix introduced `validate_safe_path()` and applied it at lines 223 and 272.\n\n**The upload-side counterpart at line 477 was not updated.** Same module, same maintainer, same class of bug (unchecked path → `open()`), opposite direction (read vs write). This advisory reports the incomplete-fix twin.\n\n## Remediation\n\n### Required\nCall `validate_safe_path(file_path)` at the top of `ConfluenceFetcher.upload_attachment` and `_upload_attachment_direct` in `src/mcp_atlassian/confluence/attachments.py`, mirroring the download path at lines 223 and 272. Reject absolute paths outside a configurable allow-listed upload directory and reject any path containing `..` after normalization.\n\n### Defense in depth\nTighten the Pydantic tool schema at `src/mcp_atlassian/servers/confluence.py:1307`:\n```python\nfile_path: Annotated[\n    str,\n    Field(\n        description=\"Relative path within the configured upload directory\",\n        pattern=r\"^(?!/)(?!.*\\.\\.)[\\w\\-./]+$\",\n    ),\n]\n```\nThis blocks absolute paths and `..` at the MCP schema layer before the handler is even entered.\n\n### Additional hardening (out of scope but recommended)\n- Default `streamable-http` to `127.0.0.1` instead of `0.0.0.0`, or require an auth token when bound to a non-loopback interface.\n- Document that `file_path` must be confined to an operator-chosen directory and expose that directory via config.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.20.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-p6hp-93wp-fh6p/GHSA-p6hp-93wp-fh6p.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-p6hp-93wp-fh6p"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/pull/1448"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
+    }
+  ]
+}

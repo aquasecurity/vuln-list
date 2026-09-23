@@ -1,0 +1,138 @@
+{
+  "id": "GHSA-mrq8-fv7v-hhjg",
+  "modified": "2026-09-22T21:00:11.414554160Z",
+  "published": "2026-09-22T20:34:58Z",
+  "aliases": [
+    "CVE-2026-77257"
+  ],
+  "summary": "MCP Atlassian: HTTP upload tools accept arbitrary server-local file paths",
+  "details": "# sooperset/mcp-atlassian: HTTP upload tools can attach arbitrary server-local files\n\nDate: 2026-05-05\nTarget: `sooperset/mcp-atlassian`\nCommit: `d8bc78698a63cb6b321c7ca796d6329d448f7f6d`\n\n## Summary\n\n`mcp-atlassian` supports HTTP/SSE deployment for persistent, remote, and multi-user use. In that mode, write-capable Jira and Confluence attachment flows accept caller-controlled server-local file paths and read those paths without an upload-source allowlist or base directory restriction.\n\nAn authenticated caller, or a prompt-injected agent with tool-call capability, can cause the MCP server process to read a local file it can access and attach that file into a Jira issue or Confluence page using configured Atlassian credentials.\n\nThis is distinct from the prior download-path advisory: that issue was an arbitrary file write sink. This path is upload-source local file disclosure.\n\n## Impact\n\nImpact is local file disclosure through an authenticated Atlassian attachment write. In Docker/Kubernetes deployments that mount `.env` or token material into the service, exposed files may include API tokens, OAuth credentials, service configuration, or other local secrets readable by the MCP process.\n\nThe issue is bounded by tool access and Atlassian permissions: the attacker needs an MCP call path to a write tool and an issue/page where the attachment can be written. It is not direct RCE.\n\nSeverity is Medium-to-High depending on deployment:\n\n- Medium for single-user/local stdio usage or tightly scoped tokens.\n- High where HTTP/streamable deployments are shared, write tools are exposed, and the server has access to secrets or broad filesystem mounts.\n\n## Source Evidence\n\nHTTP/multi-user deployment is first-class:\n\n- `docs/http-transport.mdx:1-7` describes running as a persistent HTTP service for multi-user and remote deployment.\n- `docs/http-transport.mdx:10-13` lists SSE and streamable-http endpoints.\n- `docs/http-transport.mdx:88-90` says both HTTP transports support per-request authentication.\n- `docs/advanced/docker-production.mdx:25-37` shows Docker deployment with `.env`, exposed ports, and `HOST=0.0.0.0`.\n- `docs/advanced/docker-production.mdx:91-103` shows Atlassian credentials stored in `.env`.\n- `src/mcp_atlassian/__init__.py:359-363` defaults HTTP host to `0.0.0.0` unless overridden.\n\nThe Confluence upload path reads caller-chosen server-local files:\n\n- `src/mcp_atlassian/servers/confluence.py:1290-1315` exposes `file_path` and explicitly accepts absolute or relative paths.\n- `src/mcp_atlassian/servers/confluence.py:1356-1363` passes `file_path` to `confluence_fetcher.upload_attachment`.\n- `src/mcp_atlassian/confluence/attachments.py:62-70` only converts relative paths to absolute and checks existence.\n- `src/mcp_atlassian/confluence/attachments.py:77-80` passes the path to `_upload_attachment_direct`.\n- `src/mcp_atlassian/confluence/attachments.py:477` opens `file_path` for the multipart upload.\n\nThe Jira update path can also upload caller-chosen server-local files:\n\n- `src/mcp_atlassian/servers/jira.py:1564-1568` exposes `jira_update_issue` as a write tool in `toolset:jira_issues`.\n- `src/mcp_atlassian/servers/jira.py:1609-1618` accepts `attachments` as a JSON array or comma-separated list of file paths.\n- `src/mcp_atlassian/servers/jira.py:1648-1674` parses those file paths and adds them to the update payload.\n- `src/mcp_atlassian/jira/issues.py:1132-1137` forwards `attachments` to `upload_attachments`.\n- `src/mcp_atlassian/jira/attachments.py:372-389` converts relative paths to absolute, checks existence, opens the path, and passes it to `jira.add_attachment`.\n\nExisting controls do not authorize the upload source path:\n\n- `src/mcp_atlassian/utils/decorators.py:45-72` blocks writes only when read-only mode is enabled.\n- `src/mcp_atlassian/servers/main.py:276-279` filters write tools out of listing only in read-only mode.\n- `src/mcp_atlassian/utils/toolsets.py:158-183` currently enables all toolsets when `TOOLSETS` is unset.\n- `docs/advanced/docker-production.mdx:109-119` documents `READ_ONLY_MODE=true` as an optional production hardening setting, not a default.\n- `src/mcp_atlassian/confluence/attachments.py:217-223` and `src/mcp_atlassian/jira/attachments.py:37-43` show `validate_safe_path` exists for download destinations, but no equivalent upload-source containment is applied.\n\n## Root cause\n\nThe codebase already has a path-containment primitive (`validate_safe_path`) and applies it to download destinations to prevent writes outside a configured base directory — that is, it correctly defends the filesystem-write side of the boundary. But the upload-source side of the same boundary is not defended at all: the Confluence and Jira attachment paths convert caller-supplied paths to absolute, check that the file exists, open it, and stream the bytes to Atlassian, with no equivalent \"must resolve inside an upload base directory\" check. The authorization model implicitly treats \"the MCP process can read this file\" as equivalent to \"the MCP caller is authorized to upload this file,\" which is correct only for single-user stdio mode. For HTTP/SSE multi-user mode (which the project documents as first-class and ships with `HOST=0.0.0.0`), it is not — caller identity and process filesystem-read capability are different boundaries. The structural fix is to apply the existing `validate_safe_path` containment primitive to upload-source paths under a separate `UPLOAD_BASE_DIR` configuration, and to disable server-local upload tools by default in HTTP transport mode unless that base directory is configured.\n\n## Auth boundary violated\n\n**Boundary:** Per-user resource ownership (in HTTP/SSE multi-user mode, an authenticated MCP caller's tool surface should expose only files the caller is authorized to upload — not arbitrary files in the MCP process's filesystem view, including operator-mounted secrets and other tenants' data).\n\n**Respected at:** `src/mcp_atlassian/confluence/attachments.py:217-223` and `src/mcp_atlassian/jira/attachments.py:37-43` (`validate_safe_path` is correctly applied to download-destination paths to prevent writes outside a base directory).\n\n**Violated at:** `src/mcp_atlassian/confluence/attachments.py:62-70,77-80,477` (Confluence upload path: relative-to-absolute conversion, existence check, then `open(file_path)`, with no `validate_safe_path` call against an upload base directory) and `src/mcp_atlassian/jira/attachments.py:372-389` (Jira upload path: identical pattern). The boundary is silently dropped: the same containment primitive that defends the download side is not invoked on the upload side.\n\n## Reproduction\n\nObserved:\n\n```text\nCONFLUENCE_SINK content_id=attacker-visible-page-id filename=mcp-atlassian-poc-secret.txt\nCONFLUENCE_EXFIL_MARKER=FAKE_SECRET_MARKER_DO_NOT_PUBLISH_REAL_SECRET\nCONFLUENCE_RESULT={'success': True, 'filename': 'mcp-atlassian-poc-secret.txt'}\nJIRA_SINK issue_key=ATTACKER-1 filename=mcp-atlassian-poc-secret.txt\nJIRA_EXFIL_MARKER=FAKE_SECRET_MARKER_DO_NOT_PUBLISH_REAL_SECRET\nJIRA_RESULT={'success': True, 'filename': 'mcp-atlassian-poc-secret.txt'}\n```\n\nThe PoC uses fake upload sinks and does not contact Atlassian. It demonstrates the vulnerable behavior: a caller-provided absolute server-local path is accepted, read, and delivered to the attachment sink.\n\n## Known Issue / Dupe Checks\n\nKnown advisories are different:\n\n- `GHSA-xjgw-4wvw-rgm4`: arbitrary file write through unconstrained Confluence download path.\n- `GHSA-7r34-79r5-rcc9`: SSRF through unvalidated Atlassian URL headers.\n\nClosest public non-security overlap:\n\n- issue `#618`: usability report that upload requires server-side paths.\n- issue `#1163`: unrelated upload failure on Data Center.\n- PRs `#987` / `#949`: download-path hardening, not upload-source path containment.\n\nNo public issue/PR/advisory found for upload-side arbitrary local file read.\n\n## Suggested Fix\n\nAdd an explicit upload source policy, for example:\n\n- require `MCP_ATLASSIAN_UPLOAD_BASE_DIR` for server-local upload tools in HTTP/SSE/streamable mode\n- reject absolute paths unless they resolve inside that configured base directory\n- apply `validate_safe_path(path, base_dir=upload_base_dir)` before existence checks or reads\n- consider disabling server-local upload tools by default in HTTP mode unless an upload directory is configured\n\nAdd regression tests for both Confluence and Jira upload paths:\n\n- reject `/etc/passwd`\n- reject `../../../etc/passwd`\n- reject symlinks escaping the upload base\n- accept a file inside the configured upload directory\n- verify `READ_ONLY_MODE=true` still blocks the write independently",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.20.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-mrq8-fv7v-hhjg/GHSA-mrq8-fv7v-hhjg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-mrq8-fv7v-hhjg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/pull/1448"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
+    }
+  ]
+}

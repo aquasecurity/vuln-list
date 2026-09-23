@@ -1,0 +1,138 @@
+{
+  "id": "GHSA-4596-2p6p-28cv",
+  "modified": "2026-09-22T21:00:05.642806123Z",
+  "published": "2026-09-22T20:35:19Z",
+  "aliases": [
+    "CVE-2026-77268"
+  ],
+  "summary": "MCP Atlassian: Insecure File Permissions on OAuth Token Storage",
+  "details": "## Summary\n\nThe OAuth token fallback file storage in `OAuthConfig._save_tokens_to_file()` creates token files containing access tokens, refresh tokens, and cloud IDs with default filesystem permissions (typically `0644` on Linux, world-readable). Any local user on a shared system can read these files to obtain full Atlassian API credentials, enabling unauthorized access to the victim's Jira and Confluence data.\n\n## Details\n\nThe vulnerability exists in `src/mcp_atlassian/utils/oauth.py` in the `_save_tokens_to_file` method.\n\n**Step 1 -- Directory created without restrictive permissions:**\n\nAt line 402-403, the token directory is created with `mkdir(exist_ok=True)` which uses the default umask (typically creating directories with mode `0755`):\n\n```python\n# src/mcp_atlassian/utils/oauth.py:402-403\ntoken_dir = Path.home() / \".mcp-atlassian\"\ntoken_dir.mkdir(exist_ok=True)\n```\n\n**Step 2 -- Token file written with default permissions:**\n\nAt line 417-418, the token file containing sensitive credentials is written using `open()` with no explicit mode, inheriting default umask permissions (typically `0644` on Linux):\n\n```python\n# src/mcp_atlassian/utils/oauth.py:406-418\ntoken_path = token_dir / f\"oauth-{self.client_id}.json\"\n\nif token_data is None:\n    token_data = {\n        \"refresh_token\": self.refresh_token,\n        \"access_token\": self.access_token,\n        \"expires_at\": self.expires_at,\n        \"cloud_id\": self.cloud_id,\n        \"base_url\": self.base_url,\n    }\n\nwith open(token_path, \"w\") as f:\n    json.dump(token_data, f)\n```\n\n**Step 3 -- The file contains full API credentials:**\n\nThe token file contains:\n- `access_token`: A valid OAuth access token for the Atlassian API\n- `refresh_token`: Can be exchanged for new access tokens indefinitely\n- `cloud_id`: Identifies the target Atlassian Cloud instance\n- `base_url`: The target Data Center instance URL\n\n**No `os.chmod` or `os.fchmod` is called** anywhere after file creation.\n\nThe primary storage via `keyring` (line 373) is secure, but the fallback file storage at line 386 is always written in addition to keyring (line 386: `self._save_tokens_to_file(token_data)`). When keyring fails (common in headless/container/CI environments), the fallback becomes the only storage.\n\n## PoC\n\n```bash\n# Step 1: Victim runs mcp-atlassian with OAuth and completes the flow.\n# This creates the token file.\n\n# Step 2: As any other user on the same system, read the token file:\ncat /home/victim/.mcp-atlassian/oauth-*.json\n\n# Expected output (sensitive credentials in plaintext):\n# {\"refresh_token\": \"eyJ...\", \"access_token\": \"eyJ...\", \"expires_at\": 1741234567.0, \"cloud_id\": \"abc-123\", \"base_url\": null}\n\n# Step 3: Verify the token works:\ncurl -H \"Authorization: Bearer \u003cstolen_access_token\u003e\" \\\n  \"https://api.atlassian.com/ex/jira/\u003cstolen_cloud_id\u003e/rest/api/3/myself\"\n\n# Step 4: Use the refresh token to get a new access token:\ncurl -X POST \"https://auth.atlassian.com/oauth/token\" \\\n  -d \"grant_type=refresh_token\" \\\n  -d \"client_id=\u003cfrom_env\u003e\" \\\n  -d \"client_secret=\u003cfrom_env\u003e\" \\\n  -d \"refresh_token=\u003cstolen_refresh_token\u003e\"\n```\n\n**Verify file permissions (on Linux/macOS):**\n\n```bash\nls -la ~/.mcp-atlassian/\n# drwxr-xr-x  2 user user 4096 Mar 10 12:00 .\n# -rw-r--r--  1 user user  256 Mar 10 12:00 oauth-abc123.json\n#                ^^ ^^ ^^\n#                world-readable!\n```\n\n## Impact\n\n- **Credential theft**: Any local user can read the OAuth tokens and impersonate the victim on their Atlassian Cloud/Data Center instance.\n- **Persistent access**: The refresh token allows the attacker to generate new access tokens indefinitely, even after the original access token expires.\n- **Full API access**: The stolen tokens grant the same API permissions as the victim, including reading/writing Jira issues, Confluence pages, and potentially sensitive project data.\n- **Affected environments**: Shared servers, CI/CD runners, multi-user workstations, and containerized deployments where the fallback file storage is used (keyring unavailable).\n\n## Recommended Fix\n\n**1. Set restrictive permissions on the directory and file:**\n\n```python\n# src/mcp_atlassian/utils/oauth.py\n\nimport os\nimport stat\n\ndef _save_tokens_to_file(self, token_data: dict | None = None) -\u003e None:\n    \"\"\"Save the tokens to a file as fallback storage.\"\"\"\n    try:\n        token_dir = Path.home() / \".mcp-atlassian\"\n        token_dir.mkdir(exist_ok=True, mode=0o700)\n\n        token_path = token_dir / f\"oauth-{self.client_id}.json\"\n\n        if token_data is None:\n            token_data = {\n                \"refresh_token\": self.refresh_token,\n                \"access_token\": self.access_token,\n                \"expires_at\": self.expires_at,\n                \"cloud_id\": self.cloud_id,\n                \"base_url\": self.base_url,\n            }\n\n        # Open with restrictive permissions (owner-only read/write)\n        fd = os.open(\n            str(token_path),\n            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,\n            stat.S_IRUSR | stat.S_IWUSR,  # 0o600\n        )\n        try:\n            with os.fdopen(fd, \"w\") as f:\n                json.dump(token_data, f)\n        except Exception:\n            os.close(fd)\n            raise\n\n        logger.debug(f\"Saved OAuth tokens to file {token_path} (fallback storage)\")\n    except Exception as e:\n        logger.error(f\"Failed to save tokens to file: {e}\")\n```\n\n**2. Additionally, fix the directory permissions for existing installations:**\n\n```python\n# In __init__ or from_env, ensure existing directories are tightened\ntoken_dir = Path.home() / \".mcp-atlassian\"\nif token_dir.exists():\n    os.chmod(str(token_dir), 0o700)\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mcp-atlassian",
+        "purl": "pkg:pypi/mcp-atlassian"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.22.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.10",
+        "0.1.11",
+        "0.1.12",
+        "0.1.13",
+        "0.1.14",
+        "0.1.15",
+        "0.1.16",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.10.0",
+        "0.10.1",
+        "0.10.2",
+        "0.10.3",
+        "0.10.4",
+        "0.10.5",
+        "0.10.6",
+        "0.11.0",
+        "0.11.1",
+        "0.11.10",
+        "0.11.11",
+        "0.11.12",
+        "0.11.2",
+        "0.11.2a2",
+        "0.11.3",
+        "0.11.4",
+        "0.11.5",
+        "0.11.6",
+        "0.11.7",
+        "0.11.8",
+        "0.11.9",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15.0",
+        "0.16.0",
+        "0.16.1",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.20.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.3.0",
+        "0.3.1",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4",
+        "0.6.5",
+        "0.7.0",
+        "0.7.1",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-4596-2p6p-28cv/GHSA-4596-2p6p-28cv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-4596-2p6p-28cv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/pull/1448"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sooperset/mcp-atlassian"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
+    }
+  ]
+}

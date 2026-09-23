@@ -1,0 +1,157 @@
+{
+  "id": "GHSA-hrmj-7rvj-4hg8",
+  "modified": "2026-09-22T21:00:07.496190352Z",
+  "published": "2026-09-22T20:37:36Z",
+  "aliases": [
+    "CVE-2026-85709"
+  ],
+  "summary": "lightrag-hku: Sensitive Information Exposure Through Raw Exception Messages in API Error Responses",
+  "details": "### Summary\n\nThe LightRAG API server passes raw Python exception messages directly into HTTP\nerror responses across 30+ error handlers in every router. When combined with\nthe default unauthenticated configuration (see companion report on CWE-306), any\nnetwork-reachable client can trigger exceptions whose raw text discloses\ninternal infrastructure — server filesystem paths, database host/port/user, LLM\nprovider error details, and Python library internals. No global exception\nhandler sanitizes error messages before they reach the client.\n\n### Details\n\nThroughout the API route handlers, exceptions are caught and their string\nrepresentation is returned verbatim via `detail=str(e)` / `detail=str(exc)`\n(and f-string variants such as `detail=f\"...: {str(e)}\"`). This occurs in every\nrouter file. Location breakdown on the current `main` branch:\n\n**HTTP 500 — raw exception passthrough (`except Exception as e`):**\n- `document_routes.py` — 13\n- `graph_routes.py` — 12 (mix of `detail=f\"...{str(e)}\"` and `detail=error_msg`)\n- `query_routes.py` — 3\n- `ollama_api.py` — 2\n- `lightrag_server.py` — 1 (health endpoint)\n\n**HTTP 422 — raw exception passthrough (`except ValueError as exc`):**\n- `document_routes.py` — 2 (chunking-config validation)\n\n**Total: ~33 raw-exception-to-HTTP-response locations.** The only pre-existing\ncustom exception handler in `lightrag_server.py` is specific to\n`RequestValidationError` for `/query/data`; it does not cover the generic\n`Exception` handlers in route code.\n\nExample pattern (`document_routes.py`, upload handler):\n\n```python\nexcept Exception as e:\n    logger.error(f\"Error /documents/upload: {file.filename}: {str(e)}\")\n    raise HTTPException(status_code=500, detail=str(e))\n```\n\n**Categories of sensitive information that can leak through these responses:**\n\n1. **Server filesystem paths.** File-I/O errors from the default JSON storage\n   backend expose the server's directory layout\n   (e.g. `[Errno 13] Permission denied: '/app/data/rag_storage/default/kv_store_full_docs.json'`),\n   aiding path-traversal or targeted attacks. *(Verified — see PoC Step 1.)*\n\n2. **Database host / port / user / database name.** Connection errors from the\n   PostgreSQL, MongoDB, Redis, or Neo4j backends surface the target the driver\n   was trying to reach — e.g. asyncpg raises\n   `password authentication failed for user \"lightrag\"` (username) or a socket\n   error naming the unreachable host and port.\n   **Note on credentials:** the PostgreSQL backend uses `asyncpg`, which is\n   built from keyword parameters and does **not** echo the password in its\n   exception strings — so a raw asyncpg error leaks host/port/user/db, not the\n   password. URI-configured backends behave differently: the MongoDB backend is\n   built with `AsyncMongoClient(MONGO_URI, ...)`, and a malformed-URI /\n   configuration error from pymongo can surface the connection string itself,\n   which may embed credentials (`mongodb://user:password@host:port/`). The leak\n   surface is therefore backend- and error-type-dependent.\n\n3. **LLM provider error details.** Errors from OpenAI / Gemini / Bedrock and\n   other providers may include model names, organization ids, or partial API\n   error context that reveal the deployment.\n\n4. **Python library internals.** Unexpected exceptions expose class names,\n   library-internal messages, and stack fragments that fingerprint the server\n   stack and version.\n\n5. **Configuration details.** Errors during configuration/parsing may reveal\n   storage backend types and other configuration values.\n\nThe risk is amplified by the default unauthenticated configuration (CWE-306,\ncompanion report), which lets any network client trigger and read these errors\nwithout credentials.\n\n### PoC\n\nTested on a clean checkout with the `[api]` extras installed and the server run\nvia `lightrag-server`.\n\n#### Step 1 — Filesystem path disclosure (default JSON storage)\n\nWith the default storage backend, a file-permission error is returned verbatim:\n\n```bash\n# Make a storage file unreadable to force an I/O error.\nchmod 000 ./rag_storage/default/kv_store_full_docs.json\ncurl -s http://localhost:9621/documents | python3 -m json.tool\n```\n\nVulnerable response — the full server-side path is disclosed:\n\n```json\n{\n    \"detail\": \"[Errno 13] Permission denied: '/app/data/rag_storage/default/kv_store_full_docs.json'\"\n}\n```\n\n#### Step 2 — Database infrastructure disclosure (PostgreSQL backend)\n\nConfigure a PostgreSQL KV backend pointed at an unreachable / misconfigured host:\n\n```\nLIGHTRAG_KV_STORAGE=PGKVStorage\nPOSTGRES_HOST=nonexistent-host-12345.example.com\nPOSTGRES_PORT=5432\nPOSTGRES_USER=lightrag\nPOSTGRES_DATABASE=lightrag\n```\n\nA request that touches storage returns the raw connection error, disclosing the\nhost / port / user the server is configured to reach (the asyncpg password is\nnot echoed — see the credentials note above):\n\n```json\n{\n    \"detail\": \"[Errno -2] Name or service not known\"\n}\n```\n\nFor a URI-configured backend such as MongoDB (`MONGO_URI=mongodb://user:pass@host:port/db`),\na malformed-URI / configuration error can instead surface the connection string\nitself, including any embedded credentials.\n\n### Impact\n\nError-message information exposure. A client able to reach the LightRAG\nserver can extract:\n\n- **Confidentiality (C:L):** server filesystem paths, database host/port/user/db,\n  LLM provider configuration hints, and Python stack internals from raw\n  exception messages; for URI-configured backends, potentially the connection\n  string (with embedded credentials).\n- **Escalation risk:** leaked hosts/paths aid follow-on attacks; a leaked\n  connection URI could enable direct database access if the database is\n  network-reachable.\n\nWhen combined with the default unauthenticated configuration, any\nnetwork client can trigger and read these responses without authentication,\nwhich is why this is scored `PR:N`.\n\n### Suggested remediation\n\n1. **Replace every `detail=str(e)` / `detail=str(exc)` pattern** with a generic\n   client message. Log the full exception server-side (message + traceback) and\n   return only a generic message plus a correlation id:\n\n   ```python\n   except Exception as e:\n       logger.error(f\"Error /documents/upload: {file.filename}: {e!r}\")\n       raise HTTPException(status_code=500, detail=\"Internal server error\")\n   ```\n\n2. **Register a last-resort global handler** as defense-in-depth so any\n   exception that escapes a route is sanitized identically:\n\n   ```python\n   @app.exception_handler(Exception)\n   async def unhandled_exception_handler(request, exc):\n       logger.error(f\"Unhandled exception: {exc!r}\", exc_info=True)\n       return JSONResponse(status_code=500, content={\"detail\": \"Internal server error\"})\n   ```\n\n3. **Preserve genuine client-input validation feedback.** The two HTTP 422\n   chunking-config validators emit controlled, non-sensitive messages; keep them\n   as 422 feedback rather than genericizing to 500 — but wrap the raw exception\n   so it is never a bare passthrough.\n\n**Fix status:** implemented in HKUDS/LightRAG#3422 — a shared\n`internal_server_error()` helper routes all 500 handlers through a generic body\ncarrying a correlation id (full detail logged server-side), a global\n`@app.exception_handler(Exception)` is registered in `create_app`, and the two\n422 validators are wrapped.\n\n### Credits\n- Thai Son Dinh from VinSOC Labs (R\u0026D)\n- Nguyen Huy Vu Dung from VinSOC Labs (AppSec)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "lightrag-hku",
+        "purl": "pkg:pypi/lightrag-hku"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.5.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.0.6",
+        "0.0.7",
+        "0.0.8",
+        "0.0.9",
+        "1.0.0",
+        "1.0.1",
+        "1.0.3",
+        "1.0.5",
+        "1.0.6",
+        "1.0.8",
+        "1.0.9",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6",
+        "1.1.7",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.5",
+        "1.2.6",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.3.8",
+        "1.3.9",
+        "1.4.0",
+        "1.4.1",
+        "1.4.10",
+        "1.4.11",
+        "1.4.11rc2",
+        "1.4.12",
+        "1.4.12rc1",
+        "1.4.13",
+        "1.4.13rc1",
+        "1.4.14",
+        "1.4.15",
+        "1.4.16",
+        "1.4.2",
+        "1.4.3",
+        "1.4.4",
+        "1.4.5",
+        "1.4.6",
+        "1.4.7",
+        "1.4.8.1",
+        "1.4.8.2",
+        "1.4.8rc4",
+        "1.4.8rc6",
+        "1.4.8rc7",
+        "1.4.8rc8",
+        "1.4.8rc9",
+        "1.4.9",
+        "1.4.9.1",
+        "1.4.9.10",
+        "1.4.9.11",
+        "1.4.9.2",
+        "1.4.9.3",
+        "1.4.9.4",
+        "1.4.9.4rc1",
+        "1.4.9.5",
+        "1.4.9.6",
+        "1.4.9.7",
+        "1.4.9.8",
+        "1.4.9.9",
+        "1.4.9rc1",
+        "1.4.9rc2",
+        "1.4.9rc3",
+        "1.4.9rc4",
+        "1.5.0",
+        "1.5.0rc1",
+        "1.5.0rc2",
+        "1.5.0rc3",
+        "1.5.1",
+        "1.5.2",
+        "1.5.3",
+        "1.5.4",
+        "1.5.5rc1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.5.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-hrmj-7rvj-4hg8/GHSA-hrmj-7rvj-4hg8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/security/advisories/GHSA-hrmj-7rvj-4hg8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-85709"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/pull/3422"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/4d90a0eb35d40b45f3a9045e308ec126897a3364"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/commit/dcab315d7dc1eea682e9b2c4fcb1b06474484c47"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/HKUDS/LightRAG"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/HKUDS/LightRAG/releases/tag/v1.5.5"
+    }
+  ]
+}

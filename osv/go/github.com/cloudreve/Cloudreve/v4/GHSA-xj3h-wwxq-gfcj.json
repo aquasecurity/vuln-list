@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-xj3h-wwxq-gfcj",
+  "modified": "2026-09-22T21:00:11.406907997Z",
+  "published": "2026-09-22T20:40:33Z",
+  "aliases": [
+    "CVE-2026-77633"
+  ],
+  "summary": "Cloudreve: Storage-quota TOCTOU race allows quota bypass and storage-based denial of service",
+  "details": "## Summary\n\nCloudreve v4 splits the storage-quota **check** (reading the user's `used` bytes and comparing them to `MaxStorage`) and the **charge** (incrementing `users.storage`) into two non-atomic steps in the `PrepareUpload` code path. This creates a Time-of-Check to Time-of-Use (TOCTOU) race condition. Any authenticated user — including an unprivileged account in the default `User` group — can concurrently issue several upload-session requests that all read the same stale `used` snapshot, each pass the check, and then each contribute their declared `size` to `users.storage`. The end result is that the total approved capacity exceeds the group's `MaxStorage` many times over.\n\nThe same primitive is trivially amplifiable into a storage-based denial of service. During `PrepareUpload`, Cloudreve reserves the declared size against `users.storage` before any bytes are written, so an attacker can push the reserved amount far beyond the host's physical disk (tested: a 1 GiB-quota account reserved 17 GiB in a single 20-way burst), and can then materialise the reservation by completing chunked uploads to actually write the excess bytes to disk. Amplification to the host's free space fills the disk and denies uploads for every user of the instance.\n\nExploitation requires only a valid session with `Files.Write` permission. No administrator configuration, no non-default storage policy, and no elevated privileges are needed. The default deployment (local storage policy, default `User` group) is affected.\n\n## Technical details\n\n`PrepareUpload` in `pkg/filemanager/fs/dbfs/upload.go` splits quota enforcement across two stages:\n\n**Stage A — the check (snapshot compare, no lock)** — `pkg/filemanager/fs/dbfs/validator.go`:\n\n```go\nfunc (f *DBFS) validateUserCapacity(ctx context.Context, size int64, u *ent.User) error {\n    capacity, err := f.Capacity(ctx, u)              // reads \"used\"\n    if err != nil { return ... }\n    return f.validateUserCapacityRaw(ctx, size, capacity)\n}\n\nfunc (f *DBFS) validateUserCapacityRaw(ctx context.Context, size int64, capacity *fs.Capacity) error {\n    if capacity.Used + size \u003e capacity.Total {       // snapshot compare only; no lock, no reservation\n        return fs.ErrInsufficientCapacity\n    }\n    return nil\n}\n```\n\n`capacity.Used` comes from the in-memory `*ent.User` that was hydrated once at the beginning of the request — `pkg/filemanager/fs/dbfs/dbfs.go`:\n\n```go\nfunc (f *DBFS) Capacity(ctx context.Context, u *ent.User) (*fs.Capacity, error) {\n    ...\n    res.Used  = f.user.Storage            // captured at request start\n    res.Total = requesterGroup.MaxStorage\n    return res, nil\n}\n```\n\nNo SELECT is issued at check time, no row lock is taken on the user row, and pending upload sessions are not counted.\n\n**Stage B — the charge (single unconditional UPDATE, outside the tx)** — `pkg/filemanager/fs/dbfs/upload.go` → `inventory/tx.go` → `inventory/user.go`:\n\n```go\n// PrepareUpload: check (A) ...  then, many statements later ...\nif err := f.validateUserCapacity(ctx, req.Props.Size, ancestor.Owner()); err != nil {\n    return nil, err\n}\n...\nif err := inventory.CommitWithStorageDiff(ctx, dbTx, f.l, f.userClient); err != nil { ... }  // charge (B)\n\n// inventory/user.go\nc.client.User.Update().Where(user.ID(uid)).AddStorage(diff).Exec(ctx)  // SQL: storage = storage + diff\n```\n\nBetween A and B the code performs storage-policy load-balancing, save-path generation, encryption-metadata generation, transaction start, placeholder-file/entity creation, and metadata upsert. This leaves a wide race window. `N` concurrent `PrepareUpload` requests each read the same stale `Used` snapshot at A, each pass their independent quota check, and then each add their own `size` to `users.storage` at B. The committed total is up to `N × size` above `MaxStorage`.\n\nThree defensive controls that would each independently close the race are missing:\n\n1. The check and the charge are not enclosed in the same transaction with a `SELECT ... FOR UPDATE` on the user row.\n2. The charge is a plain `storage = storage + :size` UPDATE, not an atomic conditional update of the form `UPDATE users SET storage = storage + :size WHERE id = :uid AND storage + :size \u003c= :max_storage`.\n3. `Used` is computed only from committed entities. Concurrent pending upload sessions (which have already been reserved by the accounting model) are not counted, so races among sessions that haven't yet completed are invisible to each other.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/cloudreve/Cloudreve/v4",
+        "purl": "pkg:golang/github.com/cloudreve/Cloudreve/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.0.0-20260715025621-7329602751c0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-xj3h-wwxq-gfcj/GHSA-xj3h-wwxq-gfcj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/cloudreve/cloudreve/security/advisories/GHSA-xj3h-wwxq-gfcj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-77633"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cloudreve/cloudreve/commit/7329602751c00bb4136fe9ad8b364d0df70773df"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/cloudreve/cloudreve"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cloudreve/cloudreve/releases/tag/4.18.0"
+    }
+  ]
+}
