@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-97cv-x867-6xhm",
+  "modified": "2026-09-23T19:30:05.308824766Z",
+  "published": "2026-09-23T19:27:08Z",
+  "aliases": [
+    "CVE-2026-82405"
+  ],
+  "summary": "Klever-Go Account takeover: `kleverUpdateAccountPermission` authorizes on attacker-controlled `RecipientAddr` instead of the authenticated caller",
+  "details": "### Description\n\nThe VM built-in function `KleverUpdateAccountPermission` (registered always-active, `creator.go:381-390` / `core/vmconstants.go:234`) rewrites an account's entire permission set. Its authorization check uses `vmInput.RecipientAddr` **attacker-controlled**  instead of the authenticated `vmInput.CallerAddr`. The sibling handler `kleverChangeOwnerAddress.go:86` uses `vmInput.CallerAddr` correctly, so the safe pattern exists in-repo; this handler deviates. The native transaction path (`txProcess.go:833`) is safe  it uses `tx.GetSender()`.\n\nMechanism:\n1. **Wrong variable:** `CallerAddr` is never referenced in the handler; auth is `contractHasValidPermission(target.GetPermissions(), RecipientAddr)`, which returns true if `RecipientAddr` is a signer with `Weight \u003e= Threshold` in the *target* account's permissions and the permission grants `UpdateAccountPermissionContractType`.\n2. **RecipientAddr is attacker-controlled:** when a contract calls a built-in via `ExecuteOnDestContextWithTypedArgs` (`baseOps.go:1967`), `prepareIndirectContractCallInput` (`baseOps.go:2485`) sets `RecipientAddr = destination` (contract-chosen) and `CallerAddr = the calling contract`. The blockchain hook (`blockChainHook.go:454/467`) dispatches on `input.Function` and passes the input through unchanged; no guard forces `RecipientAddr == CallerAddr` and there is no SC-destination validation on this path.\n3. **Self-signer default satisfies the check:** `createDefaultOwnerPermission` (`accounts.go:1848`) makes an account its own signer (weight 1, threshold 1, Owner type), and `CheckPermissionGrantedForContracts` returns true for Owner, so `contractHasValidPermission(V.perms, V) == true`. (More generally, `RecipientAddr` can be set to *any* of V's signer addresses meeting threshold all public on-chain.) Accounts with no stored permissions have empty `GetPermissions()` and are immune.\n4. **Overwrite is unrestricted:** `UpdatePermission(V, attackerContract)` (`accounts.go:1863`) replaces V's permission set with attacker-supplied signers; if the attacker supplies an Owner-type permission, no default is appended and V's prior control is fully evicted.\n\n### Code walkthrough\n\n**(a) The vulnerable handler** — `core/kapp/builtInFunctions/kleverUpdateAccountPermission.go`:\n```go\nfunc (e *kleverUpdateAccountPermission) ProcessBuiltinFunction(vmInput *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {\n    ...\n    address := vmInput.NextArg()                       // Arguments[0] — attacker-chosen target account V\n    contract, err := e.getUpdateAccountPermissionContract(vmInput) // Arguments[1] — attacker-chosen new permissions\n    ...\n    acc, err := e.accountsCacher.LoadUser(address)      // loads V\n    ...\n    // BUG: authorizes against vmInput.RecipientAddr (attacker-controlled), NOT vmInput.CallerAddr\n    if !e.contractHasValidPermission(acc.GetPermissions(), vmInput.RecipientAddr) {   // L91\n        return nil, errors.New(\"invalid permission operation\")\n    }\n    // overwrites V's entire permission set with attacker-supplied signers\n    resultCode, err := e.kappController.GetAccountsKApp().UpdatePermission(address, contract)\n    ...\n}\n```\n\n**(b) The check just name-matches `recipientAddr` against V's own signers** — same file:\n```go\nfunc (e *kleverUpdateAccountPermission) contractHasValidPermission(permissions []*state.Permission, recipientAddr []byte) bool {\n    for _, permission := range permissions {\n        for _, signer := range permission.Signers {\n            if !bytes.Equal(signer.Address, recipientAddr) {   // recipientAddr, not the authenticated caller\n                continue\n            }\n            if signer.Weight \u003e= permission.Threshold \u0026\u0026\n                permission.CheckPermissionGrantedForContracts(transaction.TXContract_UpdateAccountPermissionContractType) {\n                return true\n            }\n        }\n    }\n    return false\n}\n```\n\n**(c) The dispatch makes `RecipientAddr` attacker-controlled** — `kvm/vmhost/vmhooks/baseOps.go:2464` `prepareIndirectContractCallInput` (invoked when a contract calls the built-in via `ExecuteOnDestContext`):\n```go\ncontractCallInput := \u0026vmcommon.ContractCallInput{\n    VMInput: vmcommon.VMInput{\n        CallerAddr: sender,        // the calling contract (authenticated) — NOT used by the handler\n        Arguments:  data,          // attacker-chosen: [V, attackerPermissions]\n        ...\n    },\n    RecipientAddr: destination,    // the contract's chosen `dest` argument — attacker sets this to V\n    Function:      string(function),\n}\n```\n\n**(d) Every account with configured permissions is its own signer** — `core/kapp/accounts/accounts.go:1848` `createDefaultOwnerPermission` (appended by `UpdatePermission` when no Owner permission is supplied):\n```go\nreturn \u0026state.Permission{\n    Type:      state.Permission_Owner,   // Owner grants ALL contract types incl. type 22\n    Threshold: 1,\n    Signers: []*state.Key{\n        { Address: ownerAcc.AddressBytes(), Weight: 1 },   // the account signs for itself\n    },\n}\n```\nSo `contractHasValidPermission(V.perms, RecipientAddr=V)` finds V's own address as a `Weight 1 \u003e= Threshold 1` Owner signer → returns `true`.\n\n**(e) Contrast — the sibling handler does it correctly** — `core/kapp/builtInFunctions/kleverChangeOwnerAddress.go:86`:\n```go\ncallerAddress := vmInput.CallerAddr                        // authenticated caller\n...\nif !bytes.Equal(callerAddress, acc.GetOwnerAddress()) {    // checks the CALLER, not RecipientAddr\n    return nil, ErrOperationNotPermitted\n}\n```\n\n**Putting it together — the attacker's contract call:**\n```\nExecuteOnDestContext(\n    gas, dest = V,                       // → RecipientAddr = V\n    value = 0,\n    function = \"KleverUpdateAccountPermission\",\n    args = [ V, attackerOwnerPermsWithOnlyAttackerKey ],   // Arguments[0]=V, Arguments[1]=new perms\n)\n```\n→ `CallerAddr = attackerContract` (ignored), `RecipientAddr = V`, `contractHasValidPermission(V.perms, V) == true` → V's permissions overwritten with the attacker's key as sole Owner signer. The attacker never held a key of V and provided no signature from V.\n\n### POC\n\nput the following poc testcase under /core/kapp/builtInFunctions/ \n\nPOC Code: https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9\n\nRun:\n```\ncd klever-go\nGOTOOLCHAIN=auto go test ./core/kapp/builtInFunctions/ -run TestPoC_PermTakeover -v\n```\nOutput:\n```\nTAKEOVER CONFIRMED: caller=\"attacker-contract\" (attacker SC) rewrote account V=\"victim-account-V\"; new sole owner signer=\"attacker-key-EVIL\"\n--- PASS: TestPoC_PermTakeover\n--- PASS: TestPoC_PermTakeover_NoStoredPermsIsSafe\n```\nThe harm asserted is the takeover itself: after the call, V's permission set is a single Owner permission whose sole signer is the attacker's key; V's original owner signer is gone.\n\n### Impact\n\nFull takeover of **any account that has configured permissions**  i.e. every multisig / advanced-permission account , by an attacker who deploys a cheap smart contract and supplies only public on-chain addresses (no keys, no signatures from the victim). After takeover the attacker controls all of the victim's operations → theft or permanent lock of all the account's assets. Reachable via a permissionlessly-deployed contract (the plain-tx path is safe, so it is Critical-via-contract, not fully no-contract). No fork flag gates it.\n\nSeverity **Critical**: Impact High (full account/asset compromise)\n\n### Recommendation\n\nAuthorize against the authenticated caller, mirroring `kleverChangeOwnerAddress`:\n```go\nif !e.contractHasValidPermission(acc.GetPermissions(), vmInput.CallerAddr) { ... }\n```\nReconcile the SC-call authority model: on the built-in path `CallerAddr` is the calling contract, so a contract should only be able to update permissions of accounts that legitimately list *it* as an authorized signer — never an arbitrary victim. Consider also requiring the target account (`Arguments[0]`) to equal the authorized caller's account, matching the native `tx.GetSender()` model.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klever-io/klever-go",
+        "purl": "pkg:golang/github.com/klever-io/klever-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.20"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.7.19",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-97cv-x867-6xhm/GHSA-97cv-x867-6xhm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/security/advisories/GHSA-97cv-x867-6xhm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/commit/c58740eb74d7ee8f07db1e18a7d6214b5559ba32"
+    },
+    {
+      "type": "WEB",
+      "url": "https://gist.github.com/mabdullah22/a41f90aa5ba86bbebf121f739bd5f5e9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klever-io/klever-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/releases/tag/v1.7.20"
+    }
+  ]
+}

