@@ -1,0 +1,199 @@
+{
+  "id": "GHSA-mr95-65j8-9mxp",
+  "modified": "2026-09-24T20:00:05.202081845Z",
+  "published": "2026-09-24T19:50:27Z",
+  "aliases": [
+    "CVE-2026-57170"
+  ],
+  "summary": "Trestle SSTI in Jinja2 include tags allows arbitrary code execution (Incomplete fix of CVE-2026-46439)",
+  "details": "Reporter: Cavan Loughran, Celvex Group Inc.\n\nSummary\n-------\nThe fix for CVE-2026-46439 (3.12.2 / 4.0.3) removed the recursive re-render loop in trestle/core/commands/author/jinja.py render_template, but the custom include tags in trestle/core/jinja/tags.py (MDSectionInclude, MDCleanInclude) still re-parse the CONTENT of an included markdown file as a Jinja2 template via Parser(self.environment, \u003cfile text\u003e).parse() in a plain (non-sandboxed) jinja2.Environment. Because the trestle markdown writers (ssp_io.py SSPMarkdownWriter, docs_control_writer.py DocsControlWriter) write OSCAL prose / component-description fields verbatim (the {{ -\u003e [[ neutralization is applied to parameter tables only), attacker-controlled OSCAL data that flows into an included markdown file is interpreted as template code and can achieve arbitrary code execution on the runner. This is the same trust boundary and impact as CVE-2026-46439 via a sink the fix did not cover.\n\nAffected versions\n-----------------\n4.0.3 and earlier on this code path (the include tags predate and were untouched by the parent fix); the 3.12.x line likewise. Verified present in the fixed release 4.0.3 by direct source read.\n\nTechnical detail\n----------------\nSink (UNCHANGED by the parent fix), trestle/core/jinja/tags.py:\n\nMDSectionInclude.parse (the {% mdsection_include 'file.md' '# Section' %} tag), approximately:\n  md_content, _, _ = self.environment.loader.get_source(self.environment, markdown_source.value)   # ~line 90\n  ...\n  local_parser = Parser(self.environment, md_section.content.raw_text)   # ~line 104  \u003c-- RE-PARSE\n  top_level_output = local_parser.parse()                                # ~line 105\n  return top_level_output.body                                           # ~line 106\n\nMDCleanInclude.parse (the {% md_clean_include 'file.md' %} tag), approximately:\n  md_content, _, _ = self.environment.loader.get_source(self.environment, markdown_source.value)   # ~line 141\n  ...\n  local_parser = Parser(self.environment, content)   # ~line 150  \u003c-- RE-PARSE\n  top_level_output = local_parser.parse()            # ~line 151\n  return top_level_output.body                       # ~line 152\n\nParser(self.environment, \u003cincluded file text\u003e).parse() compiles the included file's markdown text AS A JINJA TEMPLATE and splices the resulting AST .body directly into the host template's compilation. Any {{ ... }} / {% ... %} present in the included file is interpreted as template code, not emitted as literal text. The single-pass fix in render_template has no effect on this: the re-parse happens at compile time inside the tag, on a string the outer render loop never sees as data.\n\nEnvironment is NOT sandboxed (UNCHANGED by the fix), trestle/core/commands/author/jinja.py _create_jinja_environment:\n  return Environment(loader=FileSystemLoader(template_folder), extensions=extensions(), trim_blocks=True, autoescape=True)\nThis is a plain jinja2.Environment, not jinja2.sandbox.SandboxedEnvironment, so a re-parsed expression has full access to the usual Jinja SSTI gadget chain leading to OS command execution. autoescape=True HTML-escapes output but does not constrain expression evaluation, so it does not mitigate code execution.\n\nData bridge (partial neutralization only): the included markdown is, in trestle's documented workflow, produced from OSCAL by the trestle generators / writers. trestle/core/ssp_io.py SSPMarkdownWriter writes control statement prose (get_control_statement_ssp) and component implementation descriptions (prose = by_comp.description) into markdown with no Jinja-delimiter escaping. trestle/core/docs_control_writer.py DocsControlWriter writes control section prose (self._md_file.new_line(prose)) and part text raw. The maintainers DO know about the {{-in-data risk: ssp_io.py applies line.replace('{{', '[[').replace('}}', ']]') to neutralize delimiters, but ONLY inside the parameter-table method (_parameter_table). Control-statement prose and component description fields receive no such neutralization. So an OSCAL field such as an SSP component description, a control statement override, or a catalog part prose string that contains {{ \u003cgadget\u003e }} lands verbatim in the generated markdown, and then the include tag re-parses and executes it.\n\nWhy this is a genuine incomplete fix (not the same bug): the parent CVE-2026-46439 re-evaluation site was the recursive loop in render_template (main template output) in commands/author/jinja.py, which the fix removed. THIS variant's re-evaluation site is Parser(self.environment, ...) inside mdsection_include / md_clean_include (included file content) in core/jinja/tags.py, which the fix did NOT touch, and which runs in a plain (non-sandboxed) Environment. Same class (SSTI -\u003e RCE), same trust boundary (untrusted OSCAL data), different and still-live sink.\n\nReachability (non-destructive reasoning)\n----------------------------------------\n1. A pipeline ingests OSCAL content (component-definition, SSP, profile, or catalog) that an external or lower-trust party can influence (a component supplier, a control-narrative contributor, an upstream catalog). This is precisely the parent's accepted attacker: a malicious actor supplies crafted OSCAL content in an automated pipeline (CI/CD).\n2. The pipeline runs trestle author ssp-generate (or equivalent) which writes the OSCAL prose/description fields into markdown verbatim. A field value such as {{ cycler.__init__.__globals__['os'].popen('id').read() }} survives intact (no neutralization on prose/description).\n3. The pipeline then runs trestle author jinja -i template.md.j2 ... where the template composes the document with {% md_clean_include 'generated_control.md' %} or {% mdsection_include 'generated_ssp.md' '# Some Section' %} (the documented populate-content-from-other-documents pattern).\n4. The include tag re-parses the generated markdown in the non-sandboxed environment and the embedded expression executes =\u003e code runs with the privileges of the trestle process (the CI runner).\n\nNon-destructive confirmation: place a benign marker such as {{ 7*7 }} in an OSCAL prose / description field; run the generator that writes it to markdown; include that markdown with {% md_clean_include 'generated.md' %}; observe 49 rather than the literal {{ 7*7 }}, confirming evaluation. A malicious field would use the standard Jinja gadget chain; that is deliberately NOT included here.\n\nImpact\n------\nArbitrary code execution on the trestle process (the CI runner), under the same trust boundary that CVE-2026-46439 was assigned on (untrusted OSCAL data in an automated pipeline). Non-sandboxed environment =\u003e full RCE in a release that is patched for the parent CVE.\n\nRemediation\n-----------\n(a) render the include re-parse through jinja2.sandbox.SandboxedEnvironment, OR (b) emit the included file content as literal text (do not re-parse it as a template), OR (c) extend the {{ / }} -\u003e [[ / ]] neutralization in ssp_io.py / docs_control_writer.py to ALL OSCAL prose / description / part-text writes, not just parameter tables. Option (a) or (b) is the durable fix; (c) is defense-in-depth.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.12.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.2",
+        "0.0.3",
+        "0.1.0",
+        "0.1.1",
+        "0.10.0",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.13.1",
+        "0.14.0",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.14.4",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.20.0",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.27.2",
+        "0.28.0",
+        "0.28.1",
+        "0.29.0",
+        "0.3.0",
+        "0.30.0",
+        "0.31.0",
+        "0.32.0",
+        "0.32.1",
+        "0.33.0",
+        "0.34.0",
+        "0.35.0",
+        "0.36.0",
+        "0.37.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "1.0.0rc0",
+        "1.0.1",
+        "1.0.2",
+        "1.1.0",
+        "1.2.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1",
+        "2.2.0",
+        "2.2.1",
+        "2.3.0",
+        "2.3.1",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.6.0",
+        "2.6.1",
+        "3.0.1",
+        "3.1.0",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-mr95-65j8-9mxp/GHSA-mr95-65j8-9mxp.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "compliance-trestle",
+        "purl": "pkg:pypi/compliance-trestle"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "fixed": "4.1.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "4.0.0",
+        "4.0.1",
+        "4.0.2",
+        "4.0.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-mr95-65j8-9mxp/GHSA-mr95-65j8-9mxp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/security/advisories/GHSA-mr95-65j8-9mxp"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-57170"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/pull/2270"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/0f82d19bd42f9cc0f1b3acd7fc3f6dafe3b6ae10"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/commit/5335ff873a2a68eb7de43df029bea09cadff22fd"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oscal-compass/compliance-trestle"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/releases/tag/v3.12.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oscal-compass/compliance-trestle/releases/tag/v4.1.0"
+    }
+  ]
+}
