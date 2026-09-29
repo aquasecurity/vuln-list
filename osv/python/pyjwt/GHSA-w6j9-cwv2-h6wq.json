@@ -1,0 +1,67 @@
+{
+  "id": "GHSA-w6j9-cwv2-h6wq",
+  "modified": "2026-09-29T18:30:41.171809330Z",
+  "published": "2026-09-29T18:23:01Z",
+  "aliases": [
+    "CVE-2026-102274"
+  ],
+  "summary": "PyJWT: Malformed RSA JWK aborts parsing of an entire JWK Set",
+  "details": "## Summary\n\nA malformed RSA JWK inside a JWK Set aborts parsing of the entire set instead of being skipped, because `RSAAlgorithm.from_jwk` can raise a plain `ValueError` that isn't caught by `PyJWKSet`'s per-key error-skipping logic.\n\n## Affected component / version\n\n- Package: `PyJWT` (PyPI, ecosystem `pip`)\n- Files: `jwt/api_jwk.py` (`PyJWK.__init__`, `PyJWKSet.__init__`), `jwt/algorithms.py` (`RSAAlgorithm.from_jwk`)\n- Confirmed present in the `master` branch as of 2026-09-05 (commit `7144e4534c34810f4525dc4578a32addd8212cff`, tag `2.13.0`). Directly verified identical in tags `2.9.0`, `2.10.0`, `2.11.0`, `2.12.0`, `2.12.1`, `2.13.0` -- the vulnerable call and the `except PyJWTError` guard are unchanged across all six releases. Not verified against any release prior to `2.9.0`.\n\n## Details\n\n`PyJWKSet.__init__` (`jwt/api_jwk.py:145-152`) iterates each key in a JWK Set:\n\n```python\nfor key in keys:\n    try:\n        self.keys.append(PyJWK(key))\n    except PyJWTError as error:\n        if isinstance(error, MissingCryptographyError):\n            raise error\n        # skip unusable keys\n        continue\n```\n\n`PyJWK.__init__` (`api_jwk.py:82`) calls `self.Algorithm.from_jwk(self._jwk_data)` with no try/except of its own. For an RSA JWK, this dispatches to `RSAAlgorithm.from_jwk` (`jwt/algorithms.py:539-586`). When the JWK supplies `d`, `e`, `n` without the CRT parameters (`p`, `q`, `dp`, `dq`, `qi`), `from_jwk` calls `cryptography`'s `rsa_recover_prime_factors(public_numbers.n, d, public_numbers.e)` (`algorithms.py:572-574`) to derive the key. If `d` is not the correct private exponent for that `n`/`e` pair, `rsa_recover_prime_factors` raises a plain `ValueError`.\n\n`ValueError` is a built-in Python exception and is not a subclass of `jwt.exceptions.PyJWTError` (`PyJWTError(Exception)` is the root of PyJWT's own exception hierarchy). It is therefore not caught by `PyJWKSet.__init__`'s `except PyJWTError`, and propagates out of the constructor, aborting the `for key in keys:` loop before any subsequent key in the list is processed.\n\n`PyJWKSet.from_dict`/`from_json` and `PyJWK.from_dict`/`from_json` are exported public API (`jwt/__init__.py`). `PyJWKClient.get_jwk_set` (`jwt/jwks_client.py:158`) feeds a fetched JWKS HTTP response directly into `PyJWKSet.from_dict` with no per-key pre-validation, so this is reachable through the documented `PyJWKClient` flow whenever the fetched JWKS contains a malformed key alongside valid ones.\n\n## Proof of concept\n\n```python\nimport jwt\n\ngood_jwk = {\n    \"kty\": \"RSA\",\n    \"n\": \"\u003ca valid base64url-encoded RSA modulus, e.g. from a real 2048-bit public key\u003e\",\n    \"e\": \"AQAB\",\n}\n\nbad_jwk = {\n    \"kty\": \"RSA\",\n    \"n\": good_jwk[\"n\"],\n    \"e\": \"AQAB\",\n    \"d\": \"AAAAAA\",  # not the true private exponent for n/e, no CRT params present\n}\n\njwks_doc = {\"keys\": [bad_jwk, good_jwk]}\n\njwt.PyJWKSet.from_dict(jwks_doc)\n# raises: ValueError: Unable to compute factors p and q from exponent d.\n# (uncaught -- PyJWKSet.__init__ never returns, `good_jwk` is never added)\n```\n\n## Impact\n\n`PyJWKSet.__init__` raises before completing, so no key in the JWK Set is added to the resulting set, including keys unrelated to the malformed entry. This requires the malformed key to already be present in a JWK Set the application parses (e.g. one entry in an aggregated/federated key set, or a key affected by transit corruption before signature verification of the JWKS transport itself). Applications that vet each key individually before adding it to a trusted set are not affected. The failure is an uncaught `ValueError`, not one of PyJWT's documented `jwt.exceptions.*` types, so exception handling written against PyJWT's documented contract (`except jwt.exceptions.PyJWTError`) will not catch it either.\n\n## Suggested remediation\n\nWrap the key-construction call in `PyJWK.__init__` (`api_jwk.py:82`) so a `ValueError` is converted into `InvalidKeyError` (a `PyJWTError` subclass):\n\n```python\ntry:\n    self.key = self.Algorithm.from_jwk(self._jwk_data)\nexcept ValueError as e:\n    raise InvalidKeyError(f\"Unable to construct key from JWK: {e}\") from e\n```\n\nThis lets `PyJWKSet.__init__`'s existing `except PyJWTError: continue` skip the one malformed key as its own comment already states is intended.\n\n## Responsible Disclosure Timeline\n\nPer the [OWASP Vulnerability Disclosure Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Vulnerability_Disclosure_Cheat_Sheet.html) and [Google Project Zero's 2020 disclosure policy](https://projectzero.google/2020/01/policy-and-disclosure-2020-edition.html):\n\n- **Day 0** (date of submission): to be set to the actual API response's `created_at` timestamp when this report is submitted. If submitted on the date of this draft (2026-09-05), Day 0 = 2026-09-05.\n- **Day 90** (full-public-disclosure deadline, regardless of fix status): Day 0 + 90 days -- 2026-12-04 if Day 0 is 2026-09-05.\n- A brief mutually-agreed extension (standard 14-day grace period) is available if a fix is scheduled but not yet shipped by Day 90 -- extending to 2026-12-18 in that case.\n- This window may shorten instead of extend if the issue is confirmed under active exploitation.\n\n## Try It Yourself (Sandbox)\n\nReproduce the PoC above, and attempt your own fix, in an isolated sandbox with no access to production systems, secrets, or real data.\n\n- Sandbox: [jwt.py](https://play.secdim.com/game/python/challenge/jwtpy)\n- Course: [Tenant Zero: AI \u0026 SaaS Authz Failures](https://learn.secdim.com/course/tenant-zero)\n\n## Credit\n\nDiscovered and reported by SecDim Security Research: secdim.com, @secdim, security@secdim.com.\n\n## Maintainer update — 2026-09-08\n\nWe reproduced the reported behavior on PyJWT 2.13.0 with `cryptography` installed: a malformed RSA private JWK containing an invalid `d` value and no CRT parameters raised a plain `ValueError` while parsing a JWK set. Because `PyJWKSet` skips `PyJWTError` instances only, that exception aborted parsing before subsequent valid keys were loaded. The impact is a conditional availability failure for applications that parse a key set containing a malformed entry; it is not a signature-forgery or claims-verification bypass.\n\nThe independently verified affected range is `\u003e= 2.9.0, \u003c= 2.13.0`; earlier releases were not checked. A narrow fix has been prepared in commit `8915570` based on master commit `5fa7594`: `PyJWK` converts key-construction `ValueError` exceptions to `InvalidKeyError`, allowing the existing `PyJWKSet` skip path to continue. Regression coverage verifies that a malformed RSA key is skipped while a valid key in the same set remains usable. The full suite passes with 370 tests and 4 intentional cryptography-environment skips; formatting, lint, and targeted type checks pass. The advisory remains in triage while the fix goes through release planning.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyjwt",
+        "purl": "pkg:pypi/pyjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.9.0"
+            },
+            {
+              "fixed": "2.14.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.13.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-w6j9-cwv2-h6wq/GHSA-w6j9-cwv2-h6wq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/security/advisories/GHSA-w6j9-cwv2-h6wq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102274"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/commit/8915570a0bfda9f0ff0e34e7fb09bdb9d71580cf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpadilla/pyjwt"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/releases/tag/2.14.0"
+    }
+  ]
+}
