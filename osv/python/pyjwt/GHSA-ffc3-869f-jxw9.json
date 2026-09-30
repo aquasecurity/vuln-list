@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-ffc3-869f-jxw9",
+  "modified": "2026-09-29T23:30:03.866776038Z",
+  "published": "2026-09-29T23:17:33Z",
+  "aliases": [
+    "CVE-2026-102268"
+  ],
+  "summary": "PyJWT: Asymmetric-PEM detection bypass: whitespace/line-ending-mutated public keys skip the HS/asymmetric confusion guard",
+  "details": "**Prerequisites** (both conditions must hold; both are deployment properties, not attacker-controlled at request time):\n\n- The `jwt.decode` allow-list mixes an HMAC algorithm with an asymmetric one, e.g. `algorithms=[\"ES256\", \"HS256\"]` (the RFC 8725 footgun the guard exists to backstop).\n- The verification key is passed as raw PEM text/bytes on the non-`PyJWK` path, in a byte-form that `cryptography`'s loader accepts but PyJWT's `is_pem_format` regex does not recognize (marker-adjacent whitespace/indentation, CR-only line terminators, or the PEM folded to a single line). Such forms arise naturally from an indented YAML/JSON block, a single-line environment variable or JSON string, or a CR/LF round-trip through config tooling.\n\nThe attacker additionally needs the public verification key, which is public by definition, and `cryptography` must be installed.\n\nThe fix for CVE-2022-29217 rejects an asymmetric key handed to an HMAC algorithm, but only when `is_pem_format()` recognizes the key as PEM. That recognizer accepts strictly fewer byte-forms than the loader that later parses the key, so a PEM the guard misses still loads as a valid public key and is then used as an HMAC secret. This is an incomplete-guard bypass of the CVE-2022-29217 family.\n\n### Summary\nA PEM public key with marker-adjacent whitespace, CR-only line terminators, or folded to a single line makes PyJWT's `is_pem_format()` return `False` while `cryptography.load_pem_public_key()` accepts the identical bytes. The asymmetric-key rejection in `HMACAlgorithm.prepare_key` is skipped, the public key becomes the HMAC secret, and an attacker who knows the public key mints a valid `HS256` token — universal forgery — whenever the verify allow-list mixes an HMAC and an asymmetric algorithm.\n\n### Details\nAt `jwt/algorithms.py:331-335`, `HMACAlgorithm.prepare_key` contains the sole family-mismatch guard:\n\n    if is_pem_format(key_bytes) or is_ssh_key(key_bytes):\n        raise InvalidKeyError(\n            \"The specified key is an asymmetric key or x509 certificate and\"\n            \" should not be used as an HMAC secret.\"\n        )\n\nIf neither predicate fires, `:357` returns `key_bytes` unchanged — the PEM text is used directly as the HMAC secret.\n\n`is_pem_format` (`jwt/utils.py:116-127`) is `bool(_PEM_RE.search(key))`, where `_PEM_RE` requires `----[- ]BEGIN (...)[- ]----\\r?\\n`, then `.+?\\r?\\n`, then the END marker. The LF in each `\\r?\\n` is mandatory, the markers are anchored directly after a newline, and only `[- ]` is tolerated adjacent to them — not arbitrary whitespace. So a key with a tab/space before the END marker, with bare `\\r` terminators, or folded onto one line is not recognized as PEM. `cryptography`'s `load_pem_public_key` is tolerant of exactly these forms and still returns the key.\n\nReach: `jwt/api_jws.py:386` performs the allow-list check (passes when `HS256` is in the list) and takes the non-`PyJWK` branch to `alg_obj.prepare_key(key)` at `:407`. The mismatch guard above is the only thing standing between a mixed allow-list and using the public key as an HMAC secret.\n\n### PoC\nVulnerable path: `jwt/algorithms.py:331` (guard gated on `is_pem_format`) -\u003e `is_pem_format` returns `False` for a loader-accepted PEM -\u003e `jwt/algorithms.py:357` returns the public-key bytes as the HMAC secret -\u003e `HS256` verification succeeds.\n\nReproduced on PyJWT 2.13.0 (commit `7144e453`) with `cryptography` 49.0.0, using only the public API. For each of an EC (ES256) and an RSA-2048 (RS256) key: start from the correct public-key PEM, apply a mutation, confirm `is_pem_format` now returns `False` while `cryptography` still loads the bytes, then verify a token signed `alg=HS256` with the public-key text as the HMAC secret, under `algorithms=[\"ES256\",\"HS256\"]` (resp. `[\"RS256\",\"HS256\"]`).\n\nObserved output:\n\n    pyjwt 2.13.0\n      ec  canonical (control)                is_pem_format=True  crypto_loads=True  forgery=BLOCKED:InvalidKeyError\n      ec  marker-adjacent (tab before END)   is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      ec  CR-only terminators                is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      ec  folded single-line                 is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      rsa canonical (control)                is_pem_format=True  crypto_loads=True  forgery=BLOCKED:InvalidKeyError\n      rsa marker-adjacent (tab before END)   is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      rsa CR-only terminators                is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      rsa folded single-line                 is_pem_format=False crypto_loads=True  forgery=FORGED(superadmin)\n      [control B] single-alg [ES256] allow-list vs forged HS256: REJECTED:InvalidAlgorithmError\n    RESULT: ALL-INVARIANTS-HOLD\n\nEach mutated form on both key types forged a token accepted as `superadmin`. Controls: the unmodified PEM is correctly rejected with `InvalidKeyError` (the guard works and the mutation is load-bearing); a single-algorithm allow-list `[\"ES256\"]` rejects the forged `HS256` token with `InvalidAlgorithmError` (the mixed allow-list is a necessary precondition).\n\nSteps to reproduce:\n1. Generate an EC P-256 (or RSA-2048) keypair; serialize the public key to PEM.\n2. Mutate the PEM into a loader-accepted, regex-missed form — e.g. insert a tab before `-----END`, convert terminators to bare `\\r`, or join all lines into one.\n3. Confirm `jwt.utils.is_pem_format(mutated) is False` and `cryptography.hazmat.primitives.serialization.load_pem_public_key(mutated)` succeeds.\n4. `jwt.encode({\"sub\":\"superadmin\"}, mutated, algorithm=\"HS256\")`, then `jwt.decode(token, mutated, algorithms=[\"ES256\",\"HS256\"])` — verification succeeds.\n\n### Impact\nCryptographic signature-verification bypass (CWE-347): algorithm confusion re-enabled by an incomplete asymmetric-key guard. An attacker who knows only the public verification key forges arbitrary-claim tokens that verify as authentic, subject to the two deployment preconditions above. The `PyJWK` verification path binds a single algorithm and is unaffected; `enforce_minimum_key_length` (off by default) does not block a 2048-bit/P-256 PEM. Impact when the preconditions hold is critical (universal forgery); the compound precondition is realistic but was not observed in a specific real-world deployment, so this is rated Critical, with the deployment precondition captured in CVSS.\n\n## Maintainer update — 2026-09-10\n\nWe reproduced the reported asymmetric-key guard bypass on PyJWT 2.13.0: PEM public keys with loader-accepted formatting mutations were missed by `is_pem_format`, then accepted as HMAC secrets when a verification call mixed symmetric and asymmetric algorithms. Canonical PEM controls remained blocked, and a single-algorithm allow-list rejected the forged HS256 token.\n\nThe fix is committed as `8b4e233a22206b34ec1186e912e75c0b2396ac07`. PyJWT now scans supported PEM BEGIN/END markers in one pass, preserving matching labels and handling overlapping markers without regex backtracking. Regression coverage includes RSA loader-accepted mutations, incomplete repeated markers, later valid PEM blocks, and overlapping END/BEGIN markers. The fix does not broaden DER-key classification or change the caller's algorithm allow-list policy.\n\nVerification on the signed commit passes with 400 tests and 4 intentional cryptography-environment skips; Ruff formatting/lint and the Python 3.9 mypy tox target pass. Fresh Astra/max independent review accepted the final snapshot and confirmed O(n) scanning, bounded storage, and no blocking compatibility or security finding. The fix has not been released; the advisory remains Critical with CVSS 3.1 score 9.1 and CWE-347.\n\n## Maintainer update — 2026-09-11\n\nThe verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with 2.14.0 recorded as the patched version.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyjwt",
+        "purl": "pkg:pypi/pyjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.14.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.3",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.3.0",
+        "1.4.0",
+        "1.4.1",
+        "1.4.2",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.5.3",
+        "1.6.0",
+        "1.6.1",
+        "1.6.3",
+        "1.6.4",
+        "1.7.0",
+        "1.7.1",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.1",
+        "2.1.0",
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.2.0",
+        "2.3.0",
+        "2.4.0",
+        "2.5.0",
+        "2.6.0",
+        "2.7.0",
+        "2.8.0",
+        "2.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.13.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-ffc3-869f-jxw9/GHSA-ffc3-869f-jxw9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/security/advisories/GHSA-ffc3-869f-jxw9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102268"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/commit/8b4e233a22206b34ec1186e912e75c0b2396ac07"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpadilla/pyjwt"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/releases/tag/2.14.0"
+    }
+  ]
+}
