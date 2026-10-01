@@ -1,0 +1,88 @@
+{
+  "id": "PYSEC-2026-4141",
+  "modified": "2026-10-01T17:45:16.836914789Z",
+  "published": "2026-10-01T16:38:41.274770Z",
+  "aliases": [
+    "CVE-2026-101918",
+    "GHSA-42vr-xj54-vc7v"
+  ],
+  "summary": "PyJWT: Unauthenticated RecursionError DoS in pre-verification payload parse (PyJWKClient.get_signing_key_from_jwt / verify_signature=False)",
+  "details": "## Summary\n\n`PyJWKClient.get_signing_key_from_jwt(token)` — the first step of the JWKS\nverification flow documented in `docs/usage.rst` — must decode a token's\npayload before its signature can be checked, via\n`jwt.api_jwt.decode_complete(token, options={\"verify_signature\": False})`.\nThat call parses the payload with `json.loads` in `PyJWT._decode_payload`\n(`jwt/api_jwt.py:297-300`), whose `except` clause catches only `ValueError`.\nA payload that is valid JSON but nested ~20,000 levels deep makes\n`json.loads` raise `RecursionError`, which is **not** a `ValueError` and\nescapes as a raw, undocumented exception type — not `DecodeError`,\n`InvalidTokenError`, or `PyJWTError`, so every documented error-handling\npattern in `docs/usage.rst` misses it.\n\nThe token needs no valid signature and no network access — the crash\nhappens during payload parsing, before the `kid` is even looked up. A\nsingle unauthenticated ~50KB request crashes the caller's auth handler\n(HTTP 500 / dead worker), repeatably. The same path is reachable through\nplain `jwt.decode(token, options={\"verify_signature\": False})` too.\n\nNotably, this project already fixed the **identical** bug class for the\nJWS **header** path — `PyJWS._load` catches `(ValueError, RecursionError)`\nand wraps it in `DecodeError` (`jwt/api_jws.py:360-361`), and\n`CHANGELOG.rst` (v2.14.0, \"Security\") states \"Handle deeply nested and\nmalformed JWS/JWK input without uncaught recursion errors.\" The payload\npath — the one part of a forged token an unauthenticated attacker fully\ncontrols — was left catching `ValueError` alone, so that security fix does\nnot fully hold.\n\nA second, related instance: `PyJWKClient.fetch_data` (`jwt/jwks_client.py:168`)\nparses a JWKS endpoint's response with `json.load(response)` inside a\n`try` that only catches `(URLError, TimeoutError, http.client.HTTPException)`\n— a deeply-nested JSON response from a JWKS endpoint raises the same raw\n`RecursionError`, uncaught entirely (worse than the payload path, which at\nleast caught plain `ValueError`).\n\n**Affected versions:** confirmed present in the current release, 2.14.0,\nand on the current `master` branch (commit `4adcd02722f5011c60079d3978dfc167b9a8eaa5`).\n\n## Reproduction\n\n```python\nimport base64, json, jwt\n\ndef b64url(b):\n    return base64.urlsafe_b64encode(b).rstrip(b\"=\")\n\nheader = b64url(json.dumps({\"alg\": \"HS256\", \"typ\": \"JWT\"}).encode())\npayload = b64url(b\"[\" * 20_000 + b\"]\" * 20_000)\ntoken = (header + b\".\" + payload + b\".\" + b64url(b\"forged-sig\")).decode()\n\njwt.decode(token, options={\"verify_signature\": False})\n# raises: RecursionError (not DecodeError/InvalidTokenError/PyJWTError)\n```\n\nControl: the same deeply-nested structure moved into the token's **header**\ninstead of its payload is correctly converted to `jwt.DecodeError` by the\nalready-hardened `jwt/api_jws.py:360` — confirming the payload path is\nspecifically the missed half of the v2.14.0 hardening, not a general gap.\n\n## Impact assessment\n\nUnauthenticated denial-of-service via unhandled exception on an auth path.\nNot an auth bypass — rated medium. With signature verification enabled,\nthis parse runs after `_verify_signature`, so only the pre-verification\npaths (`get_signing_key_from_jwt`, explicit `verify_signature=False`) are\nattacker-reachable pre-auth; the JWKS-endpoint variant requires control of\n(or a MITM on) the configured JWKS endpoint rather than being reachable\nfrom an arbitrary client token.\n\n## Suggested fix\n\nIn `jwt/api_jwt.py:299`, change `except ValueError as e:` to\n`except (ValueError, RecursionError) as e:`, mirroring\n`jwt/api_jws.py:360` exactly. In `jwt/jwks_client.py`, add the same\n`(ValueError, RecursionError)` handling around `json.load(response)` in\n`fetch_data`, raising `PyJWKClientError` (consistent with the method's\nexisting documented error contract). A patch implementing both, verified\nagainst the full test suite (457 passed, 4 skipped — pre-existing,\nenvironment-related) and against the reproduction above (now correctly\nraises `DecodeError`), is attached (`fix.patch`).\n\n## Discovery method\n\nFound and verified using `scopegrep` (https://github.com/not-ekalabya/scopegrep)\n— a semantic code-retrieval tool that surfaces every other call site of a\nsymbol alongside relevance-ranked results, which is what surfaced the\nalready-hardened header path as the direct comparison here — paired with\nan LLM coding agent (GLM-5.3) run as an open-ended security review of this\nrepository. Independently reproduced against the exact commit above before\nthis report was written. Happy to share the full session transcript on\nrequest.\n\n## Disclosure status\n\nNot shared with any other party or published. Submitting through this\nprivate channel per the project's stated security policy; no planned\npublic/conference disclosure ahead of a coordinated timeline.\n\n\n---\n\n## Maintainer triage update (2026-09-22)\n\n### Confirmed finding and scope\n\nWe confirmed that an attacker-controlled recursively nested JWT payload can cause a raw Python `RecursionError` to escape PyJWT at PyJWT 2.14.0 and the tested current source. The confirmed in-scope paths are direct decoding with `verify_signature=False` and `PyJWKClient.get_signing_key_from_jwt`, where payload parsing occurs before key lookup.\n\nThe demonstrated impact is limited to an uncaught exception for the affected call, which may surface as an application HTTP 500 when the application does not catch it. Testing did not demonstrate a worker or process crash, persistent resource exhaustion, resource amplification, authentication bypass, or confidentiality or integrity impact.\n\nThe separate JWKS-response subclaim is out of scope under the policy boundary that requires the application to trust its configured JWKS source and transport. The confirmed payload finding is not a duplicate of the earlier protected-header parser finding: it occurs in a distinct payload parsing path that remained affected after the earlier header-only fix.\n\n### Version and remediation status\n\nHistorical testing reproduced the confirmed payload behavior in all 20 official supported PyJWT 2.x releases from 2.0.0a1 through 2.14.0, inclusive. Unsupported PyJWT 1.7.1 also reproduces the behavior, but it is excluded from the advisory range under the supported-2.x policy. No supported unaffected release and no patched release exists. The exact evidence is `/Users/jpadilla/.codex/security-advisories/pyjwt/GHSA-42vr-xj54-vc7v-historical-range-20260922.md` (SHA-256 `c48f1ac35641e9382d53e6a879a71ad9a8fb4432bbe871f2b8330f8d166a2d81`) and `/Users/jpadilla/.codex/security-advisories/pyjwt/historical-range-42vr-20260922/historical-range-results.json` (SHA-256 `324997f231561bf6da39b8f9d1e272f69bfde8871a7863f5cb7b70e22e91f076`). The evidence-backed supported affected range is `\u003e= 2.0.0a1, \u003c= 2.14.0`.\n\nHistorical range verification is complete. A local fix commit exists and has passed independent review and the complete local CI suite, but it has not been merged into `master` or released. Consequently, `patched_versions` remains empty and this advisory remains in `triage`. The remaining next step is a maintainer decision on remediation and merge. After a fix lands in `master` and is released, `patched_versions` and advisory lifecycle can be updated in a separate approved batch.\n\n---\n\n## Maintainer remediation update (2026-09-23)\n\nThe confirmed payload-parser finding has been fixed on `master`. Commit\n`5fde08a6cf906aa7698de2d6391d88b73006b17b` converts a recursive\npayload parse failure to the expected `DecodeError`; commit\n`9bc06658f875b9b40091539140bbbdc4639161c3` makes the regression tests\ndeterministic across supported Python versions. This update supersedes the\n2026-09-22 remediation-status statement that the fix had not landed.\n\nThe original pre-verification payload reproducer and the\n`PyJWKClient.get_signing_key_from_jwt` path were covered by regression tests.\nThe exact landed tree passed the full 39-environment local tox matrix and\nGitHub CI for commit `9bc06658f875b9b40091539140bbbdc4639161c3` passed\nall 25 jobs, including Ubuntu Python 3.14 and 3.15. The demonstrated impact\nremains an uncaught request-level exception in affected releases; there is\nstill no evidence of process termination, persistent resource exhaustion,\nauthentication bypass, or confidentiality or integrity impact.\n\nThe supported affected range remains `\u003e= 2.0.0a1, \u003c= 2.14.0`. The latest\nreleased version is 2.14.0, which predates these commits; no released\npatched version exists yet, so `patched_versions` remains unset. CVSS v3.1\n5.3 (Medium) and CWE-248 remain unchanged. The advisory may now move from\ntriage to private draft. The next lifecycle step is a new supported 2.x\nrelease containing the fix, followed by separately approved patched-version\nand publication updates after release verification.\n\n---\n\n## Maintainer release update (2026-09-23)\n\nPyJWT 2.15.0 is the first released version containing the payload-parser fix. Its GitHub release tag points to commit `1d41a6478e1562e68ff667fcd703356acf085f68`, which includes fix commit `5fde08a6cf906aa7698de2d6391d88b73006b17b` and deterministic regression-test commit `9bc06658f875b9b40091539140bbbdc4639161c3`. PyPI published both the wheel and source distribution from that release commit through the successful production workflow at https://github.com/jpadilla/pyjwt/actions/runs/35891602963.\n\nThe published PyPI wheel (`pyjwt-2.15.0-py3-none-any.whl`, SHA-256 `7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8`) was checked directly: the deeply nested unsigned payload now raises `DecodeError`, while an ordinary unsigned payload still decodes. The supported affected range remains `\u003e= 2.0.0a1, \u003c= 2.14.0`; the patched version is `2.15.0`. Earlier statements in this advisory that no released patched version exists are superseded by this update.\n\nThe confirmed impact remains an uncaught request-level exception in affected versions, not a demonstrated process crash or authentication bypass. The separate JWKS-response subclaim remains outside this advisory's confirmed PyJWT-owned scope.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyjwt",
+        "purl": "pkg:pypi/pyjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.0.0a1"
+            },
+            {
+              "fixed": "2.15.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.1",
+        "2.1.0",
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.14.0",
+        "2.2.0",
+        "2.3.0",
+        "2.4.0",
+        "2.5.0",
+        "2.6.0",
+        "2.7.0",
+        "2.8.0",
+        "2.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/pyjwt/PYSEC-2026-4141.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/security/advisories/GHSA-42vr-xj54-vc7v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-101918"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/commit/5fde08a6cf906aa7698de2d6391d88b73006b17b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpadilla/pyjwt"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/releases/tag/2.15.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/pyjwt"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-42vr-xj54-vc7v"
+    }
+  ]
+}
