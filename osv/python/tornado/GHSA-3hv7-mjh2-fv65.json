@@ -1,0 +1,145 @@
+{
+  "id": "GHSA-3hv7-mjh2-fv65",
+  "modified": "2026-10-01T00:00:04.690479804Z",
+  "published": "2026-09-30T23:49:25Z",
+  "summary": "Tornado: Unbounded query-string argument count allows event-loop-stalling DoS",
+  "details": "## Summary\n\n`HTTPServerRequest.__init__` in `tornado/httputil.py` parses the URL query string via\n`parse_qs_bytes()` with no field-count limit — while the sibling POST-body parsing path\n(`parse_body_arguments`) received a `max_num_fields=1000` cap added earlier in this exact\nsame release (v6.5.8, commit `8d6363ed`), explicitly to bound parsing cost for the identical\nunderlying primitive. This leaves the query-string path with the resource-exhaustion exposure\nthe body-path fix was meant to close.\n\n**File**: `tornado/httputil.py`, line 553 (`HTTPServerRequest.__init__`)\n\n### Root Cause\n\n```python\n# tornado/httputil.py:553 (before fix)\nself.arguments = parse_qs_bytes(self.query, keep_blank_values=True)\n```\n\nCompare with the POST-body path fixed one commit earlier in the same release:\n\n```python\n# tornado/httputil.py:1038-1041\nuri_arguments = parse_qs_bytes(\n    body,\n    keep_blank_values=True,\n    max_num_fields=config.urlencoded.max_arguments,  # default 1000\n)\n```\n\nBoth call sites funnel through the same `tornado.escape.parse_qs_bytes` (a thin wrapper over\n`urllib.parse.parse_qs`), which is exactly why `max_num_fields` was added to\n`urllib.parse.parse_qsl` upstream — to let frameworks bound field count. The fix was applied\nonly to the body path; the query-string path was missed.\n\nThe request line + headers together are capped at `max_header_size` (default 65536 bytes), so\nthis is not literally unbounded, but a single ~64KB request line can carry thousands of short\n`key=value` pairs — far beyond the 1000-field limit the maintainer judged appropriate for the\nstructurally identical body case.\n\n### Attack Scenario\n\n1. Attacker sends a `GET` request whose query string is packed with thousands of short fields\n   (e.g. `k0=1\u0026k1=1\u0026...\u0026k7799=1`, ~61KB), fitting comfortably under `max_header_size`. No\n   authentication, cookies, or prior state required.\n2. Tornado accepts and parses this with no field-count cap, unlike the equivalent POST-body\n   request (which is correctly rejected with 400 once \u003e1000 fields are present).\n3. Parsing thousands of fields is CPU work performed synchronously inside Tornado's\n   single-threaded `IOLoop`. Several such requests in flight concurrently stall the event\n   loop, delaying processing of *all* other connections on that loop — not just the\n   attacker's own request.\n\n### Verification (dynamic, local reproduction against v6.5.8)\n\nRan the unmodified v6.5.8 source directly (no external dependencies needed) with a minimal\n`tornado.web.Application` on `127.0.0.1:8888`.\n\n- Identical 7800-field/~61KB payload sent as GET query string → `200 OK`; sent as POST body\n  (`application/x-www-form-urlencoded`) → `400 Bad Request` (correctly rejected by the\n  existing `max_num_fields` body-path limit). This confirms the asymmetry directly.\n- Per-request parse cost: baseline (`/?a=1`) averaged 1.86ms; the 7800-field query string\n  averaged 25.1ms (~13x).\n- Event-loop-blocking amplification (raw-socket test, isolating server-side stall from\n  client overhead): with 10 sequential baseline probe requests fired with no load, average\n  latency was 1.47ms (max 5.9ms). With 5 concurrent 61KB/7800-field requests in flight,\n  the same baseline probes averaged 13.0ms (max 118.1ms) — an **8.9x average slowdown** for\n  unrelated clients, produced by ~305KB of unauthenticated attacker traffic.\n\n### Impact\n\nAll Tornado servers/applications are affected — this triggers on every request with a query\nstring, independent of application/handler logic. An unauthenticated, unprivileged remote\nattacker can measurably degrade response times for all other clients sharing the same\n`IOLoop`, using a small amount of bandwidth and no special conditions. This is an\navailability/DoS concern; no confidentiality or integrity impact.\n\n### Recommended Fix\n\n```python\n# tornado/httputil.py — HTTPServerRequest.__init__\nif uri is not None:\n    self.path, sep, self.query = uri.partition(\"?\")\ntry:\n    self.arguments = parse_qs_bytes(\n        self.query,\n        keep_blank_values=True,\n        max_num_fields=_DEFAULT_PARSE_BODY_CONFIG.urlencoded.max_arguments,\n    )\nexcept ValueError as e:\n    raise HTTPInputError(\"Invalid query string: %s\" % e) from e\n```\n\nThis reuses the existing `ParseUrlEncodedConfig.max_arguments` default (1000) via the\nmodule's `_DEFAULT_PARSE_BODY_CONFIG`, matching the POST-body limit and honoring any global\noverride via `set_parse_body_config()`. The `try/except` is necessary because — unlike\n`parse_body_arguments`, which already wraps its call and converts `ValueError` into a clean\n`HTTPInputError`/400 — the query-string call site currently has no such handling, so without\nit, a request exceeding the limit would raise an uncaught `ValueError` instead of a clean 400.\n\nVerified: with the fix applied, requests with ≤1000 query-string fields are unaffected;\nrequests with \u003e1000 fields are rejected with `400 Bad Request` (consistent with the POST-body\nbehavior); Tornado's own `httputil_test` and `web_test` suites (256 tests) pass unchanged.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "tornado",
+        "purl": "pkg:pypi/tornado"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "6.5.9"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.2",
+        "1.0",
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2.1",
+        "2.0",
+        "2.1",
+        "2.1.1",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.4",
+        "2.4.1",
+        "3.0",
+        "3.0.1",
+        "3.0.2",
+        "3.1",
+        "3.1.1",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "4.0",
+        "4.0.1",
+        "4.0.2",
+        "4.1",
+        "4.1b2",
+        "4.2",
+        "4.2.1",
+        "4.2b1",
+        "4.3",
+        "4.3b1",
+        "4.3b2",
+        "4.4",
+        "4.4.1",
+        "4.4.2",
+        "4.4.3",
+        "4.4b1",
+        "4.5",
+        "4.5.1",
+        "4.5.2",
+        "4.5.3",
+        "4.5b1",
+        "4.5b2",
+        "5.0",
+        "5.0.1",
+        "5.0.2",
+        "5.0a1",
+        "5.0b1",
+        "5.1",
+        "5.1.1",
+        "5.1b1",
+        "6.0",
+        "6.0.1",
+        "6.0.2",
+        "6.0.3",
+        "6.0.4",
+        "6.0a1",
+        "6.0b1",
+        "6.1",
+        "6.1b1",
+        "6.1b2",
+        "6.2",
+        "6.2b1",
+        "6.2b2",
+        "6.3",
+        "6.3.1",
+        "6.3.2",
+        "6.3.3",
+        "6.3b1",
+        "6.4",
+        "6.4.1",
+        "6.4.2",
+        "6.4b1",
+        "6.5",
+        "6.5.1",
+        "6.5.2",
+        "6.5.3",
+        "6.5.4",
+        "6.5.5",
+        "6.5.6",
+        "6.5.7",
+        "6.5.8",
+        "6.5b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 6.5.8",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-3hv7-mjh2-fv65/GHSA-3hv7-mjh2-fv65.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tornadoweb/tornado/security/advisories/GHSA-3hv7-mjh2-fv65"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tornadoweb/tornado/pull/3719"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tornadoweb/tornado/commit/03945136ea9746eccf61caf88edae39642e59c93"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tornadoweb/tornado/commit/8a61dd6005f42733015160f3c23a2bcffe200542"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tornadoweb/tornado"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tornadoweb/tornado/releases/tag/v6.5.9"
+    }
+  ]
+}

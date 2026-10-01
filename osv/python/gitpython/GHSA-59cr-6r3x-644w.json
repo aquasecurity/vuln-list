@@ -1,0 +1,174 @@
+{
+  "id": "GHSA-59cr-6r3x-644w",
+  "modified": "2026-10-01T00:00:05.754996881Z",
+  "published": "2026-09-30T23:47:12Z",
+  "aliases": [
+    "CVE-2026-100689"
+  ],
+  "summary": "GitPython submodule update path traversal can write outside the repository",
+  "details": "**Affected:** `GitPython` **3.1.61** (latest release) and `main` — `git/objects/submodule/base.py`. `git diff 3.1.61 origin/main -- git/objects/submodule/` is empty, so both are identical here.\n\n---\n\n## The gap\n\nThe fix for `GHSA-hmq2-w58f-27jc` added `Submodule._validated_name()` and wired it into `update()` and five siblings, closing the `.gitmodules` **name** → `.git/modules/\u003cname\u003e` traversal. The other attacker-controlled `.gitmodules` field, **`path`**, is read raw:\n\n```python\n# git/objects/submodule/base.py:172-177\ndef _set_cache_(self, attr):\n    if attr in (\"path\", \"_url\", \"_branch_path\"):\n        reader = self.config_reader()\n        self.path = reader.get(\"path\")          # raw .gitmodules value\n```\n\nand GitPython's own containment guard is applied in only two of the places that consume it:\n\n```\n400: def _to_relative_path(cls, parent_repo, path)      # the guard (abspath + commonpath containment)\n542:     path = cls._to_relative_path(repo, path)        # add()   — guarded\n1041:    module_checkout_path = self._to_relative_path(self.repo, module_path)   # move() — guarded\n```\n\n`update()` validates only the name and then uses the path-derived absolute location directly:\n\n```\n788:  self._validated_name(self.name)                    # NAME only\n801:  checkout_module_abspath = self.abspath             # derived from self.path — unguarded\n821:  os.makedirs(checkout_module_abspath, exist_ok=True)\n```\n\nSo `path = ../../../tmp/escaped` in an attacker-authored `.gitmodules` selects the directory that gets created and, on the clone path, populated from the submodule URL. The same absolute location is what `force_remove` hands to `shutil.rmtree`.\n\nThe asymmetry is the argument: this is not a missing concept — the project wrote `_to_relative_path()` precisely for this, and `add()`/`move()` use it. `update()` does not.\n\n## Honest limits (please read before rating)\n\n- **The most common flow is not affected.** `Repo.clone_from(...)` → `repo.submodules` → `sm.update(init=True)` re-derives `path` from a canonical tree lookup, and real git refuses to check out a tree containing a `..` component, so an evil `.gitmodules` never lands in the working tree in the first place. A reachable trigger therefore requires the victim's code to name a **non-HEAD commit** (a historical-commit API such as `submodule_update(previous_commit=...)`).\n- **The researcher did not build that end-to-end trigger.** The researcher only verified first-hand the code above: the guard's two call sites, the name-only validation in `update()`, and the unguarded `abspath` → `os.makedirs()` flow at 3.1.61 == `main`.\n\n## Suggested fix\n\nApply the guard the project already has, wherever the path is consumed:\n\n```python\n# in update(), before deriving abspath (and in any other consumer of self.path):\ncheckout_rel = self._to_relative_path(self.repo, self.path)   # raises if it escapes the working tree\n```\n\nBetter still, validate at the boundary: reject a `.gitmodules` entry whose `path` is absolute or contains a `..` component when the section is first read in `_set_cache_()`/`iter_items()`, so no consumer can be added later without the check. A regression test with `path = ../escaped` alongside the existing `name` test would pin both fields.\n\n## Prior art checked\n\n`GHSA-hmq2-w58f-27jc` (this is a residual of its fix, in the sibling field, not a re-report) plus the repository's 30 published advisories — none mentions the `path` field or `_to_relative_path`. Searched issues and PRs for `_to_relative_path`, `gitmodules path` and `submodule traversal`: no report of this.\n\n## Credit\n\n**kta1kri**.\n\n\n---\n\n## Appendix — `EVIDENCE_gitpython_path_unguarded_20260901.txt` (inlined; advisories accept no attachments)\n\n```text\n=== EVIDENCE: GitPython — the .gitmodules 'path' field reaches os.makedirs()/clone unguarded ===\nMon Aug 31 18:45:22 UTC 2026\n\n--- artifact: tag 3.1.61 (latest release); git diff 3.1.61 origin/main -- git/objects/submodule/ is empty ---\n\n--- the containment guard GitPython owns, and its only two call sites ---\n33:    _to_relative_path,\n400:    def _to_relative_path(cls, parent_repo: \"Repo\", path: PathLike) -\u003e PathLike:\n407:            path = _to_relative_path(parent_repo.working_tree_dir, path)\n542:        path = cls._to_relative_path(repo, path)\n1041:        module_checkout_path = self._to_relative_path(self.repo, module_path)\n\n--- the parent fix (_validated_name) call sites: it validates the NAME ---\n309:    def _validated_name(cls, name: str) -\u003e str:\n321:        name = cls._validated_name(name)\n541:        cls._validated_name(name)\n788:            self._validated_name(self.name)\n1040:        self._validated_name(self.name)\n1181:        self._validated_name(self.name)\n1439:        self._validated_name(self.name)\n1440:        self._validated_name(new_name)\n1489:        self._validated_name(self.name)\n\n--- update(): name validated, path not; abspath -\u003e os.makedirs ---\n\n        try:\n            self._validated_name(self.name)\n\n            # ENSURE REPO IS PRESENT AND UP-TO-DATE\n                # END early abort if init is not allowed\n\n                checkout_module_abspath = self.abspath\n                module_abspath = self._module_abspath(self.repo, self.path, self.name)\n\n                # ``git submodule deinit`` leaves the repository in\n                # ``.git/modules`` and empties the checkout. Reconnect that retained\n                # repository instead of trying to clone over it.\n                if not dry_run and osp.isdir(module_abspath):\n                    try:\n                        git.Repo(module_abspath)\n                    except InvalidGitRepositoryError:\n                        pass\n                    else:\n                        if osp.lexists(checkout_module_abspath) and (\n                            osp.islink(checkout_module_abspath)\n                            or not osp.isdir(checkout_module_abspath)\n                            or os.listdir(checkout_module_abspath)\n                        ):\n                            raise OSError(\n                                \"Module directory at %r does already exist and is non-empty\" % checkout_module_abspath\n                            )\n                        os.makedirs(checkout_module_abspath, exist_ok=True)\n                        self._write_git_file_and_module_config(checkout_module_abspath, module_abspath)\n                        mrepo = git.Repo(checkout_module_abspath)\n\n--- where self.path comes from (raw .gitmodules value) ---\n    def _set_cache_(self, attr: str) -\u003e None:\n        if attr in (\"path\", \"_url\", \"_branch_path\"):\n            reader: SectionConstraint = self.config_reader()\n            # Default submodule values.\n            try:\n                self.path = reader.get(\"path\")\n            except cp.NoSectionError as e:\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.62"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.60",
+        "3.1.61",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.61",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-59cr-6r3x-644w/GHSA-59cr-6r3x-644w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-59cr-6r3x-644w"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2225"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/1ed0ebc2f2e74d979cdc367a4864a7731fdcc093"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.62"
+    }
+  ]
+}

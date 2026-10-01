@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-35g8-35p8-c8fw",
+  "modified": "2026-10-01T00:00:04.683452538Z",
+  "published": "2026-09-30T23:40:43Z",
+  "aliases": [
+    "CVE-2026-102821"
+  ],
+  "summary": "Russh: Unbounded memory exhaustion via CHANNEL_OPEN flood during a client-stalled rekey",
+  "details": "## Summary\n\nA russh **server** can be driven to unbounded heap growth (process OOM / kill) by\na peer that speaks only standard SSH messages, in the **default configuration**.\n\nThe peer starts a key re-exchange (sends `SSH_MSG_KEXINIT`) but never sends the\nfollow-up `SSH_MSG_KEX_ECDH_INIT`, leaving the server's kex state machine in\n`SessionKexState::InProgress` **indefinitely**. While a rekey is in progress the\nserver's three message-drain paths are all gated off (`if !self.kex.active()`),\nbut the network-read path stays active, so every `SSH_MSG_CHANNEL_OPEN` the peer\nsends is processed inline and appends one reply to an **unbounded** internal\nqueue (`priority_receiver`, an `UnboundedReceiver`) that is not dequeued until\nthe rekey completes. Because the peer decides whether the rekey ever completes,\nthe queue — and the server's memory — grows without bound.\n\nThis is reproducible end-to-end against a real russh server over a real\nencrypted transport; see \"Proof of concept\". A one-line negative control (same\nflood, no rekey) keeps memory flat, isolating the rekey window as the sole\ntrigger.\n\n## Impact\n\n- **Availability / DoS.** Server RSS climbs at roughly 3.3 KB per\n  `CHANNEL_OPEN`, driven entirely by the peer, until the process is OOM-killed.\n  In the reproduction one connection pushed the server from ~4 MB to **2.57 GB**\n  (and past **4.8 GB** against the stock `echoserver` example) and it was still\n  climbing when the flood was stopped.\n- **Reached with standard messages, no special configuration.** Any handler is\n  affected, including one that rejects every channel (the reply enqueued on\n  rejection is exactly what accumulates). There is no per-connection cap on\n  in-flight channel opens or on the queue, and the queue's sender has no\n  backpressure.\n- The peer keeps the connection alive simply by continuing to send, so the\n  inactivity timer never fires.\n\n## Affected component\n\n- `russh/src/server/session.rs` — `Session::run` `tokio::select!` loop. The\n  network-read arm is ungated; the three drain paths are gated on\n  `!self.kex.active()`.\n- `russh/src/server/mod.rs` — `reply()` routes a non-kex message received during\n  a rekey straight to `server_read_encrypted` (inline processing).\n- `russh/src/lib_inner.rs` — `ChannelOpenHandleInner`'s `accept`/`reject`/`Drop`\n  all `send` a reply on an `UnboundedSender`.\n\nVerified on **v0.63.1** (commit `d3ae702`), which is the latest release. The\ngating logic predates it.\n\n## Details\n\n`Session::run` (`russh/src/server/session.rs:631`) drives a `tokio::select!`\n(`:713`). Three of its message-drain sites are gated on `!self.kex.active()`:\n\n- the pre-`select!` batch drain of `priority_receiver`/`receiver`\n  (`session.rs:680`),\n- the `priority_receiver.recv()` arm (`session.rs:762`),\n- the `receiver.recv()` arm (`session.rs:770`, which also holds the only other\n  `priority_receiver` drain at `:777`).\n\nThe fourth arm, `r = \u0026mut reading` (`session.rs:714`), is **ungated**: it reads\nand processes one incoming packet every loop iteration regardless of rekey\nstate, calling `reply()` (`server/mod.rs:1128`).\n\nDuring a **rekey**, `session.common.encrypted.is_some()`, so the strict-kex\nmessage-ordering guard (`server/mod.rs:1143`, which is additionally gated on\n`encrypted.is_none()`) does **not** apply. A non-kex message therefore falls\nthrough `reply()` to `session.server_read_encrypted(handler, pkt)`\n(`server/mod.rs:1232`) and is handled inline. For `SSH_MSG_CHANNEL_OPEN` this\nreaches the channel-open handling, which hands the application a\n`ChannelOpenHandle`.\n\nWhether the handler accepts or (the trait default) rejects, the handle's\n`accept` / `reject` / `Drop` all `send` a `Msg::ChannelOpenReply` on an\n`UnboundedSender` (`russh/src/lib_inner.rs:560-603`; `Drop` sends\n`AdministrativelyProhibited` at `:594-603`). That sender feeds\n`priority_receiver`, declared `UnboundedReceiver\u003cMsg\u003e` (`session.rs:23`) and\ncreated with `tokio::sync::mpsc::unbounded_channel()` (`session.rs:1522`). Its\nonly drain sites are the three arms gated off during the rekey. So each\n`CHANNEL_OPEN` processed during the rekey window appends one reply (carrying a\n`PendingChannelOpen` = channel params + mpsc `ChannelRef` + ids, a few KB\nretained in practice) to a queue that is never dequeued.\n\nTwo facts make this unbounded and remote:\n\n1. The server enters `InProgress` the moment it receives the peer's `KEXINIT`\n   (`server/mod.rs:1153-1158`, `begin_rekey`) and only leaves it upon receiving\n   the peer's `KEX_ECDH_INIT`. **The peer decides** whether to ever send that,\n   so the window is attacker-held.\n2. There is no per-connection cap on channels or on the priority queue, and the\n   sender is unbounded (no backpressure).\n\n### Root cause\n\nThe intended design was to *buffer* packets received during a rekey and replay\nthem afterwards: the fields `pending_reads: Vec\u003cVec\u003cu8\u003e\u003e` and `pending_len: u32`\n(`session.rs:26-27`) exist and are **drained** at kex completion\n(`server/mod.rs:1194-1198`). But nothing ever **pushes** to `pending_reads` or\nincrements `pending_len` (they are dead — confirmed by grep across\n`russh/src/`). Instead of being buffered, channel messages received during a\nrekey are processed inline, and their replies pile up in the unbounded\n`priority_receiver`. The missing piece is a bound on — or bounded deferral of —\nchannel processing while `kex.active()`.\n\n## Proof of concept\n\nEverything runs inside a container; nothing touches the host.\n\n**Lab.** `poc/Dockerfile` builds `russh-lab:head` from Eugeny/russh @ `d3ae702`\n(v0.63.1), default features (rust 1.91). A raw-SSH-client PoC\n(`poc/poc_rekey_dos.rs`) implements curve25519-sha256 / ssh-ed25519 /\naes256-ctr / hmac-sha2-256 by hand, completes the handshake and a `publickey`\nauth, then:\n\n1. sends `SSH_MSG_KEXINIT` (server enters `kex.active()`),\n2. **never** sends `KEX_ECDH_INIT` (rekey stalls, attacker-held),\n3. floods `SSH_MSG_CHANNEL_OPEN`.\n\nA minimal server (`poc/poc_server.rs`) uses the **trait-default**\n`channel_open_session` (which rejects by dropping the handle), so the measured\ngrowth is purely the undrained priority queue, not accepted-channel state.\n\n`poc/run.sh` runs the attack leg and an identical **negative control** with no\nrekey. Fresh run inside the lab, `N = 800,000` opens\n(`results/rerun-2026-08-29.log`):\n\n```\n=== ATTACK (rekey stall) === (poc_server baseline_RSS=4208KB, N=800000)\n  t=2s  server_RSS=667760KB\n  t=4s  server_RSS=1599600KB\n  t=6s  server_RSS=2556016KB\n  t=8s  server_RSS=2566256KB   (flood done; memory retained)\n=== CONTROL (no rekey) === (poc_server baseline_RSS=4208KB, N=800000)\n  t=2s..t=12s  server_RSS=4208KB   (flat throughout)\n```\n\n- **ATTACK**: RSS `4,208 KB → 2,566,256 KB` (~2.57 GB) and retained after the\n  flood ends — ~3.3 KB per `CHANNEL_OPEN`, attacker-driven. (An earlier canonical\n  run reached 2.7 GB at 800k opens, and past 4.8 GB against the stock\n  `echoserver` example at 1.5 M opens — see `results/canonical-run.log`.)\n- **CONTROL**: RSS flat at `4,208 KB`. Without the rekey window the replies are\n  drained normally; TCP backpressure (the client never reads the failure\n  replies) even throttles the flood.\n\nThe control isolates the rekey window as the sole trigger. Both legs exercise\nthe real server entry point (`Session::run` → `reply` → `server_read_encrypted`)\nover a real encrypted transport.\n\nReproduce: `C=russh-lab N=800000 ./poc/run.sh` (see `poc/POC-README.md`).\n\n## Remediation\n\nThe priority queue carries locally generated channel-open replies, which are\nnon-kex messages the server **must not send** during a rekey anyway (RFC 4253\n§7.1). So the fix is to bound how much channel work is done during a rekey, not\nto drain the queue mid-rekey. Any of:\n\n- **(recommended, minimal)** cap the number of non-kex messages processed while a\n  rekey is in progress and disconnect a peer that exceeds it. A stalled/abusive\n  rekey is then torn down after a small constant instead of growing memory\n  without bound. See `patch/rekey-message-cap.patch` (a ~10-line change local to\n  `Session::run`, validated in the lab — the attack leg is disconnected after the\n  cap and RSS stays flat; a normal rekey, which completes in one round trip, is\n  unaffected).\n- bound / deferred-buffer channel messages during a rekey using the existing\n  (currently dead) `pending_reads`/`pending_len` machinery, with a hard cap.\n- bound the number of in-flight channel opens per connection and reject beyond it.\n\nOpenSSH does not service new channels mid-kex; matching that intent closes the\nwhole family.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.63.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.63.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-35g8-35p8-c8fw/GHSA-35g8-35p8-c8fw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-35g8-35p8-c8fw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102821"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/a282af361ac99bc76b80876d1aae128e89dbf66b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.63.2"
+    }
+  ]
+}

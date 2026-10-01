@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-g4mp-vgx3-xrvm",
+  "modified": "2026-10-01T00:00:04.680017331Z",
+  "published": "2026-09-30T23:41:02Z",
+  "aliases": [
+    "CVE-2026-102820"
+  ],
+  "summary": "pageant: Out-of-bounds read / oversized allocation in `pageant` MemoryMap::read via a malicious Pageant agent (Windows)",
+  "details": "## Summary\n\n`MemoryMap::read` in the `pageant` crate (part of the russh workspace, used by\nrussh's SSH-agent client on Windows via `AgentClient::connect_pageant`) copies a\n**peer-controlled** number of bytes out of an 8192-byte shared-memory view with\n**no bounds check** — unlike the sibling `MemoryMap::write`, which correctly\nrejects oversize access with `Error::Overflow`. The byte count comes straight\nfrom a `u32` length prefix that the responding \"Pageant\" process writes into the\nshared mapping. A malicious local process that answers as the Pageant agent can\ntherefore cause:\n\n- an **out-of-bounds read** past the 8 KiB view (access violation → process\n  crash; or disclosure of adjacent process memory if the following page is\n  committed)\n- an allocation of up to **~4 GiB** from a single `u32` (`vec![0; n]`).\n\nThis was reproduced **end-to-end against the real, unmodified `pageant` crate**\n(not a model) on `x86_64-pc-windows-gnu` under Wine; see \"Proof of concept\".\n\n## Impact\n\n- **Availability / DoS (reliable).** `MemoryMap::read(size)` walks off the end of\n  the 8192-byte view and faults on the next, unmapped page — an\n  `EXCEPTION_ACCESS_VIOLATION` that crashes the russh SSH client. Independently,\n  a `size` near `u32::MAX` drives a ~4 GiB `vec![0; n]` before any copy.\n- **Confidentiality (conditional).** If memory immediately after the mapped view\n  happens to be committed, `read` returns those adjacent bytes to russh as the\n  \"agent response\", which russh then parses as agent identities/signatures. This\n  arm depends on process memory layout, so it is opportunistic; the crash/alloc\n  is the deterministic outcome.\n- **Trust boundary.** russh locates the agent with\n  `FindWindowW(\"Pageant\", \"Pageant\")` and passes the shared-mapping name inside\n  the `WM_COPYDATA` `COPYDATASTRUCT`. **Any** local process can register a window\n  of class + title `\"Pageant\"`, receive that name, open the same mapping, and\n  write a hostile `size`. So an unprivileged local process impersonating Pageant\n  can attack every russh-based SSH client that uses the Pageant agent.\n\n## Affected component\n\n- `pageant/src/wmmessage.rs`\n  - `MemoryMap::read` (`:160-171`) — no bound (contrast `MemoryMap::write`\n    `:139-158`, which returns `Error::Overflow` when `pos + len \u003e length`).\n  - `query_pageant_direct` (`:199-237`) — reads a 4-byte `u32` size from the\n    shared mapping (`:233`) and calls `map.read(size)` (`:234`) with no check\n    against `_AGENT_MAX_MSGLEN` (8192).\n- Reached from russh via `AgentClient::connect_pageant` → `PageantStream` →\n  `query_pageant_direct`.\n\nPlatform: **Windows only** (`cfg(windows)`), local attacker. Verified against\nthe `pageant` crate **v0.2.2** as shipped in russh **v0.63.1** (`d3ae702`, the\nlatest release). `read` has never had a bound in any revision\n(`git log -p -- pageant/src/wmmessage.rs`).\n\n## Details\n\n```rust\nfn write(\u0026mut self, data: \u0026[u8]) -\u003e Result\u003c(), Error\u003e {\n    if self.pos + data.len() \u003e self.length {      // :140  BOUND PRESENT\n        return Err(Error::Overflow);\n    }\n    ... copy_nonoverlapping(\u0026data[0], view+pos, data.len()) ...\n}\n\nfn read(\u0026mut self, n: usize) -\u003e Vec\u003cu8\u003e {         // :160  NO BOUND\n    let out = vec![0; n];                         // n up to 0xFFFF_FFFF (CWE-789)\n    unsafe {\n        std::ptr::copy_nonoverlapping(\n            self.view.Value.add(self.pos) as *const u8,   // view is length==8192\n            out.as_ptr() as *mut u8,\n            n,                                    // reads n bytes, may run past the view (CWE-125)\n        );\n    }\n    self.pos += n;\n    out\n}\n```\n\n`query_pageant_direct` creates the mapping at `_AGENT_MAX_MSGLEN = 8192`, writes\nthe request, sends the `WM_COPYDATA`, then reads the response the peer wrote:\n\n```rust\nmap.seek(0);\nlet mut buf = map.read(4);\nlet size = u32::from_be_bytes([buf[0],buf[1],buf[2],buf[3]]) as usize; // :233 peer-controlled\nbuf.extend(map.read(size));                                            // :234 unbounded\n```\n\nNothing checks `4 + size \u003c= 8192`, so `map.read(size)` runs past the 8 KiB view.\n\n## Proof of concept\n\nBecause the bug is Windows-only (`WM_COPYDATA` + `MapViewOfFile`), the PoC is a\nWindows cross-build (`x86_64-pc-windows-gnu`) driven under **Wine**, entirely\ninside a Linux container. It exercises the **real, unmodified** crate: the PoC\ntakes a path dependency on `pageant` and calls\n`pageant::wmmessage::query_pageant_direct`, exactly what\n`AgentClient::connect_pageant` uses. A second thread impersonates Pageant\n(registers the window class + title `\"Pageant\"`) and, on `WM_COPYDATA`, opens\nthe shared mapping russh created and writes an attacker-chosen 4-byte\nbig-endian length.\n\n`poc/run.sh` builds and runs it. Full log in `results/e2e-wine-run.log`:\n\n```\n======== LEG 1 — ATTACK: fake agent reports length 0x00080000 (512 KiB) \u003e\u003e 8192-byte view ========\n[attacker] impersonating Pageant window is up (class+title \"Pageant\")\n[victim ] calling pageant::wmmessage::query_pageant_direct() over the 8192-byte view ...\n[attacker] WM_COPYDATA received; shared mapping = \"PageantRequestpoc\"\n[attacker] wrote hostile response length = 524288 (0x00080000) into the 8192-byte view\nwine: Unhandled page fault on read access to 0000000002092000 at address 00000002282CFDC4 ...\nWINE-EXIT=5\n\n======== LEG 2 — CONTROL: fake agent reports length 0x00000010 (16 B), in-bounds ========\n[victim ] returned 20 bytes — request+response fit inside the 8192-byte view (in-bounds control); no fault\nWINE-EXIT=0\n```\n\n- **LEG 1 (attack)**: an oversized `size` makes `MemoryMap::read` read past the\n  8192-byte view; Wine reports an unhandled page fault at a page-aligned address\n  (`0x…2092000`) — the out-of-bounds read as an access violation (crash). Exit\n  code 5 = `STATUS_ACCESS_VIOLATION`.\n- **LEG 2 (control)**: an in-bounds `size` returns cleanly. Same code path; the\n  only difference is whether the peer's length exceeds the view — isolating the\n  missing bound.\n\n**Fix validation.** With `patch/pageant-read-bound.patch` applied and the PoC\nrebuilt against the patched crate, the identical attack input is rejected\n(`results/patched-wine-run.log`):\n\n```\n[attacker] wrote hostile response length = 524288 (0x00080000) into the 8192-byte view\n[victim ] query_pageant_direct error: Overflow\nWINE-EXIT=0\n```\n\nNo fault; the read is refused at the bound, exactly as `write` already refuses\noversize writes. (A pure-logic Linux model of the same control flow is also\nincluded as `poc/pageant_read_oob_demo.rs` / `results/logic-demo-run.log`.)\n\n## Remediation\n\nMirror `write`'s guard in `read` and validate the response length before\nallocating/copying. `patch/pageant-read-bound.patch`:\n\n- `MemoryMap::read(n)` returns `Result\u003cVec\u003cu8\u003e, Error\u003e` and returns\n  `Error::Overflow` when `self.pos + n \u003e self.length`;\n- `query_pageant_direct` propagates that `Result` and additionally rejects\n  `size \u003e _AGENT_MAX_MSGLEN - 4` before `map.read(size)`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "pageant",
+        "purl": "pkg:cargo/pageant"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.2.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.2.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-g4mp-vgx3-xrvm/GHSA-g4mp-vgx3-xrvm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-g4mp-vgx3-xrvm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102820"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/5d566989ebabfdebfe6b33243d31765a0812260b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.63.2"
+    }
+  ]
+}

@@ -1,0 +1,185 @@
+{
+  "id": "GHSA-239g-whfq-7xj9",
+  "modified": "2026-09-30T23:45:04.022111787Z",
+  "published": "2026-09-30T23:27:59Z",
+  "aliases": [
+    "CVE-2026-87817",
+    "PYSEC-2026-3982"
+  ],
+  "summary": "GitPython: Repository content can impersonate the git directory, leading to arbitrary code execution",
+  "details": "### Summary\n\n`Repo.__init__` decides which directory is the git directory by testing candidate paths in an order that\nconsiders the real `.git` **last**. Two earlier tests can be satisfied by ordinary tracked files. Git\nreserves only the literal name `.git`, so `HEAD`, `objects/`, `refs/`, `config`, `gitdir`, `commondir`\nand `hooks/` at a repository root are all legal tracked content.\n\nConsequently, after a victim opens or clones an attacker's repository, GitPython resolves `git_dir` to\nthe **working-tree root** while real git correctly resolves `\u003croot\u003e/.git`. Everything GitPython then\ntreats as \"inside the git directory\" is attacker-authored content — including `hooks/`, which it\nexecutes.\n\n### CVE-2026-87817\n\n### Affected code (3.1.59)\n\nThe discovery loop in `git/repo/base.py` tests, in order:\n\n1. `git/repo/base.py:299` — `isfile(curpath/gitdir)` **and** `isfile(curpath/commondir)` **and** `isfile(curpath/HEAD)`\n2. `git/repo/base.py:320` — `is_git_dir(curpath)`\n3. `git/repo/base.py:341` — `dotgit = osp.join(curpath, \".git\")` ← the real git dir, considered last\n\n`is_git_dir` (`git/repo/fun.py:60`) requires only that `objects/` and `refs/` are directories and that\n`HEAD` is a file; **`HEAD`'s contents are never parsed.** The hook path is resolved from\n`index.repo.git_dir` (`git/index/fun.py:73`), i.e. the mis-resolved directory.\n\n### Proof of concept\n\nRequires only `pip install GitPython==3.1.59`. Full script attached as `poc1_rce.py`; it runs entirely\nin a temp directory and the payload only writes a marker file.\n\nAttacker repository — four ordinary tracked files at the root:\n\n| path | mode | content |\n|---|---|---|\n| `gitdir` | 100644 | `.git\\n` |\n| `commondir` | 100644 | `.git\\n` |\n| `HEAD` | 100644 | `ref: refs/heads/master\\n` |\n| `hooks/pre-commit` | **100755** | `#!/bin/sh` + payload |\n\nVictim — two ordinary calls:\n\n```python\nrepo = git.Repo.clone_from(url, dst)     # or git.Repo(dst)\nrepo.index.commit(\"automated commit\")    # code execution happens here\n```\n\nObserved on the PyPI release 3.1.59 (Linux and Windows):\n\n```\nreal git says the git dir is : /tmp/.../victim/.git\nGitPython says it is         : /tmp/.../victim      \u003c- shadowed\nattacker's hook executed     : True\ngit fsck                     : (clean)\n```\n\nThe `pre-commit` hook runs at `git/index/base.py:1201`, before `write_tree()`, so it fires even though\nthe commit later fails.\n\n### Impact\n\nA service that opens or clones an untrusted repository with GitPython — a CI runner building a fork\npull request, a code-scanning/SBOM service, a mirror, a dependency bot, an AI code-review/agent tool —\ncan be made to:\n\n1. **Execute arbitrary commands** via the tracked `\u003croot\u003e/hooks/pre-commit` when the victim calls\n   `index.commit()`.\n2. **Read files outside the repository**: the tracked `\u003croot\u003e/config` becomes the repository config and\n   is parsed with `merge_includes=True` (`git/repo/base.py:765`), so `[include] path = ~/.aws/credentials`\n   discloses the file. (`Repo._config_reader` still defaults `merge_includes=True`, so the hardening\n   added in 3.1.59 for `.gitmodules`/GHSA-7833 does not cover this path.)\n3. **Write a config file to an attacker-chosen directory** via an absolute tracked `commondir`.\n\nDelivery is silent: `git clone` exits 0, `git fsck` (including `--strict`, and with\n`transfer.fsckObjects`/`fetch.fsckObjects=true`) reports nothing, and the clone passes every read-only\nprobe (`head.commit`, `branches`, `is_dirty()`, `untracked_files`, `iter_commits`) because a tracked\n`commondir` of `.git` pins `common_dir` to the real `.git`.\n\n### Threat model / preconditions\n\n- Attacker controls the content of a repository the victim opens or clones with GitPython (public repo,\n  fork PR, mirrored dependency).\n- For code execution, the victim performs a commit via GitPython's native `index.commit()`. For the\n  file-read impact, opening the repo and reading config is enough.\n- `GIT_WORK_TREE` is **not** a mitigation — `git_dir` is assigned and the discovery loop breaks before\n  the environment is consulted.\n- Real git is unaffected; only GitPython mis-resolves the directory.\n\n### Remediation\n\n1. Test `curpath/.git` **before** the `gitdir`/`commondir`/`HEAD` triple and before `is_git_dir(curpath)`.\n2. Resolve `hook_path` / `_commit_hook_path` / `_get_validated_reflog_path` through `repo.common_dir`.\n3. Containment-check `commondir`/`gitdir` contents before joining (reuse\n   `SymbolicReference._get_validated_path`).\n4. Validate `HEAD` in `is_git_dir` (require `ref: refs/...` or a 40-hex sha).\n5. Pass `merge_includes=False` in `Repo._config_reader` (`git/repo/base.py:765`).\n\n### Note for the maintainers\n\nCommit `406b98e1` (2026-05-31, \"respect core.hooksPath for commit hooks\") resolved the hook path via\n`git rev-parse --git-path`, which is immune because git rediscovers the true `.git`. Commit `9bc287a2`\n(2026-07-20) reverted it to avoid an unconditional `rev-parse` dependency — reintroducing the exec step.\nMeasured at each commit with the healthy-looking layout: `406b98e1` → hook did not fire; `9bc287a2` …\n`3.1.59` → hook fired.\n\n### Scope note\n\nOnly the **repository-root** case is reported: where a real `.git` exists, git prefers it, and GitPython\ndoes not. A fake git dir in a subdirectory fools real git too, so that variant is out of scope as a\ngeneral ecosystem hazard rather than a GitPython defect.\n\n###POC Files :\n[poc1_rce.py](https://github.com/user-attachments/files/31388464/poc1_rce.py)\n[poc2_file_read.py](https://github.com/user-attachments/files/31388465/poc2_file_read.py)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.60"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.59",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-239g-whfq-7xj9/GHSA-239g-whfq-7xj9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-239g-whfq-7xj9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-87817"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2218"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/c7cf4d13b1ed0a2e70f2a1f3c6b4fc6c2652cf0b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.1.60"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/gitpython/PYSEC-2026-3982.yaml"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/gitpython-before-3.1.60-remote-code-execution-via-git-directory-impersonation"
+    }
+  ]
+}

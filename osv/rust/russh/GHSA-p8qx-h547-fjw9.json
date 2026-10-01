@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-p8qx-h547-fjw9",
+  "modified": "2026-09-30T23:45:04.010001283Z",
+  "published": "2026-09-30T23:27:30Z",
+  "aliases": [
+    "CVE-2026-102822"
+  ],
+  "summary": "russh: negotiating a MAC-requiring block cipher (CTR/CBC) with mac=none causes a slice-index-out-of-range panic",
+  "details": "### Summary\n`SshBlockCipher` implementations (AES-CBC, AES-CTR, 3DES-CBC, etc.) report `needs_mac() == true`, meaning they are documented/intended to always be paired with a separate integrity MAC. However, key-exchange negotiation only checks `needs_mac()` inside the *fallback* branch of MAC algorithm selection (used when no common MAC algorithm exists). If both peers' preferred MAC lists simply contain `none` and it is successfully negotiated through the normal selection path, nothing rejects pairing `none` with a cipher that requires a MAC. Once negotiated, a single crafted packet from either peer causes `cipher::read()` to shrink an already-allocated buffer below the number of bytes it is about to index, causing a Rust slice-index-out-of-range panic and killing that connection's task.\n\n### Details\nIn `russh/src/cipher/mod.rs`, `read()` for a block cipher:\n1. Reads `packet_length_to_read_for_block_length()` bytes up front (16 bytes for any `SshBlockCipher`) into `buffer.buffer`.\n2. Decrypts the first block to recover the plaintext packet-length field `len`.\n3. Computes `buffer.len = len + cipher.tag_len()`.\n4. Calls `buffer.buffer.resize(buffer.len + 4, 0)`.\n5. Immediately indexes `buffer.buffer[16..]` (via the constant used for the first block read) to continue decrypting/reading the rest of the packet.\n\nWhen the negotiated MAC is `none`, `tag_len() == 0`. If the attacker (or a MITM holding the session key, or simply the accepting peer testing a hostile client) sends a packet whose *decrypted* length field is `0`, then `buffer.len = 0` and `resize(0 + 4, 0)` **shrinks** the buffer that was already grown to 16 bytes in step 1 down to 4 bytes. The subsequent slice operation `buffer.buffer[16..]` then panics with `range start index 16 out of range for slice of length 4`.\n\nThe file already defines a `MINIMUM_PACKET_LEN` constant, but it is only consulted on the *write*/padding side, never on the read path — so nothing prevents an incoming packet from declaring a length shorter than the bytes already buffered.\n\nNegotiation gap: `negotiation.rs`'s `Select` MAC-selection logic only special-cases `needs_mac()` when negotiation would otherwise *fail* (no common MAC), substituting `none` only if the cipher does not need one. It never re-validates the case where `none` is a common/successfully-negotiated MAC on both sides regardless of what the chosen cipher requires. So an application (or a malicious peer, since negotiation is attacker-influenced on one side) that includes `none` in its own preferred MAC list — while still allowing the default CTR/CBC cipher suite — ends up with an invalid, panic-inducing combination that the library itself should refuse.\n\n### PoC\n1. Configure one side's `Preferred` config to include `mac::NONE` in the MAC list (this is a supported, non-default configuration exposed by the crate's public `Preferred` API — used e.g. for legacy/interop compatibility), while leaving the default cipher list (which includes `aes256-ctr`/`aes256-cbc`) untouched.\n2. Complete a normal key exchange; negotiation lands on `{cipher: aes*-ctr (or -cbc), mac: none}` because `none` is present and preferred/common on both sides, and nothing during negotiation rejects this pairing.\n3. From the peer, send one transport packet whose decrypted packet-length field is `0` (trivial to construct once the session keys are known to that peer, or for the peer that legitimately owns the connection to simply hand-craft, e.g. a modified client for testing).\n4. `cipher::read()` on the receiving side panics: `range start index 16 out of range for slice of length 4`.\n5. Because each connection is handled in its own `tokio::spawn`'ed task (see the per-connection `select!` loop that calls into `cipher::read()`), the panic unwinds only that task by default, but it unconditionally terminates that SSH connection/session — a working, currently-unauthenticated, already-established connection is killed with no attacker interaction beyond the one crafted packet, and the check runs on every inbound packet including pre-auth ones.\n\n\n### Impact\nDenial of service: a remote peer that can influence MAC preference negotiation (or a MITM in possession of the session key) can crash any individual SSH connection/session that ends up negotiating a block cipher together with `mac=none`, with a single crafted packet, pre-authentication. This does not affect the process as a whole (panic is scoped to that connection's task under `panic=unwind`), and does require a non-default configuration that permits `none` as a preferred MAC — hence Low severity.\n\n### Suggested fix\nIn the MAC-selection logic in `negotiation.rs`, reject (or force substitution of) `mac::NONE` whenever the negotiated cipher's `needs_mac()` is `true`, regardless of *how* `none` came to be selected — not only in the \"no common MAC\" fallback branch. Defensively, `cipher::read()` could also refuse to shrink a buffer below the number of bytes already consumed for the length-field block, returning a protocol error instead of resizing blindly.\n\nFor credit/changelog purposes, please use: Yazan Balawneh, Cystack.ps",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.63.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.63.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/09/GHSA-p8qx-h547-fjw9/GHSA-p8qx-h547-fjw9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-p8qx-h547-fjw9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102822"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/2885385abfee279092a41d80c6cb6ac367353159"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.63.1"
+    }
+  ]
+}
