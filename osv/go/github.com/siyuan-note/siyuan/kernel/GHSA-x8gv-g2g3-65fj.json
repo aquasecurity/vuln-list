@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-x8gv-g2g3-65fj",
+  "modified": "2026-10-02T23:30:05.659377632Z",
+  "published": "2026-10-02T23:17:16Z",
+  "aliases": [
+    "CVE-2026-82234"
+  ],
+  "summary": "SiYuan Agent Tools SSRF via DNS-Rebinding TOCTOU (Bypass of CheckHostSSRF)",
+  "details": "# Security Advisory — SiYuan Agent Tools SSRF via DNS-Rebinding TOCTOU (Bypass of `CheckHostSSRF`)\n\n| Field | Value |\n|---|---|\n| **Disclosed by** | joysinleung (`joysinleung@gmail.com`) |\n| **Report date** | 2026-08-13 |\n| **Product** | SiYuan (思源笔记) — `siyuan-note/siyuan` |\n| **Go module** | `github.com/siyuan-note/siyuan/kernel` |\n| **Affected versions** | `\u003c= 3.8.0` (latest release at report time; dynamically verified on v3.8.0) |\n| **Patched versions** | 3.8.1 |\n| **Component** | `kernel/util/httprequest.go` (`CheckHostSSRF`), `kernel/mcp/tools/http_request.go`, `kernel/util/webfetch.go`, `kernel/util/net.go` (`SSRFSafeDialer`) |\n| **Relationship to prior advisory** | **Incomplete-fix variant of GHSA-rg26-cg95-gq6p** (SSRF main-vector remediation). See §Relationship. |\n| **EPSS (exploitation probability)** | Low–Moderate. Requires the attacker to influence an AI Agent / MCP client into fetching an attacker-controlled domain (prompt-injection scenario documented by the tool itself). |\n| **KEV (CISA Known Exploited)** | No (not listed in CISA KEV at report time). |\n| **Default-config reachable** | **Yes** — exploitable under *both* `SafeMode` on and off; only requires the agent `http_request` / `web_fetch` tool to be reachable (default AI tooling). |\n\n---\n\n## Summary\n\nSiYuan's AI Agent tools `http_request` (`util.HTTPRequest`) and `web_fetch` (`util.WebFetch`) are the only SSRF gate for outbound requests from the kernel. That gate is `CheckHostSSRF`, which performs a **single DNS resolution at guard time** and checks whether any returned IP is private/loopback/link-local. The actual connection, however, performs a **second, independent DNS resolution** through the default `net.Dialer` — and **no connect-time private-IP check is mounted** on this path.\n\nBecause the two resolutions are not pinned to the same result, an attacker-controlled domain can answer the guard-resolution with a **public IP** (passing `CheckHostSSRF`) and the connect-resolution with a **private/loopback/metadata IP** (e.g. `169.254.169.254`). This is a classic **DNS-rebinding TOCTOU** that bypasses the SSRF defense entirely. It reaches cloud instance metadata and internal services that the guard was specifically added to block.\n\n## Relationship to Prior Advisories\n\n- **GHSA-rg26-cg95-gq6p** remediated the SSRF *main vector* by adding `CheckHostSSRF` (parse-time) **and** `SSRFSafeDialer` (connect-time). However, **the agent tool paths (`http_request` / `web_fetch`) only received the parse-time half**: they call `CheckHostSSRF` but then connect via `httpclient.NewBrowserRequest()`, whose transport does **not** mount `SSRFSafeDialer`. Even where `SSRFSafeDialer` *is* mounted, it only blocks private IPs when `SafeMode == true` (default false), so it would not help here regardless. The sibling path `openai.go:generatedImageDialer` *does* mount a connect-time `Control` hook (blocking private/loopback/link-local/100.64/198.18), proving the project knows the technique — the agent path is a clear omission. We report this as an **incomplete-fix variant** with a concrete v3.8.0 reproduction.\n- **CVE-2026-32110** (GHSA-56cv-c5p2-j2wg) covered the older `forwardProxy` endpoint and is unrelated to the agent tool path.\n\n## Affected Version\n\n**Dynamically verified on v3.8.0** (tag `v3.8.0`, commit `251596fc0`). A process-level DNS hijack was installed so that the attacker domain `rebind.local` returns a public IP (`203.0.113.1`) on odd (guard) resolutions and `127.0.0.1` on even (connect) resolutions; a loopback \"victim\" service returned `F9_REBIND_PROOF=reached-internal-only-service-via-TOCTOU`. Both `util.HTTPRequest(\"GET\", \"http://rebind.local:\u003cport\u003e/secret\")` and `util.WebFetch(...)` returned the internal-only proof body, while `CheckHostSSRF(\"127.0.0.1\")` directly blocked and the legit public domain `pub.local` passed — confirming the guard passed but the connection hit the internal address. All versions `\u003c= 3.8.0` are affected.\n\n## Component\n\n- `kernel/util/httprequest.go:42` `CheckHostSSRF` — single `net.LookupIP` + `isPrivateIP` at guard time only.\n- `kernel/mcp/tools/http_request.go:90` → `util.HTTPRequest`; `kernel/util/webfetch.go:50` → `CheckHostSSRF` + `httpclient.NewBrowserRequest()`.\n- `github.com/siyuan-note/httpclient` `client.go:92` `NewBrowserRequest` uses the default `http.Transport` → default `net.Dialer` with **no `SSRFSafeDialer`**.\n- `kernel/util/net.go:151` `SSRFSafeDialer` exists but is (a) not mounted on the agent path and (b) only active under `SafeMode`.\n- Correctly-defended sibling: `kernel/util/openai.go:829` `generatedImageDialer` mounts a connect-time `Control` hook.\n\n\n## Attack Vector\n\n**Network + AI Agent.** The `url` of `http_request` / `web_fetch` is fully controlled by the agent / MCP client. In SiYuan's documented red-team scenario (\"prompt-inject the agent → induce it to visit an attacker domain\"), the attacker needs only a rebinding domain (own authoritative DNS, first answer public, later `169.254.169.254` / internal). No auth, no special position beyond prompting the agent. Real targets: cloud metadata `169.254.169.254` (IMDSv1 IAM creds) and same-host/internal unauthenticated services.\n\n## Proof of Concept\n\n```\n# Attacker authoritative DNS for rebind.local:\n#   odd  query (guard)  -\u003e 203.0.113.1   (public, passes CheckHostSSRF)\n#   even query (dial)   -\u003e 127.0.0.1     (loopback internal victim)\n#\n# Directly invoke the real agent-tool functions (v3.8.0 code path):\nutil.HTTPRequest(\"GET\", \"http://rebind.local:15353/secret\", ...)\nutil.WebFetch(\"http://rebind.local:15353/secret\", ...)\n\n# Result (evidence):\n#   body = \"F9_REBIND_PROOF=reached-internal-only-service-via-TOCTOU\"\n# Negative control: CheckHostSSRF(\"127.0.0.1\") -\u003e blocked.\n# Positive control: CheckHostSSRF(\"pub.local\") -\u003e 203.0.113.1, allowed.\n```\n\nThe loopback victim is a faithful stand-in for `169.254.169.254` / any internal address: the guard allowed a public IP while the connection reached a private one.\n\n## Impact\n\nConfidentiality breach via SSRF: an attacker who can steer the agent can read cloud instance metadata (IAM temporary credentials), internal service responses, and anything reachable from the SiYuan kernel's network position. Scope is changed (`S:C`) because the kernel often runs with cloud-instance privileges. Exploitable under default config (SafeMode on or off).\n\n## Scope\n\nReachable whenever the agent `http_request` / `web_fetch` tool is usable (default AI tooling). Independent of Publish/auth configuration. Not gated by `SafeMode`.\n\n## Remediation\n\n1. **Connect-time enforcement (preferred)**: mount `SSRFSafeDialer` (or a dedicated always-on private-IP `Control` hook) on the transport used by `http_request` / `web_fetch`, independent of `SafeMode` — matching the already-correct `generatedImageDialer`.\n2. **Pin resolution**: after `CheckHostSSRF` passes, reuse the *same* resolved IP for the connection (or short-TTL cache) so guard and dial cannot diverge.\n3. **Minimum change**: replace `httpclient.NewBrowserRequest()` in `http_request.go` / `webfetch.go` with a custom client whose `DialContext` is `util.SSRFSafeDialer(timeout).DialContext` (not `SafeMode`-gated).\n\n\u003e Note: patch authored against v3.8.0 source; regression-tested in the researcher's environment for the PoC path but not compiled into a full SiYuan release build. Provided for the maintainer to validate in CI.\n\n---\n\n## Appendix: Suggested Patch (F9)\n\n```diff\ndiff --git a/kernel/util/httprequest.go b/kernel/util/httprequest.go\nindex aaa..bbb 100644\n--- a/kernel/util/httprequest.go\n+++ b/kernel/util/httprequest.go\n@@ -40,6 +40,18 @@ func CheckHostSSRF(host string) error {\n \treturn nil\n }\n \n+// SSRFSafeClient returns an *http.Client whose transport enforces the\n+// private/loopback/link-local IP block at CONNECT time (independent of SafeMode),\n+// closing the DNS-rebinding TOCTOU left by parse-time-only CheckHostSSRF.\n+func SSRFSafeClient(timeout time.Duration) *http.Client {\n+\treturn \u0026http.Client{\n+\t\tTimeout: timeout,\n+\t\tTransport: \u0026http.Transport{\n+\t\t\tDialContext: util.SSRFSafeDialer(timeout).DialContext,\n+\t\t},\n+\t}\n+}\n+\n diff --git a/kernel/mcp/tools/http_request.go b/kernel/mcp/tools/http_request.go\n index ccc..ddd 100644\n--- a/kernel/mcp/tools/http_request.go\n+++ b/kernel/mcp/tools/http_request.go\n@@ -90,7 +90,7 @@ func httpRequest(args map[string]any) (CallToolResult, error) {\n \tif serr := util.CheckHostSSRF(u.Hostname()); serr != nil {\n \t\treturn CallToolResult{}, serr\n \t}\n-\tresp, err := httpclient.NewBrowserRequest().Get(rawURL)\n+\tresp, err := util.SSRFSafeClient(30 * time.Second).Get(rawURL)\n \t...\n }\n diff --git a/kernel/util/webfetch.go b/kernel/util/webfetch.go\n index eee..fff 100644\n--- a/kernel/util/webfetch.go\n+++ b/kernel/util/webfetch.go\n@@ -50,7 +50,7 @@ func WebFetch(rawURL string, ...) (string, error) {\n \tif serr := util.CheckHostSSRF(u.Hostname()); serr != nil {\n \t\treturn \"\", serr\n \t}\n-\tresp, err := httpclient.NewBrowserRequest().Get(rawURL)\n+\tresp, err := util.SSRFSafeClient(30 * time.Second).Get(rawURL)\n \t...\n }\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260813142806-dd2778b70d02"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-x8gv-g2g3-65fj/GHSA-x8gv-g2g3-65fj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-x8gv-g2g3-65fj"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/dd2778b70d020b15491ef7418f5f63214583cd63"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.8.1"
+    }
+  ]
+}

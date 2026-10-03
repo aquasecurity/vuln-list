@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-4vpg-gwqq-w44c",
+  "modified": "2026-10-02T23:15:06.672610959Z",
+  "published": "2026-10-02T23:05:33Z",
+  "aliases": [
+    "CVE-2026-74904"
+  ],
+  "summary": "SiYuan: 17 block metadata/content endpoints in kernel/api/block.go have zero publish-access filtering, reachable by anonymous publish-mode readers",
+  "details": "Same CWE-862 family, found via an automated bulk sweep of every\n`/api/block/*` handler in `kernel/api/block.go` for the presence of any\naccess-check reference (`IsReadOnlyRoleContext`, `checkBlockPublishAccess`,\n`GetPublishAccess`) anywhere in the function body. 17 of 28 candidate\nendpoints have none. Cross-checked against the file's own sibling\nfunctions (`getBlockInfo`, `getBlockDOM`, `getRefIDs`, etc.), which\ncorrectly implement the check, confirming this is a real, uneven gap\nrather than a deliberate design choice for the whole file.\n\n\n### Summary\n17 handlers in `kernel/api/block.go`, all gated only by `model.CheckAuth`\nwith no admin-role requirement, return block content-derived text,\nstructural metadata, or existence information for any block ID supplied,\nwith no access check anywhere in the handler or, for the ones checked in\ndetail, the model functions they call. This is CWE-862 (Missing\nAuthorization), the same class as the companion advisories from this\nreview round, found in a different file via a systematic bulk check\nrather than manual inspection of each function individually.\n\n### Details\nConfirmed via automated extraction of every function body between\n`func NAME(c *gin.Context) {` and the next such declaration, then\nsearching each for any of `IsReadOnlyRoleContext`,\n`checkBlockPublishAccess`, `GetPublishAccess`, or `PublishAccess`. The\nfollowing contain none of these, at all:\n\n| Endpoint | What it discloses |\n|---|---|\n| `getRefText` | The block's actual reference-display text, derived from its content, for any ID (`kernel/api/block.go:564`) |\n| `getBlockBreadcrumb` | The block's breadcrumb/title path (`:?`) |\n| `getBlockDefIDsByRefText` | Which block IDs a given reference text resolves to |\n| `getRefIDsByFileAnnotationID` | Block IDs referencing a given PDF/file annotation |\n| `getBlockIndex` / `getBlocksIndexes` | A block's position/index within its document |\n| `getTreeStat` | Structural statistics for a document tree |\n| `getBlocksWordCount` / `getContentWordCount` | Word/character counts for arbitrary content |\n| `checkBlockExist` / `checkBlocksExist` | Existence oracle for any block ID |\n| `getUnfoldedParentID` | The nearest unfolded ancestor of a block |\n| `checkBlockFold` | Whether a block is currently folded |\n| `getBlockSiblingID` | A block's sibling in document order |\n| `getBlockRelevantIDs` | IDs of blocks related to a given block |\n| `getBlockTreeInfos` | Block tree metadata for a set of IDs |\n| `checkBlockRef` | Whether a block is referenced elsewhere |\n\nThe clearest, most severe example, `getRefText`\n(`POST /api/block/getRefText`, `kernel/api/router.go:238`):\n```go\nfunc getRefText(c *gin.Context) {\n    ...\n    id := arg[\"id\"].(string)\n    if util.InvalidIDPattern(id, ret) {\n        return\n    }\n    var refText string\n    if notebook, ok := arg[\"notebook\"].(string); ok \u0026\u0026 notebook != \"\" \u0026\u0026 model.IsEncryptedBox(notebook) {\n        refText = model.GetBlockRefTextInBox(id, notebook)\n    } else {\n        refText = model.GetBlockRefText(id)\n    }\n    ...\n    ret.Data = refText\n}\n```\n`model.GetBlockRefText(id)` resolves the actual display text used\nwherever this block is referenced, ordinarily derived from the block's\nreal content, for any `id` in the workspace, with no scoping.\n\nFor contrast, sibling functions in the same file correctly implement\nthe check, e.g. `getRefIDs` (`kernel/api/router.go:235`) and\n`getBlockInfo`/`getBlockDOM`/`getBlockKramdown` all contain\n`if model.IsReadOnlyRoleContext(c) { ... }` guards. This confirms the\n17 above are an inconsistency within the file, not an intentional\ndecision that the whole file is exempt from this control.\n\n### Step-by-step reproduction\n```bash\n# id: a block inside a document that was never published, or is\n# Disable=true in publish access\ncurl -s -X POST http://\u003ctarget\u003e:6806/api/block/getRefText \\\n  -H \"Content-Type: application/json\" -d '{\"id\":\"\u003cprivate-block-id\u003e\"}'\n# Returns the block's actual reference text with no session, no\n# AccessAuthCode, no publish password.\n\ncurl -s -X POST http://\u003ctarget\u003e:6806/api/block/checkBlockExist \\\n  -H \"Content-Type: application/json\" -d '{\"id\":\"\u003cguessed-block-id\u003e\"}'\n# Confirms or denies existence of any guessed ID workspace-wide.\n```\nRepeat against any of the other 15 endpoints in the table above,\nsubstituting their expected arguments, each returns data with no\naccess check.\n\n### Impact\nAny published SiYuan workspace discloses block-level content-derived\ntext, structural metadata, and existence information for the *entire*\nworkspace, not just published notebooks, to any anonymous internet\nvisitor. `getRefText` in particular discloses real content text, not\njust metadata, for any block ID. The existence-oracle endpoints\n(`checkBlockExist`/`checkBlockRef`) combine with the companion\nadvisory's `getIDsByHPath` title-guessing primitive to let an attacker\nefficiently probe for and confirm private content without ever needing\nlegitimate access.\n```\n\n## Affected products\n\n| Field | Value |\n|---|---|\n| Ecosystem | **Go** |\n| Package name | `github.com/siyuan-note/siyuan/kernel` |\n| Affected versions | Present at current HEAD (commit `eef1056`/`1673b75`, reviewed 2026-08-03) |\n| Patched versions | *(none yet, leave blank until a fix is released)* |\n\n## Severity\n\n| Field | Value |\n|---|---|\n| Vector string | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` |\n| Score | **7.5 (High)**. Network vector, low complexity, no privileges or user interaction required, high confidentiality impact via `getRefText`'s real content-text disclosure plus the combined structural/existence oracle from the other 16, no integrity/availability impact since all 17 are read-only. |\n\n## Weaknesses (CWE)\n\n- **CWE-862**: Missing Authorization (primary)\n- **CWE-204**: Observable Response Discrepancy (contributing, via the existence-oracle endpoints)\n\n## Notes for filing\n- Same CWE-862 family as the two companion advisories from this review\n  round (asset/attribute-view listing, and path/title resolution).\n  Recommend the maintainers treat all three as one remediation pass:\n  grep every `/api/*` handler for the literal presence of\n  `IsReadOnlyRoleContext` and manually audit every one that lacks it,\n  rather than fixing endpoint-by-endpoint, since the pattern has now\n  recurred across three separate files.\n- Suggested fix: add `if model.IsReadOnlyRoleContext(c) { ... }` guards\n  matching the pattern already correctly used by this file's own\n  `getBlockInfo`/`getBlockDOM`/`getRefIDs` functions.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260804015139-bd067a4fe9b2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4vpg-gwqq-w44c/GHSA-4vpg-gwqq-w44c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-4vpg-gwqq-w44c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-74904"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/bd067a4fe9b208c0858d8d9dc6220dc8affc403e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/siyuan-before-missing-authorization-via-block-api"
+    }
+  ]
+}
