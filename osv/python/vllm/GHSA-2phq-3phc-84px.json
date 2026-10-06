@@ -1,0 +1,156 @@
+{
+  "id": "GHSA-2phq-3phc-84px",
+  "modified": "2026-10-06T00:00:10.442942839Z",
+  "published": "2026-10-05T23:42:39Z",
+  "aliases": [
+    "CVE-2026-105755"
+  ],
+  "summary": "vLLM: Flash late-interaction scoring caches query embeddings under a caller-controlled request id — cross-request integrity break and induced errors on `/score` and `/rerank`",
+  "details": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the flash late-interaction query cache reaches.\n\n## Summary\n\nOn late-interaction `/score` and `/rerank` deployments with flash late interaction enabled (the default for supported models), the worker caches per-request query embeddings under a key derived from the **caller-controlled** `X-Request-Id` header. A second concurrent request that reuses the victim's header value replaces the victim's cached query embedding before document scoring — so the victim's documents are scored against the **attacker's** query. Because the data-parallel router pins all requests sharing a cache key to the same engine, the collision is deterministic for an attacker who reuses the victim's `X-Request-Id`. Depending on timing, one request can also consume the shared use counter and force the other request into a late-interaction cache-miss error.\n\nThis is a remotely reachable, request-controlled cross-request integrity break on the standard scoring and reranking endpoints. It requires only that flash late interaction be enabled, which is the default for supported models.\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1):\n\n- [`vllm/entrypoints/serve/engine/serving.py#L117-L124`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/serve/engine/serving.py#L117-L124) — `_base_request_id()` copies the public `X-Request-Id` header directly.\n- [`vllm/entrypoints/pooling/base/serving.py#L109`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/pooling/base/serving.py#L109) — the frontend request id is `f\"{self.request_id_prefix}-{self._base_request_id(raw_request)}\"`.\n- [`vllm/entrypoints/pooling/scoring/serving.py#L211`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/pooling/scoring/serving.py#L211) — `flash_late_interaction()` (at [L191](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/pooling/scoring/serving.py#L191)) derives worker cache keys directly from that id: `query_keys = [f\"{ctx.request_id}-query-{i}\" for i in range(n_queries)]`.\n- [`vllm/v1/pool/late_interaction.py#L30-L36`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/pool/late_interaction.py#L30-L36) — the data-parallel routing helper pins all requests sharing a `query_key` to the same engine via `crc32(query_key)`, making collisions deterministic.\n- [`vllm/v1/worker/gpu/pool/late_interaction_runner.py#L95`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/worker/gpu/pool/late_interaction_runner.py#L95) — the worker stores query embeddings in a process-local cache keyed only by that string: `self._query_cache[query_key] = output.clone()`.\n\nThe caller-controlled header enters as the request id, and the flash late-interaction path derives the worker cache key directly from it:\n\n```python\n# vllm/entrypoints/serve/engine/serving.py Lines 116-126\n    @staticmethod\n    def _base_request_id(\n        raw_request: Request | None, default: str | None = None\n    ) -\u003e str | None:\n        \"\"\"Pulls the request id to use from a header, if provided\"\"\"\n        if raw_request is not None and (\n            (req_id := raw_request.headers.get(\"X-Request-Id\")) is not None\n        ):\n            return req_id\n\n        return random_uuid() if default is None else default\n```\n\n```python\n# vllm/entrypoints/pooling/scoring/serving.py Lines 207-212\n        n_queries = ctx.n_queries\n        n_docs = len(ctx.engine_inputs) - n_queries\n        query_engine_inputs = ctx.engine_inputs[:n_queries]\n\n        query_keys = [f\"{ctx.request_id}-query-{i}\" for i in range(n_queries)]\n        query_uses = [n_docs if n_queries == 1 else 1] * n_queries\n```\n\nThe worker then stores and reads the query embedding under that string with no check that the reader owns the entry — a colliding key returns another request's cached query, or (once the use counter is exhausted) raises a cache-miss error:\n\n```python\n# vllm/v1/worker/gpu/pool/late_interaction_runner.py Lines 91-107\n            if mode == LATE_INTERACTION_MODE_CACHE_QUERY:\n                assert query_uses is not None\n                # `output` can be a view into the current step's hidden-states\n                # buffer, so clone it before storing across scheduling steps.\n                self._query_cache[query_key] = output.clone()\n                self._query_uses[query_key] = query_uses\n                outputs[i] = torch.zeros((), device=output.device, dtype=torch.float32)\n                continue\n\n            if mode == LATE_INTERACTION_MODE_SCORE_DOC:\n                query_output = self._query_cache.get(query_key)\n                if query_output is None:\n                    raise ValueError(\n                        \"late-interaction query cache miss for key \"\n                        f\"{query_key!r}. Ensure query requests are executed \"\n                        \"before their paired document requests.\"\n                    )\n```\n\nThe bug is specific to the flash late-interaction path. Non-flash late-interaction scoring computes MaxSim directly from one request's in-memory outputs and does not create a cross-request worker cache key.\n\n## Impact\n\nA network client of the standard scoring API can, on a flash late-interaction `/score` or `/rerank` deployment:\n\n1. **Corrupt another user's results** — by reusing the victim's `X-Request-Id`, the attacker's query embedding overwrites the victim's cached entry, so the victim's documents are scored against the attacker's query (a cross-request integrity break).\n2. **Induce errors** — depending on timing, one request consumes the shared use counter and forces the other request into a late-interaction cache-miss error.\n\nBoth consequences follow deterministically from reusing the victim's header value, because same-key work is pinned to one engine. This is reachable through normal request handling and does not depend on any trusted inter-node network.\n\n\n## Suggested Fix\n\nDerive the flash late-interaction query-cache key from a server-generated, unforgeable per-request identifier (a `random_uuid()` namespace) rather than the caller-supplied `X-Request-Id`, and thread that key through the `PoolingServeContext` to the doc-scoring pass so both passes reuse the same key and a caller cannot address another request's cache entry.\n\nIn `vllm/entrypoints/pooling/scoring/serving.py`, the encode-queries pass mints a fresh namespace and stashes the keys on the context:\n\n```python\n-        query_keys = [f\"{ctx.request_id}-query-{i}\" for i in range(n_queries)]\n+        query_namespace = random_uuid()\n+        query_keys = [\n+            f\"late-interaction-{query_namespace}-query-{i}\" for i in range(n_queries)\n+        ]\n+        ctx.late_interaction_query_keys = query_keys\n```\n\nand the encode-docs pass reads those stored keys instead of re-deriving them from `ctx.request_id`:\n\n```python\n-        query_keys = [f\"{ctx.request_id}-query-{i}\" for i in range(n_queries)]\n+        query_keys = ctx.late_interaction_query_keys\n+        if query_keys is None:\n+            raise RuntimeError(\"Late-interaction query keys were not initialized.\")\n```\n\nThis requires adding the `late_interaction_query_keys: list[str] | None = None` field to `PoolingServeContext` (`vllm/entrypoints/pooling/typing.py`). Because the namespace is a server-generated UUID, colliding `X-Request-Id` values no longer produce a shared cache key; a regression test asserting exactly that (colliding request ids yield distinct query-cache keys) accompanies the change.\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThis vulnerability was discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n---\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51445",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.30.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2phq-3phc-84px/GHSA-2phq-3phc-84px.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-2phq-3phc-84px"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/51445"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/ee17d0d869203ef9a35ad73358a4987bba14b1fc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.30.0"
+    }
+  ]
+}

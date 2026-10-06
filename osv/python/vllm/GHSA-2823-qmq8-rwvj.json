@@ -1,0 +1,156 @@
+{
+  "id": "GHSA-2823-qmq8-rwvj",
+  "modified": "2026-10-06T00:00:08.472594612Z",
+  "published": "2026-10-05T23:42:34Z",
+  "aliases": [
+    "CVE-2026-105756"
+  ],
+  "summary": "vLLM: Loose `cache_salt` validation lets a single request kill EngineCore on LMCache-MP deployments — uncaught downstream `ValueError` denial of service",
+  "details": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the loose `cache_salt` validator and unguarded scheduling-path lookup reach.\n\n## Summary\n\nvLLM's OpenAI-compatible request models (Completions, Chat Completions, Responses) accept a client-supplied `cache_salt` field and validate it only as \"must be a non-empty string\" — no character or length restrictions. On a deployment with the built-in LMCache-MP KV connector enabled, that value is stored verbatim on the request tracker and forwarded unguarded as a keyword argument into the scheduler's per-step cache lookup. The downstream LMCache library applies a *stricter* check in `IPCCacheServerKey.__post_init__`, which raises `ValueError` for any `cache_salt` containing `@`, `/`, `\\`, or NUL (or longer than 128 characters).\n\nNeither the LMCache-MP connector lookup call site nor `Scheduler.schedule()` wraps that call in a request-scoped `try`/`except`, so the `ValueError` propagates uncaught into `EngineCore`'s top-level handler, which treats any uncaught exception as fatal and kills the whole engine process. A single publicly reachable request with, for example, `cache_salt=\"/\"` therefore takes down the engine for all concurrent users. vLLM's boundary validator is looser than the downstream consumer's, and the gap is never converted into a request-scoped failure on the scheduling path.\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1):\n\n- The three `check_cache_salt_support` validators require only a non-empty string — no character or length bound: [`vllm/entrypoints/openai/completion/protocol.py#L502-L508`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/completion/protocol.py#L502-L508) (field at [`#L172`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/completion/protocol.py#L172)), [`vllm/entrypoints/openai/chat_completion/protocol.py#L913-L919`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/chat_completion/protocol.py#L913-L919) (field at [`#L425`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/chat_completion/protocol.py#L425)), and [`vllm/entrypoints/openai/responses/protocol.py#L459-L465`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/protocol.py#L459-L465) (field at [`#L235`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/protocol.py#L235)). The loose test itself is at [`completion #L503-L505`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/completion/protocol.py#L503-L505), [`chat_completion #L914-L916`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/chat_completion/protocol.py#L914-L916), [`responses #L460-L462`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/protocol.py#L460-L462).\n- Two further request models accept `cache_salt` with the same or weaker checking, and should be hardened at the same time: [`vllm/entrypoints/pooling/base/protocol.py#L74-L85`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/pooling/base/protocol.py#L74-L85) carries the identical non-empty-string-only validator (field at [`#L59`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/pooling/base/protocol.py#L59)), and the token-in-token-out scale-out `GenerateRequest` exposes the field with **no** `cache_salt` validator at all: [`vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L110`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L110).\n- The LMCache-MP request tracker stores the salt verbatim: [`vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L189`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L189) (`LMCacheMPRequestTracker`), assignment at [`#L223`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L223).\n- The lookup call forwards `cache_salt` with no surrounding `try`: [`vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L733-L774`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L733-L774) (`get_num_new_matched_tokens` → `maybe_submit_lookup_request(...)` at [`#L770`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py#L770)).\n- The scheduler invokes the connector unguarded: [`vllm/v1/core/sched/scheduler.py#L739`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/core/sched/scheduler.py#L739) (`self.connector.get_num_new_matched_tokens(...)`, inside [`schedule()` at #L396](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/core/sched/scheduler.py#L396)).\n- The generic top-level handler treats the exception as fatal: [`vllm/v1/engine/core.py#L1229-L1235`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/core.py#L1229-L1235) — the `except Exception` in `run_engine_core` ([`#L1154`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/core.py#L1154)) logs `EngineCore encountered a fatal error.`, calls `_send_engine_dead()`, and re-raises.\n- Downstream strict validator (external LMCache library, not vLLM): `IPCCacheServerKey.__post_init__` in `lmcache/v1/multiprocess/custom_types.py` rejects `@ / \\` NUL and \u003e128-char salts (`_SALT_FORBIDDEN_CHARS = frozenset(\"@/\\\\\\x00\")`) by raising `ValueError`.\n\nThe three OpenAI `check_cache_salt_support` validators are identical; the completion one is representative — a non-empty-string test with no character or length bound:\n\n```python\n# vllm/entrypoints/openai/completion/protocol.py Lines 503-509\n        if data.get(\"cache_salt\") is not None and (\n            not isinstance(data[\"cache_salt\"], str) or not data[\"cache_salt\"]\n        ):\n            raise VLLMValidationError(\n                \"Parameter 'cache_salt' must be a non-empty string if provided.\",\n                parameter=\"cache_salt\",\n            )\n```\n\nOn the scheduling path the connector is invoked with no surrounding `try` — a `ValueError` from the downstream salt check propagates straight out of `schedule()`:\n\n```python\n# vllm/v1/core/sched/scheduler.py Lines 736-742\n                    # Get externally-cached tokens if using a KVConnector.\n                    if self.connector is not None:\n                        ext_tokens, load_kv_async = (\n                            self.connector.get_num_new_matched_tokens(\n                                request, num_new_local_computed_tokens\n                            )\n                        )\n```\n\n`run_engine_core`'s generic handler — the next `except` up the stack — treats that as fatal, marks the engine dead, and re-raises:\n\n```python\n# vllm/v1/engine/core.py Lines 1229-1235\n        except Exception as e:\n            if engine_core is None:\n                logger.exception(\"EngineCore failed to start.\")\n            else:\n                logger.exception(\"EngineCore encountered a fatal error.\")\n                engine_core._send_engine_dead()\n            raise e\n```\n\n## Impact\n\nAvailability only. `cache_salt` is an attacker-controlled, publicly reachable request field that vLLM validates too loosely. A value such as `\"/\"` passes vLLM's check, reaches the stricter downstream validator, and its `ValueError` is never converted into a request-scoped failure — instead it kills the EngineCore process, a denial of service for every concurrent request on that server (HTTP failures, then `/health` failing).\n\nApplicability: the built-in LMCache-MP KV connector must be enabled (`lmcache \u003e= 0.4.4`), which is itself an opt-in KV-connector boundary. On such deployments no other special configuration is required, and the crash is a resource-availability failure rather than expected behavior of the opt-in feature.\n\n\n## Suggested Fix\n\nTwo independent fixes:\n\n1. **Tighten admission** — add one shared `validate_cache_salt()` helper (for example in `vllm/entrypoints/openai/engine/protocol.py`) that matches or exceeds the downstream `IPCCacheServerKey` rules — reject `@`, `/`, `\\`, NUL, and \u003e128-character salts at the HTTP boundary with a 4xx — and route every request model that exposes `cache_salt` through it: the three `check_cache_salt_support` validators above, the pooling base request, and the token-in-token-out `GenerateRequest` (which has no validator today).\n2. **Defense in depth** — wrap the LMCache-MP lookup call reached from `Scheduler.schedule()` so a downstream validator `ValueError` becomes a request-scoped failure instead of an EngineCore-fatal exception. This is the fix that also covers future divergence between vLLM's and LMCache's salt rules; the right failure semantics (fail the request vs. fall back to a cold lookup) is a maintainer design call.\n\nThe core of fix 1 is a single shared helper; each `check_cache_salt_support` body then becomes `validate_cache_salt(data.get(\"cache_salt\"))`, and `GenerateRequest` gains an equivalent `mode=\"before\"` validator:\n\n```python\n# vllm/entrypoints/openai/engine/protocol.py — new shared helper\n_CACHE_SALT_FORBIDDEN_CHARS = frozenset(\"@/\\\\\\x00\")\n_MAX_CACHE_SALT_LENGTH = 128\n\n\ndef validate_cache_salt(cache_salt: object) -\u003e None:\n    \"\"\"Validate cache salts before they reach downstream cache backends.\"\"\"\n    if cache_salt is None:\n        return\n    if not isinstance(cache_salt, str) or not cache_salt:\n        raise VLLMValidationError(\n            \"Parameter 'cache_salt' must be a non-empty string if provided.\",\n            parameter=\"cache_salt\",\n        )\n    if len(cache_salt) \u003e _MAX_CACHE_SALT_LENGTH or any(\n        char in _CACHE_SALT_FORBIDDEN_CHARS for char in cache_salt\n    ):\n        raise VLLMValidationError(\n            \"Parameter 'cache_salt' must be at most 128 characters and must \"\n            \"not contain '@', '/', '\\\\\\\\', or NUL.\",\n            parameter=\"cache_salt\",\n        )\n```\n\nThis distinguishes the finding from **[GHSA-6qc9-v4r8-22xg](https://github.com/vllm-project/vllm/security/advisories/GHSA-6qc9-v4r8-22xg)**: that advisory fixed only the `guided_json`/`xgrammar` trigger of the same `schedule()`-into-`run_engine_core` fatal-handler family, so the `cache_salt` admission gap and the `schedule()`-level defense-in-depth (fix 2) survive its published fix. A patch implementing fix 1 across all five request models, with a regression test covering the rejected (`\"/\"`, 129-char) and accepted salt shapes, applies to v0.25.1 with line offsets and no fuzz.\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThis vulnerability was discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n---\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51444",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.30.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2823-qmq8-rwvj/GHSA-2823-qmq8-rwvj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-2823-qmq8-rwvj"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/51444"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/e962733e08d10f7ca65dac4df99e116460b8b174"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.30.0"
+    }
+  ]
+}

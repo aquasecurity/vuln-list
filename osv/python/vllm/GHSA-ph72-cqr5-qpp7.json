@@ -1,0 +1,156 @@
+{
+  "id": "GHSA-ph72-cqr5-qpp7",
+  "modified": "2026-10-06T00:00:10.347848188Z",
+  "published": "2026-10-05T23:42:50Z",
+  "aliases": [
+    "CVE-2026-105754"
+  ],
+  "summary": "vLLM: Scale-out disaggregated multimodal transport trusts caller-supplied features",
+  "details": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the scale-out transport path reaches.\n\n## Summary\n\nvLLM's disaggregated **scale-out** transport splits a multimodal request into a trusted render step (`POST /v1/chat/completions/render`) and a separate generate step (`POST /inference/v1/generate`). The generate route decodes a caller-supplied `features` object — serialized encoder tensors (`kwargs_data`), multimodal hashes (`mm_hashes`), placeholder ranges (`mm_placeholders`), and the internal field-processor selection — and forwards it into the engine **as if it had come from the trusted renderer**, with no rebinding to (or validation against) the active model's renderer contract. Because the two routes are ordinary auth-guarded HTTP endpoints (the `/inference` prefix is registered by default on generate-capable servers), any authenticated caller can submit an otherwise-valid render body with a single forged field.\n\nDepending on which field is forged, this produces:\n\n- an **engine-fatal crash** of the shared EngineCore process (denial of service), reproduced as a CUDA illegal-memory-access, a post-admission rank-mismatch `ValueError`, and a hard `assert` — three independent forged fields (sites 1, 2, 3);\n- **silent cross-request encoder-cache poisoning / disclosure** of shared encoder state when the cache-key hash is not bound to the payload (site 4);\n- **transport-level integrity loss** when sparse placeholder masks are dropped during render-to-generate replay (site 5).\n\nAll five share one root cause and one fix shape: the reconstructed multimodal state on the scale-out path is trusted without being rebound to, and validated against, the active model's renderer output before it reaches the engine.\n\nThese sites are distinct from prior multimodal hardening. Site 1 survives [GHSA-wv77-2vpf-vmmg](https://github.com/vllm-project/vllm/security/advisories/GHSA-wv77-2vpf-vmmg) (that fix validates full tensor shape in `MultiModalDataParser`/`get_input_embeddings` on the prompt-embeds path), because our request forges `image_grid_thw` metadata with the pixel bytes intact and reaches the Qwen2 vision RoPE/`cu_seqlens` and `image_embeds.split` sink, which the shape-check fix does not rebind. Site 4 is distinct from [GHSA-c65p-x677-fgj6](https://github.com/vllm-project/vllm/security/advisories/GHSA-c65p-x677-fgj6) (which folds metadata into `MultiModalHasher.serialize_item` to stop hash collisions), because the scale-out generate path trusts a caller-supplied `mm_hash` as the cache key with no origin binding, so that fix does not stop a caller from submitting a victim's hash or a `kwargs_data=None` cache read.\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1).\n\nShared entry point and control surface for all five sites:\n\n- `POST /inference/v1/generate` route: [`vllm/entrypoints/scale_out/token_in_token_out/api_router.py#L46-L75`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/api_router.py#L46-L75).\n- Public `features` schema (`kwargs_data`, `mm_hashes`, `mm_placeholders`): [`vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L42-L63`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L42-L63).\n- `ServingTokens.serve_tokens()` copies the decoded geometry and hashes into engine structures without rebinding to the renderer schema: [`vllm/entrypoints/scale_out/token_in_token_out/serving.py#L145-L172`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/serving.py#L145-L172).\n- The scale-out routers are registered by default on generate-capable servers and `/inference` is treated as an ordinary auth-guarded prefix: [`vllm/entrypoints/openai/api_server.py#L217-L219`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/api_server.py#L217-L219).\n\n**Site 1 — forged Qwen grid geometry (engine-fatal DoS).** The decoded `image_grid_thw` is never rebound to the rendered pixel-tensor element count.\n\n- Reconstruction with no model-specific geometry invariant: [`serving.py#L147-L172`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/serving.py#L147-L172).\n- `Qwen2VisionTransformer.prepare_encoder_metadata()` derives RoPE tables, `cu_seqlens`, and the FlashAttention `max_seqlen` from the caller-supplied grid: [`qwen2_vl.py#L658-L712`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L658-L712), consumed in [`forward()` (`#L713-L751`)](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L713-L751).\n- `_process_image_input()` computes `image_embeds.split(sizes)` from the same untrusted metadata: [`qwen2_vl.py#L1348-L1369`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L1348-L1369); M-RoPE positions at [`qwen2_vl.py#L1223`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L1223).\n\nThe only shape check is `assert grid_thw.ndim == 2`; the split sizes and the vision-encoder call are then derived directly from the caller-supplied grid, with no cross-check against the pixel-tensor row count:\n\n```python\n# vllm/model_executor/models/qwen2_vl.py Lines 1348-1369\n    def _process_image_input(\n        self, image_input: Qwen2VLImageInputs\n    ) -\u003e tuple[torch.Tensor, ...]:\n        grid_thw = image_input[\"image_grid_thw\"]\n        assert grid_thw.ndim == 2\n\n        if image_input[\"type\"] == \"image_embeds\":\n            image_embeds = image_input[\"image_embeds\"]\n        else:\n            pixel_values = image_input[\"pixel_values\"]\n\n            if self.use_data_parallel:\n                return run_dp_sharded_mrope_vision_model(\n                    self.visual, pixel_values, grid_thw.tolist(), rope_type=\"rope_3d\"\n                )\n            else:\n                image_embeds = self.visual(pixel_values, grid_thw=grid_thw)\n\n        # Split concatenated embeddings for each image item.\n        merge_size = self.visual.spatial_merge_size\n        sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()\n        return image_embeds.split(sizes)\n```\n\n**Site 2 — wire-selected field-processor type confusion (engine-fatal DoS).** `MsgpackDecoder._decode_mm_field_elem()` trusts a wire-selected field-factory name and constructs the internal field processor directly from caller data.\n\n- [`vllm/v1/serial_utils.py#L440-L454`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/serial_utils.py#L440-L454) reads `factory_meth_name, factory_kw = obj[\"field\"]` and calls `getattr(MultiModalFieldConfig, factory_meth_name)`.\n- Qwen2-VL field/schema contract: [`qwen2_vl.py#L763-L791`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L763-L791) and [`Qwen2VLImagePixelInputs` (`#L119-L144`)](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L119-L144); parse/validate at [`qwen2_vl.py#L1300`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/model_executor/models/qwen2_vl.py#L1300).\n- Rank mismatch raised post-admission: [`vllm/utils/tensor_schema.py#L155-L171`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/utils/tensor_schema.py#L155-L171), reached from [`TensorSchema.__init__` → `validate()` (`#L63`)](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/utils/tensor_schema.py#L63).\n\n**Site 3 — non-positive placeholder length (engine-fatal DoS via reachable assert).** `PlaceholderRangeInfo{offset,length}` is accepted as unconstrained integers and copied verbatim into the engine's `PlaceholderRange`.\n\n- Schema: [`protocol.py#L28-L35`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L28-L35).\n- Copied into `PlaceholderRange`: [`serving.py#L147-L153`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/serving.py#L147-L153).\n- The only guard is an upper bound on embed count (`num_embeds \u003e mm_encoder_cache_size`), with no non-positive check: [`vllm/v1/engine/input_processor.py#L459-L464`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/input_processor.py#L459-L464); raw length returned by [`vllm/multimodal/inputs.py#L152-L154`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/inputs.py#L152-L154); window selection assumes non-empty ranges at [`vllm/multimodal/utils.py#L114-L134`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/utils.py#L114-L134).\n- Sink: `assert start_idx \u003c end_idx` at [`vllm/v1/worker/gpu/mm/encoder_runner.py#L114`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/worker/gpu/mm/encoder_runner.py#L114) (duplicated at [`vllm/v1/worker/gpu_model_runner.py#L3192`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/worker/gpu_model_runner.py#L3192)); turned into a fatal shutdown by EngineCore's uncaught-exception path at [`vllm/v1/engine/core.py#L1229-L1233`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/core.py#L1229-L1233).\n\nA `length` of `0` makes `num_encoder_tokens == 0`, so `end_idx` collapses to `0` and the bare `assert` fires inside the engine worker:\n\n```python\n# vllm/v1/worker/gpu/mm/encoder_runner.py Lines 108-114\n                pos_info = mm_feature.mm_position\n                start_pos = pos_info.offset\n                num_encoder_tokens = pos_info.length\n\n                start_idx = max(cur_query_start - start_pos, 0)\n                end_idx = min(cur_query_end - start_pos, num_encoder_tokens)\n                assert start_idx \u003c end_idx\n```\n\n**Site 4 — cache hash not bound to payload (integrity / disclosure).** `features.mm_hashes` (the cache key) and `kwargs_data` (the tensor) are independent fields with no origin or integrity binding.\n\n- Schema exposing the caller-controlled hash and the `None` = resolve-from-cache semantics: [`protocol.py#L42-L63`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L42-L63).\n- Handler forwards the caller's hashes unchanged into `mm_input(...)`: [`serving.py#L164-L170`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/serving.py#L164-L170).\n- Input processing copies the caller hash into the feature identifier with only a string-type check: [`vllm/v1/engine/input_processor.py#L165-L181`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/input_processor.py#L165-L181).\n- Sink — the receiver cache returns the cached tensor solely by that key (`cache_key = feature.mm_hash or feature.identifier`): [`vllm/multimodal/cache.py#L602-L607`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L602-L607).\n\nThe cache key is the caller-supplied hash with no verification against the tensor bytes, so a forged `mm_hash` both stores under and reads back another request's slot:\n\n```python\n# vllm/multimodal/cache.py Lines 601-607\n        for feature in mm_features:\n            cache_key = feature.mm_hash or feature.identifier\n            self.touch_receiver_cache_item(cache_key, feature.data)\n\n        for feature in mm_features:\n            cache_key = feature.mm_hash or feature.identifier\n            feature.data = self.get_and_update_item(feature.data, cache_key)\n        return mm_features\n```\n\n**Site 5 — dropped sparse placeholder mask (transport integrity loss).** The render path serializes placeholders as only `offset`/`length`, so models relying on sparse `is_embed` masks lose the mask during render-to-generate replay.\n\n- `ServingRender._extract_mm_features()` builds each `PlaceholderRangeInfo(offset=p.offset, length=p.length)`, discarding `is_embed`: [`vllm/entrypoints/scale_out/render/serving.py#L212-L229`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/render/serving.py#L212-L229).\n- Transport schema carries no field for the mask: [`protocol.py#L28`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/protocol.py#L28).\n- `ServingTokens.serve_tokens()` reconstructs a dense `PlaceholderRange` regardless of the original: [`serving.py#L148-L152`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/scale_out/token_in_token_out/serving.py#L148-L152).\n\n## Impact\n\nA single authenticated request to a scale-out multimodal deployment can:\n\n- **Crash the shared EngineCore process** (sites 1, 2, 3), taking the served model down for every tenant (`/health` → 503). Availability-only; no code execution or data disclosure demonstrated for these sites.\n- **Silently poison or read back another request's shared encoder-cache state** (site 4) — an integrity/disclosure primitive. Attack complexity is High because the attacker must know or induce the victim's content hash; there is no availability impact for this site.\n- **Corrupt backend-visible placeholder semantics across the render-to-generate boundary** (site 5) for models that depend on sparse `is_embed` masks.\n\nThe forged multimodal payload is small; only the trust in its self-declared geometry/identity is the defect.\n\n\n## Suggested Fix\n\nOn the scale-out path, do not trust caller-supplied multimodal state as renderer-produced. After decoding `features`, **rebind and validate** the reconstructed `MultiModalKwargsItem` against the active model's renderer contract at the HTTP boundary:\n\n1. Reject any request whose decoded grid geometry is inconsistent with the rendered pixel-tensor element count and declared placeholder span, before it reaches `prepare_encoder_metadata()` (site 1).\n2. Rebind each field's processor type to the schema the active model's renderer declares (or reject if it differs), instead of reconstructing internal field processors from wire-selected factory names (site 2).\n3. Reject any `PlaceholderRangeInfo` with `length \u003c= 0` (or out-of-range `offset`) with a request-scoped 4xx, and convert the encoder-runner invariant into a checked, request-scoped error rather than a process-fatal `assert` (site 3).\n4. Recompute or verify the content hash for submitted `kwargs_data` before using it as a cache key, and namespace receiver-cache keys to a server-generated or principal scope, refusing cache-reads for hashes the caller did not legitimately produce (site 4).\n5. Serialize `is_embed` in `PlaceholderRangeInfo`, validate its length against the placeholder span, and reconstruct it on replay (site 5).\n\n**Site 1 — validate grid geometry before the vision encoder.** Replace the bare `assert grid_thw.ndim == 2` in `_process_image_input()`/`_process_video_input()` with a shared helper that recomputes the split sizes and rejects a grid whose patch-row count does not match the pixel tensor (and rejects non-positive / non-merge-divisible dims), so the mismatch never reaches `image_embeds.split()`:\n\n```python\n# vllm/model_executor/models/qwen2_vl.py — _process_image_input()\n-        grid_thw = image_input[\"image_grid_thw\"]\n-        assert grid_thw.ndim == 2\n+        grid_thw = image_input[\"image_grid_thw\"]\n+        input_type = image_input[\"type\"]\n+        input_tensor = (\n+            image_input[\"image_embeds\"]\n+            if input_type == \"image_embeds\"\n+            else image_input[\"pixel_values\"]\n+        )\n+        sizes = _validate_qwen2_vl_input_geometry(\n+            modality=\"image\",\n+            input_type=input_type,\n+            input_tensor=input_tensor,\n+            grid_thw=grid_thw,\n+            spatial_merge_size=self.visual.spatial_merge_size,\n+        )\n...\n-        # Split concatenated embeddings for each image item.\n-        merge_size = self.visual.spatial_merge_size\n-        sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()\n         return image_embeds.split(sizes)\n```\n\nwhere the helper raises before the encoder runs:\n\n```python\n# vllm/model_executor/models/qwen2_vl.py — new _validate_qwen2_vl_input_geometry()\n        if t \u003c= 0 or h \u003c= 0 or w \u003c= 0:\n            raise ValueError(f\"{modality} grid_thw row {index} must be positive ...\")\n        if h % spatial_merge_size != 0 or w % spatial_merge_size != 0:\n            raise ValueError(f\"{modality} grid_thw row {index} must be divisible ...\")\n        ...\n        if actual_rows != expected_rows:\n            raise ValueError(\n                f\"{modality} {row_kind} do not match grid_thw: \"\n                f\"expected {expected_rows}, got {actual_rows}.\"\n            )\n```\n\n**Site 3 — constrain the placeholder schema.** Make `PlaceholderRangeInfo` reject non-positive lengths and negative offsets at the Pydantic boundary (plus parallel-length, non-overlapping, and within-prompt validators), turning the process-fatal `assert` into a request-scoped 422:\n\n```python\n# vllm/entrypoints/scale_out/token_in_token_out/protocol.py — PlaceholderRangeInfo\n-    offset: int\n-    length: int\n+    offset: int = Field(ge=0)\n+    length: int = Field(gt=0)\n```\n\n**Site 4 — bind the cache key to the payload.** Derive each cache key by hashing the submitted serialized tensor (ignoring the caller's `mm_hashes`) and refuse cache-only reads, so a forged hash can neither poison nor read a victim's slot:\n\n```python\n# vllm/entrypoints/scale_out/token_in_token_out/serving.py — serve_tokens()\n+            mm_hashes = _bind_mm_hashes_to_kwargs_data(\n+                features.mm_hashes, features.kwargs_data,\n+            )\n             engine_input = mm_input(\n                 prompt_token_ids=request.token_ids,\n                 mm_kwargs=MultiModalKwargsItems(mm_kwargs),\n-                mm_hashes=features.mm_hashes,\n+                mm_hashes=mm_hashes,\n                 mm_placeholders=mm_placeholders,\n                 cache_salt=request.cache_salt,\n             )\n```\n\nwhere `_bind_mm_hashes_to_kwargs_data()` raises on `kwargs_data is None` (cache-only read) and derives `sha256(modality || \"\\0\" || serialized_item)` per item. Site 2 applies the same rebind-to-declared-schema pattern in `mm_serde.py` (passing `modality` + `mm_processor` into `decode_mm_kwargs_item`), and site 5 adds an `is_embed` field to `PlaceholderRangeInfo` with `from_placeholder_range`/`to_placeholder_range` helpers so the sparse mask survives render-to-generate replay. Each site fix ships with a regression test. This packet groups the five sites because they share one entry point (`/inference/v1/generate` + `/render`) and one root cause; we are happy to split it into per-component advisories (for example, engine-fatal input-validation vs. cache-key binding vs. transport-schema integrity) if the vLLM team prefers.\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThese vulnerabilities were discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n---\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51898",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.30.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-ph72-cqr5-qpp7/GHSA-ph72-cqr5-qpp7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-ph72-cqr5-qpp7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/51898"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/1970f3ed4be7fa8620e4ddc4a12c36a8384cfc27"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.30.0"
+    }
+  ]
+}
