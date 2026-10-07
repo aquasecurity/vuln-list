@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-4f6c-2vvp-gw82",
+  "modified": "2026-10-07T16:30:05.836794418Z",
+  "published": "2026-10-07T16:18:23Z",
+  "aliases": [
+    "CVE-2026-105741"
+  ],
+  "summary": "Langflow: IP Spoofing Bypass via `X-Forwarded-For` Allowing Remote Configuration Write",
+  "details": "**Description**:\n### Summary\nAn IP spoofing vulnerability in the Model Context Protocol (MCP) configuration installation endpoint (`POST /api/v1/mcp/project/{project_id}/install`) allowed authenticated remote attackers to bypass the \"local-only\" access restriction. By sending a spoofed `X-Forwarded-For: 127.0.0.1` header, an attacker could make the server treat the request as originating from localhost, letting them write/overwrite an MCP client configuration file on the server's filesystem.\n\n### Details\nThe vulnerability lived in the `get_client_ip` helper, used to enforce the local-only gate for `install_mcp_config`. It trusted the leftmost (fully client-controlled) entry of `X-Forwarded-For` unconditionally, with no check for whether the request had actually passed through a trusted proxy.\n\n**Vulnerable code (introduced by commit `d3d06be8e5`, first released in v1.5.0):** `src/backend/base/langflow/api/v1/mcp_projects.py`\n\n```python\ndef get_client_ip(request: Request) -\u003e str:\n    # Check for X-Forwarded-For header (common when behind proxies)\n    forwarded_for = request.headers.get(\"X-Forwarded-For\")\n    if forwarded_for:\n        # The client IP is the first one in the list\n        return forwarded_for.split(\",\")[0].strip()\n    if request.client:\n        return request.client.host\n    return \"255.255.255.255\"\n\n\n@router.post(\"/{project_id}/install\")\nasync def install_mcp_config(\n    project_id: UUID,\n    body: MCPInstallRequest,        # {client: str, transport: \"sse\" | \"streamablehttp\" | None}\n    request: Request,\n    current_user: CurrentActiveMCPUser,\n):\n    client_ip = get_client_ip(request)\n    if not is_local_ip(client_ip):\n        raise HTTPException(status_code=500, detail=\"MCP configuration can only be installed from a local connection\")\n    ...\n```\n\n**Correction vs. the original report:** the request body accepted by this endpoint is `MCPInstallRequest {client: str, transport: str | None}` (`src/backend/base/langflow/api/v1/schemas/__init__.py`). There is no `mcp_path` field, and the destination path is never attacker-supplied. `install_mcp_config` resolves the write target itself, via `get_config_path(body.client)`, to one of a fixed, small set of well-known per-OS developer-tool config paths under the server process's home directory: `~/.cursor/mcp.json` (Cursor), `~/.codeium/windsurf/mcp_config.json` (Windsurf), or the Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\\Claude\\claude_desktop_config.json` on Windows/WSL). The impact is therefore \"attacker-influenced content written into one of these fixed files,\" not an arbitrary-path write.\n\n### PoC\n1. Authenticate to obtain a valid access token.\n2. Identify a `project_id` the attacker has access to.\n3. Send:\n   ```bash\n   curl -X POST \"http://\u003cserver-ip\u003e:7860/api/v1/mcp/project/\u003cproject_id\u003e/install\" \\\n        -H \"Authorization: Bearer \u003ctoken\u003e\" \\\n        -H \"X-Forwarded-For: 127.0.0.1\" \\\n        -H \"Content-Type: application/json\" \\\n        -d '{\"client\": \"cursor\"}'\n   ```\n4. The server returns `200 OK` and writes/overwrites `~/.cursor/mcp.json` on the host with an attacker-influenced MCP server entry, despite the request originating from a remote, non-local address.\n\n### Impact\nAuthenticated Remote Configuration Write to one of a fixed set of IDE/MCP client config files on the host. Could be leveraged to:\n- Inject a malicious MCP server definition into Cursor/Windsurf/Claude Desktop config, so a local developer who later opens that IDE on the host connects to an attacker-controlled MCP server.\n- Disrupt or corrupt the existing MCP configuration for those tools.\n- Bypass an intended network-boundary control (\"local-only\").\n\n### Status: already fixed\nThis exact bypass (single-line, comma-separated `X-Forwarded-For` spoofing, default configuration) is fixed as of:\n- **Fix PR:** langflow-ai/langflow#13915 — \"fix(security): stop trusting X-Forwarded-For for the MCP install locality check\", landed as part of the broader hardening effort in langflow-ai/langflow#13530.\n- **Fix:** `get_client_ip` now uses the real TCP peer (`request.client.host`) by default and ignores `X-Forwarded-For` entirely unless the operator has explicitly opted in via the `rate_limit_trust_proxy` setting (default `False`); when opted in, it takes the **rightmost** entry, mirroring `langflow.services.rate_limit.service.get_client_ip`.\n- **Released in:** v1.11.0, and backported to v1.10.3 (langflow-ai/langflow#14071).\n- **Related follow-up:** a narrower, related bypass — reachable only when an operator has explicitly set `rate_limit_trust_proxy=true` behind a proxy that emits `X-Forwarded-For` as repeated header lines rather than a single comma-separated line (e.g. HAProxy's `option forwardfor`) — was separately closed by langflow-ai/langflow#14425, released in v1.11.3. This does not affect default deployments (`rate_limit_trust_proxy` defaults to `False`).\n- This report is a near-duplicate of GHSA-qvvj-g573-9638, which describes the same root cause and is fixed by the same PR.\n\n### Affected versions\n- The vulnerable endpoint/helper was introduced in **v1.5.0** (langflow-ai/langflow#8271, \"add one click install to mcp servers on specific clients\", 2025-07-08). Versions prior to v1.5.0 do not contain this endpoint and are not affected by this issue.\n- **Vulnerable:** \u003e= 1.5.0, \u003c 1.10.3 (and \u003c 1.11.0 on mainline).\n- **Fixed:** v1.10.3 (backport) and v1.11.0 onward.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "langflow",
+        "purl": "pkg:pypi/langflow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.5.0"
+            },
+            {
+              "fixed": "1.10.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.10.0",
+        "1.10.0rc0",
+        "1.10.1",
+        "1.10.1rc0",
+        "1.10.1rc3",
+        "1.10.2",
+        "1.10.2rc4",
+        "1.10.3rc0",
+        "1.5.0",
+        "1.5.0.post1",
+        "1.5.0.post2",
+        "1.5.1",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8.0",
+        "1.8.0rc0",
+        "1.8.0rc1",
+        "1.8.0rc2",
+        "1.8.0rc3",
+        "1.8.0rc4",
+        "1.8.0rc5",
+        "1.8.0rc6",
+        "1.8.1",
+        "1.8.2",
+        "1.8.3",
+        "1.8.3rc0",
+        "1.8.4",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3",
+        "1.9.3rc0",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "1.9.6rc0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4f6c-2vvp-gw82/GHSA-4f6c-2vvp-gw82.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/security/advisories/GHSA-4f6c-2vvp-gw82"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-105741"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/pull/13915"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/commit/1f39a4b9d62c9dfa1b21fa7f85e23a180c351b72"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/commit/94859df33acd70b2a1f816e26d68f5e89a7e5639"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/langflow-ai/langflow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/releases/tag/v1.10.3"
+    }
+  ]
+}

