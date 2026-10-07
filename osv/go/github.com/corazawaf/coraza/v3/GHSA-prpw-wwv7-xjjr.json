@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-prpw-wwv7-xjjr",
+  "modified": "2026-10-06T20:45:03.759257693Z",
+  "published": "2026-10-06T20:37:27Z",
+  "aliases": [
+    "CVE-2026-41504"
+  ],
+  "summary": "Coraza: Native audit-log format allows CRLF injection and log forgery via request body and header fields",
+  "details": "## Root Cause\n\nFile: `internal/auditlog/formats.go` — multiple sites write attacker-influenced bytes into the Native audit-log stream without escaping `\\r` or `\\n`:\n\n```go\n// Part B — request headers (lines 72–80)\nfor k, vv := range al.Transaction().Request().Headers() {\n    for _, v := range vv {\n        res.WriteByte('\\n')\n        res.WriteString(k)\n        res.WriteString(\": \")\n        res.WriteString(v)   // ← raw\n    }\n}\n\n// Part C — request body (lines 85–86)\nif body := al.Transaction().Request().Body(); body != \"\" {\n    res.WriteString(body)    // ← raw\n    res.WriteByte('\\n')\n}\n\n// Part E — response body (lines 93–94)      raw\n// Part F — response headers (lines 111–118) raw\n// Part H — error messages (line 125)        raw\n// Part K — matched-rule raw data (line 151)  raw\n```\n\nThe Native format's section structure is line-based: sections are delimited by lines of the form `--\u003c10-char-random-prefix\u003e-\u003cPart\u003e--`, and line-based log parsers / SIEM rules rely on that structure. Any attacker-controlled bytes containing `\\n` break the structural invariant and allow the attacker to inject lines that look like genuine audit content.\n\nThe other two Native-format implementations in Coraza are not affected: the JSON formatter (`formats_json.go`) and the OCSF formatter both round-trip values through `json.Marshal`, which escapes `\\r` and `\\n`.\n\n## Impact\n\nAn attacker who can land bytes into any of the listed audit-log fields can inject arbitrary lines — including lines that visually resemble new log entries — into the audit log file of a defender running the default `SecAuditLogFormat Native` configuration. Realistic consequences:\n\n- **Forging entries to shift attribution.** An injected line such as `[client \"9.9.9.9\"] Coraza: Warning. ...` sits alongside genuine matches in Part H, and a human operator (or simple SIEM rule) reading the log cannot tell them apart.\n- **Confusing SIEM correlation.** Any ingestion pipeline that splits on `--...-[A-Z]--` boundaries or on `[client \"...\"]` patterns without validating the session prefix will treat the forged lines as separate records.\n- **Breaking log-parsing tooling.** Grep/awk pipelines, log tailers, and log-rotation tools with line-based assumptions can be poisoned with crafted binary sequences.\n- **Hiding genuine incidents.** An attacker who can also trigger a rule match on the same transaction (trivial — send any request that matches *any* audit-logged rule) can bury the real match under noise they control.\n\nThe forged lines cannot trivially impersonate an entire *separate* session: the 10-char random prefix in the real boundaries (`boundaryPrefix := \"--\" + utils.RandomString(10) + \"-\"`, line 42) is not predictable from outside, and each transaction uses a fresh prefix. But the integrity of a *single* record is fully compromised, which is enough for the SIEM-confusion and attribution-shifting attacks.\n\n## Proof of Concept\n\nServer with `coraza.conf-recommended`-style defaults:\n\n```conf\nSecRuleEngine On\nSecAuditEngine On\nSecAuditLogParts ABCFHZ\nSecAuditLogType Serial\nSecAuditLog /tmp/audit.log\nSecAuditLogFormat Native\nSecRequestBodyAccess On\nSecRule REQUEST_METHOD \"@rx .\" \\\n    \"id:1001,phase:1,pass,log,auditlog,msg:'trigger'\"\n```\n\n### Body vector — reachable via stock `coraza/v3/http` + `net/http`\n\nSend an ordinary urlencoded POST whose body contains raw CRLF sequences and forged boundaries:\n\n```\nPOST / HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\n\nevil=benign\\r\\n--coraza-forged-X--\\r\\nForgedLine: yes\\r\\n--coraza-forged-H--\\r\\n[client \"9.9.9.9\"] FAKE ATTACK ENTRY\n```\n\nResulting audit.log:\n\n```\n--heLNtylvjY-C--\nevil=benign\n--coraza-forged-X--\nForgedLine: yes\n--coraza-forged-H--\n[client \"9.9.9.9\"] FAKE ATTACK ENTRY\n\n--heLNtylvjY-F--\n```\n\nThe forged `--coraza-forged-X--` / `--coraza-forged-H--` boundaries and the spoofed `[client \"9.9.9.9\"]` line are structurally indistinguishable from the surrounding genuine log content. No rule fires, no error is raised, the attack is invisible to the WAF.\n\n### Header vector — reachable via non-net/http integrations only\n\nThe same effect applies to Part B (request headers) and Part F (response headers) when a header value contains raw `\\r\\n`. Go's `net/http` rejects such headers at parse time (`400 Bad Request`), so the stock HTTP wrapper is safe from this path; the vector is reachable when Coraza is called with header values that were not validated by `net/http`:\n\n- `coraza-spoa` (HAProxy SPOP agent) forwards headers from HAProxy, which has more permissive validation.\n- `coraza-proxy-wasm` / Envoy WASM hosts forward header values from the upstream proxy.\n- Custom FFI/WASM hosts and any embedder calling `tx.AddRequestHeader(k, v)` with unvalidated bytes.\n\nOther raw-write sites (Part E response body, Part H error messages, Part K matched-rule data) share the same class of issue and should be fixed together.\n\n## Mitigation\n\nEscape `\\r` and `\\n` at every raw-write site in `internal/auditlog/formats.go`. A single package-level helper is sufficient:\n\n```go\nvar logEscaper = strings.NewReplacer(\"\\r\", \"\\\\r\", \"\\n\", \"\\\\n\")\n\n// Part B — header values:\nres.WriteString(logEscaper.Replace(v))\n\n// Part F — header values: same\n// Part H — error messages:\nres.WriteString(logEscaper.Replace(alWithErrMsg.ErrorMessage()))\n// Part K — matched-rule raw data:\nres.WriteString(logEscaper.Replace(alEntry.Data().Raw()))\n```\n\nFor Part C / Part E (bodies), the choice is policy-dependent:\n\n- **Escape inline** (`logEscaper.Replace(body)`): keeps the log human-readable for text bodies but loses fidelity for binary.\n- **Base64 / hex-encode** the whole part: binary-safe, matches the spirit of ModSecurity v2's binary-log handling, but less human-readable.\n\nEscaping is the minimum; base64 for bodies is the more conservative default and is a reasonable audit-log-default change.\n\n### Additional defensive measure\n\nConsider lengthening the `boundaryPrefix` random suffix from 10 chars to ≥16 chars (line 42). This strictly raises the bar for attackers attempting to *fully* forge a separate-looking session (not just inject lines into the current one). Low-cost change; narrows future variants of this bug class.\n\n## Affected versions\n\nThe Native formatter has been present since `v3.0.0` (file existed at the first-release commit). All releases `\u003e= 3.0.0, \u003c= 3.7.0` are affected when `SecAuditLogFormat Native` is used with `SecAuditLogType Serial` or `SecAuditLogType Concurrent`.\n\n**Unaffected:**\n\n- Deployments using `SecAuditLogFormat JSON` (`formats_json.go` uses `json.Marshal` which escapes `\\r\\n`).\n- Deployments using OCSF output.\n- Deployments with `SecAuditEngine Off`.\n\n## References\n\n- `internal/auditlog/formats.go` lines 42, 72–80 (Part B), 85–88 (Part C), 93–96 (Part E), 111–118 (Part F), 125 (Part H), 151 (Part K)\n- `coraza.conf-recommended` — default `SecAuditLogFormat Native`, `SecAuditLogParts ABIJDEFHZ` / `ABCFHZ` variants\n- CWE-117 — Improper Output Neutralization for Logs\n- CWE-93 — CRLF Injection",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.8.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.7.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-prpw-wwv7-xjjr/GHSA-prpw-wwv7-xjjr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-prpw-wwv7-xjjr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/a3079325547c7c1e08522aed4d6468f25d080e25"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.0"
+    }
+  ]
+}

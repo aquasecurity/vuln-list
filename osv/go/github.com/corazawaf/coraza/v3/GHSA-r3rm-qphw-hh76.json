@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-r3rm-qphw-hh76",
+  "modified": "2026-10-06T20:45:03.776574590Z",
+  "published": "2026-10-06T20:37:54Z",
+  "aliases": [
+    "CVE-2026-41508"
+  ],
+  "summary": "Coraza: Truncated multipart body bypasses MULTIPART_STRICT_ERROR (rule 200003) via silent io.ErrUnexpectedEOF handling",
+  "details": "## Root Cause\n\nFile: `internal/bodyprocessors/multipart.go` (since commit `3347961b`, PR #1453 *\"feat: ignore unexpected EOF in MIME multipart request body processor\"*, merged 2026-03-06, first shipped in `v3.4.0`).\n\nThe multipart body processor treats `io.ErrUnexpectedEOF` as a benign condition. Three sites are affected; all mishandle the error the same way.\n\n### File branch, filesystem-backed (lines 71–77)\n\n```go\nsz, err := io.Copy(temp, p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n    seenUnexpectedEOF = true     // \u003c-- flag never set for UnexpectedEOF\n}\n```\n\n### File branch, TinyGo path (lines 82–88)\n\n```go\nsz, err := io.Copy(io.Discard, p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n    seenUnexpectedEOF = true     // \u003c-- same gap\n}\n```\n\n### Field branch (lines 102–113)\n\n```go\ndata, err := io.ReadAll(p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n}\n...\nif errors.Is(err, io.ErrUnexpectedEOF) {\n    break                         // \u003c-- exits loop with no flag set\n}\n```\n\nThe function then returns `nil` at line 116 for any body that ended prematurely. Consequences:\n\n1. `MULTIPART_STRICT_ERROR` stays at its initial value `0`.\n2. `REQBODY_ERROR` is not propagated either (since `ProcessRequest` returns `nil`).\n3. Neither of the two canonical defensive rules shipped in `coraza.conf-recommended` fires:\n   ```conf\n   SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400,...\"\n   SecRule MULTIPART_STRICT_ERROR \"!@eq 0\" \"id:200003,phase:2,deny,status:400,...\"\n   ```\n\nAll other error branches in the same function (lines 27, 48, 66, 84, 104) correctly set `MULTIPART_STRICT_ERROR` before returning; this is an inconsistency introduced in #1453, not a systemic issue.\n\n## Context — why the error is swallowed\n\nPR #1453 was introduced to support `SecRequestBodyLimitAction ProcessPartial`: when a body is cut off because it hit the configured request-body limit, the parser should still surface the parts it did receive. The PR legitimately needs to avoid `return err` on `ErrUnexpectedEOF`. But it also silenced the strict-error flag, which is the wrong compromise — the flag is exactly how operators observe that something was incomplete. The fix should keep the non-fatal `break` and still set `MULTIPART_STRICT_ERROR`, letting the operator decide (via rule 200003 or their own policy) whether partial processing is acceptable.\n\n## Impact\n\nRule 200003 is Coraza's blanket defense against **multipart parser-inconsistency evasions** — attack classes where the body is crafted so Coraza's Go `mime/multipart` reader and the backend's multipart parser (PHP, Node, Java, legacy libmodsecurity, etc.) disagree about where fields start or end. The rule fails-closed on *any* malformed body, so the operator does not need to enumerate every parser-disagreement trick. That defense is now void for any evasion that also truncates the body.\n\nExamples of what becomes reachable:\n\n- Smuggling a second field past the truncation boundary that the backend's more permissive parser still extracts.\n- Hiding payload bytes after a deliberately malformed `Content-Disposition` header that the Go parser refuses but the backend accepts.\n- Generic CRS evasion chains that depend on rule 200003 as a catch-all.\n\nThe fix is tiny and low-risk. The impact is disproportionately large because rule 200003 is the *only* defense-in-depth rule for multipart in the recommended config — there is no secondary signal.\n\n## Proof of Concept\n\nStart a Coraza-wrapped HTTP server shipping the canonical defensive rules from `coraza.conf-recommended`:\n\n```conf\nSecRuleEngine On\nSecRequestBodyAccess On\nSecRule REQBODY_ERROR \"!@eq 0\" \\\n    \"id:200002,phase:2,t:none,log,deny,status:400,msg:'Failed to parse request body.'\"\nSecRule MULTIPART_STRICT_ERROR \"!@eq 0\" \\\n    \"id:200003,phase:2,t:none,log,deny,status:400,msg:'Multipart strict validation failed.'\"\n```\n\nThree real-curl requests against the listener:\n\n| # | Body | Expected (with rule 200003) | Observed |\n|---|---|---|---|\n| 1 | Well-formed `field1=benign` + closing boundary | HTTP 200 | HTTP 200 (baseline) |\n| 2 | Two parts, **no closing boundary** (`...MALFORMED_NO_TRAILING_BOUNDARY`) | HTTP 400 | **HTTP 200** |\n| 3 | Mid-part cutoff: `name=\"x\"\\r\\n\\r\\nabc` (no `\\r\\n`, no boundary) | HTTP 400 | **HTTP 200** |\n\nServer-side match log is empty for cases 2 and 3: neither rule 200002 nor rule 200003 fires. Example (case 2):\n\n```\n--PoCBoundary12345\\r\\n\nContent-Disposition: form-data; name=\"field1\"\\r\\n\\r\\n\nbenign\\r\\n\n--PoCBoundary12345\\r\\n\nContent-Disposition: form-data; name=\"truncated\"\\r\\n\\r\\n\nMALFORMED_NO_TRAILING_BOUNDARY\n```\n→ `HTTP 200`, no audit record, transaction.variables.multipartStrictError == 0.\n\n## Mitigation\n\nA two-line change per site in `internal/bodyprocessors/multipart.go`:\n\n```go\nif errors.Is(err, io.ErrUnexpectedEOF) {\n    v.MultipartStrictError().(*collections.Single).Set(\"1\")\n    seenUnexpectedEOF = true   // keep existing break semantics\n}\n```\n\nApply at the three sites (lines 71–77, 82–88, 102–113 in the current code). No change to the `return err` control flow is needed — the fix only adds the flag-setter alongside the existing `seenUnexpectedEOF = true` / `break` path. PR #1453's ProcessPartial goal is preserved.\n\nOperators running in `ProcessPartial` mode who intentionally allow truncated bodies should pair this with a config-level change (downgrade rule 200003 to detection-only, or scope it with a secondary check on whether `SecRequestBodyLimit` was actually hit). The engine change above is safe by default — it restores the invariant that malformed multipart always raises `MULTIPART_STRICT_ERROR`.\n\n## Affected versions\n\nIntroduced in PR #1453 (commit `3347961b`, merged 2026-03-06). First released in `v3.4.0` and still present on `main` at `599ae64a`.\n\nAffected: `\u003e= 3.4.0, \u003c= 3.7.0`.\n\nReleases prior to `v3.4.0` returned `err` on `io.ErrUnexpectedEOF` and so `REQBODY_ERROR` would propagate via rule 200002 even if `MULTIPART_STRICT_ERROR` was not set — a different (arguably stricter) behavior that did not exhibit this bypass.\n\n## References\n\n- `internal/bodyprocessors/multipart.go` lines 70–113\n- `coraza.conf-recommended` rule `id:200003` (`MULTIPART_STRICT_ERROR`)\n- PR #1453 — introduction of `ErrUnexpectedEOF` swallowing\n- `coraza.conf-recommended` rule `id:200002` (`REQBODY_ERROR`) — also not raised because `ProcessRequest` returns `nil`",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.4.0"
+            },
+            {
+              "fixed": "3.8.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.7.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r3rm-qphw-hh76/GHSA-r3rm-qphw-hh76.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-r3rm-qphw-hh76"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/f94c81bec209f658120c418448d0590a549b71df"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.0"
+    }
+  ]
+}
