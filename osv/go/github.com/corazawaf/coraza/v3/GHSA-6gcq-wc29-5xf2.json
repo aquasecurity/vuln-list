@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-6gcq-wc29-5xf2",
+  "modified": "2026-10-08T18:00:10.424963833Z",
+  "published": "2026-10-08T17:45:46Z",
+  "summary": "Coraza JSON body processor: argument-limit truncation reopens an unbounded-depth gjson.Valid stack overflow (process crash)",
+  "details": "### Summary\n\nThe JSON body processor (`internal/bodyprocessors/json.go`) can be made to\ncrash the whole process with an unrecoverable `fatal error: stack overflow`,\nusing a request body that is well under the recommended `SecRequestBodyLimit`\nand the default `SecArgumentsLimit`.\n\n### Root cause\n\n`readJSON` (json.go:113-143) runs a bounded, best-effort flattening walk\n(`readItems`) and *afterwards* calls `gjson.Valid(s)` on the raw body if\n`readItems` returned no error:\n\n```go\njson := gjson.Parse(s)\n...\ntruncated, err = readItems(json, key, maxRecursion, argumentLimit, byteBudget, \u0026usedBytes, \u0026argCount, res)\nif err != nil {\n    return res, truncated, err\n}\nif !gjson.Valid(s) {\n    return res, truncated, errors.New(\"invalid JSON\")\n}\n```\n\n`gjson.Valid` (gjson v1.18.0, `validany` -\u003e `validarray`/`validobject`) recurses\nonce per nesting level with **no depth bound**. `readItems` does have a depth\nbound (`maxRecursion`), enforced here (json.go:163-182):\n\n```go\nfunc readItems(json gjson.Result, objKey []byte, maxRecursion int, argumentLimit int, byteBudget int, usedBytes *int, argCount *int, res map[string][]string) (truncated bool, err error) {\n    if byteBudget \u003e 0 \u0026\u0026 *usedBytes \u003e= byteBudget {\n        return true, nil                 // \u003c-- checked first\n    }\n    if argumentLimit \u003e 0 \u0026\u0026 *argCount \u003e= argumentLimit {\n        return true, nil                 // \u003c-- checked second\n    }\n    ...\n    if maxRecursion \u003c= 0 {\n        return false, errors.New(\"max recursion reached while reading json object\")\n    }\n```\n\nThe byte-budget and argument-limit checks run *before* the recursion-depth\ncheck, and they short-circuit the walk with `truncated=true, err=nil` instead\nof recursing further. If the configured `SecArgumentsLimit`\n(`ArgumentLimit`, default 1000, `internal/corazawaf/waf.go:359`) is reached by\nearlier, shallow values in the document, `readItems` stops walking *before it\never reaches* a deeply nested tail later in the same document — so the\n`maxRecursion` error is never produced, `err` comes back `nil`, and `readJSON`\nfalls through to the unconditional `gjson.Valid(s)` call on the complete raw\nbody, including the part `readItems` never visited.\n\nThis is not a new interaction with the recursion limit itself: at v3.7.0,\n`gjson.Valid` ran unconditionally before any recursion check at all, so a\nplain deeply-nested body crashed the process directly. A later fix added a\ndepth check that returns an error before `Valid` runs for the *straightforward*\ncase (nesting reached before any other guard fires). The argument-limit /\nbyte-budget guards added since then (GHSA-6r3q-mjv7-xr8m,\nGHSA-3ww9-vw83-9w5x) reopened the same crash for the case above, because they\nshort-circuit the walk (and therefore the recursion counter) ahead of the\ndepth check, on both the request and response body path (`ProcessResponse`\ncalls the same `readJSON`, json.go:57-88).\n\nBecause this is `fatal error: stack overflow`, not a `panic`, it is **not**\nrecoverable by any `recover()` in the calling goroutine — the process\nterminates unconditionally.\n\n### PoC\n\n```go\npackage bodyprocessors\n\nimport (\n    \"strings\"\n    \"testing\"\n)\n\nfunc TestStackOverflowRepro(t *testing.T) {\n    body := \"[\" + strings.Repeat(\"1,\", 1000) + strings.Repeat(\"[\", 13_000_000)\n    // 13,002,001 bytes total: under the recommended SecRequestBodyLimit\n    // (13107200, coraza.conf-recommended:78) and default ArgumentLimit (1000,\n    // internal/corazawaf/waf.go:359).\n    _, _, _ = readJSON(body, 20, 1000)\n}\n```\n\n```\n$ go test -run TestStackOverflowRepro ./internal/bodyprocessors/ -v\nruntime: goroutine stack exceeds 1000000000-byte limit\nfatal error: stack overflow\n...\ngithub.com/tidwall/gjson.validarray(...)\n\t.../gjson@v1.18.0/gjson.go:2584\ngithub.com/tidwall/gjson.validany(...)\n\t.../gjson@v1.18.0/gjson.go:2499\ngithub.com/tidwall/gjson.validarray(...)\n\t.../gjson@v1.18.0/gjson.go:2589\n... (repeats until the goroutine stack limit is hit)\n```\n\nReproduced against commit `19b86824` (tag `v3.8.0`), both by calling\n`readJSON` directly and end-to-end through the recommended\n`coraza.conf-recommended` configuration (JSON `Content-Type`, default\n`SecArgumentsLimit`, recommended `SecRequestBodyLimit`).\n\n### Impact\n\nAn unauthenticated attacker who can send an HTTP request body (any endpoint\nprotected by Coraza with the JSON body processor enabled, which is the\ndefault for `application/json`) can crash the entire host process with a\nsingle request, using a payload well within default and recommended body\nsize and argument-count limits. There is no privilege or interaction\nrequirement, and the crash cannot be caught or mitigated by the integrator\n(no `recover()` stops a stack-overflow fatal error). This is strictly worse\nthan a CPU-exhaustion or slow-request DoS: the process must be restarted, and\nevery in-flight request/transaction on that process is lost.\n\n### Suggested fix\n\nRun an iterative, explicitly-bounded-depth pre-scan (or reuse `readItems`'s\nown recursion accounting) before calling `gjson.Valid`, and never call\n`gjson.Valid` on input whose nesting exceeds `maxRecursion`. The response\npath (`ProcessResponse`) needs the same treatment since it shares `readJSON`.\n\n### AI involvement disclosure\n\n- **AI tools/models used:** Claude Sonnet 5 (Anthropic), via Claude Code.\n- **What was generated/assisted:** the initial vulnerability hypothesis and\n  repro shape were supplied by the reporter as an existing written finding;\n  Claude Sonnet 5 independently re-derived the root cause by reading the\n  current source, wrote and ran a fresh PoC test against commit `19b86824`\n  (tag `v3.8.0`), confirmed the crash and stack trace shown above, verified\n  the default configuration values cited (`ArgumentLimit` default,\n  `SecRequestBodyLimit` recommended value) against the current source, and\n  drafted this advisory text.\n- **Review performed:** reproduced by hand by running the PoC test above with\n  `go test -run TestStackOverflowRepro ./internal/bodyprocessors/ -v` against\n  a clean checkout of commit `19b86824`; observed the `fatal error: stack\n  overflow` and stack trace through `gjson.validarray`/`validany`; traced\n  `readJSON`/`readItems` line by line to confirm the guard ordering described\n  above; the PoC was reviewed by a human maintainer (fzipi) before\n  submission of this advisory.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.8.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-6gcq-wc29-5xf2/GHSA-6gcq-wc29-5xf2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-6gcq-wc29-5xf2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/814e1898e083d2ff2ceb644382d0da17e930f93f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.1"
+    }
+  ]
+}

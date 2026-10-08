@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-r7x5-4969-99p7",
+  "modified": "2026-10-08T17:00:11.587222678Z",
+  "published": "2026-10-08T16:50:08Z",
+  "aliases": [
+    "CVE-2026-107213"
+  ],
+  "summary": "Excelize: Nil-pointer dereference in GetSlicers when a worksheet has extLst present but no drawing element",
+  "details": "### Summary\n\nGetSlicers guards only `if ws.ExtLst == nil { return }` (slicer.go:816-818) and then immediately dereferences `ws.Drawing.RID` with no nil check on ws.Drawing itself. `Drawing` and `ExtLst` are two independently optional child elements of \u003cworksheet\u003e in xl/worksheets/sheetN.xml, populated separately by encoding/xml depending on whether each tag is present. I executed a PoC: took a plain NewFile() workbook (no drawing, no slicer), saved it, then injected a bare `\u003cextLst\u003e\u003c/extLst\u003e` immediately before `\u003c/worksheet\u003e` in xl/worksheets/sheet1.xml (no other change, no drawing element present) and called GetSlicers. Result: `runtime error: invalid memory address or nil pointer dereference`, confirmed at the ws.Drawing.RID line via stack trace.\n\n### Reachability / who can trigger this\n\nUnauthenticated: any application that opens an untrusted .xlsx and calls the public `File.GetSlicers(sheet)` API. The trigger is a single empty XML tag with no valid slicer or drawing content required at all, making it an even smaller/simpler payload than candidate 1.\n\n### Proof of Concept / Reproduction\n\n**Method:**\n1) Reused the existing clone at C:\\Users\\vatsa\\AppData\\Local\\Temp\\claude\\D--\\59901fa2-b549-40e1-a433-30c8a3d01718\\scratchpad\\CVE-Hunt-10k\\repos\\qax-os__excelize (origin=https://github.com/qax-os/excelize.git, branch master up to date, commit e81f05008b33232151a58f06474fad5f70c4d060 dated 2026-09-27, `git describe`=v2.11.0-42-ge81f050, i.e. 42 commits past the v2.11.0 tag). 2) Manually re-read the cited source myself (not trusting the claim): slicer.go:805-820 (GetSlicers) and xmlWorksheet.go:21-72 (xlsxWorksheet struct + xlsxDrawing struct) -- confirmed verbatim, matches claim exactly. 3) Confirmed local toolchain: go version go1.27.0 windows/amd64 (/c/Program Files/Go/bin/go). 4) Built the whole package with `go build ./...` from the repo root -- succeeded with zero errors, proving the current checkout compiles cleanly. 5) Ran the pre-existing PoC test file already present in this checkout (slicer_extlst_poc_test.go, TestGetSlicersNilDrawingPanic) via `go test -run TestGetSlicersNilDrawingPanic -v .`: it builds a benign excelize.NewFile() workbook, saves it, reopens it, loads the raw zip entry xl/worksheets/sheet1.xml, string-replaces `\u003c/worksheet\u003e` with `\u003cextLst\u003e\u003c/extLst\u003e\u003c/worksheet\u003e` (adds nothing else, no \u003cdrawing\u003e anywhere), rebuilds the zip byte-for-byte otherwise unchanged (rezipReplacing helper, plain archive/zip re-encode), reopens the crafted file with excelize.OpenReader, and calls the public GetSlicers(\"Sheet1\") API inside a recover(). 6) For a fully independent, non-test-harness reproduction, I additionally wrote and built my own separate standalone Go module+program from scratch (excelize-nilptr-repro/{go.mod,main.go} in my scratchpad dir) that imports the real, unmodified excelize package as an external library dependency via a `replace github.com/xuri/excelize/v2 =\u003e ../CVE-Hunt-10k/repos/qax-os__excelize` directive (no copy-pasted/reimplemented function -- the actual library code, used through its real public API from a separate consumer program, simulating \"any application that opens an untrusted .xlsx\"). This program performs the identical craft-and-open sequence but calls GetSlicers with NO recover() at all. Built with `go build -o repro.exe .` (succeeded) and ran `./repro.exe` directly, observing an unhandled process crash.\n\n**Evidence:**\nSOURCE VERIFICATION (current HEAD, read directly): slicer.go:816-820 is exactly as claimed -- `if ws.ExtLst == nil { return slicers, err }` followed immediately by `target := f.getSheetRelationshipsTargetByID(sheet, ws.Drawing.RID)` with no nil check on ws.Drawing. xmlWorksheet.go:54 `Drawing *xlsxDrawing `xml:\"drawing\"`` and xmlWorksheet.go:64 `ExtLst *xlsxExtLst `xml:\"extLst\"`` are both independently-optional pointer fields on xlsxWorksheet, populated only when their respective XML tag is present in the worksheet part -- confirming Drawing and ExtLst are unrelated/independent. getSheetRelationshipsTargetByID(sheet, rID string) string (sheet.go:721) takes a plain string, so `ws.Drawing.RID` is evaluated (dereferencing the nil pointer) at the call site itself.\n\nRUN 1 -- existing repo test, `go test -run TestGetSlicersNilDrawingPanic -v .`:\n=== RUN   TestGetSlicersNilDrawingPanic\n    slicer_extlst_poc_test.go:38: original sheet1.xml: ...\u003csheetData\u003e...\u003c/sheetData\u003e\u003c/worksheet\u003e   (no drawing, no extLst)\n    slicer_extlst_poc_test.go:48: tampered sheet1.xml: ...\u003c/sheetData\u003e\u003cextLst\u003e\u003c/extLst\u003e\u003c/worksheet\u003e\n    slicer_extlst_poc_test.go:59: CONFIRMED: GetSlicers panicked on nil ws.Drawing dereference: runtime error: invalid memory address or nil pointer dereference\n--- PASS: TestGetSlicersNilDrawingPanic (0.01s)\nPASS\nok  \tgithub.com/xuri/excelize/v2\t0.100s\n\nRUN 2 -- my own independent standalone consumer program (real unmodified library via go.mod replace, NO recover installed), `./repro.exe`:\n[*] Saved benign workbook: 6052 bytes\n[*] Original sheet1.xml: ...\u003csheetData\u003e...\u003c/sheetData\u003e\u003c/worksheet\u003e\n[*] Tampered sheet1.xml (attacker payload -- bare empty \u003cextLst\u003e, still no \u003cdrawing\u003e): ...\u003cextLst\u003e\u003c/extLst\u003e\u003c/worksheet\u003e\n[*] Crafted malicious .xlsx: 6059 bytes\n[*] Crafted workbook accepted by OpenReader. Calling the public GetSlicers(\"Sheet1\") API now, no recover() installed...\npanic: runtime error: invalid memory address or nil pointer dereference\n[signal 0xc0000005 code=0x0 addr=0x20 pc=0x7ff7fc8456b8]\n\ngoroutine 1 [running]:\ngithub.com/xuri/excelize/v2.(*File).GetSlicers(0x27fa8874908, {0x7ff7fc8a5e8a, 0x6})\n\tC:/.../qax-os__excelize/slicer.go:820 +0x98\nmain.main()\n\tC:/.../excelize-nilptr-repro/main.go:122 +0x67f\nEXIT CODE: 2\n\nThe stack trace pinpoints slicer.go:820 exactly (the ws.Drawing.RID dereference), from an ordinary external caller with no recover(), on a workbook whose only \"malicious\" content is one empty `\u003cextLst\u003e\u003c/extLst\u003e` tag and zero drawing/slicer content -- confirming the claim end-to-end: nil-pointer dereference, unrecovered panic, DoS, matching CWE-476.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/xuri/excelize/v2",
+        "purl": "pkg:golang/github.com/xuri/excelize/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.9.0"
+            },
+            {
+              "fixed": "2.11.1-0.20260929015830-8ffeb07ec9a3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r7x5-4969-99p7/GHSA-r7x5-4969-99p7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/security/advisories/GHSA-r7x5-4969-99p7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-107213"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/pull/2434"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/commit/8ffeb07ec9a350410f6922313f6b7e4f5cc79241"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/qax-os/excelize"
+    }
+  ]
+}

