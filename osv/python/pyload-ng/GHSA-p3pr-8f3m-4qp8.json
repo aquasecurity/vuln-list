@@ -1,0 +1,150 @@
+{
+  "id": "GHSA-p3pr-8f3m-4qp8",
+  "modified": "2026-10-09T17:15:05.068909822Z",
+  "published": "2026-10-09T17:09:03Z",
+  "summary": "pyLoad WindowsPhoneNotify addon: non-admin SETTINGS user triggers SSRF via unguarded http.client notification host",
+  "details": "## Summary\n\npyLoad ships the WindowsPhoneNotify addon, whose `send()` method opens an HTTP connection to a host taken directly from the plugin's `pushurl` configuration value. A user holding the standard non-admin `SETTINGS` permission can set `pushurl` and `pushid` and enable the addon through the web API, since these plugin options are not in the admin-only option set. Once enabled, the addon activates dynamically without a restart, and any completed download (download events fire globally, not per user) causes the addon to send an HTTP POST to the configured host and path. The request is made with Python's `http.client.HTTPConnection`, so it never passes through pyLoad's pycurl-based outbound connection guard. The attacker can therefore direct blind POST requests at internal hosts such as loopback services, RFC 1918 addresses, or the cloud metadata endpoint `169.254.169.254`.\n\n## Root Cause\n\npyLoad enforces its outbound SSRF protection only inside the pycurl request path, where a `PREREQFUNCTION` callback calls `is_global_address()` on the resolved peer IP before each connection. The WindowsPhoneNotify addon uses a completely separate HTTP client (`http.client.HTTPConnection`) that is never subjected to that callback and performs no address validation of its own. In addition, the API config-write authorization only guards a narrow hard-coded set of plugin options, which does not include the WindowsPhoneNotify host and path fields, so a non-admin user can point the notifier at any destination.\n\n```text\nAffected symbols:\n- WindowsPhoneNotify.send (src/pyload/plugins/addons/WindowsPhoneNotify.py): opens http.client.HTTPConnection(url) on the attacker-controlled pushurl with no destination check.\n- Api.set_config_value (src/pyload/core/api/__init__.py): ADMIN_ONLY_PLUGIN_OPTIONS contains only AntiVirus entries, so a non-admin SETTINGS user can write the WindowsPhoneNotify pushurl, pushid, and enabled values.\n```\n\n## Impact\n\nAn authenticated user with the non-admin `SETTINGS` permission can cause the pyLoad server to issue blind HTTP POST requests to arbitrary internal hosts, ports, and paths that the user cannot reach directly. The attacker controls the destination host and port (`pushurl`), the request path (`pushid`), and part of the XML request body (through file and package names surfaced in the notification text). Because the request is blind, response bodies are not returned; the demonstrated capability is internal service discovery, port and host probing through timing or error differences, cloud metadata endpoint reachability where the network routes it, and triggering state changes on internal HTTP endpoints that act on POST requests. Confidentiality and integrity impact are limited but real; no direct availability impact was demonstrated.\n\n## Proof of Concept\n\n```text\nPreconditions: an authenticated pyLoad account with the SETTINGS permission (128), a network path from the pyLoad host to the chosen internal target, and at least one download that completes to fire the notification event.\n```\n\n1. As a user with the `SETTINGS` permission, POST to `/json/save_config` with `category=\"plugin\"` and config values `WindowsPhoneNotify|pushurl=169.254.169.254`, `WindowsPhoneNotify|pushid=/latest/meta-data/`, and `WindowsPhoneNotify|enabled=True`.\n2. The write is accepted because `(WindowsPhoneNotify, pushurl)` is not in the admin-only option set, and setting `enabled` to true triggers the addon manager's dynamic activation callback, loading the plugin immediately.\n3. Allow (or cause) any download to finish. The global `download_finished` event iterates activated addons and invokes the notifier.\n\n```text\nPOST /json/save_config HTTP/1.1\nHost: pyload.target\nCookie: \u003cauthenticated session with SETTINGS\u003e\nContent-Type: application/x-www-form-urlencoded\n\ncategory=plugin\u0026config=%7B%22WindowsPhoneNotify%7Cenabled%22%3A%22True%22%2C%22WindowsPhoneNotify%7Cpushurl%22%3A%22169.254.169.254%22%2C%22WindowsPhoneNotify%7Cpushid%22%3A%22%2Flatest%2Fmeta-data%2F%22%7D\n```\n\n```text\nObserved result: on the next completed download, the pyLoad process opens a TCP connection to 169.254.169.254:80 and sends \"POST /latest/meta-data/\" with a text/xml notification body. The connection is made by http.client.HTTPConnection with no address validation.\n```\n\n## Attack Chain\n\n1. **Exposure:** The `/json/save_config` web endpoint is network reachable and gated only by `login_required(\"SETTINGS\")`, a standard non-admin permission bit.\n2. **Control:** The attacker supplies the notifier `pushurl` (host and port), `pushid` (request path), and `enabled` flag as config values.\n3. **Path:** `set_config_value` writes the plugin options; the addon manager's config-change callback fires on `enabled` and activates the addon without a restart; a completed download dispatches the global `download_finished` event to activated addons.\n4. **Guard:** The config-write check consults `ADMIN_ONLY_PLUGIN_OPTIONS`, which lists only two AntiVirus options, so the notifier fields pass; the notifier rate and client-connection checks do not block the request; the pycurl `PREREQFUNCTION` SSRF guard and `is_global_address` are never invoked on this path.\n5. **Primitive:** `WindowsPhoneNotify.send()` calls `http.client.HTTPConnection(pushurl)` and issues a POST to `pushid`.\n6. **Result:** A blind HTTP POST reaches an attacker-chosen internal host and path from the pyLoad server's network position.\n\n## Bypass Evidence\n\npyLoad's outbound SSRF protection lives entirely in the pycurl request path: `is_global_address()` is called only from the pycurl `PREREQFUNCTION` callback, and `is_global_host()` is called only from URL parsing for user-submitted download links. Neither helper appears anywhere in the notifier dispatch path. The WindowsPhoneNotify sink uses `http.client.HTTPConnection`, which has no relationship to pycurl and no destination validation, so the guard is not bypassed by a payload trick but is simply not present on this code path. Attempts to disprove the finding were made and failed: the `SETTINGS` permission is a non-admin bit that an admin can grant independently of the admin role; the admin-only plugin option set does not contain the notifier fields; the dynamic activation callback fires on `enabled` and the activation and download-event handlers share a lock so there is no activation race; the notifier key-emptiness, client-connection, and rate-limit checks all pass with attacker-chosen non-empty values and default settings; and the `testing` plugin status is loadable (only `broken` is rejected).\n\n## Affected Versions\n\n- `Ecosystem: pip`\n- `Package: pyload-ng`\n- `Confirmed affected range: \u003c= 0.5.0b3.dev101`\n- `Latest release checked: pyload-ng 0.5.0b3.dev101 (PyPI sdist, sha256 427cfb35bc8e0db104e86a53576b2fdef99127aec178b80f58380a7977130251)`\n- `Fix status: not fixed in any released version`\n\nThe vulnerable `send()` method and the narrow admin-only plugin option set are present in the latest published PyPI artifact, `pyload_ng-0.5.0b3.dev101`. The project publishes only prerelease builds; there is no final `0.5.0` release, so the upper bound is the latest published prerelease. The introduction point was not bisected, so the range uses an open lower bound; the WindowsPhoneNotify addon carries an internal plugin version of 0.19, indicating a long history. No published version contains a fix.\n\n## Suggested Fix\n\nEnforce the same outbound destination policy on every HTTP client pyLoad uses, not only the pycurl path. Before the notifier opens a connection, resolve the configured host and reject non-global or otherwise disallowed destinations using the existing `is_global_host` / `is_global_address` logic (including the IPv6 transition-form handling), or route all addon HTTP traffic through a single hardened client that applies the guard. As defense in depth, add the WindowsPhoneNotify host and path options (and any other plugin option that designates a network destination) to the admin-only option set so a non-admin `SETTINGS` user cannot repoint them. Interim mitigation: restrict the `SETTINGS` permission to trusted accounts and ensure the pyLoad host cannot reach sensitive internal endpoints such as the cloud metadata service.\n\nReported by zx (GitHub: @manus-pi).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.5.0b3.dev101"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0a5.dev528",
+        "0.5.0a5.dev532",
+        "0.5.0a5.dev535",
+        "0.5.0a5.dev536",
+        "0.5.0a5.dev537",
+        "0.5.0a5.dev539",
+        "0.5.0a5.dev540",
+        "0.5.0a5.dev545",
+        "0.5.0a5.dev562",
+        "0.5.0a5.dev564",
+        "0.5.0a5.dev565",
+        "0.5.0a6.dev570",
+        "0.5.0a6.dev578",
+        "0.5.0a6.dev587",
+        "0.5.0a7.dev596",
+        "0.5.0a8.dev602",
+        "0.5.0a9.dev615",
+        "0.5.0a9.dev629",
+        "0.5.0a9.dev632",
+        "0.5.0a9.dev641",
+        "0.5.0a9.dev643",
+        "0.5.0a9.dev655",
+        "0.5.0a9.dev806",
+        "0.5.0b1.dev1",
+        "0.5.0b1.dev2",
+        "0.5.0b1.dev3",
+        "0.5.0b1.dev4",
+        "0.5.0b1.dev5",
+        "0.5.0b2.dev10",
+        "0.5.0b2.dev11",
+        "0.5.0b2.dev12",
+        "0.5.0b2.dev9",
+        "0.5.0b3.dev100",
+        "0.5.0b3.dev101",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96",
+        "0.5.0b3.dev97",
+        "0.5.0b3.dev98",
+        "0.5.0b3.dev99"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-p3pr-8f3m-4qp8/GHSA-p3pr-8f3m-4qp8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-p3pr-8f3m-4qp8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

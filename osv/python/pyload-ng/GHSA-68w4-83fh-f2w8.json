@@ -1,0 +1,122 @@
+{
+  "id": "GHSA-68w4-83fh-f2w8",
+  "modified": "2026-10-09T17:15:04.825976777Z",
+  "published": "2026-10-09T17:09:15Z",
+  "summary": "pyload-ng: getUserData/get_userdata exposed at Perms.ANY allow any authenticated account to brute-force the administrator password",
+  "details": "## Summary\n\n`Api.getUserData` (legacy) and `Api.get_userdata` are declared with `@permission(Perms.ANY)` and are reachable at `/api/getUserData` and `/api/get_userdata`. Because `Perms.ANY == 0` and pyLoad's permission check is a bitmask AND, that gate is a no-op: **every authenticated account passes, including one holding zero permission bits.**\n\nBoth methods are thin wrappers around `check_auth()`, which the maintainers deliberately restricted to administrators by omitting `@permission` (no entry in `perm_map`, so `is_authorized()` returns `False` for non-admins). The wrappers undo that protection.\n\nAn attacker holding the lowest-privileged account in the system therefore has a clean binary oracle on the **administrator password**, with no account lockout anywhere in the codebase, and with the 100 req/min rate limiter bypassable by rotating `X-Forwarded-For`.\n\n## Affected code\n\n`src/pyload/core/api/__init__.py:1446` and `:1464`\n\n```python\n    #: Old API\n    @permission(Perms.ANY)\n    @get\n    def getUserData(self, username: str, password: str) -\u003e OldUserData:\n        \"\"\"\n        similar to `check_auth` but returns UserData type.\n        \"\"\"\n        user = self.check_auth(username, password)\n        ...\n\n    @permission(Perms.ANY)\n    @get\n    def get_userdata(self, username: str, password: str) -\u003e UserData:\n        user = self.check_auth(username, password)\n        ...\n```\n\n## Root cause\n\n`src/pyload/core/api/__init__.py:57`\n\n```python\nclass Perms(IntFlag):\n    ANY = 0  #: requires no permission, but login\n```\n\n`src/pyload/core/api/__init__.py:108`\n\n```python\ndef has_permission(user_perms: Perms, required_perms: Perms):\n    return required_perms == (user_perms \u0026 required_perms)\n```\n\nFor `required_perms == 0` this evaluates to `0 == (user_perms \u0026 0)` → `0 == 0` → **always `True`**. The `@permission(Perms.ANY)` gate therefore admits every authenticated principal regardless of which permission bits they hold.\n\nContrast with the intended admin-only primitive, `src/pyload/core/api/__init__.py:1396`:\n\n```python\n    @legacy(\"checkAuth\")\n    @get\n    def check_auth(self, username: str, password: str) -\u003e dict[str, Any]:\n```\n\n`check_auth` has **no** `@permission`; `is_authorized()` at `api/__init__.py:1430` returns `False` for non-admins. The two wrappers carry `Perms.ANY` and restore access for everyone.\n\nBecause both wrappers also carry `@get`, they are placed in `method_map` and are directly routable via `/api/\u003cfunc\u003e`.\n\n## Amplifiers\n\n**1. No lockout.** There is no failed-login counter, delay, or ban anywhere in the codebase. A failed guess costs the attacker only one PBKDF2 computation.\n\n**2. Rate limiting is bypassable.** `/api/*` applies `rate_limit(count=100, period=60)` (`src/pyload/webui/app/blueprints/api_blueprint.py:25`), which buckets on a fully client-controlled header (`src/pyload/webui/app/helpers.py:446`):\n\n```python\nclient_ip = flask.request.headers.get(\"X-Forwarded-For\", \"\").split(\",\")[0].strip() \\\n    or flask.request.remote_addr\n```\n\nRotating `X-Forwarded-For` per request yields a fresh bucket each time. Notably, `is_loopback_request()` in the **same file** (`helpers.py:288-294`) explicitly treats the presence of `X-Forwarded-For` / `X-Real-IP` / `Forwarded` as untrustworthy — the same guard was evidently not applied inside `rate_limit()`.\n\n## Impact\n\nOnline brute force of the administrator account leading to full administrative takeover. A successful response additionally discloses the target account's `id`, `name`, `email`, `role`, and `permission` bits.\n\n## Proof of concept\n\nVerified against 0.5.0b3, commit `a5b008958`.\n\nSetup: stock instance with admin `pyload`, plus a non-admin user `bob` created with `role=USER` and `permission=0`.\n\n**Step 1 — establish that `bob` is genuinely unprivileged:**\n\n```\nGET /api/checkAuth?username=pyload\u0026password=pyload   -\u003e  401 {\"error\": \"Access denied\"}\nGET /api/getAllUserData                              -\u003e  401 {\"error\": \"Access denied\"}\n```\n\n**Step 2 — the flaw. Same user, same session, `Perms.ANY` gate:**\n\n```\nGET /api/getUserData?username=pyload\u0026password=WRONG\n  -\u003e 200 {\"name\": null, \"email\": null, \"role\": null, \"permission\": null, \"template_name\": null}\n\nGET /api/getUserData?username=pyload\u0026password=pyload\n  -\u003e 200 {\"name\": \"pyload\", \"email\": \"\", \"role\": 0, \"permission\": 0, \"template_name\": \"default\"}\n```\n\n`role: 0` is `Role.ADMIN`. `get_userdata` behaves identically. This is a perfect yes/no oracle.\n\n**Step 3 — measured brute force and recovery.** Run as `bob` (`permission = 0`), admin password set to a 2-character value, `X-Forwarded-For` rotated on every request:\n\n```\nattempts         : 667\nelapsed          : 39.7s   (16.8 guesses/sec)\n429 rate-limits  : 0\naccount lockout  : NONE - same session authenticated throughout\nRECOVERED SECRET : 'zq'   (true value 'zq')   match=True\n```\n\n**Step 4 — full takeover with the recovered secret:**\n\n```\nPOST /login as pyload/\u003crecovered\u003e       -\u003e  HTTP 302  (authenticated as admin)\nGET  /api/getAllUserData (admin-only)  -\u003e  HTTP 200  (full user dump)\n```\n\nMeasured throughput is 17-47 guesses/sec/thread. The only bound is PBKDF2-HMAC-SHA256 at 100,000 iterations in `src/pyload/core/database/user_database.py:14`, not any rate limit.\n\n## Suggested remediation\n\n- Remove `@permission(Perms.ANY)` from `getUserData` and `get_userdata`, or drop them entirely — they are legacy compatibility shims, and modern callers already use the admin-only `check_auth`.\n- Structurally: `Perms.ANY = 0` makes `has_permission()` vacuous, so **any** method decorated `@permission(Perms.ANY)` silently becomes public to every logged-in user. Give `ANY` a real bit value, or handle it explicitly in `has_permission()` as \"requires an authenticated session\".\n- Do not trust `X-Forwarded-For` unless a trusted-proxy deployment is explicitly configured. Otherwise bucket `rate_limit()` on `request.remote_addr`, or add the same guard `is_loopback_request()` already uses.\n- Add per-account failed-authentication throttling or lockout.\n- Consider `hmac.compare_digest()` in `_check_password()` (`src/pyload/core/database/user_database.py:61` uses a plain `==` on the derived hash, contradicting the \"always use compare_digest\" guidance two files away).\n\n## Notes for triage\n\nThere is no `0.5.0b3` release on PyPI. The `develop` branch auto-publishes dev builds (`setup.py:86` appends `.dev\u003cbuild\u003e` to the `VERSION` file); the newest at time of testing was `0.5.0b3.dev101`. The `Perms.ANY = 0` design is long-standing, but only the `0.5.0b3.dev*` line was verified here — please confirm whether `0.5.0b2.*` and `0.4.x` are affected before finalizing the version range.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyload-ng",
+        "purl": "pkg:pypi/pyload-ng"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.5.0b3.dev1"
+            },
+            {
+              "last_affected": "0.5.0b3.dev101"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.5.0b3.dev100",
+        "0.5.0b3.dev101",
+        "0.5.0b3.dev13",
+        "0.5.0b3.dev14",
+        "0.5.0b3.dev17",
+        "0.5.0b3.dev18",
+        "0.5.0b3.dev19",
+        "0.5.0b3.dev20",
+        "0.5.0b3.dev21",
+        "0.5.0b3.dev22",
+        "0.5.0b3.dev24",
+        "0.5.0b3.dev26",
+        "0.5.0b3.dev27",
+        "0.5.0b3.dev28",
+        "0.5.0b3.dev29",
+        "0.5.0b3.dev30",
+        "0.5.0b3.dev31",
+        "0.5.0b3.dev32",
+        "0.5.0b3.dev33",
+        "0.5.0b3.dev34",
+        "0.5.0b3.dev35",
+        "0.5.0b3.dev38",
+        "0.5.0b3.dev39",
+        "0.5.0b3.dev40",
+        "0.5.0b3.dev41",
+        "0.5.0b3.dev42",
+        "0.5.0b3.dev43",
+        "0.5.0b3.dev44",
+        "0.5.0b3.dev45",
+        "0.5.0b3.dev46",
+        "0.5.0b3.dev47",
+        "0.5.0b3.dev48",
+        "0.5.0b3.dev49",
+        "0.5.0b3.dev50",
+        "0.5.0b3.dev51",
+        "0.5.0b3.dev52",
+        "0.5.0b3.dev53",
+        "0.5.0b3.dev54",
+        "0.5.0b3.dev57",
+        "0.5.0b3.dev60",
+        "0.5.0b3.dev62",
+        "0.5.0b3.dev64",
+        "0.5.0b3.dev65",
+        "0.5.0b3.dev66",
+        "0.5.0b3.dev67",
+        "0.5.0b3.dev68",
+        "0.5.0b3.dev69",
+        "0.5.0b3.dev70",
+        "0.5.0b3.dev71",
+        "0.5.0b3.dev72",
+        "0.5.0b3.dev73",
+        "0.5.0b3.dev74",
+        "0.5.0b3.dev75",
+        "0.5.0b3.dev76",
+        "0.5.0b3.dev77",
+        "0.5.0b3.dev78",
+        "0.5.0b3.dev79",
+        "0.5.0b3.dev80",
+        "0.5.0b3.dev81",
+        "0.5.0b3.dev82",
+        "0.5.0b3.dev85",
+        "0.5.0b3.dev87",
+        "0.5.0b3.dev88",
+        "0.5.0b3.dev89",
+        "0.5.0b3.dev90",
+        "0.5.0b3.dev91",
+        "0.5.0b3.dev92",
+        "0.5.0b3.dev93",
+        "0.5.0b3.dev94",
+        "0.5.0b3.dev95",
+        "0.5.0b3.dev96",
+        "0.5.0b3.dev97",
+        "0.5.0b3.dev98",
+        "0.5.0b3.dev99"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-68w4-83fh-f2w8/GHSA-68w4-83fh-f2w8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/security/advisories/GHSA-68w4-83fh-f2w8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyload/pyload/commit/b99d2a2f06135363ceb0aab16aac5025f138e658"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyload/pyload"
+    }
+  ]
+}

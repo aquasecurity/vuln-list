@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-45gv-9wjv-xh7p",
+  "modified": "2026-10-09T17:15:04.820155610Z",
+  "published": "2026-10-09T17:08:15Z",
+  "aliases": [
+    "CVE-2026-107808"
+  ],
+  "summary": "Nginx UI: Authentication bypass: password login does not enforce a passkey-only second factor (2FA bypass)",
+  "details": "## Summary\n\nnginx-ui supports two second-factor methods — TOTP (OTP) and WebAuthn passkeys —\nand reports an account as 2FA-enabled when **either** is configured. However, the\npassword login endpoint (`POST /api/login`) only enforces a second factor when a\n**TOTP secret** is present. An account that has registered a **passkey but no\nTOTP** is logged in after password verification alone — the passkey is never\nrequested. This silently downgrades a passkey-protected account to single-factor\n(password-only) authentication.\n\n## Details\n\nThe account's 2FA policy treats passkeys as a valid factor (`model/user.go`):\n\n```go\nfunc (u *User) EnabledOTP() bool     { return len(u.OTPSecret) != 0 }\nfunc (u *User) EnabledPasskey() bool { /* true if a passkey row exists */ }\nfunc (u *User) Enabled2FA() bool     { return u.EnabledOTP() || u.EnabledPasskey() }\n\nfunc (u *User) AfterFind(_ *gorm.DB) error {\n    u.EnabledTwoFA = u.Enabled2FA() // exposed to the UI as `enabled_2fa`\n    return nil\n}\n```\n\nBut the login handler only checks `EnabledOTP()` (`api/user/auth.go`, `Login`):\n\n```go\nu, err := user.Login(json.Name, json.Password)\n...\nif u.EnabledOTP() {                       // \u003c-- only TOTP is enforced\n    if json.OTP == \"\" \u0026\u0026 json.RecoveryCode == \"\" {\n        c.JSON(http.StatusOK, LoginResponse{Message: \"The user has enabled 2FA\", Code: Enabled2FA}) // 199\n        user.BanIP(clientIP)\n        return\n    }\n    if _, err = user.VerifyOTP(u, json.OTP, json.RecoveryCode); err != nil { /* ... */ }\n    secureSessionID = user.SetSecureSessionID(u.ID)\n}\n\n// Passkey-only accounts fall through to here and receive a full session token:\naccessToken, err := user.GenerateJWT(u)\n```\n\nNo branch requires a WebAuthn assertion during password login when\n`EnabledPasskey()` is true. The root cause is the mismatch between the\n**policy definition** (`Enabled2FA()` = OTP **or** passkey) and the\n**enforcement check** (`EnabledOTP()` only).\n\nThe same `EnabledOTP()`-only gating in `RequireSecureSession()`\n(`internal/middleware/secure_session.go`) means passkey-only users are also\nexempted from step-up on sensitive actions.\n\n## Proof of Concept\n\nTested against nginx-ui built from source (`go build -tags unembed`) on\n`127.0.0.1:9000`, with WebAuthn configured and a victim account that has a\nregistered passkey and **no** TOTP. The vulnerable code is identical on the\nproduction `main` branch (`api/user/auth.go` `Login` gates on `u.EnabledOTP()`\nonly; verified at commit `6c86e5a`, 2026-05-17).\n\nAccount state advertised by `GET /api/2fa_status`:\n\n```json\n{\"enabled\":true,\"otp_status\":false,\"passkey_status\":true, ...}\n```\n\nAttacker logs in with **password only** (`POST /api/login`, encrypted params as\nthe client normally sends):\n\n```\nHTTP 200\n{\"message\":\"ok\",\"code\":200,\"token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....\"}\n```\n\n`code: 200` + a valid JWT = an authenticated session, with the passkey never\nused. For comparison, the identical account with a TOTP secret instead correctly\nreturns the second-factor challenge:\n\n```\nHTTP 200\n{\"message\":\"The user has enabled 2FA\",\"code\":199}\n```\n\n| Account state | `POST /api/login` (password only) |\n|---|---|\n| Passkey registered, no TOTP | `code 200` + JWT — **2FA NOT enforced** |\n| TOTP registered | `code 199` — 2FA challenge enforced |\n\nThis isolates the defect: the login path enforces OTP but ignores passkeys.\n\n## Impact\n\n- Any account protected **only** by a passkey is reduced to password-only\n  authentication. An attacker who obtains the password (phishing, reuse, leak)\n  gains full access despite the registered security key.\n- In nginx-ui all authenticated users are effectively administrators and the\n  terminal feature grants a host shell, so account takeover leads to full\n  control of the managed nginx instance / host.\n- Users are given a false sense of security: the UI shows the account as\n  2FA-enabled while the second factor is not enforced at login.\n\n## Remediation\n\n- Gate the second-factor decision on `u.Enabled2FA()` (not `u.EnabledOTP()`) in\n  `Login`, in both SSO callbacks, and in `RequireSecureSession()`.\n- For a passkey-only user logging in with a password, return a\n  \"passkey assertion required\" challenge and complete login only after a\n  successful WebAuthn assertion (the `begin_passkey_login` / `finish_passkey_login`\n  flow already exists and should be required as the second step).\n- Centralize session-token issuance so no login entry point can skip the 2FA\n  decision.\n\n## Affected components\n\n- `api/user/auth.go` — `Login`\n- `model/user.go` — `EnabledOTP`, `EnabledPasskey`, `Enabled2FA`, `AfterFind`\n- `api/user/2fa.go` — `get2FAStatus`\n- `internal/middleware/secure_session.go` — `RequireSecureSession`",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.9.10-0.20250517140552-daee3ac7ade1"
+            },
+            {
+              "fixed": "1.9.10-0.20260728074558-95cd21b70814"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-45gv-9wjv-xh7p/GHSA-45gv-9wjv-xh7p.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-45gv-9wjv-xh7p"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/95cd21b70814e5d9a48a359aa238aeea1ac97429"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0"
+    }
+  ]
+}

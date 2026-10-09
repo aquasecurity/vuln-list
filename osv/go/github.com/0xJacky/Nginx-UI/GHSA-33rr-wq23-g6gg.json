@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-33rr-wq23-g6gg",
+  "modified": "2026-10-09T17:15:04.758372242Z",
+  "published": "2026-10-09T17:08:10Z",
+  "aliases": [
+    "CVE-2026-107809"
+  ],
+  "summary": "Nginx-UI AuthRequired token cookie fallback enables CSRF against management APIs",
+  "details": "## Summary\nNginx-UI v2.4.3 stores the API JWT in a browser cookie named `token` and the `AuthRequired` middleware accepts that cookie as an authentication source. Because management endpoints are protected by `AuthRequired` and do not enforce a universal CSRF token or Origin/Referer check, a remote attacker can induce a logged-in administrator to submit cross-site state-changing requests. The attacker does not need to read the cross-origin response; the browser-sent cookie is enough to authenticate the request.\n\n## Details\nThe root cause is a trust-boundary failure between browser-managed cookies and API bearer-token authentication. In `app/src/pinia/moudule/user.ts:25-35`, the front end writes the JWT to a `token` cookie when the token changes. In `internal/middleware/middleware.go:16-36`, `getToken` first checks the `Authorization` header and `token` query parameter, then falls back to `c.Cookie(\"token\")`. That fallback causes browser-initiated cross-site requests to carry a valid API credential automatically. The route group in `router/routers.go:87-110` applies `middleware.AuthRequired()` to many management modules, including `config.InitRouter`, `nginx.InitRouter`, `settings.InitRouter`, and backup-related handlers. For accounts without OTP/Passkey, `RequireSecureSession` does not provide a universal second factor for all state-changing operations. A representative sink is `api/config/add.go:68-78`, where an authenticated request writes Nginx configuration with `os.WriteFile` and then calls `nginx.Control(nginx.Reload)`. CORS does not mitigate this issue because preventing cross-origin response reads does not prevent cross-site form or no-cors requests from being sent with cookies.\n\nCore vulnerable code path:\n\n```typescript\n// app/src/pinia/moudule/user.ts:25-35\nwatch(token, v =\u003e {\n    if (v) {\n      cookies.set('token', v, getCookieOptions(86400))\n      if (!shortToken.value) {\n        void fetchShortToken()\n      }\n    }\n    else {\n      cookies.remove('token', { path: '/' })\n      shortToken.value = ''\n    }\n  })\n```\n\nThe front end stores the authentication token in a `token` cookie. The cookie is created client-side and is not shown here as HttpOnly; it becomes the credential that the back end later accepts through cookie fallback.\n\n```go\n// internal/middleware/middleware.go:16-36\n// getToken from header, cookie or query\nfunc getToken(c *gin.Context) (token string) {\n\tif token = c.GetHeader(\"Authorization\"); token != \"\" {\n\t\treturn\n\t}\n\n\tif token = c.Query(\"token\"); token != \"\" {\n\t\tif len(token) \u003e 16 {\n\t\t\t// Long token (base64 encoded JWT)\n\t\t\ttokenBytes, _ := base64.StdEncoding.DecodeString(token)\n\t\t\treturn string(tokenBytes)\n\t\t}\n\t\t// Short token (16 characters)\n\t\treturn token\n\t}\n\n\tif token, _ = c.Cookie(\"token\"); token != \"\" {\n\t\treturn token\n\t}\n\n\treturn \"\"\n}\n```\n\n`getToken` accepts the `token` cookie as an authentication credential after checking the header and query parameter. That behavior lets a browser-sent cookie authenticate state-changing API requests triggered from another origin.\n\n```go\n// router/routers.go:87-110\n// Authorization required and not websocket request\n\t\tg := root.Group(\"/\", middleware.AuthRequired(), middleware.Proxy())\n\t\t{\n\t\t\tdebug.InitRouter(g)\n\t\t\tuser.InitUserRouter(g)\n\t\t\tanalytic.InitRouter(g)\n\t\t\tuser.InitManageUserRouter(g)\n\t\t\tnginx.InitRouter(g)\n\t\t\tsites.InitRouter(g)\n\t\t\tstreams.InitRouter(g)\n\t\t\tconfig.InitRouter(g)\n\t\t\ttemplate.InitRouter(g)\n\t\t\tcertificate.InitCertificateRouter(g)\n\t\t\tcertificate.InitDNSCredentialRouter(g)\n\t\t\tcertificate.InitAcmeUserRouter(g)\n\t\t\tdnsapi.InitRouter(g)\n\t\t\tsystem.InitPrivateRouter(g)\n\t\t\tsettings.InitRouter(g)\n\t\t\tllm.InitRouter(g)\n\t\t\tcluster.InitRouter(g)\n\t\t\tnotification.InitRouter(g)\n\t\t\texternal_notify.InitRouter(g)\n\t\t\tbackup.InitAutoBackupRouter(g)\n\t\t\tnginxLog.InitRouter(g)\n\t\t\tupstream.InitHTTPRouter(g)\n```\n\nMany management modules, including Nginx, configuration, settings, backup, and user management, are placed behind `AuthRequired`. The cookie fallback therefore protects high-impact state-changing routes, not only read-only endpoints.\n\n```go\n// api/config/add.go:68-78\nerr = os.WriteFile(path, []byte(content), 0644)\n\tif err != nil {\n\t\tcosy.ErrHandler(c, err)\n\t\treturn\n\t}\n\n\tres := nginx.Control(nginx.Reload)\n\tif res.IsError() {\n\t\tres.RespError(c)\n\t\treturn\n\t}\n```\n\nThis representative sink shows why the CSRF is high impact: once authenticated through the cookie fallback, a request can write Nginx configuration content and trigger a reload.\n\n## POC\nPrerequisites: an administrator is logged in to Nginx-UI and has a browser `token` cookie; the administrator account has not enabled OTP/Passkey, or the chosen target endpoint does not require secure-session proof; the attacker knows the Nginx-UI management URL and can induce the administrator to visit an attacker-controlled page. Reproduction: (1) Host an attacker page at `GET /csrf.html` that automatically submits a cross-site request to the victim instance. (2) The page submits `POST /api/configs` with configuration fields such as `base_dir`, `name`, `content`, `overwrite`, and `sync_node_ids`; the attacker does not need to read the response. (3) When the administrator visits the page, the browser attaches the victim site's `token` cookie. (4) Expected result: `AuthRequired` authenticates from the cookie, `AddConfig` writes the Nginx configuration, and the application attempts an Nginx reload. Testing should use a harmless configuration in an isolated environment.\n\n## Impact\nAn attacker can trigger administrative operations while an administrator is logged in, including Nginx configuration creation or modification, reload/restart operations, settings changes, and backup-related actions depending on endpoint protections. Direct impacts include traffic redirection, reverse proxy tampering, denial of service, and sensitive configuration changes. In deployments with permissive Nginx modules or dangerous configuration capabilities, configuration tampering may lead to further server-side impact or internal network abuse.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.9.10-0.20250517140552-daee3ac7ade1"
+            },
+            {
+              "fixed": "1.9.10-0.20260728074433-a3999bd78a3b"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-33rr-wq23-g6gg/GHSA-33rr-wq23-g6gg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-33rr-wq23-g6gg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/a3999bd78a3b97ab22e6b5e9fd478ac57598a954"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0"
+    }
+  ]
+}

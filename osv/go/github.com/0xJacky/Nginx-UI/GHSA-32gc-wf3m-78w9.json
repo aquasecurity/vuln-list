@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-32gc-wf3m-78w9",
+  "modified": "2026-10-09T17:15:05.309183812Z",
+  "published": "2026-10-09T17:07:23Z",
+  "aliases": [
+    "CVE-2026-107811"
+  ],
+  "summary": "0xJacky/nginx-ui /api/nodes Leaks Cluster Node Tokens and Allows Cross-Node Impersonation as initUser",
+  "details": "Summary\n0xJacky/nginx-ui contains a high-severity trust-boundary failure between ordinary users and cluster node credentials. The source code shows that cluster node list and detail endpoints are reachable by ordinary authenticated users and return node objects containing the token field.\n\nThat same token is also used as the X-Node-Secret shared credential for node-to-node authentication. When the middleware receives a correct node secret, it upgrades the request to initUser and bypasses the normal user-authentication path. As a result, any low-privileged authenticated user can first read a node token from /api/nodes and then impersonate a trusted node against a remote node's management API, achieving cross-node administrative authentication bypass.\n\nDetails\nThe root cause is a combination of sensitive credential exposure and improper trust elevation for node-to-node authentication. First, router/routers.go:87-105 mounts cluster.InitRouter(g) inside the shared /api authenticated route group, so any successfully authenticated user can access node list and detail endpoints.\n\nNext, api/cluster/node.go:19-48 implements GetNode and GetNodeList by directly returning analytic.GetNode(node). Meanwhile, model/node.go:8-13 defines Token with the JSON tag json:\"token\", meaning the node secret is serialized into API responses. The surrounding code path does not redact that field. Therefore, a low-privileged user can call /api/nodes or /api/nodes/:id and retrieve both the target node URL and the token value used for trusted node authentication.\n\nThe second half of the exploit chain is in internal/middleware/middleware.go:73-103. The middleware reads a node secret from the X-Node-Secret header or node_secret query parameter. If that supplied value matches settings.NodeSettings.Secret, the request is immediately associated with user.GetInitUser(c), stored in the context as user, and allowed to continue. In other words, possession of the node secret is treated as sufficient to become initUser and bypass the normal JWT-based user-authentication flow.\n\nThis makes the disclosed token directly reusable for privilege escalation. A low-privileged user logs in to the primary instance, retrieves the cluster node token through /api/nodes, then sends a request to the remote node with X-Node-Secret set to the leaked token. Because the remote node upgrades the request to initUser, the attacker can invoke sensitive management handlers. The verified evidence identifies api/system/router.go and api/system/restart.go as examples of reachable high-risk operations, including POST /api/system/restart.\n\nCore vulnerable code path:\n\ngo\n// router/routers.go:87-105\ng := root.Group(\"/\", middleware.AuthRequired(), middleware.Proxy())\n{\n\tdebug.InitRouter(g)\n\tuser.InitUserRouter(g)\n\tanalytic.InitRouter(g)\n\tuser.InitManageUserRouter(g)\n\tnginx.InitRouter(g)\n\tsites.InitRouter(g)\n\tstreams.InitRouter(g)\n\tconfig.InitRouter(g)\n\ttemplate.InitRouter(g)\n\tcertificate.InitCertificateRouter(g)\n\tcertificate.InitDNSCredentialRouter(g)\n\tcertificate.InitAcmeUserRouter(g)\n\tdnsapi.InitRouter(g)\n\tsystem.InitPrivateRouter(g)\n\tsettings.InitRouter(g)\n\tllm.InitRouter(g)\n\tcluster.InitRouter(g)\n\tnotification.InitRouter(g)\n\texternal_notify.InitRouter(g)\n\tbackup.InitAutoBackupRouter(g)\n\tnginxLog.InitRouter(g)\n\tupstream.InitHTTPRouter(g)\n\tg.GET(\"/geolite/status\", geolite.GetStatus)\n}\nThis route block shows that cluster endpoints are mounted in the shared authenticated route group. Any user with a valid JWT can reach cluster management APIs; there is no administrator-only authorization gate here.\n\ngo\n// api/cluster/node.go:19-48\nfunc GetNode(c *gin.Context) {\n\tid := cast.ToUint64(c.Param(\"id\"))\n\n\tnodeQuery := query.Node\n\n\tnode, err := nodeQuery.FirstByID(id)\n\tif err != nil {\n\t\tcosy.ErrHandler(c, err)\n\t\treturn\n\t}\n\n\tc.JSON(http.StatusOK, analytic.GetNode(node))\n}\n\nfunc GetNodeList(c *gin.Context) {\n\tcore := cosy.Core[model.Node](c).\n\t\tSetFussy(\"name\")\n\n\t// fix for sqlite\n\tif c.Query(\"enabled\") != \"\" {\n\t\tcore.GormScope(func(tx *gorm.DB) *gorm.DB {\n\t\t\treturn tx.Where(\"enabled = ?\", cast.ToInt(cast.ToBool(c.Query(\"enabled\"))))\n\t\t})\n\t}\n\n\tcore.SetTransformer(func(m *model.Node) any {\n\t\treturn analytic.GetNode(m)\n\t})\n\n\tcore.List()\n}\nThese handlers return node information directly to authenticated users. Because the returned object ultimately embeds the raw model.Node and that model contains a JSON token field, the API leaks the remote node shared secret.\n\ngo\n// model/node.go:8-13\ntype Node struct {\n\tModel\n\tName    string `json:\"name\"`\n\tURL     string `json:\"url\"`\n\tToken   string `json:\"token\"`\n\tEnabled bool   `json:\"enabled\" gorm:\"default:false\"`\n}\nThe model definition confirms that Token is JSON-serializable. This is a core part of the sensitive-information exposure because the field is not restricted to internal-only use.\n\ngo\n// internal/middleware/middleware.go:73-103\n// getNodeSecret from header or query\nfunc getNodeSecret(c *gin.Context) (secret string) {\n\tif secret = c.GetHeader(\"X-Node-Secret\"); secret != \"\" {\n\t\treturn secret\n\t}\n\n\treturn c.Query(\"node_secret\")\n}\n\n// AuthRequired is a middleware that checks if the user is authenticated\nfunc AuthRequired() gin.HandlerFunc {\n\treturn func(c *gin.Context) {\n\t\tabortWithAuthFailure := func() {\n\t\t\tc.AbortWithStatusJSON(http.StatusForbidden, gin.H{\n\t\t\t\t\"message\": \"Authorization failed\",\n\t\t\t})\n\t\t}\n\n\t\txNodeID := getXNodeID(c)\n\t\tif xNodeID != \"\" {\n\t\t\tc.Set(\"ProxyNodeID\", xNodeID)\n\t\t}\n\n\t\t// Check node secret authentication\n\t\tif nodeSecret := getNodeSecret(c); nodeSecret != \"\" \u0026\u0026 nodeSecret == settings.NodeSettings.Secret {\n\t\t\tinitUser := user.GetInitUser(c)\n\t\t\tc.Set(\"Secret\", nodeSecret)\n\t\t\tc.Set(\"user\", initUser)\n\t\t\tc.Next()\n\t\t\treturn\n\t\t}\nThis authentication logic converts knowledge of the leaked node secret into an authenticated request as initUser. That makes the disclosed token immediately reusable for cross-node privilege escalation.\n\nPOC\nPrerequisites: (1) the attacker has a valid low-privileged user account, (2) at least one cluster node is configured, and (3) the target node management address is reachable from the current deployment, which is typical in clustered setups.\n\nReproduction steps:\n\nLog in as a low-privileged user with POST /api/login using a request body containing name and password. Capture the returned JWT token.\nRequest GET /api/nodes or GET /api/nodes/:id with the low-privileged user's Authorization token.\nInspect the JSON response and extract the target node's url and token fields. The token is the shared secret accepted by the remote node as X-Node-Secret.\nSend a sensitive management request directly to the target node, such as POST /api/system/restart, with the leaked token in the X-Node-Secret header.\nIf the target node returns 200 or an equivalent success response, the request has been accepted as trusted node traffic.\nExpected result: the attacker performs administrative actions on the remote node without possessing a legitimate high-privileged user session on that node, demonstrating cross-node authentication bypass and privilege escalation to initUser-level access.\n\nImpact\nAny ordinary authenticated user can extract cluster node shared secrets and convert them into direct authentication bypass on remote nodes. The attacker can then execute high-risk administrative actions such as system restart, Nginx reload/restart, and configuration synchronization, enabling lateral movement across managed nodes and ultimately full compromise of the cluster management plane. The issue combines sensitive information disclosure with privilege escalation.\n\nRemediation\nDo not return cluster node tokens in normal API responses. Use dedicated output DTOs for node APIs and fully redact or omit the token field. Require administrator-level authorization for node-management endpoints instead of exposing them to every authenticated user. X-Node-Secret should not be shared with the normal HTTP management plane; it should be restricted to controlled network paths or stronger node-to-node trust channels such as mutually authenticated connections. Even when node-secret authentication succeeds, its capabilities should be minimized rather than mapping directly to a general-purpose initUser identity.\n\nDisclosure Notes\nThe affected version is identified from the report-generation context as v2.4.2. No fixing commit, patched release, or vendor advisory was verified during this reporting stage, so patched_versions is marked as to be confirmed. The narrative below is based only on verified source-code evidence and the managed-vulnerability metadata.\n\nSupplemental Information\nAffected products\nEcosystem: self-hosted\nPackage name: 0xJacky/nginx-ui\nAffected versions: v2.4.2\nPatched versions: to be confirmed",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.9.10-0.20250517140552-daee3ac7ade1"
+            },
+            {
+              "fixed": "1.9.10-0.20260728091109-0ecbd106c37b"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-32gc-wf3m-78w9/GHSA-32gc-wf3m-78w9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-32gc-wf3m-78w9"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/0ecbd106c37b5143be14880c9447a66135151512"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0"
+    }
+  ]
+}
