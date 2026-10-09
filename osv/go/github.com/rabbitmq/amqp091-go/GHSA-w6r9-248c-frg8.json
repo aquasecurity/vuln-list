@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-w6r9-248c-frg8",
+  "modified": "2026-10-08T20:00:05.881334554Z",
+  "published": "2026-10-08T19:40:19Z",
+  "aliases": [
+    "CVE-2026-107386"
+  ],
+  "summary": "amqp091-go: Pre-negotiation frame limit is not enforced to 4KB",
+  "details": "## Summary\nThe frame-size mitigation released in `amqp091-go` v1.13.0 can be bypassed before `connection.tune` completes. A malicious or compromised AMQP peer can send only a seven-byte body-frame header containing a large attacker-controlled `uint32` payload length. The client allocates a slice of that declared length before it verifies that the payload exists or rejects the frame for its invalid protocol state.\n\nThe bypass occurs because `Connection.maxFrameSize` starts at zero. The reader interprets zero as both “negotiated unlimited” and “not negotiated yet,” and skips the pre-allocation size check in either case. `Open` starts the reader goroutine before negotiation and does not store a limit until after it receives `connection.tune`.\n\nThis remains reachable even if the caller explicitly uses `Config{FrameSize: frameMinSize}`. A malicious broker can therefore cause excessive memory allocation, potentially terminating the Go client process through memory exhaustion, before authentication and connection setup complete.\n\n## Relationship to the existing advisory\n\n[GHSA-r9c8-gcjp-xfwh](https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-r9c8-gcjp-xfwh) describes attacker-controlled, unbounded allocation by a malicious broker and identifies v1.13.0 as the patched version. [Pull request 369](https://github.com/rabbitmq/amqp091-go/pull/369) added a frame-size check before parser allocation, but the check is active only when the stored maximum is nonzero.\n\nThe v1.13.0 source still:\n\n1. starts the reader before protocol negotiation;\n2. skips the bound while `maxFrameSize == 0`;\n3. allocates the body using the peer-declared size; and\n4. stores the negotiated maximum only after `connection.tune`.\n\nThis appears to be an incomplete-fix or state-boundary bypass of the existing advisory rather than an unrelated allocation issue.\n\n## Affected source and root cause\n\nThe issue was reproduced at commit [`9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde`](https://github.com/rabbitmq/amqp091-go/commit/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde), dated 2026-07-30. The same relevant control flow is in the v1.13.0 tag.\n\nThe vulnerable sequence is:\n\n1. [`Open` starts `c.reader(conn)` before calling `c.open(config)`](https://github.com/rabbitmq/amqp091-go/blob/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde/connection.go#L373-L392).\n2. [The reader receives a pointer to the initially zero-valued `c.maxFrameSize`](https://github.com/rabbitmq/amqp091-go/blob/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde/connection.go#L971-L979).\n3. [`ReadFrame` decodes the peer-controlled `uint32` size but rejects it only when `max \u003e 0`](https://github.com/rabbitmq/amqp091-go/blob/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde/read.go#L46-L79).\n4. [`parseBodyFrame` executes `make([]byte, size)` before `io.ReadFull`](https://github.com/rabbitmq/amqp091-go/blob/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde/read.go#L459-L466).\n5. [`maxFrameSize` is first stored after processing `connection.tune`](https://github.com/rabbitmq/amqp091-go/blob/9313fd9ea47bdb4e8f7f5db9bef94d5534d0bdde/connection.go#L1297-L1305).\n\nThe source comments and regression tests explicitly combine “negotiated unlimited” with “not yet negotiated” as the same zero state. Those states need different security behavior.\n\n## Safe reproduction\n\nThis reproducer does not start RabbitMQ, contact any hosted service, send a large payload, or attempt to crash the process. It declares a 2 MiB body and observes the size of the slice passed to the transport's payload `Read`. Receiving a 2 MiB destination slice proves that the allocation occurred; the test then releases the blocked read and exits.\n\n1. Check out v1.13.0.\n2. Save the following as `pre_negotiation_frame_limit_test.go` in the repository root.\n3. Run `go test -run '^TestPreNegotiationFrameLimitBypass$' -count=1 -v .`.\n\n```go\npackage amqp091\n\nimport (\n\t\"encoding/binary\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nconst declaredBodySize = 2 \u003c\u003c 20\n\ntype stagedFrameConn struct {\n\tmu          sync.Mutex\n\theader      []byte\n\theaderRead  bool\n\tbodyRead    chan int\n\tbodyOnce    sync.Once\n\trelease     chan struct{}\n\treleaseOnce sync.Once\n}\n\nfunc newStagedFrameConn() *stagedFrameConn {\n\theader := make([]byte, 7)\n\theader[0] = frameBody\n\tbinary.BigEndian.PutUint16(header[1:3], 1)\n\tbinary.BigEndian.PutUint32(header[3:7], declaredBodySize)\n\treturn \u0026stagedFrameConn{\n\t\theader:   header,\n\t\tbodyRead: make(chan int, 1),\n\t\trelease:  make(chan struct{}),\n\t}\n}\n\nfunc (c *stagedFrameConn) Read(p []byte) (int, error) {\n\tc.mu.Lock()\n\tif !c.headerRead {\n\t\tc.headerRead = true\n\t\tn := copy(p, c.header)\n\t\tc.mu.Unlock()\n\t\treturn n, nil\n\t}\n\tc.mu.Unlock()\n\n\tc.bodyOnce.Do(func() { c.bodyRead \u003c- len(p) })\n\t\u003c-c.release\n\treturn 0, io.EOF\n}\n\nfunc (c *stagedFrameConn) Write(p []byte) (int, error) { return len(p), nil }\n\nfunc (c *stagedFrameConn) Close() error {\n\tc.releaseOnce.Do(func() { close(c.release) })\n\treturn nil\n}\n\nfunc TestPreNegotiationFrameLimitBypass(t *testing.T) {\n\tconn := newStagedFrameConn()\n\topenDone := make(chan error, 1)\n\n\tgo func() {\n\t\t_, err := Open(conn, Config{FrameSize: frameMinSize})\n\t\topenDone \u003c- err\n\t}()\n\n\tselect {\n\tcase got := \u003c-conn.bodyRead:\n\t\tif got != declaredBodySize {\n\t\t\tt.Fatalf(\"payload Read received a %d-byte slice; want %d\", got, declaredBodySize)\n\t\t}\n\tcase \u003c-time.After(5 * time.Second):\n\t\tt.Fatal(\"payload Read was not reached\")\n\t}\n\n\t_ = conn.Close()\n\tselect {\n\tcase \u003c-openDone:\n\tcase \u003c-time.After(5 * time.Second):\n\t\tt.Fatal(\"Open did not exit after the test connection closed\")\n\t}\n}\n```\n\n### Expected secure behavior\n\nThe pre-negotiation reader rejects the oversized declared frame before allocating its payload buffer. The transport should never receive a payload `Read` with a 2 MiB destination slice.\n\n### Actual behavior\n\nThe test passes because the transport receives a payload `Read` whose destination slice is exactly 2 MiB, despite the caller setting `Config.FrameSize` to `frameMinSize`. This slice was created by `make([]byte, size)` using the untrusted frame header.\n\n## Additional local validation\n\nA five-test differential harness was run against the exact tested commit. All tests passed:\n\n```text\n=== RUN   TestCounterfactualZeroFrameLimitAllocatesBeforePayloadRead\n--- PASS: TestCounterfactualZeroFrameLimitAllocatesBeforePayloadRead\n=== RUN   TestCounterfactualNegotiatedLimitRejectsBeforePayloadAllocation\n--- PASS: TestCounterfactualNegotiatedLimitRejectsBeforePayloadAllocation\n=== RUN   TestCounterfactualZeroLimitAllowsSmallFrameControl\n--- PASS: TestCounterfactualZeroLimitAllowsSmallFrameControl\n=== RUN   TestCounterfactualNegotiatedLimitAllowsSmallFrameControl\n--- PASS: TestCounterfactualNegotiatedLimitAllowsSmallFrameControl\n=== RUN   TestCounterfactualPublicOpenReachesZeroLimitAllocation\n--- PASS: TestCounterfactualPublicOpenReachesZeroLimitAllocation\nPASS\nok github.com/rabbitmq/amqp091-go 0.907s\n```\n\nThe controls establish that:\n\n- the zero pre-negotiation state reaches attacker-sized allocation;\n- a `frameMinSize` bound rejects the same declaration before allocation;\n- both states continue to accept a valid small frame; and\n- the vulnerable state is reachable through public `Open`, not only through an internal helper.\n\n## Impact\n\nThe frame body length is a network-controlled 32-bit unsigned integer, so one seven-byte frame header can request an allocation approaching 4 GiB on a 64-bit client. The attacker does not need to transmit the declared body before allocation occurs. On memory-constrained clients or containers, this can cause severe memory pressure, an out-of-memory condition, or process termination.\n\nThe required attacker position is a malicious or compromised broker, or an equivalent peer able to provide the AMQP transport during connection establishment. No application credentials, user interaction, confidentiality impact, or integrity impact is required or claimed. The primary impact is availability of the client process and potentially dependent services.\n\n## Protocol relevance\n\nThe [AMQP 0-9-1 reference](https://github.com/rabbitmq/amqp-0.9.1-spec/blob/main/docs/amqp-0-9-1-reference.md#L395-L398) requires peers to accept frames up to the 4096-byte `frame-min-size` before `frame-max` is negotiated. It does not require accepting arbitrarily large pre-negotiation frames. A provisional 4096-byte receive limit is therefore compatible with the stated pre-negotiation requirement.\n\n## Suggested remediation\n\nRepresent these states separately:\n\n- pre-negotiation, with a provisional `frameMinSize` receive bound;\n- negotiated with a finite `frame_max`; and\n- explicitly negotiated unlimited, if that behavior remains supported.\n\nInitialize the provisional bound before the reader goroutine starts, then replace it with the negotiated result after `connection.tune`. Reject any declared payload that would make the total frame exceed the active limit before calling a frame parser or allocating a payload buffer. A protocol-state check that rejects body frames before connection setup completes would add defense in depth.\n\nPlease add a regression through public `Open` that sends an oversized body-frame header before `connection.tune` and verifies rejection before payload allocation, while retaining small valid-frame controls.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/rabbitmq/amqp091-go",
+        "purl": "pkg:golang/github.com/rabbitmq/amqp091-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.14.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-w6r9-248c-frg8/GHSA-w6r9-248c-frg8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-w6r9-248c-frg8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rabbitmq/amqp091-go/pull/377"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rabbitmq/amqp091-go/commit/6723e8cff8710f0a6bf5fb4af375e285052535b3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rabbitmq/amqp091-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.14.0"
+    }
+  ]
+}
