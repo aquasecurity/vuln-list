@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-rj9j-8772-4h6c",
+  "modified": "2026-10-09T21:00:15.613696542Z",
+  "published": "2026-10-09T20:42:33Z",
+  "aliases": [
+    "CVE-2026-68582"
+  ],
+  "summary": "Vikunja: Link-share token reads any tenant's kanban buckets and enumerates usernames/IDs instance-wide (BOLA)",
+  "details": "## Summary\n\nThe task-collection endpoint `GET /api/v1/projects/{project}/views/{view}/tasks` loads the requested project view straight from the URL path without verifying the caller is authorized for it. For a **link-share token**, the task query is correctly pinned to the share's own project, but the *view* is taken from the attacker-controlled path and never re-validated against the share. A holder of a share link to **any** project can therefore point the endpoint at any other tenant's kanban view and receive that view's bucket records — bucket titles plus the full `created_by` user object (username, name, id) — for every view in the instance. The same missing pre-authorization view load also yields a project/view-ID existence oracle (404 vs. non-404) usable by link shares and ordinary authenticated users alike.\n\n## Details\n\nRoot cause is in `TaskCollection.ReadAll` (`pkg/models/task_collection.go`).\n\n1. The view is resolved from the URL params before any permission check:\n\n```go\n// pkg/models/task_collection.go  (ReadAll)\nif tf.ProjectViewID != 0 {\n    view, err = GetProjectViewByIDAndProject(s, tf.ProjectViewID, tf.ProjectID) // (URL params)\n    ...\n}\n```\n\n`GetProjectViewByIDAndProject` (`pkg/models/project_view.go`) filters only on `WHERE id = ? AND project_id = ?` — it performs no authorization. A valid `(project, view)` pair returns the view; an invalid pair returns `ErrProjectViewDoesNotExist` (HTTP 404).\n\n2. For a link-share caller, the code pins the *task* scope to the token's own project but reuses the attacker-supplied `view`:\n\n```go\nshareAuth, is := a.(*LinkSharing)\nif is {\n    project, err := GetProjectSimpleByID(s, shareAuth.ProjectID)   // token's project\n    ...\n    return getTaskOrTasksInBuckets(s, a, []*Project{project}, view, opts, filteringForBucket, tf.forceFlatTasks)\n    // `view` is the foreign, attacker-controlled view — never validated against shareAuth.ProjectID\n}\n```\n\n3. `getTaskOrTasksInBuckets` → `GetTasksInBucketsForView` (`pkg/models/kanban.go`) reads the buckets of that foreign view directly:\n\n```go\nerr = s.Where(\"project_view_id = ?\", view.ID).OrderBy(\"position\").Find(\u0026buckets)\n...\nusers, err := getUsersOrLinkSharesFromIDs(s, userIDs) // resolves each bucket's created_by\n```\n\nEach returned `Bucket` serializes `CreatedBy *user.User` as `json:\"created_by\"` (`pkg/models/kanban.go`), exposing the creating user's username, name, and id.\n\nThe normal (non-share) path is protected because it runs `getRelevantProjectsFromCollection`, which calls `project.CanRead` on the URL project and returns 403 before any bucket data is produced. Only the `LinkSharing` branch skips that gate, which is why the bucket disclosure is link-share-specific. `ReadAllWeb` (`pkg/web/handler/read_all.go`) performs no permission check of its own, so all authorization for this endpoint lives inside `ReadAll`.\n\nScope of the leak (verified against fixtures): the *tasks* returned inside the buckets are still constrained to the share's own project (`getRawTasksForProjects` filters `tasks.project_id IN opts.projectIDs`, derived from the share's project). So victim task **contents do not leak**; what leaks is the foreign view's bucket structure and, critically, the `created_by` user identities of arbitrary buckets instance-wide.\n\nIntroduced in v0.24.0 by the per-view kanban feature (`feat(views)!: return tasks in buckets by view`), which added the `views/{view}/tasks` endpoint and the foreign-view bucket load. The link-share branch predates it, but the two only combine into this bug from v0.24.0 onward.\n\n## Impact\n\nA holder of a link-share token to any single project (link shares are designed to be handed out, often semi-publicly) can:\n\n- **Enumerate all project and view IDs instance-wide.** IDs are sequential auto-increment integers; an invalid `(project, view)` pair returns 404 while a valid one returns 200, giving a reliable existence oracle across all tenants.\n- **Disclose the `created_by` user of any kanban view's buckets** — username, display name, and user id. Because Vikunja auto-creates a default project with a Kanban view for every user, iterating view IDs enumerates usernames and user IDs for essentially every account on the instance.\n- **Disclose bucket titles** of every kanban view in the instance.\n\nThis is a cross-tenant broken-object-level-authorization bypass. It does not disclose victim task contents through this path, but instance-wide username/user-id enumeration plus kanban structure disclosure is a meaningful PII and reconnaissance exposure that defeats the tenant isolation the permission model is meant to enforce. The ID-enumeration oracle additionally works for any ordinary authenticated user (invalid combo → 404 vs. inaccessible combo → 403), because the view is loaded before the `CanRead` check.\n\n## Proof of Concept\n\nPrerequisites: link sharing enabled (default), a share link to any project (call it project A), and any second project B (e.g. another tenant's) with a kanban view V_B.\n\n1. Authenticate the share link to obtain a share JWT:\n   `POST /api/v1/shares/{shareHash}/auth`\n2. Using that token, request a foreign kanban view's tasks:\n   `GET /api/v1/projects/{B}/views/{V_B}/tasks`\n3. The 200 response is a list of `Bucket` objects belonging to view `V_B` — each with `title` and a populated `created_by` (username, name, id) — even though the token has no relationship to project B.\n4. Iterate `{B}`/`{V_B}` over sequential integers: valid pairs return bucket lists (harvest usernames/ids), invalid pairs return 404.\n\nVerified locally against the model fixtures: a `LinkSharing{ProjectID: 1}` (project 1 owned by user 1) calling `TaskCollection{ProjectID: 2, ProjectViewID: 8}.ReadAll` (project 2 owned by user 3) returns project 2's buckets (`\"testbucket4 - other project\"`, `\"testbucket40\"`) with their `created_by` user objects populated, and no error — while a nonexistent view id returns `ErrProjectViewDoesNotExist`.\n\n## Recommended Fix\n\nIn `TaskCollection.ReadAll`, before the view is loaded, pin the requested project to the link share's own project so any foreign view resolves to a 404 instead of leaking:\n\n```go\nif shareAuth, is := a.(*LinkSharing); is {\n    tf.ProjectID = shareAuth.ProjectID\n}\n```\n\nThis is consistent with the existing behavior that already forces the task query to `shareAuth.ProjectID`, and it closes both the bucket disclosure and the share-token half of the enumeration oracle. As defence-in-depth, resolve the view's authorization against the authenticated caller for every auth type (not just link shares), so the endpoint never loads a view the caller cannot read — closing the 404-vs-403 existence oracle for ordinary users as well.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.24.0"
+            },
+            {
+              "fixed": "2.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rj9j-8772-4h6c/GHSA-rj9j-8772-4h6c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-rj9j-8772-4h6c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-68582"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vikunja-broken-object-level-authorization-via-link-share-token"
+    }
+  ]
+}

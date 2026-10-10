@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-4hv6-xc92-j86g",
+  "modified": "2026-10-09T21:15:03.705569904Z",
+  "published": "2026-10-09T20:57:34Z",
+  "summary": "Vikunja: WebSocket authentication ignores server-side session state, so revoked sessions keep receiving live pushes",
+  "details": "### Summary\n\nVikunja v2.6.0 introduced server-side sessions with revocation semantics: `DELETE /api/v2/user/sessions/{id}` documents \"Revokes a specific session by its UUID\", and enabling TOTP calls `DeleteAllUserSessions` to invalidate all sessions. The WebSocket endpoint accepts any cryptographically valid user JWT without ever resolving its `sid` (session id) claim against the sessions table. A connection authenticated before revocation stays authenticated and continues to receive live pushes indefinitely, and even brand-new WebSocket connections are accepted with a token whose session was deleted. The revocation feature therefore does not cover the WebSocket boundary at all.\n\n### Details\n\nUser access JWTs carry a session reference: `NewUserJWTAuthtoken` (`pkg/modules/auth/auth.go:188`) sets `claims[\"sid\"] = sessionID`, and the API login-session documentation describes the claim as tying the JWT to a server-side session. On the HTTP side nothing consumes the claim per request either (REST access tokens simply expire after their short TTL, a design the maintainers documented when fixing GHSA-96q5, and refresh tokens are correctly invalidated when the session row is deleted).\n\nThe WebSocket endpoint `GET /api/v2/ws` authenticates through the first client message. `Connection.handleAuth` (`pkg/websocket/connection.go:168`) validates the token exclusively with `auth.GetUserIDFromToken` (`pkg/modules/auth/auth.go:292`):\n\n```go\nfunc GetUserIDFromToken(tokenString string) (int64, error) {\n\ttoken, err := jwt.Parse(tokenString, func(_ *jwt.Token) (any, error) {\n\t\treturn []byte(config.ServiceSecret.GetString()), nil\n\t})\n\t...\n\ttyp, ok := claims[\"type\"].(float64)\n\tif !ok || int(typ) != AuthTypeUser {\n\t\treturn 0, jwt.ErrTokenInvalidClaims\n\t}\n\t...\n}\n```\n\nThe function verifies signature and token type only. No session lookup occurs anywhere in the WebSocket path, and no re-validation happens after the initial auth. Consequently:\n\n1. A connection authenticated before `DELETE /api/v2/user/sessions/{id}` (or before TOTP enable, which runs `models.DeleteAllUserSessions`, `pkg/routes/api/v2/user_totp.go:208`) remains registered in the hub and keeps receiving every subscribed event, such as `notification.created` with the full notification object including comment, task and project content.\n2. A new connection opened after the deletion, using the same pre-revocation token, authenticates successfully.\n3. Session deletion is observable only in the REST surface. The user's session list empties, the refresh token dies on next use, but the WebSocket channel never notices.\n\nFor REST the exposure is bounded by the 10-minute access-token TTL. For WebSocket it is not: a connection lives until the client closes it, so a session the user believes revoked retains a live, server-pushed data channel with no time bound.\n\n### PoC\n\n\u003e [vikunja-ws-auth-ignores-session-revocation-PoC.zip](https://github.com/user-attachments/files/32741065/vikunja-ws-auth-ignores-session-revocation-PoC.zip)\n\nThe attached archive contains `deployment/deploy.sh` (local Vikunja v2.6.0 on loopback with SQLite) and `poc/poc.sh` running `poc/poc.py`:\n\n1. Victim registers and logs in. Second user registers for later interaction.\n2. Control: the victim's WebSocket authenticates and subscribes to `notification.created`. Negative control: a garbage token is rejected with `invalid_token`.\n3. Every victim session is deleted via `DELETE /api/v2/user/sessions/{id}` (the list afterwards reports 0 remaining).\n4. Exploit A: a brand-new WebSocket connection authenticates successfully with the deleted-session token.\n5. Exploit B: the second user comments on a task mentioning the victim. The victim's pre-revocation WebSocket connection receives the `notification.created` push with the full notification payload.\n\nResult: 10 checks passed on two consecutive runs, each from a wiped database.\n\n### Impact\n\nSession revocation, the mechanism a user relies on when a device is lost or a token is suspected stolen, silently excludes the WebSocket channel. A stolen or leaked access token can be converted into a push channel that survives every revocation action available to the user, including TOTP enrollment whose documented purpose is invalidating all sessions, and keeps delivering the victim's notifications (comment mentions, task and project metadata) until the attacker chooses to disconnect. The fix is to resolve the `sid` claim against the sessions table during `handleAuth` and to re-validate or drop hub connections when their session is deleted.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "2.3.0"
+            },
+            {
+              "last_affected": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4hv6-xc92-j86g/GHSA-4hv6-xc92-j86g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-4hv6-xc92-j86g"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    }
+  ]
+}

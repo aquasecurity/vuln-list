@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-fprf-r6rv-xg99",
+  "modified": "2026-10-09T21:15:04.455062561Z",
+  "published": "2026-10-09T20:57:38Z",
+  "summary": "Vikunja: Saved filter creation with an empty filter string recalculates task positions across all tenants",
+  "details": "### Summary\n\nIn Vikunja v2.6.0 the task position recalculation that runs when a saved filter view is created fails open when the requesting user has no accessible projects. Instead of aborting, the search that feeds the recalculation loses its project scope entirely and returns every task in the instance. The server then writes one `task_positions` row per task per view (four views per filter) into views owned by the requesting user, including rows that reference tasks of other tenants the user can never see. Any authenticated user can trigger this. The impact is a cross-tenant integrity violation, a single-request write amplification primitive that scales with instance size, and a violation of the invariant stated in the fix for GHSA-w39f-h553-h2mx that position writes are scoped by project read access.\n\n### Details\n\nVikunja computes kanban and list ordering in a shared `task_positions` table keyed by `(task_id, project_view_id)`. When a saved filter is created, `SavedFilter.Create` (`pkg/models/saved_filters.go:130`) calls `CreateDefaultViewsForProject` (`pkg/models/project_view.go:816`) which, for every default view it creates, calls `RecalculateTaskPositions` with `addExistingTasksToView = true` (`pkg/models/project_view.go:447`).\n\n`RecalculateTaskPositions` (`pkg/models/task_position.go:312`) builds a `TaskCollection` and, for filter views (`view.ProjectID \u003c -1`), resets the project scope to zero and injects the saved filter's filter string. The scope of the subsequent search is derived from `getRelevantProjectsFromCollection` (`pkg/models/task_collection.go:188`), which for `ProjectID == 0` returns exactly the projects the requesting user can access.\n\nInside `dbTaskSearcher.Search` (`pkg/models/task_search.go`), the WHERE clause is assembled at line 632:\n\n```go\ncond := builder.And(builder.Or(projectIDCond, favoritesCond), where, filterCond)\n```\n\n`projectIDCond` is only set when `len(opts.projectIDs) \u003e 0` and `favoritesCond` only when the caller opted into the favorites arm, which `RecalculateTaskPositions` never does. With zero accessible projects, an empty filter string (which produces no filter condition in `getTaskFiltersFromFilterString`) and no search string, all four children of the `builder.And` are invalid. go-xorm's condition builders silently drop invalid children, so the query becomes `SELECT ... FROM tasks` with no WHERE clause at all.\n\nThe result is written back unconditionally: the function deletes the view's position rows and bulk-inserts one row per returned task per view. Because the filter creation path runs this for four default views, one request writes `4 x total_task_count` rows, every one of them referencing tasks the requesting user has no relationship with, including tasks in other users' private projects.\n\nReaching the zero-project precondition does not require any bug beyond this one. `UpdateUserGeneralSettings` (`pkg/models/user_settings.go:105`) assigns `default_project_id` from the request body without validating that the referenced project exists or belongs to the caller. A user can therefore point their default project at any project id, which unblocks deleting their own Inbox (deletion is refused only while the Inbox is the default project, error 3012 in `pkg/models/error.go:482`). After the Inbox is gone, `getRawProjectsForUser` returns an empty list.\n\nTwo neighboring controls confirm the intended invariant exists elsewhere and is enforced in sibling paths. The event-driven filter update path gates candidate filters on the filter owner's access to each task's project (`matchTasksToViewsOfFilter`, introduced by commit `b1ad4063e7`), and the fix for GHSA-w39f-h553-h2mx validates position target views. The recalculation path on filter creation has no equivalent gate and contradicts the advisory statement that recalculation \"aborts on its own project read-access check\".\n\n### PoC\n\n\u003e [vikunja-filter-empty-scope-cross-tenant-positions-PoC.zip](https://github.com/user-attachments/files/32740623/vikunja-filter-empty-scope-cross-tenant-positions-PoC.zip)\n\nThe attached archive contains `deployment/deploy.sh` (local Vikunja v2.6.0 on loopback with SQLite) and `poc/poc.sh`, which performs the full sequence:\n\n1. Victim registers, creates a private project and a task.\n2. Attacker registers, sets `default_project_id` to the victim's project via `PUT /api/v2/user/settings/general`, deletes their own Inbox, and now has zero accessible projects.\n3. Control: `GET /api/v2/projects/{victim}` returns 403.\n4. Attacker creates a saved filter with `{\"filter\":\"\",\"filter_include_nulls\":true}`.\n5. Verification: direct SQLite inspection shows `task_positions` rows referencing the victim's task in all four of the attacker's filter views.\n6. Control: `GET /api/v2/projects/{filter_pseudo_project}/tasks` returns 0 items, so the written rows are not readable back through collection endpoints.\n\nResult: 10 checks passed on two consecutive runs, each from a wiped database.\n\n### Impact\n\nAn authenticated user, even one with no project access at all, causes the server to persist cross-tenant references: rows pointing at arbitrary other users' tasks are written into views the attacker controls. Task content is not exposed through the documented read paths (verified), so this is an integrity and availability issue rather than a direct disclosure:\n\n- Cross-tenant integrity violation. The `task_positions` state of the attacker's views now encodes other tenants' objects, against the access model the rest of the code enforces.\n- Write amplification and denial of service. One cheap request performs a full-table scan plus `4 x N` inserts, where N is the number of tasks in the instance. On an instance with 100,000 tasks that is 400,000 rows per request, and the request can be repeated without bound. CPU, IO and storage costs scale with instance size while attacker cost stays constant.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0-rc0"
+            },
+            {
+              "last_affected": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fprf-r6rv-xg99/GHSA-fprf-r6rv-xg99.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fprf-r6rv-xg99"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    }
+  ]
+}

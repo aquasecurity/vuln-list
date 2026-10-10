@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-32r8-5843-4qw2",
+  "modified": "2026-10-09T21:00:07.884951671Z",
+  "published": "2026-10-09T20:43:40Z",
+  "aliases": [
+    "CVE-2026-76216"
+  ],
+  "summary": "Vikunja: Link-share principal-type confusion enables cross-account team removal, bot takeover, and roster disclosure",
+  "details": "## Summary\nVikunja's `web.Auth` interface (`pkg/web/web.go`, single method `GetID() int64`) is satisfied by BOTH `*user.User` and `*models.LinkSharing`. A link-share's `GetID()` returns the **raw positive** `share.ID` (`pkg/models/link_sharing.go:83-85`), which lives in the same positive autoincrement ID space as `users.id`. The safe negated form `getUserID() = share.ID * -1` (`link_sharing.go:126-128`) exists but is NOT used at three permission sinks. As a result, a link-share principal with id `N` — which should have zero authority over teams or bot users — is treated as the *user* whose `users.id == N` at three permission checks that lack the `a.(*LinkSharing)` guard their sibling methods have. This is the same principal-type-confusion class as CVE-2026-68581 (GHSA-vvcv-vpph-h844), but at three code paths that advisory/fix never touched.\n\n## Root Cause\n`web.Auth` is a one-method interface (`GetID() int64`). `*LinkSharing.GetID()` returns the raw positive share id. Three permission methods compare this raw id directly and omit the link-share type guard used elsewhere in the same files:\n\n1. **`TeamMember.CanDelete`** (`pkg/models/team_members_permissions.go:31-40`): the self-removal fast path `if u.ID == a.GetID() { return true }` (:36) executes **before** `IsAdmin`. `IsAdmin` (:48-51) is the ONLY place that rejects link shares (`if _, is := a.(*LinkSharing); is { return false }`, :50) — and it is never reached when the fast path returns true.\n2. **`BotUser.isOwner`** (`pkg/models/bot_users_permissions.go:47-56`): `return u.BotOwnerID == a.GetID()` (:55), used by `CanRead`/`CanUpdate`/`CanDelete` (:36-45). Unlike `CanCreate` (:27-30) which type-asserts `a.(*user.User)`, these three paths have no principal guard.\n3. **`Team.CanRead`** (`pkg/models/teams_permissions.go:68-78`): matches membership on `And(\"user_id = ?\", a.GetID())` (:76) with no link-share guard, unlike sibling `IsAdmin` (:45-49, guard at :47).\n\nLink-share JWTs reach these routes: `SetupTokenMiddleware` validates the signature only, `GetAuthFromClaims` returns `*models.LinkSharing`, and the `/user`/`/teams` route groups add no link-share rejection. Link sharing is enabled by default (`config.go` `ServiceEnableLinkSharing.setDefault(true)`).\n\n## Impact\nA link-share principal (obtainable from any public share link, or self-registered via a share on the attacker's own project) whose id `N` collides with a victim's `users.id == N` can, without being that user or any user:\n- **Integrity (I:H):** remove the victim from any team they belong to (`DELETE /api/v1/teams/{T}/members/{username}`) → revokes all project permissions the victim inherited through that team.\n- **Availability/Integrity (A:H, I:H):** enumerate the victim's bot users (`GET /api/v1/user/bots` → `bot_owner_id = a.GetID()`), then disable/rename or **permanently delete** them (`DELETE /api/v1/user/bots/{id}` → `DeleteUser`), destroying data owned solely by those bots.\n- **Confidentiality (C:H):** read the roster + metadata (name, description, full member list) of any team the colliding user belongs to (`GET /api/v1/teams/{T}`), plus read bot-user records via `isOwner`-gated reads.\n\n## Attack Chain\n\n### Sink 1 — TeamMember.CanDelete (integrity)\n1. **Entry:** `POST /api/v1/shares/{hash}/auth` → link-share JWT with `id = N`. **Guard:** JWT middleware — signature only. **Bypass proof:** `GetAuthFromClaims` returns `*models.LinkSharing`; no route-group link-share rejection on the `/teams` group.\n2. **Action:** `DELETE /api/v1/teams/{T}/members/{usernameOfUserN}` with the link-share bearer, targeting a team `T` (≥2 members) that user `N` belongs to. **Guard:** `CanDelete` → `GetUserByUsername(tm.Username)` returns user N, then `u.ID == a.GetID()` (`team_members_permissions.go:36`). **Bypass proof:** `a.GetID()` returns `N` (raw positive `share.ID`, `link_sharing.go:84`) == user N's id → `true`. No `a.(*LinkSharing)` check on this branch (only `IsAdmin` at :50 has it, never reached).\n3. **Sink:** `Delete` (`team_members.go`) removes user N from team T (last-member check passes when team has ≥2 members). **Impact:** victim loses all project access inherited through team T.\n\n### Sink 2 — BotUser.isOwner (bot takeover / destruction)\n1. **Entry:** link-share JWT id N (as above). **Guard:** signature-only; `/user` group adds no link-share reject.\n2. **Enumerate:** `GET /api/v1/user/bots` → `ReadAll` runs `Where(\"bot_owner_id = ?\", a.GetID())` = bots owned by user N. **Bypass proof:** `a.GetID()` = N; returns victim's bot ids self-contained (removes the id-guessing barrier).\n3. **Sink:** `DELETE /api/v1/user/bots/{botId}` → `CanDelete` → `isOwner` → `u.BotOwnerID == a.GetID()` (`bot_users_permissions.go:55`) → true; `Delete` calls `DeleteUser`. **Bypass proof:** no `a.(*LinkSharing)` guard here (Create-only, :28). **Impact:** disable/rename/permanently delete victim's bot automation identities.\n\n### Sink 3 — Team.CanRead (info disclosure)\n1. **Entry:** link-share JWT id N. **Guard:** signature-only; no reject on `GET /teams/:team`.\n2. **Sink:** `GET /api/v1/teams/{T}` → `CanRead` runs `Where(\"team_id=?\", t.ID).And(\"user_id=?\", a.GetID()).Get(tm)` (`teams_permissions.go:74-77`). **Bypass proof:** `a.GetID()` = N matches user N's `team_members` row → `can = true`; no `a.(*LinkSharing)` check (contrast `IsAdmin` at :47). **Impact:** read roster + metadata of a team the link share is not part of.\n\n## Bypass Evidence\n- `link_sharing.go:83-85` `GetID()` returns raw positive `share.ID` (NOT the negated `getUserID()` at :126-128).\n- `team_members_permissions.go:36` raw `u.ID == a.GetID()` before `IsAdmin`; the LinkSharing guard sits at :50 on a branch never reached when the fast path returns true.\n- `bot_users_permissions.go:55` raw `u.BotOwnerID == a.GetID()`; the `a.(*user.User)` guard at :28 is Create-only and NOT replicated on `isOwner`.\n- `teams_permissions.go:76` raw `a.GetID()` in `CanRead`; sibling `IsAdmin` has the guard at :47, `CanRead` omits it.\n- All three sinks verified present on latest release tag `v2.4.0` (`git show v2.4.0:\u003cfile\u003e`). No fix commits touch these files between v2.4.0 and HEAD (the only post-tag commit to link_sharing.go, `c580d51`, merely shadows an embedded Update method).\n\n## Affected Versions\n`\u003c= 2.4.0` (latest release; also present on HEAD of `main`). Requires default-enabled link sharing.\n\n## Exploitability Constraint (reflected in AC:H)\nThe attacker cannot freely choose the colliding id — `link_shares.id` is autoincrement. Exploitation is (a) *opportunistic* (a guest holding a share with id N attacks the user whose `users.id == N`) or (b) *targeted* (self-register and walk the autoincrement toward a chosen id; low-numbered shares collide with low-numbered/early/admin accounts). This is the identical constraint the accepted CVE-2026-68581 had; it affects target selection (AC), not reachability of the boundary crossing.\n\n## Suggested Fix\nAdd the link-share principal guard (`if _, is := a.(*LinkSharing); is { return false }`) — which `IsAdmin`/`CanCreate` already use — to all three sinks: the `TeamMember.CanDelete` self-removal fast path (before the `u.ID == a.GetID()` check), `BotUser.isOwner`, and `Team.CanRead`. Alternatively, resolve principals through `getUserID()` (negated id space) at every permission check so link-share ids can never collide with user ids.\n\n---\nReported by **zx (Jace)** — GitHub: @manus-use",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "code.vikunja.io/api",
+        "purl": "pkg:golang/code.vikunja.io/api"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-32r8-5843-4qw2/GHSA-32r8-5843-4qw2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-32r8-5843-4qw2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-76216"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/go-vikunja/vikunja"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vikunja-through-principal-type-confusion-via-linksharing"
+    }
+  ]
+}
