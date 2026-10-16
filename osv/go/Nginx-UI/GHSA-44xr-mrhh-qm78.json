@@ -1,0 +1,55 @@
+{
+  "id": "GHSA-44xr-mrhh-qm78",
+  "modified": "2026-10-15T20:30:07.150257953Z",
+  "published": "2026-10-15T20:12:52Z",
+  "aliases": [
+    "CVE-2026-84312"
+  ],
+  "summary": "Nginx UI: Casdoor SSO callback uses a constant `state` parameter (login CSRF)",
+  "details": "## Summary\n\nIn the Casdoor SSO flow, the OAuth `state` parameter is hard-coded to `settings.CasdoorSettings.Application` — a value identical for every user and every login. The callback handler accepts whatever `state` the client sends without comparing it to anything stored in the user agent, enabling a login-CSRF: an attacker can force the victim's browser to authenticate as the *attacker*.\n\n## Details\n\n`api/user/casdoor.go:92-117` (`GetCasdoorUri`):\n\n```go\nfunc GetCasdoorUri(c *gin.Context) {\n    clientId := settings.CasdoorSettings.ClientId\n    redirectUri := settings.CasdoorSettings.RedirectUri\n    state := settings.CasdoorSettings.Application      // ← constant\n    ...\n    c.JSON(http.StatusOK, gin.H{\n        \"uri\": fmt.Sprintf(\n            \"%s/login/oauth/authorize?client_id=%s\u0026response_type=code\u0026redirect_uri=%s\u0026state=%s\u0026scope=read\",\n            endpoint, clientId, encodedRedirectUri, state),\n    })\n}\n```\n\n`api/user/casdoor.go:24-90` (`CasdoorCallback`):\n\n```go\ntype CasdoorLoginUser struct {\n    Code  string `json:\"code\" binding:\"required,max=255\"`\n    State string `json:\"state\" binding:\"required,max=255\"`\n}\n\nfunc CasdoorCallback(c *gin.Context) {\n    var loginUser CasdoorLoginUser\n    if !cosy.BindAndValid(c, \u0026loginUser) { return }\n    ...\n    // state is NEVER compared to a per-session value\n    token, err := casdoorsdk.GetOAuthToken(loginUser.Code, loginUser.State)\n    ...\n    u, err := user.GetUser(claims.Name)        // username from Casdoor's JWT\n    ...\n    userToken, err := user.GenerateJWT(u)       // JWT minted for whatever user came back\n}\n```\n\nCompare with the OIDC implementation in `api/user/oidc.go:35-48`, which generates a random state, stores it in an `oidc_state` cookie, and validates it on the callback. Casdoor has no such check.\n\n## Proof of Concept\n\n1. Attacker initiates a Casdoor authorisation flow on their own browser, obtaining an authorisation `code` for *their* Casdoor account.\n2. Attacker hosts a page that auto-submits the captured `code` to the victim's nginx-ui:\n\n   ```html\n   \u003chtml\u003e\u003cbody\u003e\u003cform action=\"https://victim.example/api/casdoor_callback\" method=\"POST\"\n                     enctype=\"text/plain\" id=\"x\"\u003e\n     \u003cinput name='{\"code\":\"\u003cattacker_code\u003e\",\"state\":\"\u003cApp\u003e\",\"junk\":\"' value='\"}'\u003e\n   \u003c/form\u003e\n   \u003cscript\u003edocument.getElementById('x').submit()\u003c/script\u003e\n   \u003c/body\u003e\u003c/html\u003e\n   ```\n\n3. Server exchanges the attacker's `code`, looks up the username from `claims.Name` in the local user table, and mints a JWT for *that* row. The callback also sets the `_nginx_ui_secure_session` cookie via `middleware.EnsureSecureSessionCookie(c)` (`casdoor.go:84`) — meaning the victim is now silently authenticated as the attacker.\n4. Victim, believing they are using their own account, configures sites / TLS keys; the attacker reads them.\n\n## Impact\n\nLogin CSRF — the victim is forced to authenticate as the attacker, leading to data exfiltration of anything the victim subsequently uploads or configures. Particularly dangerous when nginx-ui is used by an organisation where Casdoor maps internal identities — the attacker can attribute their changes to the victim.\n\n## Patches\n\nMirror the OIDC implementation:\n\n```diff\n+ import (\n+    \"crypto/rand\"\n+    \"crypto/subtle\"\n+    \"encoding/hex\"\n+    ...\n+ )\n\n func GetCasdoorUri(c *gin.Context) {\n     ...\n-    state := settings.CasdoorSettings.Application\n+    b := make([]byte, 16)\n+    if _, err := rand.Read(b); err != nil {\n+        cosy.ErrHandler(c, err); return\n+    }\n+    state := hex.EncodeToString(b)\n+    c.SetSameSite(http.SameSiteLaxMode)\n+    c.SetCookie(\"casdoor_state\", state, 600, \"/\", \"\",\n+                cSettings.ServerSettings.EnableHTTPS, true)\n     ...\n }\n\n func CasdoorCallback(c *gin.Context) {\n+    expected, err := c.Cookie(\"casdoor_state\")\n+    if err != nil {\n+        c.AbortWithStatusJSON(http.StatusBadRequest,\n+            gin.H{\"message\":\"missing state cookie\"}); return\n+    }\n     var loginUser CasdoorLoginUser\n     if !cosy.BindAndValid(c, \u0026loginUser) { return }\n+    if subtle.ConstantTimeCompare([]byte(expected), []byte(loginUser.State)) != 1 {\n+        c.AbortWithStatusJSON(http.StatusBadRequest,\n+            gin.H{\"message\":\"invalid state\"}); return\n+    }\n     ...\n }\n```\n\n## Workarounds\n\nDisable Casdoor SSO until patched. The OIDC integration in `api/user/oidc.go` is correctly implemented and can be used as a substitute.\n\n## References\n\n* [`api/user/casdoor.go:92-117`](https://github.com/0xJacky/nginx-ui/blob/dev/api/user/casdoor.go#L92-L117)\n* [`api/user/casdoor.go:24-90`](https://github.com/0xJacky/nginx-ui/blob/dev/api/user/casdoor.go#L24-L90)\n* [`api/user/oidc.go:35-48`](https://github.com/0xJacky/nginx-ui/blob/dev/api/user/oidc.go#L35-L48) (correct implementation for comparison)\n\n## Credits\n\nVishal Shukla ([@shukla304](https://github.com/shukla304)) and Sechub.dev AI Agent.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "Nginx-UI",
+        "purl": "pkg:golang/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c 1.9.10-0.20260703131214-23d1934099b0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-44xr-mrhh-qm78/GHSA-44xr-mrhh-qm78.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-44xr-mrhh-qm78"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-84312"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/23d1934099b05b2a01589b48129dc3d3159d91c2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.4.1"
+    }
+  ]
+}

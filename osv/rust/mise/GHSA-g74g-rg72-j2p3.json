@@ -1,0 +1,62 @@
+{
+  "id": "GHSA-g74g-rg72-j2p3",
+  "modified": "2026-10-15T20:30:06.548105165Z",
+  "published": "2026-10-15T20:16:09Z",
+  "aliases": [
+    "CVE-2026-103929"
+  ],
+  "summary": "mise permits untrusted local configuration to override default shell arguments",
+  "details": "## Summary\n\nUntrusted local .mise.toml [settings] can set the shell interpreter args (unix/windows default_inline / default_file shell_args), yielding arbitrary command execution, because those command-interpreter settings were not added to the global_only denylist the CVE-2026-55448 fix relies on. Code execution from an untrusted repository with no trust prompt for the malicious file, on par with the patched CVE. Confirmed at HEAD 7160170206782fdd3ef287c8302369e32152fb71.\n\n## The defect\n\nCVE-2026-55448 and CVE-2026-35533 fixed the fact that a local project [settings] table is harvested by the settings preloader independent of the trust store (an untrusted .mise.toml sets settings without the user ever trusting it). The remediation is a per-field global_only denylist: settings marked global_only are stripped from non-global config. The maintainers marked the command-execution fields they knew about (the three forge credential_command values) but did not mark the four shell-interpreter-args settings, which are also command-execution settings because they choose the interpreter for every command mise spawns.\n\nThe global_only denylist and the gap. In settings.toml, the three credential_command sinks are global_only (forgejo.credential_command around line 775, github.credential_command around 828, gitlab.credential_command around 990). The four shell-args settings do not carry global_only:\n\n- unix_default_file_shell_args (settings.toml around 2920)\n- unix_default_inline_shell_args (around 2926)\n- windows_default_file_shell_args (around 3004)\n- windows_default_inline_shell_args (around 3010)\n\nThe strip logic only removes global_only keys. src/config/settings.rs strip_local_only_settings (line 409) filters by meta.global_only (line 416: `filter_map(|(key, meta)| meta.global_only.then_some(*key))`), so any field not marked global_only survives from a local untrusted config. The settings preload loads every config path including the local project file (all_settings_files, line 778), and in default (non-safe) mode there is no trust check (safe_mode defaults false, line 1141).\n\nThe sink. src/config/settings.rs default_inline_shell (line 1032) reads self.unix_default_inline_shell_args (line 1040), and default_file_shell reads unix_default_file_shell_args. Settings::get returns the merged global-plus-local value minus global_only, so the untrusted project value overrides the built-in default (sh -c -o errexit).\n\nInjection semantics. The real command is appended after the attacker's args, so PAYLOAD runs and the real command is demoted to $0:\n\n- tera inline exec builtin: src/tera.rs (tera1_exec around 1358, and around 1470) builds shell[1..] + [command] with program = shell[0]. An attacker unix_default_inline_shell_args = \"sh -c 'PAYLOAD'\" yields sh -c 'PAYLOAD' \u003ccommand\u003e.\n- postinstall runner: src/backend/mod.rs around 2405 calls cmd_body_args(shell_args, body); src/cmd.rs cmd_body_args (non-Windows, around 520) returns program flags... body, the same demotion.\n- task execution: src/task/task_executor.rs (around 916, 939, 993) uses task.shell()?.unwrap_or(default_inline_shell()/default_file_shell()), so a trusted task with no explicit shell (the common case) runs through the attacker's interpreter.\n- hooks: src/hooks.rs (around 540, 603) also fall back to default_inline_shell().\n\n## Attacker model and reachability\n\nAn untrusted repository the developer clones and cd's into. The attacker's .mise.toml sits in the working directory or any ancestor and is never trusted by the victim; its [settings] table is harvested by the preloader independent of the trust store, exactly as the two prior CVEs established. The executed command can come from a trusted or global source; only the interpreter is attacker-controlled. Any of these, run while the untrusted .mise.toml is in an ancestor directory, fires it: mise run \u003ctask\u003e for a task defined in the global config or a trusted parent repo (inline run, no explicit shell); mise install of any tool with a postinstall directive; any tera template that calls exec(...) in the victim's own trusted or global config; a directory-enter hook from any trusted config in scope.\n\nProof of concept. In an untrusted repo, .mise.toml:\n\n```toml\n[settings]\nunix_default_inline_shell_args = \"sh -c 'id \u003e /tmp/mise_pwned'\"\n```\n\nThe victim cd's in (does not trust the file) and later runs any global or trusted-parent task with no explicit shell, or mise install of a tool with a postinstall, or a config that renders {{ exec(...) }}. mise builds `sh -c 'id \u003e /tmp/mise_pwned' \u003crealcommand\u003e`, so the payload runs.\n\n## Verification\n\nSource-verified at HEAD: the four shell-args settings lack global_only while the credential_command sinks have it, strip_local_only_settings removes only global_only keys, default_inline_shell reads the setting, and the exec/postinstall/task paths append the real command after the attacker args. The load path is the same one two shipped CVEs already proved reachable. I did not run mise end to end.\n\n## Suggested fix\n\nMark all four *_default_*_shell_args settings global_only = true (the same treatment as credential_command), or flip the default-mode policy to an allowlist so any setting not explicitly known-safe is stripped from non-global config.\n\nSecondary note (weaker, not the main finding): the CVE-2026-54557 path-sanitization fix added sanitize_install_version_name only inside the HTTP backend (src/backend/http.rs around 628), while the general path builder ToolVersion::tv_pathname (src/toolset/tool_version.rs around 292) still only replaces ':' and '/' and does not neutralize '..' or backslash. Impact is narrow (one level up, stays in the mise data dir on Unix), so this is a hardening note, not a primary finding.\n\n## Tooling\n\nAI assistance was used while investigating, but the researcher read strip_local_only_settings (confirming it strips only global_only), the settings.toml entries (confirming the four shell-args settings lack global_only while credential_command has it), default_inline_shell (confirming it reads the setting), and the exec/postinstall/task invocation sites (confirming the real command is appended after the attacker args) themself at HEAD, so the incomplete fix is source-verified.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "mise",
+        "purl": "pkg:cargo/mise"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2026.7.14"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2026.7.13",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-g74g-rg72-j2p3/GHSA-g74g-rg72-j2p3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jdx/mise/security/advisories/GHSA-g74g-rg72-j2p3"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-103929"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jdx/mise/pull/11293"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jdx/mise/commit/c6cd7a9a2ca580918562566126646e5d04317895"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jdx/mise"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jdx/mise/releases/tag/v2026.7.14"
+    }
+  ]
+}

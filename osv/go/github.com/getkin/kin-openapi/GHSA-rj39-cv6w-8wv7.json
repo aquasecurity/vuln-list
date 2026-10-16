@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-rj39-cv6w-8wv7",
+  "modified": "2026-10-15T20:30:11.872986933Z",
+  "published": "2026-10-15T20:20:27Z",
+  "aliases": [
+    "CVE-2026-100352"
+  ],
+  "summary": "kin-openapi: YAML NaN/Inf Values Bypass Built-in Guards and Panic via OAS 3.1 Validation Path",
+  "details": "## Summary\n\nkin-openapi guards against `NaN` and `Inf` values in its built-in schema visitor (`visitJSON`) by returning `ErrSchemaInputNaN` / `ErrSchemaInputInf` when a `float64` input violates those constraints. For OAS 3.1 specs, however, `Schema.VisitJSON` routes through `useJSONSchema2020`, which hands the value directly to `santhosh-tekuri/jsonschema/v6` v6.0.2 without applying the same guard.\n\nInside `jsonschema/v6` v6.0.2, `numValidate` builds a `*big.Rat` from the input via `big.Rat.SetString(fmt.Sprintf(\"%v\", v))`. For `NaN`/`Inf` this parse fails silently and returns `nil`. `numValidate` then dereferences the nil `*big.Rat` (in `math/big.(*Rat).Cmp`), producing a Go runtime panic.\n\nAn attacker delivers this by sending an HTTP request with `Content-Type: application/yaml` (or `application/x-yaml`) and a YAML body containing `.nan`, `.inf`, or `-.inf`. The `YamlBodyDecoder` decodes those tokens into `math.NaN()` / `math.Inf(±1)` (standard YAML 1.2 behavior), and they propagate to the unguarded `useJSONSchema2020` path whenever the schema declares a numeric constraint (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, or `multipleOf`).\n\n## Details\n### Root Cause\n\nThe built-in visitor `visitJSON` at `openapi3/schema.go:1968` guards NaN/Inf explicitly:\n\n```go\ncase float64:\n    if math.IsNaN(value) {\n        return ErrSchemaInputNaN\n    }\n    if math.IsInf(value, 0) {\n        return ErrSchemaInputInf\n    }\n```\n\nFor OAS 3.1 specs, `VisitJSON` dispatches to `useJSONSchema2020` (`openapi3/schema_jsonschema_validator.go:204`), which contains no such guard:\n\n```go\nfunc (schema *Schema) useJSONSchema2020(settings *schemaValidationSettings, value any) error {\n    validator, err := newJSONSchemaValidator(schema)\n    if err != nil {\n        return schema.visitJSON(settings, value)\n    }\n    return validator.validate(value)      // value handed straight through\n}\n```\n\n`jsonSchemaValidator.validate` calls `jsonschema/v6.Schema.Validate` (line 146), which reaches `numValidate` in v6.0.2. There, `big.Rat.SetString(fmt.Sprintf(\"%v\", v))` returns `(nil, false)` for `NaN`/`Inf`, and the code dereferences the `nil` `*big.Rat` in `Rat.Cmp`, causing the panic.\n\n## Proof of Concept\n\n### Environment\n\n- kin-openapi v0.144.0 (tag `v0.144.0`, commit `f0407d5`)\n- santhosh-tekuri/jsonschema/v6 v6.0.2 (transitive dep)\n- Go 1.26.7\n\n### Spec\n\nMinimal OAS 3.1 spec (`spec.yaml`) declaring a YAML body with a numeric constraint:\n\n```yaml\nopenapi: '3.1.0'\ninfo: { title: Test, version: '1.0' }\npaths:\n  /test:\n    post:\n      requestBody:\n        required: true\n        content:\n          application/yaml:\n            schema:\n              type: number\n              minimum: 0\n      responses:\n        '200': { description: OK }\n```\n\n### Trigger\n\nA single `POST /test` with `Content-Type: application/yaml` and body `.nan`, `.inf`, or `-.inf`. All three variants panic:\n\n```\n=== RUN   TestNaNInf\n[nan]    PANIC (confirms vuln): runtime error: invalid memory address or nil pointer dereference\n[inf]    PANIC (confirms vuln): runtime error: invalid memory address or nil pointer dereference\n[neginf] PANIC (confirms vuln): runtime error: invalid memory address or nil pointer dereference\n```\n\n### Panic stack trace (confirms exact chain)\n\n```\npanic: runtime error: invalid memory address or nil pointer dereference\n\nmath/big.(*Rat).Cmp(0x0, ...)                                       \u003c- nil *big.Rat dereferenced\n    C:/Program Files/Go/src/math/big/rat.go:492\ngithub.com/santhosh-tekuri/jsonschema/v6.(*validator).numValidate(...)\n    .../jsonschema/v6@v6.0.2/validator.go:525\ngithub.com/santhosh-tekuri/jsonschema/v6.(*validator).validate(...)\n    .../jsonschema/v6@v6.0.2/validator.go:168\ngithub.com/santhosh-tekuri/jsonschema/v6.(*Schema).validate(...)\n    .../jsonschema/v6@v6.0.2/validator.go:34\ngithub.com/getkin/kin-openapi/openapi3.(*jsonSchemaValidator).validate(...)\n    openapi3/schema_jsonschema_validator.go:146\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).useJSONSchema2020(...)   \u003c- MISSING NaN/Inf guard\n    openapi3/schema_jsonschema_validator.go:211\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).VisitJSON(...)\n    openapi3/schema.go:1946\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateRequestBody(...)\n    openapi3filter/validate_request.go:364\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateRequest(...)\n    openapi3filter/validate_request.go:96\n```\n\n### net/http behavior (severity nuance)\n\nBehind a standard `net/http` server, the panic is recovered per-connection. The client sees a dropped connection; the server process continues:\n\n```\nSending POST /test body=.nan against real net/http server...\n2026/08/25 http: panic serving 127.0.0.1:40625: runtime error: invalid memory address or nil pointer dereference\nCLIENT ERROR (connection dropped): Post \".../test\": EOF\nProcess still alive after request: true\n```\n\nThis is a **recoverable panic**, unlike the recursion finding. `recover()` catches it (verified by capturing the panic value in a `defer` in the same goroutine). Non-`net/http` hosts or validation performed in an application-spawned goroutine are not covered by that recovery and would experience a full-process crash.\n\n### Fix verification\n\nUpgrading only the transitive dependency to `jsonschema/v6@v6.0.3` (via `go get github.com/santhosh-tekuri/jsonschema/v6@v6.0.3`) eliminates the panic entirely; all three payloads return a clean validation error:\n\n```\n[nan]    Returned normally, err = request body has an error: doesn't match schema: validation failed due to: at '': invalid jsonType float64\n[inf]    Returned normally, err = request body has an error: doesn't match schema: validation failed due to: at '': invalid jsonType float64\n[neginf] Returned normally, err = request body has an error: doesn't match schema: validation failed due to: at '': invalid jsonType float64\n```\n\nThis confirms the upstream `jsonschema/v6` v6.0.3 release treats the NaN/Inf case as a bug and fixes it at the source. It also confirms `useJSONSchema2020` is the reachable path: patching only the transitive dep removes the panic without touching kin-openapi code.\n\n## Why This Is a Vulnerability, Not by Design\n\n- The library explicitly refuses NaN/Inf in its own visitor (`ErrSchemaInputNaN` / `ErrSchemaInputInf` at `schema.go:1968`). The stated policy is: these values are not allowed.\n- The OAS 3.1 dispatch (`useJSONSchema2020`) simply omits the same guard — a coding gap, not a design decision.\n- Upstream `jsonschema/v6` v6.0.3 fixes the same case as a bug. Two independent code owners agree it should not panic.\n- The trigger is a single HTTP request body an unauthenticated client can send. There is no legitimate content-authoring reason to submit `.nan` / `.inf` as a numeric field.\n\n## Impact\n\n- **Per-request denial of service (net/http hosts).** Every crafted request kills its own connection with zero attacker cost. Sustained flooding degrades service reliability and log noise.\n- **Full-process denial of service (non-net/http hosts or goroutine-spawned validation).** No `net/http` recovery wrapper is present; the whole process crashes on a single request.\n- **Attack surface is any OAS 3.1 API that accepts YAML bodies with numeric constraints.** These constraints (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`) are common on any numeric field with a range.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.148.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rj39-cv6w-8wv7/GHSA-rj39-cv6w-8wv7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-rj39-cv6w-8wv7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100352"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/4487f198ab8be0c37d6ca72c54f5dca4dc25270e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.148.0"
+    }
+  ]
+}

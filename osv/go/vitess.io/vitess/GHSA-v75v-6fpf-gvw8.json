@@ -1,0 +1,104 @@
+{
+  "id": "GHSA-v75v-6fpf-gvw8",
+  "modified": "2026-10-15T20:30:05.447638204Z",
+  "published": "2026-10-15T20:16:29Z",
+  "aliases": [
+    "CVE-2026-104252"
+  ],
+  "summary": "Vitess vttablet /twopcz reflected XSS",
+  "details": "From: xylove21\nTo: security@vitess.io\nSubject: [Security Report] Vitess vttablet /twopcz reflected XSS\nDate: Tue, 24 Jun 2026 14:30:00 +0800\n\n## Summary\n\nThe `twopczHandler` in\n`go/vt/vttablet/tabletserver/twopcz.go` (line 185) reflects the `Action`\nand `dtid` form values directly into the HTML response body via\n`fmt.Fprintln(w, msg)` — **without HTML escaping**. The response is served\nas `text/html; charset=utf-8`, and Vitess's default `acl` policy is\n**allow-all**, so the endpoint is reachable by anyone who can hit the\nvttablet's HTTP port (default `15999`, multiplexed with gRPC and MySQL\nwire-protocol ports).\n\nA crafted `Action` or `dtid` value yields a **reflected XSS** that\nexecutes in the operator's browser with same-origin access to the\nvttablet's debug endpoints. This includes `/queryz` (live query plans),\n`/querylogz` (recent queries with bound values), `/txlogz` (transactions),\n`/debug/env` (environment variables — may include MySQL/topology\ncredentials), `/debug/vars` (expvar stats), and `/debug/pprof/*` if\nenabled.\n\nThe bug was introduced before v20.0.0 (long-standing) and was silently\nfixed in commit `3140c1846c` (merged 2026-06-09, PR #20255,\n\"tabletserver: escape reflected form values in twopcz handler\"). The\nfix replaces `fmt.Fprintln(w, msg)` with\n`fmt.Fprintln(w, html.EscapeString(msg))`. **No released version of\nVitess contains the fix** — the fix lives only on `main` (current tip\n`33a3c0fafe69`, 2026-06-23). There is **no CVE, GHSA, or OSV entry**\nfor this specific bug (verified 2026-06-24 against GitHub Advisory\nDatabase, OSV.dev, and NVD).\n\n## Impact\n\n| Field | Value |\n|-------|-------|\n| **Type** | Reflected Cross-Site Scripting (XSS) |\n| **CVSS 3.1** | `AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N` = **7.7 HIGH** |\n| **Attack Vector** | Network (vttablet HTTP port 15999, multiplexed with gRPC/MySQL) |\n| **Attack Complexity** | Low (craft URL, send to operator) |\n| **Privileges Required** | None (default `acl` policy is allow-all) |\n| **User Interaction** | Required (operator must visit crafted URL) |\n| **Scope** | Changed (XSS chain reaction to other vttablet debug endpoints) |\n| **Confidentiality** | High (query text, env vars, expvar stats) |\n| **Integrity** | None (XSS itself doesn't change state) |\n| **Availability** | None (XSS itself doesn't disrupt service) |\n\n### Affected versions (verified)\n\nAll released versions are vulnerable. The fix lives only on `main`:\n\n| Tag | Released | `twopcz.go` line 185 | Status |\n|---|---|---|---|\n| v20.0.0 | 2024-06-27 | `fmt.Fprintln(w, msg)` | **BUGGY** |\n| v20.0.1 - v20.0.6 | 2024 | `fmt.Fprintln(w, msg)` | **BUGGY** |\n| v22.0.4 | 2026-02-27 | `fmt.Fprintln(w, msg)` | **BUGGY** |\n| v23.0.3, v23.0.4 | 2026-02 / 2026-05 | `fmt.Fprintln(w, msg)` | **BUGGY** |\n| v24.0.0, v24.0.1 | 2026-04 / 2026-05 | `fmt.Fprintln(w, msg)` | **BUGGY** |\n| **main** (`33a3c0fafe69`) | 2026-06-23 | `fmt.Fprintln(w, html.EscapeString(msg))` | **FIXED** |\n\n### Sensitive data exposed via the same-origin XSS chain\n\nA successful XSS lands in the vttablet's origin. From there, the\nattacker can fetch (via `fetch()` from injected JavaScript) the\nfollowing same-origin endpoints, all of which are unauthenticated by\ndefault:\n\n- `/twopcz` — in-flight 2PC transactions (query text, parameters, dtid)\n- `/queryz` — live query plans\n- `/querylogz` — recent queries with bound values\n- `/txlogz` — transactions\n- `/debug/env` — environment variables (may include MySQL creds, topology\n  credentials, encryption keys)\n- `/debug/vars` — expvar stats\n- `/debug/pprof/*` — CPU/memory profiles (if enabled)\n\n## Reproduction (independent, runnable PoC)\n\nThe PoC is a self-contained Go HTTP server that replicates the buggy\n`twopczHandler` from Vitess v20.0.0 verbatim (using the same line-185\ncode). It runs on `127.0.0.1:15080` and returns the same response shape\nas the real Vitess endpoint.\n\n```bash\n# 1) Build the PoC (Go 1.23+)\ncd /path/to/finding/CVE-pending-twopcz-xss\ngo build -o /tmp/vitess-twopcz-poc ./poc.go\n\n# 2) Start the buggy server\nADDR=127.0.0.1:15080 /tmp/vitess-twopcz-poc \u0026\n\n# 3) Reproduce — Test 1: bare GET (no params)\ncurl -sS -i \"http://127.0.0.1:15080/twopcz\"\n# → Content-Type: text/html; charset=utf-8, status 200\n\n# 4) Test 2: XSS via Action param (URL-encode the script tag)\ncurl -sS -i \"http://127.0.0.1:15080/twopcz?Action=%3Cscript%3Ealert(1)%3C%2Fscript%3E\u0026dtid=zz\"\n# → Response body contains literal \"\u003cscript\u003ealert(1)\u003c/script\u003e(zz): completed.\"\n# → Browser executes the script as same-origin code\n\n# 5) Test 3: XSS via dtid param (attribute-context payload)\ncurl -sS -i \"http://127.0.0.1:15080/twopcz?Action=Demo\u0026dtid=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E\"\n# → Response body contains literal \"\u003cimg src=x onerror=alert(1)\u003e\"\n# → Browser fires the onerror handler as same-origin code\n\n# 6) Run the 3x automated runner (writes evidence/run-{1,2,3}.log)\nbash ./poc/run.sh\n```\n\nPoC result excerpt (from `evidence/run-1.log`):\n\n```\n--- Test 2: XSS via Action=\u003cscript\u003ealert(1)\u003c/script\u003e ---\nHTTP/1.1 200 OK\nContent-Type: text/html; charset=utf-8\n...\n\u003ch2\u003eWARNING: Actions on this page can jeopardize data integrity.\u003c/h2\u003e\n\u003cscript\u003ealert(1)\u003c/script\u003e(zz): completed.\n\nPASS: payload reflected UNESCAPED (XSS exploitable in browser)\n```\n\nThe PoC was run 3 times on the buggy server (all 3/3 PASS) and the same\ncode is byte-identical to the v20.0.0 commit `8aeb274f6c8e` line 185.\n\n## Root cause (technical detail)\n\n`go/vt/vttablet/tabletserver/twopcz.go` (v20.0.0 through v24.0.1):\n\n```go\n// Line 185\nfmt.Fprintln(w, msg)\n```\n\n`msg` is constructed earlier in the handler as:\n\n```go\nmsg := fmt.Sprintf(\"%s(%s): completed.\", action, dtid)\n```\n\nwith `action` and `dtid` coming from the form values\n`r.FormValue(\"Action\")` and `r.FormValue(\"dtid\")`. The form values are\nURL-decoded (so a `+` becomes a space, `%3C` becomes `\u003c`) but never\nHTML-escaped. The handler explicitly sets `Content-Type: text/html;\ncharset=utf-8` (via the `\u003c!DOCTYPE html\u003e` it writes first), so the\nbrowser executes any injected `\u003cscript\u003e` or attribute-context payload.\n\nThe fix in main (`fmt.Fprintln(w, html.EscapeString(msg))`) closes the\nhole by HTML-escaping both `action` and `dtid` before reflection.\n\n## Suggested fix (already in main)\n\n```go\n// Recommended minimal patch (already in main, needs backport to all release branches):\nimport \"html\"\n\nfunc twopczHandler(w http.ResponseWriter, r *http.Request) {\n    // ... existing logic ...\n    msg := fmt.Sprintf(\"%s(%s): completed.\", action, dtid)\n    fmt.Fprintln(w, html.EscapeString(msg))  // ← was: fmt.Fprintln(w, msg)\n}\n```\n\nBackport the fix to v20.0.x, v22.0.x, v23.0.x, and v24.0.x as patch\nreleases. The fix is one line and a one-line `import \"html\"` addition,\nso the backport risk is minimal.\n\n## Workaround / mitigation (no patch available)\n\nIf you cannot upgrade to a fixed release immediately:\n\n1. **Restrict the vttablet HTTP port** (default 15999) to localhost\n   only. vttablet can run with `--tablet-allow-stats=false` and\n   `--tablet-grpc-port` configured separately from the HTTP port, or\n   you can firewall the HTTP port at the network layer. The debug\n   endpoints are not needed by production traffic.\n\n2. **Set a non-default ACL policy**. Vitess supports an `acl` policy\n   that defaults to allow-all. Setting it to a JSON file that denies\n   unauthenticated access to debug endpoints (see\n   `go/acl/acl.go::savePolicy`) would block the XSS, but the default\n   policy is currently `\"\"` (allow-all) and many users don't override\n   it.\n\n3. **Use a reverse proxy** (nginx, envoy) in front of the vttablet\n   HTTP port with a strict allowlist of clients.\n\n## Cross-references\n\n  - The bug is **not** related to:\n    - CVE-2024-53257 (`/debug/querylogz` HTML injection, fixed in\n      v20.0.4 — different endpoint)\n    - CVE-2026-27969 (backup MANIFEST path traversal)\n    - CVE-2026-27965 / GHSA-8g8j-r87h-p36x (backup external decompressor\n      RCE)\n  - PR #20255 is the fix commit; PR #19486 (defense-in-depth) is a\n    separate hardening change\n\n## Contact\n\n  - GitHub: @xylove21",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "vitess.io/vitess",
+        "purl": "pkg:golang/vitess.io/vitess"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.23.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v75v-6fpf-gvw8/GHSA-v75v-6fpf-gvw8.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "vitess.io/vitess",
+        "purl": "pkg:golang/vitess.io/vitess"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.24.0"
+            },
+            {
+              "fixed": "0.24.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v75v-6fpf-gvw8/GHSA-v75v-6fpf-gvw8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/security/advisories/GHSA-v75v-6fpf-gvw8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-104252"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/pull/20255"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/pull/20273"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/pull/20274"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/commit/3140c1846cd120db34f33b2083139b4ab638aed2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/commit/976e1e0d78f9d29d02e5e31b4aa7e180648f08af"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/commit/c1ed96302e658190168c971afdac730cf70e43f7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vitessio/vitess"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/releases/tag/v23.0.5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitessio/vitess/releases/tag/v24.0.2"
+    }
+  ]
+}

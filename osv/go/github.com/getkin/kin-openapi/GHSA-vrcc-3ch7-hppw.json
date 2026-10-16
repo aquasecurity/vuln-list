@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-vrcc-3ch7-hppw",
+  "modified": "2026-10-15T20:30:03.597762548Z",
+  "published": "2026-10-15T20:20:47Z",
+  "aliases": [
+    "CVE-2026-100353"
+  ],
+  "summary": "kin-openapi: Incomplete Fix for GHSA-p6wj-qrr4-pgh5: Three Unpatched nil-Items Panic Paths in openapi3filter",
+  "details": "## Summary\n\nThe fix for GHSA-p6wj-qrr4-pgh5 addressed a nil-pointer dereference that occurs when an OpenAPI 3.1 array schema omits the `items` keyword (which is legal under JSON Schema 2020-12). That fix patched three decoder paths: the standalone `parseArray` function, the top-level array check in `UrlencodedBodyDecoder`, and `MultipartBodyDecoder`.\n\nThree additional crash paths were missed. All of them reach the unguarded `urlValuesDecoder.parseArray` method (`openapi3filter/req_resp_decoder.go:576`) or the unguarded array branch in `buildResObj` (line 1015):\n\n1. **Query parameters** with `type: array` and no `items`.\n2. **deepObject** query parameters containing an array property with no `items`.\n3. **URL-encoded request bodies** where the array lives inside an `allOf` / `anyOf` / `oneOf` sub-schema. This path bypasses the guard added by the GHSA-p6wj-qrr4-pgh5 fix, because that guard only inspects top-level properties.\n\nEach path is triggerable by an unauthenticated client and produces a deterministic nil-pointer panic during request validation.\n\n## Details\n### Root Cause\n\nThe three paths patched for GHSA-p6wj-qrr4-pgh5 each received a nil-`items` guard:\n\n```go\n// standalone parseArray (line 1143) -- GUARDED\nfunc parseArray(raw []string, schemaRef *openapi3.SchemaRef) ([]any, error) {\n\tif schemaRef.Value.Items == nil || schemaRef.Value.Items.Value == nil { ... }\n\n// UrlencodedBodyDecoder top-level property loop (line 1441) -- GUARDED\nif propSchema.Value.Items == nil || propSchema.Value.Items.Value == nil { ... }\n\n// MultipartBodyDecoder (line 1587) -- GUARDED\nif valueSchema.Value.Items == nil { ... }\n```\n\nBut `urlValuesDecoder.parseArray` (line 576), which handles query-parameter and urlencoded-body array decoding, has **no** such guard:\n\n```go\nfunc (d *urlValuesDecoder) parseArray(raw []string, schemaRef *openapi3.SchemaRef) ([]any, error) {\n\tvar value []any\n\tfor i, v := range raw {\n\t\titem, err := d.parseValue(v, schemaRef.Value.Items) // Items is nil -\u003e panic in parseValue\n```\n\n`parseValue` immediately dereferences the schema it is handed:\n\n```go\nfunc (d *urlValuesDecoder) parseValue(v string, schema *openapi3.SchemaRef) (any, error) {\n\tif len(schema.Value.AllOf) \u003e 0 {   // schema == nil here -\u003e nil pointer dereference\n```\n\nFor the deepObject path, `buildResObj` (line 1015) has the same gap. Its array branch recurses with `schema.Value.Items` (line 1028), which can be nil, and the recursive call dereferences it at line 1015:\n\n```go\ncase schema.Value.Type.Is(\"array\"):\n\t// ...\n\tfor i := range arr {\n\t\tr, err := buildResObj(params, mapKeys, strconv.Itoa(i), schema.Value.Items) // nil Items\n```\n\nFor the allOf body path, `UrlencodedBodyDecoder` validates only top-level `schema.Value.Properties` (line 1429-1449). But `decodeSchemaConstructs` (line 1474) recursively walks `AllOf` / `AnyOf` / `OneOf` sub-schemas and calls `decodeProperty` on their properties, which never pass through the top-level guard and reach `urlValuesDecoder.parseArray`.\n\n## Proof of Concept\n\n### Environment\n\n- kin-openapi v0.144.0 (cloned at tag `v0.144.0`, commit `f0407d5`)\n- Go 1.26.7\n- Each PoC calls `doc.Validate()` first to prove the spec is legal, then drives `openapi3filter.ValidateRequest` directly\n\n### Path 1: Query parameter array without items\n\nSpec (query param `ids` is `type: array`, no `items`), request `GET /test?ids=1\u0026ids=2`:\n\n```\nValidate() ACCEPTED the spec (type: array with no items is legal under OAS 3.1)\nCalling ValidateRequest directly (no net/http recover)...\npanic: runtime error: invalid memory address or nil pointer dereference\n[signal 0xc0000005 code=0x0 addr=0x20 ...]\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).parseValue(...)\n\treq_resp_decoder.go:605\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).parseArray(...)\n\treq_resp_decoder.go:580\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).DecodeArray(...)\n\treq_resp_decoder.go:569\n...\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateRequest(...)\n\tvalidate_request.go:83\nexit status 2\n```\n\n### Path 2: deepObject nested array without items\n\nSpec (deepObject param `filter` with array property `tags`, no `items`), request `GET /test?filter[tags][0]=a`:\n\n```\nValidate() ACCEPTED the spec\nCalling ValidateRequest directly...\npanic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/getkin/kin-openapi/openapi3filter.buildResObj(...)\n\treq_resp_decoder.go:1012\ngithub.com/getkin/kin-openapi/openapi3filter.buildResObj(...)   \u003c- recursive call with nil Items\n\treq_resp_decoder.go:1028\ngithub.com/getkin/kin-openapi/openapi3filter.makeObject(...)\n\treq_resp_decoder.go:947\n...\nexit status 2\n```\n\n### Path 3: URL-encoded body with array inside allOf (bypasses the existing fix)\n\nSpec (urlencoded body, `allOf` sub-schema with array property `tags`, no `items`), request `POST /submit` body `tags=a\u0026tags=b`:\n\n```\nValidate() ACCEPTED the spec\nCalling ValidateRequest directly...\npanic: runtime error: invalid memory address or nil pointer dereference\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).parseValue(...)\n\treq_resp_decoder.go:605\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).parseArray(...)\n\treq_resp_decoder.go:580\ngithub.com/getkin/kin-openapi/openapi3filter.(*urlValuesDecoder).DecodeArray(...)\n\treq_resp_decoder.go:569\n...\ngithub.com/getkin/kin-openapi/openapi3filter.decodeProperty(...)   \u003c- reached via decodeSchemaConstructs (allOf walker)\n\treq_resp_decoder.go:1519\nexit status 2\n```\n\nThe `decodeProperty` frame confirms the array was reached by walking the `allOf` sub-schema, bypassing the top-level guard that the GHSA-p6wj-qrr4-pgh5 fix added.\n\n### Fix verification\n\nAdding a single nil-`items` guard to `urlValuesDecoder.parseArray` (plus one to the `buildResObj` array branch) turns all three panics into clean validation errors:\n\n```\npoc1: Returned normally, err = parameter \"ids\" in query has an error: array items schema is required for decoding\npoc2: Returned normally, err = parameter \"filter\" in query has an error: path tags: array items schema is required\npoc3: Returned normally, err = \u003cnil\u003e   (no panic; the allOf property is skipped by the decoder)\n```\n\nThis confirms `urlValuesDecoder.parseArray` is the shared root cause for Paths 1 and 3, and `buildResObj` for Path 2.\n\n## Impact\n\nAn unauthenticated client can trigger a deterministic nil-pointer panic in request validation with a single crafted request, against any application that validates OAS 3.1 requests with `openapi3filter` where a spec declares an array without `items`.\n\nThe severity depends on the host:\n\n| Deployment | Behavior | Availability impact |\n|------------|----------|---------------------|\n| Standard `net/http` server (validation runs in the handler goroutine) | `net/http` recovers the panic per-connection; the connection is dropped and the process survives | Per-request denial of service (A:L) |\n| Non-`net/http` hosts (e.g. fasthttp/connect adapters) or validation performed in an application-spawned goroutine | The panic is not recovered; the process crashes | Full-process denial of service (A:H) |\n\nThis was verified in both configurations: under a live `net/http` server the process survived (the panic was logged as `http: panic serving ...` and the process exited 0 at end of test), while the direct-call PoCs above crashed the process with `exit status 2`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.136.0"
+            },
+            {
+              "fixed": "0.149.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-vrcc-3ch7-hppw/GHSA-vrcc-3ch7-hppw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-vrcc-3ch7-hppw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100353"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/9814d1f2b212f3508bf52296aa9e248b2122a5a9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.149.0"
+    }
+  ]
+}

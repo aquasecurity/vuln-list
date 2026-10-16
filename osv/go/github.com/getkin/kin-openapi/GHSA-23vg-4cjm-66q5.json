@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-23vg-4cjm-66q5",
+  "modified": "2026-10-15T20:30:05.450347889Z",
+  "published": "2026-10-15T20:19:20Z",
+  "aliases": [
+    "CVE-2026-100351"
+  ],
+  "summary": "kin-openapi: ValidationHandler security-requirement bypass via encoded-path operation confusion",
+  "details": "## Summary\n\n`openapi3filter.ValidationHandler.Middleware` validates requests with kin-openapi's\nlegacy router, which selects an OpenAPI operation from the decoded `URL.Path`. The\nmethod is documented as implementing `gorilla/mux.MiddlewareFunc`, but a downstream\ngorilla/mux router configured with `UseEncodedPath()` selects its handler from the\nencoded representation (`URL.RawPath`).\n\nAn unauthenticated request such as `/public%2Fstatus` can therefore be validated as an\nintentionally public operation (`/public/status`) and then dispatched to a protected\noperation (`/{id}`). The configured, rejecting `AuthenticationFunc` is never invoked,\nand the protected downstream handler runs.\n\nThis is distinct from GHSA-r277-6w6q-xmqw. The behavior below uses an explicit\nauthentication callback that rejects missing credentials and remains reproducible\nafter the v0.144.0 fix for the unsafe default callback.\n\n## Affected products\n\n- Product: `github.com/getkin/kin-openapi`\n- Component: `openapi3filter.ValidationHandler.Middleware`\n- Confirmed post-GHSA affected releases: v0.144.0, v0.145.0, and v0.146.0\n- Reporter attestation: each listed release was checked out separately, the attached\n  single-file test was copied into `openapi3filter/`, and that test passed; maintainers\n  should independently confirm the version range\n- Confirmed affected development revision: `d33e44e67734dcde81b576582185e1343fb3985d`\n- v0.143.0 also reproduces this mechanism, but GHSA-r277-6w6q-xmqw already provides a\n  simpler bypass on that release; the distinct post-fix claim starts at v0.144.0\n- Earlier releases: not tested; please treat the introduction boundary as unknown\n\n## Security impact\n\nAn unauthenticated remote requester can reach a handler whose OpenAPI operation\nrequires authentication when all of the following are true:\n\n1. the application uses `ValidationHandler.Middleware` as the security gate;\n2. the downstream router preserves and interprets an encoded path, such as\n   gorilla/mux with `UseEncodedPath()`;\n3. a public exact route and a protected parameterized route overlap after decoding;\n4. the public and protected operations expose the same HTTP method;\n5. the protected handler relies on the validation layer's security decision.\n\nThe protected operation's path-parameter value is constrained: it is an encoded\nrepresentation that decodes to a public literal path (`public%2Fstatus` in this PoC),\nnot an arbitrary attacker-selected identifier. A protected operation without a\ncompatible parameterized path is not reachable through this specific mechanism.\n\n- Primitive: the security decision is made for a different OpenAPI operation than the\n  operation dispatched by the application router.\n- Demonstrated impact: a protected handler executes while the explicitly rejecting\n  `AuthenticationFunc` is never invoked.\n- Impact ceiling: confidentiality or integrity loss when the reachable protected\n  handler has that authority; the PoC does not demonstrate data disclosure or state\n  modification.\n- Availability impact: not demonstrated.\n\n## Root cause\n\nAt the confirmed development revision:\n\n- `openapi3filter/validation_handler.go`: `ValidationHandler.Load` constructs\n  `routers/legacy.NewRouter` unconditionally.\n- `routers/legacy/router.go`: route selection uses the decoded request path.\n- `routers/gorillamux/router.go`: the kin-openapi gorilla router constructs a\n  gorilla/mux router with `UseEncodedPath()`.\n- `ValidationHandler.Middleware` forwards the unchanged request after validation.\n\nThe component making the authentication decision and the component dispatching the\nhandler can therefore disagree about the selected operation.\n\n## Reproduction\n\nThe attached PoC uses a real `net/http` server, an explicit API-key callback that\nrejects missing credentials, and a downstream gorilla/mux router with\n`UseEncodedPath()`.\n\nFrom a kin-openapi checkout, copy the self-contained attachment\n`encoded_path_route_confusion_test.go.txt` into `openapi3filter/` as\n`encoded_path_route_confusion_test.go`, then run:\n\n```sh\ngo test -v ./openapi3filter -run '^TestEncodedPathAuthorizationBypass$' -count=1\n```\n\nExpected attack observation:\n\n```text\nstatus=202 downstream_route=/{id} protected_id=public%2Fstatus authentication_calls=0\nwiring=Router.Use status=202 downstream_route=/{id} protected_id=public%2Fstatus authentication_calls=0\n```\n\nControls included in the test show that:\n\n- `/ordinary` selects the protected operation, invokes authentication once, and is\n  rejected with HTTP 401;\n- `/public/status` reaches only the intentionally public handler;\n- the encoded request reaches the protected `/{id}` handler with HTTP 202 while the\n  authentication callback remains uncalled;\n- both external wrapping and the documented\n  `router.Use(validationHandler.Middleware)` wiring reproduce the same result.\n\n## Reverse-proxy reachability\n\nThe same request was reproduced through Nginx 1.31.3 using the official\n`nginx:alpine` image digest\n`sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752`.\n\nThe exact container invocation was:\n\n```sh\ndocker run --rm --name kin-openapi-nginx \\\n  --add-host=host.docker.internal:host-gateway \\\n  -p 18081:8080 -p 18082:8081 \\\n  -v \"$PWD/poc/nginx.conf:/etc/nginx/nginx.conf:ro\" \\\n  nginx:alpine\n```\n\nContainer port 8080 uses `proxy_pass http://host.docker.internal:18080;` without a\nreplacement URI. Host port 18081 therefore preserved `/public%2Fstatus`; the protected\nhandler returned HTTP 202 and the\nauthentication callback remained at zero calls. With\n`proxy_pass http://host.docker.internal:18080/;` on container port 8081 / host port\n18082, Nginx canonicalized the upstream URI; both layers selected `/public/status` and\nthe bypass did not occur.\n\nNginx access-log observations:\n\n```text\nserver_port=8080 \"GET /public%2Fstatus HTTP/1.1\" 202 0 \"curl/8.7.1\"\nserver_port=8081 \"GET /public%2Fstatus HTTP/1.1\" 204 0 \"curl/8.7.1\"\nserver_port=8080 \"GET /ordinary HTTP/1.1\" 401 0 \"curl/8.7.1\"\n```\n\nThe response route headers were `X-Poc-Route: /{id}` on the preserving listener and\n`X-Poc-Route: /public/status` on the canonicalizing listener. Backend observations for\nthe two requests were:\n\n```text\nrequest_uri=\"/public%2Fstatus\" path=\"/public/status\" raw_path=\"/public%2Fstatus\" auth_before=0\ncompleted request_uri=\"/public%2Fstatus\" auth_after=0\nrequest_uri=\"/public/status\" path=\"/public/status\" raw_path=\"\" auth_before=0\ncompleted request_uri=\"/public/status\" auth_after=0\n```\n\nThis control shows that upstream path handling is a deployment precondition rather\nthan claiming that every proxy configuration is affected.\n\nThe canonical protected control produced:\n\n```text\nrequest_uri=\"/ordinary\" path=\"/ordinary\" raw_path=\"\" auth_before=0\ncompleted request_uri=\"/ordinary\" auth_after=1\n```\n\n## Suggested remediation\n\nThe authentication layer and downstream dispatcher must select the same OpenAPI\noperation from the same request representation.\n\nPotential approaches:\n\n1. make `ValidationHandler` accept a caller-supplied `routers.Router` and require it to\n   match downstream routing semantics;\n2. document that `NewValidator` already accepts a router but is safe only when the\n   supplied router selects operations using the same semantics as the dispatcher;\n   callers must also supply an `AuthenticationFunc` through `ValidationOptions`, or\n   protected requests fail with the existing missing-authentication-service error;\n3. as an interim hardening option, make `ValidationHandler` fail closed on an encoded\n   path separator when `URL.Path` and `URL.RawPath` can select different operations,\n   and verify this behavior against the full suite;\n4. document the route-identity requirement and add encoded-separator regression tests.\n\nReplacing the legacy router with the kin-openapi gorilla router closes this PoC, but a\nlocal compatibility check changed two existing missing-path-parameter tests from HTTP\n400 semantics to route-not-found HTTP 404 semantics. A direct router swap is therefore\nnot a fully validated drop-in fix.\n\n## Public-reference triage\n\nThe public advisory list and related path-encoding reports reviewed on 2026-08-18 did\nnot describe this authentication-boundary crossing. Relevant nearby reports include\nissues #397, #1089, and #1105 and PR #400. This search is not proof of novelty; please\ndeduplicate against private reports.\n\n## Credit\n\nPreferred credit: Satoru Kanno (GMO CONNECT Inc., GMO Internet Group, Inc.)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.144.0"
+            },
+            {
+              "fixed": "0.147.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-23vg-4cjm-66q5/GHSA-23vg-4cjm-66q5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-23vg-4cjm-66q5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100351"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/eda80e2676e9f577ceed2dd80e64f16083edb041"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.147.0"
+    }
+  ]
+}

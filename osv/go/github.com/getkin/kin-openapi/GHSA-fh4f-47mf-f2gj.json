@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-fh4f-47mf-f2gj",
+  "modified": "2026-10-15T20:30:11.858476899Z",
+  "published": "2026-10-15T20:15:48Z",
+  "aliases": [
+    "CVE-2026-100347"
+  ],
+  "summary": "kin-openapi: Unauthenticated panic (DoS) in openapi3filter legacy router via non-canonical/unsupported HTTP method on a static path",
+  "details": "## Summary\nThe `openapi3filter.ValidationHandler` (the exported, documented request-validation middleware) hard-wires the legacy router (`routers/legacy`). That router matches the incoming request method verbatim against a trie built exclusively from upper-cased canonical HTTP methods. A request carrying a method token that is not one of the 9 standard methods — a legitimate-but-unsupported token such as `PROPFIND`, or a non-canonical case variant such as lowercase `get` — misses the trie, leaves `route == nil`, and for an existing **static** path falls through to `PathItem.GetOperation(method)`, whose `default:` case calls `panic(...)`. The panic fires inside route resolution, **before any authentication** runs. This is an unauthenticated, remotely triggerable denial of service (recovered per-connection panic + unbounded error-log growth).\n\n## Root Cause\n- `openapi3filter/validation_handler.go:39` — `ValidationHandler.Load()` always constructs `legacyrouter.NewRouter(doc)`; there is no alternative router option on this path.\n- `routers/legacy/router.go:109` — the request method is used verbatim (`method, url := req.Method, ...`); there is no canonicalization or rejection of unknown method tokens.\n- `routers/legacy/router.go:69-70` — the trie is populated with `strings.ToUpper(method)` keys taken from `pathItem.Operations()` (canonical `http.Method*` constants only).\n- `routers/legacy/router.go:141` — `root.Match(method + \" \" + remainingPath)` misses for a non-canonical/unsupported method → `route == nil`.\n- `routers/legacy/router.go:146-150` — in the `route == nil` block, `doc.Paths.Value(path)` returns non-nil for an existing static path, and control reaches `pathItem.GetOperation(method)`.\n- `openapi3/path_item.go:174` — `GetOperation`'s `switch method` has no matching case → `default: panic(fmt.Errorf(\"unsupported HTTP method %q\", method))`.\n\n## Impact\nAn unauthenticated attacker sends a single request with a non-standard HTTP method token to any existing static path. The handler goroutine panics; Go's `net/http` recovers the panic per connection (process survives), aborts the connection (client sees a reset / 500), and logs a full stack trace. Repeated requests cause connection churn and unbounded `http: panic serving` log growth, and the request never reaches authentication. Availability impact (A:L) under the default synchronous `ValidationHandler` middleware; on non-net/http hosts or when reached on an application goroutine the ceiling is a full crash.\n\n## Proof of Concept\nServe any spec with a static path (e.g. `/ping`) behind `openapi3filter.ValidationHandler`, then:\n```\nprintf 'PROPFIND /ping HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n' | nc target 8080   # connection aborted (panic)\nprintf 'get /ping HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'      | nc target 8080   # connection aborted (panic)\nprintf 'GET /ping HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'      | nc target 8080   # 200 OK (process survived)\n```\nReproduced end-to-end against a real `net/http.Server` + `ValidationHandler`: `PROPFIND /ping` and lowercase `get /ping` both abort the connection with a panic at `path_item.go:174` (stack: `GetOperation` \u003c- `legacy.FindRoute` router.go:150 \u003c- `ValidationHandler.validateRequest` validation_handler.go:84); the process stays alive and subsequent `GET /ping` returns 200.\n\n## Attack Chain\n1. Entry: unauthenticated `PROPFIND /ping HTTP/1.1` (any known static path). Guard: net/http method validation. Bypass proof: net/http accepts any valid HTTP token as a method — `PROPFIND` and lowercase `get` both reach the handler.\n2. Route match: `legacy/router.go:141` `root.Match(\"PROPFIND /ping\")`. Guard: trie match. Bypass proof: trie holds only upper-cased canonical methods → miss → `route == nil`.\n3. `route == nil` block: `router.go:146` `doc.Paths.Value(\"/ping\")` → non-nil for an existing static path (exact map lookup). Guard: `pathItem == nil` check (l.147). Bypass proof: static path exists → not nil → proceeds.\n4. Sink: `router.go:150` `pathItem.GetOperation(\"PROPFIND\")` → `path_item.go:174` `default: panic(...)`.\n5. Impact: handler goroutine panics; net/http recovers per connection; request never reaches auth.\n\n## Bypass Evidence\n- net/http does NOT reject non-standard method tokens — confirmed empirically: `PROPFIND` and lowercase `get` both reached the handler and panicked.\n- No canonicalization/rejection exists between `FindRoute` entry and `GetOperation`; `req.Method` is used verbatim (router.go:109).\n- `git show v0.144.0:openapi3/path_item.go` shows `panic(...)` at line 174; `git show v0.144.0:routers/legacy/router.go` shows verbatim method use and the unguarded `GetOperation` call. `git log v0.144.0..HEAD` on these files is empty (no post-tag fix).\n\n## Scoping Note\nThe panic requires the request path to be an exact static (non-templated) key in the served spec. A concrete path against a `/{id}` template returns a clean 500 (not a panic), because `Paths.Value` is an exact map lookup. Static paths (`/health`, `/login`, `/version`, `/metrics`, `/ping`, `/`) are ubiquitous in real specs and discoverable from public specs/standard endpoints, so a vulnerable target almost always exists. This makes the finding arguably broader than existing panic advisories, as it needs no special spec construct — any static path suffices.\n\n## Affected Versions\n`\u003c= 0.144.0` (present on the latest release tag v0.144.0; long-standing; no patched version).\n\n## Suggested Fix\nIn the legacy router, canonicalize/validate the request method before route resolution and return `ErrMethodNotAllowed`/`ErrPathNotFound` for unknown methods, or make `PathItem.GetOperation` return an error (nil) for unrecognized methods instead of calling `panic`.\n\n---\nReported by **zx (Jace)** — GitHub: @manus-use",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.145.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.144.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fh4f-47mf-f2gj/GHSA-fh4f-47mf-f2gj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-fh4f-47mf-f2gj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100347"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/f1a5b523b82868d2d9be2e116b4e942892be72c3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.145.0"
+    }
+  ]
+}

