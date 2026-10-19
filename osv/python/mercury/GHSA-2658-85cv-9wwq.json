@@ -1,0 +1,74 @@
+{
+  "id": "GHSA-2658-85cv-9wwq",
+  "modified": "2026-10-19T17:15:04.101718667Z",
+  "published": "2026-10-19T17:01:20Z",
+  "aliases": [
+    "CVE-2026-111059"
+  ],
+  "summary": "Mercury: Stored / DOM Cross-Site Scripting (XSS): mr.Markdown renders untrusted content as raw, unsanitized HTML",
+  "details": "## Summary\n\nMercury turns Jupyter notebooks into shared web apps/dashboards. The `mr.Markdown`\nwidget converts its input to HTML with **python-markdown and no sanitization\nstep**. `MarkdownWidget` is an `ipywidgets.HTML` widget, whose value is written to\nthe page as **raw HTML (via `innerHTML`) with no sanitization**, so the result\nreaches the DOM verbatim. When an app passes **untrusted data** (database rows,\nuser submissions, uploaded file contents, or an external/LLM API response) to\n`mr.Markdown`, HTML/JS in that data executes in the browser of **whoever views the\napp** — a data-driven stored/DOM-based XSS.\n\nThis is a library-provided rendering sink that fails to neutralize output; it is\ntriggered by ordinary, reasonable application code, not by an author mistake.\n\n## Root cause\n\n`mercury/md.py` — `MarkdownWidget._to_html()` (verified at v3.2.6, lines ~57–65):\n\n```python\ndef _to_html(self, text: str) -\u003e str:\n    if md_lib is not None:\n        body = md_lib.markdown(text)          # python-markdown: passes raw HTML through\n    else:\n        body = f\"\u003cpre\u003e{escape(text)}\u003c/pre\u003e\"   # escape() is ONLY the md-lib-absent fallback\n    return self._apply_inline_theme(body)     # regex styling — adds style=, removes nothing\n```\n\nTwo neutralization failures compound:\n\n1. **Markdown → HTML is unsanitized.** `python-markdown` passes raw HTML through by\n   default: `\u003cimg src=x onerror=…\u003e`, `\u003csvg onload=…\u003e`, and `javascript:` links\n   survive verbatim. There is no `bleach`/`nh3` allowlist anywhere in the package.\n   `_apply_inline_theme()` only injects inline `style=` attributes via regex; it is\n   not a sanitizer and removes nothing. `escape()` runs only in the\n   md-lib-absent fallback.\n\n2. **The rendering sink is unsanitized `innerHTML`.** `MarkdownWidget`\n   (`mercury/md.py:21`) subclasses `ipywidgets.HTML`. The ipywidgets HTML widget\n   renders its `value` into the DOM as raw HTML via `innerHTML`, with no\n   sanitization (this is the widget's design). Event-handler payloads such as\n   `\u003cimg src=x onerror=…\u003e` therefore execute when the widget is displayed.\n\n**On the \"sanitize\" that exists:** `mercury_app/notebook_sanitize.py`\n(`sanitize_notebook_for_mercury_runtime`) and `packages/lab/src/mercury/save.ts`\n(`sanitizeMercuryNotebookContent`) strip *runtime metadata* and clear *code-cell\nsaved outputs*. They do **not** neutralize HTML/JS, and they do not touch widget\nvalues or markdown source. \"Sanitize\" here is notebook hygiene, not XSS defense.\n\n## Threat model (attacker → victim, not self-inflicted)\n\nThe CVE-relevant framing is **data-driven**: the app author writes ordinary code,\nand the *data* is attacker-controlled.\n\n```python\nimport mercury as mr\n# `row` comes from a DB / user submission / uploaded file / external API —\n# i.e. NOT authored by the app developer:\nmr.Markdown(row[\"comment\"])\n```\n\nThe attacker supplies the untrusted value (posts the comment, uploads the file,\npoisons the API/RAG source). A **different** user — another app user, a reviewer,\nan admin — then opens the app, and the payload executes in *their* browser. The\nvulnerable component (Mercury's server-side widget rendering) and the impacted\ncomponent (the victim's browser session in the app origin) differ, which is the\nclassic stored-XSS attacker/victim separation.\n\n**Amplifier — session sharing (`--keep-session`).** Mercury can serve one shared\nkernel session to all viewers (`mercury run … --keep-session`, README \"Arguments\":\n\"share the same session between multiple users … others will see this\"). It is\n**opt-in and defaults to off** (`keepSession=False` in `mercury_app/handlers.py`),\nso it is *not required* for the base case — any app that renders one user's\nuntrusted data to another user is already vulnerable. When enabled, content one\nviewer submits is rendered into the session other viewers see, extending this to\ncross-user delivery. Authentication is **opt-in and off by default**: a free\npassword gate exists (`mercury run … --pass=…`, README), while user-based\nauthentication is a paid add-on. Because auth is off unless the operator enables\nit, unauthenticated public deployments — where the attacker needs no account — are\na realistic default.\n\n## Proof of Concept\n\n```python\nimport mercury as mr\n\n# Value that would realistically arrive from untrusted data (DB row, form field,\n# uploaded file, API/LLM response):\nuntrusted = '\u003cimg src=x onerror=alert(String.fromCharCode(88,83,83))\u003e'\n\nmr.Markdown(untrusted)   # rendered to raw HTML, unsanitized, into the app DOM\n```\n\nThe generated widget HTML contains the payload verbatim; when the widget is\ndisplayed, the `onerror` handler runs.\n\n### What was confirmed (and how)\n\n- **Confirmed by execution in a real browser (sink level):** driving the *actual\n  `python-markdown` output* into the same `ipywidgets.HTML` `value` sink the widget\n  uses causes the payload to execute in headless Chromium. Execution was captured\n  via Playwright's `dialog` event (which fires only on a genuine `alert()`, so the\n  mere presence of the string in the HTML cannot cause a false positive). A benign\n  control (`**hello**`) produced **zero** dialogs, confirming the harness reports\n  only real execution. `python-markdown` passes `\u003cimg src=x onerror=…\u003e` through\n  verbatim by default (behavior is not version-specific).\n- **Reasoned from source (not executed end-to-end):** the full path from a\n  `mr.Markdown(...)` call in a *served Mercury app* to a viewer's DOM was not run\n  end-to-end, because no isolated container/VM was available in the reporting\n  environment. Because `MarkdownWidget` *is* the `ipywidgets.HTML` sink above and\n  Mercury's frontend applies no sanitizer to widget HTML values (the only frontend\n  sanitizer strips notebook metadata at save time), the served-app path is expected\n  to behave identically. Reproduce end-to-end before publishing if you want the\n  advisory to state full-path browser confirmation.\n\n## Impact\n\nMercury shares notebooks as web apps/dashboards, often for non-technical audiences.\nWhen an app renders untrusted data through `mr.Markdown`, the generated page carries\nattacker-controlled script that runs in the browser of any other viewer, in the\napp origin — enabling session/cookie/token theft, UI spoofing and forced actions as\nthe victim, and pivoting within the hosting origin. With `--keep-session`, this\nextends to cross-user delivery within a shared session.\n\n## Severity rationale (CVSS 3.1 per-metric)\n\nBase score reflects the realistic default: an unauthenticated deployment whose app\nrenders untrusted data via `mr.Markdown`.\n\n| Metric | Value | Reason |\n|---|---|---|\n| **AV** Attack Vector | **Network (N)** | App is served over HTTP to remote users. |\n| **AC** Attack Complexity | **Low (L)** | No special conditions or race; supply data that reaches an `mr.Markdown` call. |\n| **PR** Privileges Required | **None (N)** | Baseline: the injection channel (public form/upload/API) needs no account; auth is optional/paid. See variant below. |\n| **UI** User Interaction | **Required (R)** | A victim must open/view the app page for the stored payload to run. |\n| **S** Scope | **Changed (C)** | The vulnerable component (server-side widget render) injects script that executes in a different security authority — the victim's browser session/origin. (This is the canonical XSS scoping in the CVSS 3.1 spec.) |\n| **C** Confidentiality | **Low (L)** | Script can read data/session material available to the app origin; scored L (not H) for a generic app without asserting full account takeover. |\n| **I** Integrity | **Low (L)** | Script can alter the page and act as the victim within the app; scored L generically. |\n| **A** Availability | **None (N)** | No direct availability impact. |\n\nResult: **`CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N` = 6.1 (Medium)**.\n\nDeployment-dependent variants (state your environment's when filing):\n- Injection channel requires an authenticated low-privilege user → **PR:L** →\n  `…/PR:L/UI:R/S:C/C:L/I:L/A:N` = **5.4**.\n- App origin exposes high-value auth material such that XSS yields full\n  session/account takeover → **C:H/I:H** raises the score; justify per deployment\n  rather than claiming it universally.\n\n## Remediation\n\nPrimary — **sanitize by default in `mr.Markdown`, with an explicit opt-out for the\ndeliberate raw-HTML use case** (backward-compatible, non-breaking):\n\n```python\n# mercury/md.py\ndef _to_html(self, text: str, unsafe_allow_html: bool = False) -\u003e str:\n    if md_lib is not None:\n        body = md_lib.markdown(text)\n    else:\n        body = f\"\u003cpre\u003e{escape(text)}\u003c/pre\u003e\"\n    if not unsafe_allow_html:\n        # allowlist tags/attributes; strip javascript:/data: schemes and event handlers\n        body = nh3.clean(body)            # or bleach.clean(..., strip=True)\n    return self._apply_inline_theme(body)\n```\n\nExpose `unsafe_allow_html=False` on `mr.Markdown(...)` so authors who deliberately\nembed trusted raw HTML can opt in, while the default is safe. This mirrors the\nconvention used by comparable tools (e.g. Streamlit's `unsafe_allow_html`).\n\nDefense-in-depth: since widget HTML values are written via `innerHTML` without\nsanitization, consider sanitizing widget HTML values at the frontend before they\nreach the DOM, and/or serving a Content-Security-Policy that forbids inline event\nhandlers, so a single missed sink is not immediately exploitable.\n\n## Additional hardening (secondary — not the reported vulnerability)\n\nSeveral widget ESMs write the **label** with `innerHTML`, e.g. `mercury/text.py`\n`topLabel.innerHTML = model.get(\"label\") || …` (same shape in `number.py`,\n`time.py`, `date`/`datetime`/`daterange`/`select`/`json`/`file`, and\n`indicator.py`'s `_card_html`). **This is not an attacker→victim XSS path**: labels\nare static strings set by the app author in Python; URL/`url_params` overrides\naffect only widget `value` (assigned via the safe `input.value` property), never\n`label`, so there is no end-user/URL route into a label. It is a defense-in-depth /\nauthor footgun only. Recommended regardless: render UI strings with `textContent`,\nor `html.escape` labels, so output encoding is applied uniformly.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mercury",
+        "purl": "pkg:pypi/mercury"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.0.0"
+            },
+            {
+              "fixed": "3.2.11"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.4",
+        "3.1.5",
+        "3.2.0",
+        "3.2.1",
+        "3.2.10",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.2.6",
+        "3.2.7",
+        "3.2.8",
+        "3.2.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2658-85cv-9wwq/GHSA-2658-85cv-9wwq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/mljar/mercury/security/advisories/GHSA-2658-85cv-9wwq"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mljar/mercury/commit/c798a85924e6614c6fea7afe5a560e4554a1d09b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/mljar/mercury"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mljar/mercury/releases/tag/v3.2.11"
+    }
+  ]
+}

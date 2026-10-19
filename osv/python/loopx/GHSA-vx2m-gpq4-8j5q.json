@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-vx2m-gpq4-8j5q",
+  "modified": "2026-10-19T16:15:43.737645560Z",
+  "published": "2026-10-19T16:11:57Z",
+  "aliases": [
+    "CVE-2026-108372"
+  ],
+  "summary": "LoopX serve-status permissive CORS policy exposes control-plane state and private Markdown files",
+  "details": "## Summary\n\n`loopx serve-status` sends `Access-Control-Allow-Origin: *` on **every** response,\nincluding its unauthenticated `GET` routes. Because the endpoint is unauthenticated and\nbound to a fixed, well-known loopback port, **any website the operator visits can read\nLoopX control-plane state and the contents of Markdown files inside every registered goal\nrepo**, using a plain `fetch()` with no user interaction.\n\nThe write endpoints are *not* affected — they are correctly Origin-checked. This report is\nstrictly about the **read** paths.\n\n## Impact\n\nWhile `loopx serve-status` is running, a page on any origin can run:\n\n```js\n// no interaction, no preflight, no credentials needed\nconst s = await (await fetch('http://127.0.0.1:8766/status.json')).json();\nfor (const g of s.goals ?? []) {\n  const m = await (await fetch(\n    `http://127.0.0.1:8766/review-material?goal_id=${g.id}\u0026path=design-notes.md`\n  )).json();\n  exfiltrate(m.content);\n}\n```\n\nand read back:\n\n* **`GET /status.json`** — the whole status projection: goal ids, run history, and local\n  absolute paths (`registry`, `runtime_root`). With `--global-registry` this covers\n  **every project registered on the machine**, not just one.\n* **`GET /review-material?goal_id=…\u0026path=…`** — the *content* of any `.md`/`.markdown`\n  file under a goal's repo root, state dir, or runtime dir. In practice that is the\n  operator's private design notes, handoff docs, and evidence write-ups.\n* **`GET /`** — endpoint discovery, including which write APIs are enabled.\n* **`POST /control-plane/configure-goal/dry-run`** — this route has **no Origin check at\n  all**, and `do_OPTIONS` returns `Access-Control-Allow-Headers: Content-Type`, so a\n  cross-origin JSON POST passes preflight. The response leaks the `before`/`after`\n  control-plane configuration for a goal. (It does not write — I verified `written=false`.)\n\n`docs/public-private-boundary.md` classifies \"local absolute paths\", \"task ids\", \"raw logs\nand metrics\" and \"active goal state that reveals current user context\" as material that\nmust stay private. All of it is currently readable by any origin.\n\nTwo things make this more than theoretical:\n\n1. **Fixed default ports.** `8765` (project) and `8766` (global) are hardcoded defaults, so\n   an attacker page can simply try both — no discovery step needed.\n2. **It is documented as a persistent service.** `docs/guides/getting-started.md` documents\n   `loopx serve-status`, and `scripts/macos-dashboard-launchagent.sh` installs a LaunchAgent\n   that keeps `serve-status --global-registry --port 8766` running **after every login**. For\n   anyone following that guide, this is an always-on, machine-wide read surface.\n\nI have graded this **High** on the basis of zero-interaction exfiltration of private local\nmaterial from a persistent service. It is read-only and scope-limited, so if you read the\nexposure as lower I would not argue the point — you know your users' setups better than I do.\n\n## Location\n\n`loopx/status_server.py:136-146` — `StatusRequestHandler._send_json()`:\n\n```python\ndef _send_json(self, payload: dict[str, Any], *, status: int = 200) -\u003e None:\n    ...\n    self.send_header(\"Access-Control-Allow-Origin\", \"*\")   # \u003c-- line 142\n```\n\n`_send_json` is the single response path for *all* routes, so the wildcard is applied to\n`/status.json`, `/review-material`, `/healthz`, `/` and the dry-run POSTs alike.\n`do_OPTIONS` (`:148-153`) repeats it.\n\nConfirmed present at `main` HEAD (`b0c8e315`, blob `c9e53d1a`) at the time of writing.\n\n## What is NOT affected (I checked, so you don't have to)\n\nI tried to refute this before reporting. These controls all hold:\n\n* **Writes are properly defended.** With `--enable-reward-write-api` and\n  `--enable-control-plane-write-api` both on, `POST /reward/append` and\n  `POST /control-plane/configure-goal/apply` return **403 \"only accepts loopback browser\n  origins\"** for a foreign `Origin`. `is_loopback_origin()` does its job. There is no\n  cross-origin write, and DNS rebinding does not defeat it either (the rebound page still\n  carries its own non-loopback origin).\n* **No path traversal.** `../../../../etc/hostname` → 400; an absolute `.md` outside the\n  goal roots → 400 (\"outside the goal repo/state/runtime roots\"). `path_is_under()` is\n  correct.\n* **Extension allowlist holds.** `secrets.env` inside the repo → 400. Only `.md`/`.markdown`\n  can be read.\n* **Dry-run does not write.** `configure_goal_with_global_sync(execute=False)` returns\n  before any write; I observed `written=false`.\n\nSo the exposure is confined to: status JSON + Markdown under registered goal roots. That is\nstill private material, but it is not arbitrary file read and it is not remote code\nexecution.\n\n## Proof of concept\n\nRun against an unmodified clone at HEAD, **default flags** (no write APIs enabled):\n\n```\nGET /healthz                 Origin: https://evil.example  -\u003e 200  ACAO: '*'\nGET /                        Origin: https://evil.example  -\u003e 200  ACAO: '*'\nGET /status.json             Origin: https://evil.example  -\u003e 200  ACAO: '*'\nGET /review-material?goal_id=victim-goal\u0026path=internal-design-notes.md\n                             Origin: https://evil.example  -\u003e 200  ACAO: '*'\n   content: \"# Internal notes\\n\\nPROD_DB_HOST=db.internal.corp\\nCONFIDENTIAL: ...\"\n```\n\nThe file content came back verbatim to a foreign origin. Matched controls from the same\nharness, with **both write flags enabled** (i.e. the configuration most favourable to the\ncurrent design):\n\n```\nPOST /reward/append                        Origin: https://evil.example -\u003e 403 (origin check)\nPOST /control-plane/configure-goal/apply   Origin: https://evil.example -\u003e 403 (origin check)\nGET  /review-material  ../../../../etc/hostname                        -\u003e 400 (traversal blocked)\nGET  /review-material  \u003cabs path outside roots\u003e.md                     -\u003e 400 (root check)\nGET  /review-material  secrets.env                                     -\u003e 400 (extension check)\nGET  /status.json                          Origin: https://evil.example -\u003e 200 ACAO '*'  \u003c-- still readable\n```\n\nI am happy to send the exact harness script if it is useful; it is ~120 lines of stdlib\nPython and touches no file in the repo.\n\n## Suggested fix\n\nYou already have the right predicate in this file — `is_loopback_origin()`. The minimal fix\nis to stop emitting the wildcard and instead echo the request origin only when it passes\nthat check:\n\n```python\ndef _send_json(self, payload: dict[str, Any], *, status: int = 200) -\u003e None:\n    body = json.dumps(payload, ensure_ascii=False, indent=2).encode(\"utf-8\")\n    self.send_response(status)\n    self.send_header(\"Content-Type\", \"application/json; charset=utf-8\")\n    self.send_header(\"Content-Length\", str(len(body)))\n    self.send_header(\"Cache-Control\", \"no-store\")\n    origin = self.headers.get(\"Origin\")\n    if origin and is_loopback_origin(origin):\n        self.send_header(\"Access-Control-Allow-Origin\", origin)\n        self.send_header(\"Vary\", \"Origin\")\n    # no Origin header (curl, the CLI, a same-origin fetch) -\u003e send no ACAO at all\n    self.end_headers()\n    self.wfile.write(body)\n```\n\nand the same in `do_OPTIONS`. This keeps the dashboard working — it is served from\n`http://127.0.0.1:5174` and fetches `127.0.0.1:8765/8766`, which is cross-origin between two\nloopback ports, which I assume is exactly why the wildcard was added — while denying every\nnon-loopback origin.\n\nTwo optional hardening steps, if you want them:\n\n* Apply the existing `is_loopback_origin()` check to `POST /control-plane/configure-goal/dry-run`\n  and `POST /reward/dry-run` too, so the config projection is not readable cross-origin.\n* Add a `Host` header check (reject a `Host` that is not loopback) to close DNS rebinding\n  against clients that do not send `Origin`.\n\n## Scope of review\n\nReviewed 26/52 identified entrypoints across 758 files (360,618 LOC) of the `loopx` package\nand dashboard; tools: semgrep 1.172.0, trufflehog 3.96.0, osv-scanner 2.4.0, plus a manual\ndataflow pass. Skipped: `tests/`, `regression/`, `examples/`, `docs/`, and the benchmark\nadapters under `loopx/benchmark_adapters/`. Coverage confidence: partial.\n\nOther things I looked at and did **not** find a problem with, in case it saves you time:\nself-update (`curl | bash` is over HTTPS to a hardcoded `raw.githubusercontent.com` URL; the\n`LOOPX_ARCHIVE_URL` override requires environment control, i.e. privileges the attacker\nwould have to already have); project/slash-command skill installation (strict id regex plus\n`_assert_project_boundary()` containment); the `shell=True` worker tick (the value is a\nuser-configured shell command by design, and `demo_supervisor.build_visible_worker_turn_command`\npasses the objective through `shlex.quote`); outbound SSRF surfaces (`content_ops/surface.py`\nblocks private/loopback/link-local ranges and refuses redirects). No `pickle`, `yaml.load`,\n`eval`, or `os.system` anywhere in the package.\n\n3 dependency advisories exist in dev/docs tooling only (`pymdown-extensions`, `idna`,\n`postcss`); none are reachable from the runtime package, which declares no dependencies, so\nI have not opened a bump PR.\n\n## Detected by\n\n[Aeon](https://github.com/aeonfun/aeon), an automated security review. Findings are\nreproduced at HEAD and manually verified before reporting. Reported privately via GitHub PVR\nbecause that is the intake channel your `SECURITY.md` designates.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "loopx",
+        "purl": "pkg:pypi/loopx"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.0.1"
+            },
+            {
+              "fixed": "0.4.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-vx2m-gpq4-8j5q/GHSA-vx2m-gpq4-8j5q.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/huangruiteng/loopx/security/advisories/GHSA-vx2m-gpq4-8j5q"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/loopx-project/loopx/security/advisories/GHSA-vx2m-gpq4-8j5q"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-108372"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/loopx-project/loopx/pull/3137"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/loopx-project/loopx/commit/838720fba42bd22f71b5bb763ec406f7bdf4c940"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/huangruiteng/loopx"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/loopx-project/loopx/releases/tag/v0.4.5"
+    }
+  ]
+}

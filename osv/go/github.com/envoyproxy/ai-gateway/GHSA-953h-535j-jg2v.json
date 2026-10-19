@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-953h-535j-jg2v",
+  "modified": "2026-10-19T17:00:04.042439008Z",
+  "published": "2026-10-19T16:53:26Z",
+  "summary": "agent-router: MCP session resume does not verify the embedded anti-hijacking subject; default Helm seed makes session IDs forgeable",
+  "details": "## Summary\n\nThe MCP proxy's client-facing session ID embeds the authenticated caller's\nsubject (JWT `sub` claim) specifically as an anti-hijacking discriminator —\nmatching the Model Context Protocol specification's documented session-hijacking\nguidance (https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices#session-hijacking).\nHowever, the session-resume path never checks that discriminator against the\ncurrent caller's identity, so any client that obtains a session ID (its own or\nanother user's) can resume that session and act with it — including on\nroutes with per-user backend sessions. This is aggravated by the official\nHelm chart shipping a literal, publicly known default seed\n(`\"default-insecure-seed\"`) for the key that encrypts these session IDs.\n\n## Impact\n\nAn attacker who obtains (or, under the default seed, forges) another user's\n`Mcp-Session-Id` value can resume that user's MCP session against the backend\nMCP server(s) bound to the route — reading conversation/tool-call state and\ninvoking further JSON-RPC methods (e.g. `tools/call`, `resources/read`) in the\ncontext of that other user's already-initialized backend session. On a\nmulti-tenant AI Gateway deployment, this crosses the exact trust boundary the\nsubject-embedding was added to protect.\n\n## Location\n\n- `internal/mcpproxy/session.go` — `clientToGatewaySessionID.backendSessionIDs()`\n  (around line 707-765): parses `{routeName}@{subject}@{backends}` and returns\n  only `(perBackendSessionIDs, route, error)`. The comment at the subject-parsing\n  site reads: \"The subject ... is retained inside the encrypted session ID for\n  anti-hijacking purposes but is not needed during parsing.\" — the subject is\n  discarded, never returned, never compared.\n- `internal/mcpproxy/mcpproxy.go` — `sessionFromID(id, lastEvent)` (around line\n  282-323): resumes a session purely from the decrypted blob; it is never passed\n  the current request's authenticated subject, so there is nothing to compare\n  against even if `backendSessionIDs()` did return it.\n- `internal/mcpproxy/legacy.go` — `extractSubject(r)` (around line 1549-1562) is\n  called exactly once, only at session creation (`handleInitializeRequest` -\u003e\n  `newSession`, line ~307/484/491) to embed the subject when the session ID is\n  minted. All three session-resume call sites (`serveGET`/`servePOST`/`serverDELETE`\n  paths, lines ~133, 167, 216) call `sessionFromID` with no subject argument at all.\n- `internal/mcpproxy/mcpproxy.go` line 259 (`clientToGatewaySessionIDFromEntries`)\n  is where the subject is embedded at creation, confirming the intended design.\n- Aggravating factor: `manifests/charts/ai-gateway-helm/values.yaml` line 297\n  ships `seed: \"default-insecure-seed\"` as the out-of-the-box value for\n  `controller.mcp.sessionEncryption.seed`, which `templates/deployment.yaml`\n  passes straight to `--mcpSessionEncryptionSeed` (also literally defaulted to\n  `\"default-insecure-seed\"` in `cmd/controller/main.go` and\n  `cmd/extproc/mainlib/main.go` when the flag is omitted entirely). Session IDs\n  are `salt || nonce || ciphertext` (see `internal/mcpproxy/crypto.go`), so\n  knowing the seed and the (also-defaulted) PBKDF2 iteration count is sufficient\n  to derive the AES-GCM key and both decrypt observed session IDs and encrypt\n  new ones for an arbitrary chosen subject/backend-session combination.\n\n## Reproduction (code-level, not run against a live cluster)\n\n1. Deploy Envoy AI Gateway with an `MCPRoute` that has an OAuth/JWT\n   `SecurityPolicy` attached (so `internalapi.MCPSubjectHeader` is populated)\n   and at least one backend MCP server, using the Helm chart's default\n   `values.yaml` (`controller.mcp.sessionEncryption.seed` left at\n   `\"default-insecure-seed\"`).\n2. User A authenticates with a valid JWT (`sub: user-a`) and sends an\n   `initialize` JSON-RPC request to the route. The gateway creates backend\n   session(s) and returns `Mcp-Session-Id: \u003cencrypted-blob-A\u003e`, whose plaintext\n   is `{route}@user-a@{backend}:{base64(sessionID)}:{capHex}`.\n3. Attacker (any other authenticated user, or — since the seed is public and\n   default — even without ever having a legitimate session at all) constructs\n   `{route}@user-a@{backend}:{base64(\u003cany-or-known-backend-session-id\u003e)}:fff`,\n   derives the AES-GCM key via PBKDF2(sha256, \"default-insecure-seed\",\n   salt, 100000, 32) for a salt of their choosing, and encrypts it themselves\n   to produce a session ID that decrypts to the same structure `sessionFromID`\n   expects.\n4. Attacker sends a subsequent JSON-RPC request (e.g. `tools/call`) to the same\n   route with header `Mcp-Session-Id: \u003cforged-or-captured-blob-A\u003e`. The gateway\n   decrypts it, extracts `perBackendSessionIDs` for `backend`, and forwards the\n   attacker's call using that backend session — with no comparison to the\n   attacker's own JWT subject at any point in `sessionFromID` /\n   `backendSessionIDs()`.\n\n## Suggested fix\n\n- In `sessionFromID`, thread the current request's `extractSubject(r)` value\n  through to `backendSessionIDs()` (or a wrapping call) and reject resumption\n  (401/403) when the decrypted subject does not match the current caller's\n  subject — restoring the anti-hijacking check the embedding was built for.\n- Independently, change the Helm chart's default\n  `controller.mcp.sessionEncryption.seed` to be randomly generated per\n  install (e.g. via a Helm `lookup`/`randAlphaNum` in a pre-install hook, or a\n  required value with no default), rather than shipping a literal, fixed\n  string. At minimum, fail startup (rather than just logging) when the seed\n  equals the documented insecure default in a non-dev/insecure-allowed mode.\n\n## Detected by\n\nAeon vuln-scanner — agentic dataflow review (`internal/mcpproxy` entrypoint,\nEnvoy AI Gateway data-plane MCP proxy), followed by manual adversarial\nverification against the exact HEAD commit of `main`\n(`472da7db7984f769c9a77671d12c0354e75fc3ba`, confirmed to match\n`repos/theagentrouter/agent-router/commits/main` at time of report).\nDependency-CVE findings from this scan (osv-scanner, `go.mod`/`package-lock.json`)\nare not included here — they are all already covered by open Dependabot PRs\n(#2555, #2643, #2672, #2497, #2615) and are omitted to avoid duplicate filings.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/envoyproxy/ai-gateway",
+        "purl": "pkg:golang/github.com/envoyproxy/ai-gateway"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.4.0-rc1"
+            },
+            {
+              "fixed": "1.2.0-rc1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-953h-535j-jg2v/GHSA-953h-535j-jg2v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/theagentrouter/agent-router/security/advisories/GHSA-953h-535j-jg2v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theagentrouter/agent-router/pull/2740"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theagentrouter/agent-router/pull/2755"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theagentrouter/agent-router/commit/0d1e73037076d72251342d0ea578a36ffb7002c7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/theagentrouter/agent-router/commit/994579660ae2a9f2feef3cb77766e155746858b4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/theagentrouter/agent-router"
+    }
+  ]
+}

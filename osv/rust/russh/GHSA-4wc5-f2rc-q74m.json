@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-4wc5-f2rc-q74m",
+  "modified": "2026-10-19T17:15:04.083911581Z",
+  "published": "2026-10-19T17:06:46Z",
+  "aliases": [
+    "CVE-2026-111061"
+  ],
+  "summary": "russh: Unbounded memory allocation in agent protocol server via crafted constraint records",
+  "details": "### Summary\n\n`russh_keys::agent::server::add_key` (`russh/src/keys/agent/server.rs:271-319`) spawns a dedicated tokio task for every 5-byte `SSH_AGENT_CONSTRAIN_LIFETIME` record attached to an added key, each cloning the key blob and sleeping for the declared lifetime (up to ~136 years). The loop has no per-request task budget, and spawned tasks are not rolled back when the overall request fails. Repeating one constrained add-key message over an agent connection converts wire bytes into resident tasks and heap at roughly 141x amplification: in our measurement 10.2 MiB of protocol traffic produced ~2,096,120 live tasks and +1,447,856 KiB RSS, while the same traffic sent as unconstrained add-key requests cost +268 KiB. An attacker reaching the agent socket (a local process, or a remote SSH server the user connects to with agent forwarding, since russh clients accept the `auth-agent@openssh.com` channel by default at `russh/src/client/mod.rs:2686`) can exhaust the agent process's memory and task capacity with a renewable, cheap request stream. Verified on russh HEAD efa9a03 (v0.63.3-10, 2026-10-01).\n\n\n### Details\n\n```rust\n// russh/src/keys/agent/server.rs:271-319 (add_key, constraint loop)\nwhile let Ok(t) = u8::decode(r) {\n match t {\n SSH_AGENT_CONSTRAIN_LIFETIME =\u003e {\n let lifetime = u32::decode(r)?;\n ...\n tokio::spawn({\n let key = key.clone;\n async move { tokio::time::sleep(...lifetime...).await; /* remove key */ }\n });\n }\n ...\n```\n\nEach lifetime record clones the key blob into a new task regardless of how many records the same request already spawned, and a failure later in the request leaves earlier tasks alive. Data flow: agent connection -\u003e SSH_AGENTC_ADD_IDENTITY_CONSTRAINED -\u003e constraint decode loop -\u003e unbounded `tokio::spawn` per 5 bytes. The control measurement (identical wire volume as unconstrained adds) isolates the constraint path as the amplifier.\n\n### Proof of concept\n\nPrerequisites: Linux host with cargo and git. The archive's deploy script provisions russh at the pinned revision and the PoC crate (rewriting the path dependency); the PoC runs a real russh agent server on loopback and speaks the agent protocol to it.\n\n```bash\n$ POC_HOME=$HOME/russh-poc RUSSH_REPO=/home/ubuntu/HuntTargets/russh ./deployment/deploy.sh\nrussh at efa9a03 -\u003e /home/ubuntu/russh-poc/poc\n\n$ POC_HOME=$HOME/russh-poc ./poc/poc.sh 40\n[*] round 29: reply code=6 RSS=1090272 KiB (delta +1087580 KiB)\n[*] round 39: reply code=6 RSS=1450548 KiB (delta +1447856 KiB)\n[*] final RSS = 1450548 KiB (delta +1447856 KiB, x141 amplification by wire bytes)\n[*] ~2096120 tasks now sleep for ~136 years holding their blob + timer.\n[*] fds = 19\n```\n\nThe broker acks every request (code 6 = SUCCESS) while RSS grows to +1.45 GB from ~10 MiB of input. The harness's control mode (same wire volume, unconstrained adds) measured +268 KiB. The automated archive run reproduces exactly this trace.\n\n#### Manual reproduction, step by step (no archive required)\n\n1. Provision russh at the pinned revision and build the PoC crate (it hosts a real russh agent server in-process):\n\n```bash\ngit clone https://github.com/Eugeny/russh \u0026\u0026 cd russh \u0026\u0026 git checkout efa9a03e541b69505d5e6ec0d9213d011c9f6310\ncargo build --release   # in the PoC crate directory; the path dependency points at the clone\n```\n\n2. Run the PoC: it starts the agent on loopback, then sends repeated `SSH_AGENTC_ADD_IDENTITY_CONSTRAINED` messages whose constraint sections contain ~52,000 five-byte `SSH_AGENT_CONSTRAIN_LIFETIME` records each:\n\n```bash\n./target/release/poc-agent-addkey 40\n# [*] round 29: reply code=6 RSS=1090272 KiB (delta +1087580 KiB)\n# [*] round 39: reply code=6 RSS=1450548 KiB (delta +1447856 KiB)\n# [*] final RSS = 1450548 KiB (delta +1447856 KiB, x141 amplification by wire bytes)\n# [*] ~2096120 tasks now sleep for ~136 years holding their blob + timer.\n```\n\n3. Control: the same wire volume sent as UNCONSTRAINED add-key requests measures +268 KiB (`MODE=control`), isolating the constraint-record task spawn as the amplifier.\n\n4. Reachability: any local process with access to the agent socket, or a remote SSH server the user connects to with agent forwarding (russh clients accept `auth-agent@openssh.com` channels by default, `russh/src/client/mod.rs:2686`), can drive this. Each spawned task clones the key blob and sleeps for the declared lifetime (up to ~136 years); tasks are never rolled back when a request fails.\n\n### Impact\n\nAn attacker able to speak the agent protocol to a russh-based agent (local process on the socket, or a remote SSH server the user connects to with agent forwarding enabled) can drive gigabyte-scale memory growth and millions of leaked tasks per session with megabytes of traffic, renewable until the agent process is starved or OOM-killed, taking the user's SSH key agent down. The trust boundary is the agent protocol peer versus the agent process's resources. No confidentiality or integrity impact.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.64.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.64.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4wc5-f2rc-q74m/GHSA-4wc5-f2rc-q74m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-4wc5-f2rc-q74m"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/4c305033d72f8e5dd21a3fd4c53a6c291a16ebd1"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.64.1"
+    }
+  ]
+}
