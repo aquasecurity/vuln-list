@@ -1,0 +1,142 @@
+{
+  "id": "GHSA-vx6w-vv9f-6gvg",
+  "modified": "2026-10-20T21:00:04.428653055Z",
+  "published": "2026-10-20T20:53:21Z",
+  "aliases": [
+    "CVE-2026-112899"
+  ],
+  "summary": "Pillow: EPS load(scale) lets Ghostscript render past the decompression bomb limit",
+  "details": "```\n============================================================================\nEPS load(scale) lets Ghostscript render past the decompression bomb limit\nLocation: src/PIL/EpsImagePlugin.py:92  in Ghostscript()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nWhen an application opens an untrusted Encapsulated PostScript file and asks Pillow to render it at a larger scale, Pillow has Ghostscript produce an image several times bigger than Pillow's configured size limit allows. The size check runs only after Ghostscript has finished rendering and written the full raw image to a temporary file. An attacker who can upload a file of about 100 bytes makes each such request spend scale² times the Ghostscript rendering work and temporary disk space that the limit is meant to permit. For example, at scale 2 that is a 972 MB temporary file.\n\nThe cause is in `Ghostscript()` in `src/PIL/EpsImagePlugin.py`. It multiplies the file-declared size by the caller's `scale` (lines 93-94) and passes the product to `gs` as the `-g` output geometry. It never calls `Image._decompression_bomb_check()` on the scaled size. The only check is the one `Image.open()` ran on the unscaled size, so a file declaring 9000×9000 passes, and `load(scale=2)` then asks Ghostscript for 18000×18000 (3.6× `MAX_IMAGE_PIXELS`). A file declaring 18000×18000 directly would be refused before Ghostscript ever ran. `DecompressionBombError` fires only when Pillow reopens the output file, so Pillow's own in-process allocation stays bounded and there is no memory corruption.\n\nThe effect is a constant-factor overshoot rather than an unbounded one, for three reasons:\n\n* The multiplier is an integer chosen by the application, not by the file.\n* With the default warning filter, `Image.open()` already lets files up to 2× the limit reach Ghostscript at `scale=1`.\n* Any application feeding untrusted files to Ghostscript is already exposed to a tiny file that keeps Ghostscript busy indefinitely, since `gs` runs with no timeout.\n\nThis is the EPS counterpart of the WMF `load(dpi)` gap closed in af70b075a. It has been present since the decompression-bomb limit was introduced in ce2955ec7 (2.5.0). The attached reproducer stubs out Ghostscript and shows a 76-byte file passing `Image.open()` and reaching `gs` with `-g18000x18000`. A one-line patch mirroring the WMF check is included.\n\n## Details\n\n`EpsImageFile.load(scale=N)` (the documented way to rasterise an EPS at higher resolution) renders `width*N × height*N` pixels through Ghostscript, but the only decompression-bomb check on the way is the one `Image.open()` ran on the *unscaled*, file-declared `width × height`. The scaled product is never passed to `Image._decompression_bomb_check()` before `gs` is started.\n\nThis 111-byte EPS declares 9000×9000 = 81,000,000 pixels, below the default `MAX_IMAGE_PIXELS` (89,478,485), so `Image.open()` accepts it without even a warning:\n\n```\n%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 9000 9000\n%%EndComments\n0 0 moveto 9000 9000 lineto stroke\nshowpage\n```\n\n`im.load(scale=2)` on it then executes\n\n```\ngs -q -g18000x18000 -r144.000000x144.000000 -dBATCH -dNOPAUSE -dSAFER -sDEVICE=pnmraw -sOutputFile=/tmp/tmpXXXX -c 0 0 translate -f attack.eps -c showpage\n```\n\ni.e. asks Ghostscript for an 18000×18000 = 324,000,000-pixel raster (3.6× `MAX_IMAGE_PIXELS`), whose `pnmraw` output is a 972,000,019-byte file in the temp directory. An EPS that declares 18000×18000 directly is rejected by `Image.open()` with `DecompressionBombError` before Ghostscript is ever run; via `scale=2` the same raster is rendered first and the `DecompressionBombError` only appears afterwards, when Pillow opens the file Ghostscript produced. (Between 1× and 2× `MAX_IMAGE_PIXELS`, `Image.open()` only emits `DecompressionBombWarning`, so with the default warning filter an EPS declaring e.g. 13377×13377 is already rendered at `scale=1` — a 537 MB PNM. Against that baseline, `scale=2` is 4× an already-permitted render.)\n\nThe arithmetic is in `Ghostscript()`:\n\n```python\n# src/PIL/EpsImagePlugin.py:91-97\n    # Hack to support hi-res rendering\n    scale = int(scale) or 1\n    width = size[0] * scale\n    height = size[1] * scale\n    # resolution is dependent on bbox and size\n    res_x = 72.0 * width / (bbox[2] - bbox[0])\n    …\n# src/PIL/EpsImagePlugin.py:139-142\n    command = [\n        gs_binary,\n        \"-q\",  # quiet mode\n        f\"-g{width:d}x{height:d}\",  # set output geometry (pixels)\n    …\n# src/PIL/EpsImagePlugin.py:165-168\n        subprocess.check_call(command, startupinfo=startupinfo)\n        with Image.open(outfile) as out_im:\n            out_im.load()\n            return out_im.im.copy()\n```\n\nand its caller does nothing between taking `scale` from the application and invoking it:\n\n```python\n# src/PIL/EpsImagePlugin.py:411-417\n    def load(self, scale: int = 1, transparency: bool = False) -\u003e …:\n        # Load EPS via Ghostscript\n        if self.tile:\n            assert self.fp is not None\n            self.im = Ghostscript(self.tile, self.size, self.fp, scale, transparency)\n```\n\n`size` here is `self._size`, computed in `_open()` from the file's `%%BoundingBox` (or `%ImageData`) and checked once by `Image.open()` at `src/PIL/Image.py:3700`. For the benign path (`scale=1`) that check covers exactly what Ghostscript is asked to render. For `scale=N` the rendered pixel count is N² times what was checked, so a file can sit just under the limit at open time and have Ghostscript render 4× (scale 2), 9× (scale 3), 16× (scale 4) the configured budget. The first point at which Pillow looks at the real size again is `Image.open(outfile)` at line 166 — after `subprocess.check_call` has returned, i.e. after Ghostscript has spent the CPU and written `width*height*3` bytes to `tempfile.mkstemp()`'s directory.\n\n`WmfStubImageFile.load(dpi)` has the same shape (file-derived extent × caller-supplied factor → new raster) and, since af70b075a, calls `Image._decompression_bomb_check(self.size)` on the recomputed size before rendering (`src/PIL/WmfImagePlugin.py:127-131`). The EPS path lacks the equivalent line. The gap dates from ce2955ec7128 (\"Throw an exception when an opened image is larger than an arbitrary limit\", 2014-05-14, first released in 2.5.0), which added the check to `Image.open()` without covering the `scale` path.\n\n## Impact\n\nAffected are applications that open untrusted EPS/PS with Ghostscript installed and call `load(scale=N)` with a fixed N \u003e 1, as the handbook suggests for non-blurry output. Handing untrusted EPS to Ghostscript at all already lets the same attacker tie up a worker with an equally tiny file (e.g. a PostScript `{} loop`; Pillow runs `gs` with no timeout), so this bug adds a constant factor rather than a new denial-of-service capability. Within that setting, a ~110-byte upload makes each request run Ghostscript over N² × `MAX_IMAGE_PIXELS` pixels (N² × 2·`MAX_IMAGE_PIXELS` if the application does not turn `DecompressionBombWarning` into an error) and write a `W·H·3`-byte PNM into the temp directory — 972 MB for the example above at scale 2, 2.2 GB at scale 3, 8.6 GB for a 178-Mpixel declaration at scale 4 — before any limit is applied. The operator's `MAX_IMAGE_PIXELS` setting is exceeded by a factor of N²; N is an integer chosen by the application, not by the file, so the work stays bounded at N² × 2·`MAX_IMAGE_PIXELS`. The consequence is N² more Ghostscript CPU and temp-disk use per request than the configured limit intends; Pillow's own in-process pixel allocation remains bounded because `Image.open(outfile)` re-checks the PNM's size, and there is no memory corruption.\n\nThis is a sibling of the WMF `load(dpi)` issue fixed in af70b075a (\"Add decompression bomb check when loading at a different DPI\"); the EPS `scale` path was not covered by that change. Unlike the WMF case, where the file-controlled `_inch` makes the ratio unbounded, the EPS multiplier is fixed by the application.\n\n## Reproducing\n\nRun `repro` against the installed Pillow. Ghostscript does not need to be installed: the script sets `EpsImagePlugin.gs_binary = \"gs\"` so that `has_ghostscript()` skips its `gs --version` probe, and replaces `subprocess.check_call` with a function that records the command line Pillow builds and then raises `OSError`, so nothing is actually rendered.\n\nIt writes a 76-byte EPS declaring `%%BoundingBox: 0 0 9000 9000` (the example above without the drawing line; 81 Mpixel, below the default `MAX_IMAGE_PIXELS` of 89,478,485) and turns `DecompressionBombWarning` into an error, so any bomb check — warning or hard error — counts. It then calls `Image.open()` and `im.load(scale=2)`. `Image.open()` accepts the file and `load(scale=2)` reaches the intercepted Ghostscript call with `-g18000x18000` (324,000,000 pixels, 3.6× `MAX_IMAGE_PIXELS`, a 972 MB `pnmraw` output with real Ghostscript). The script prints the geometry it captured.\n\nIt prints `BUG` when Ghostscript was invoked with a `-g` geometry above `2*MAX_IMAGE_PIXELS` (178,956,970) and no decompression-bomb check fired before that call; otherwise it prints `OK`. With the attached patch applied, `load(scale=2)` raises `DecompressionBombError` before Ghostscript is called and the script prints `OK`.\n\n## Suggested fix\n\nThe attached patch checks the scaled size in `Ghostscript()` right after the scaled `width`/`height` are computed (`src/PIL/EpsImagePlugin.py:93-94`) and before the `gs` command is built, mirroring `WmfStubImageFile.load`:\n\n```diff\n--- a/src/PIL/EpsImagePlugin.py\n+++ b/src/PIL/EpsImagePlugin.py\n@@ -92,6 +92,7 @@ def Ghostscript(\n     scale = int(scale) or 1\n     width = size[0] * scale\n     height = size[1] * scale\n+    Image._decompression_bomb_check((width, height))\n     # resolution is dependent on bbox and size\n     res_x = 72.0 * width / (bbox[2] - bbox[0])\n     res_y = 72.0 * height / (bbox[3] - bbox[1])\n```\n\n`load(scale=N)` now raises `DecompressionBombError` / emits `DecompressionBombWarning` under the same `MAX_IMAGE_PIXELS` thresholds `Image.open()` applies, before Ghostscript runs instead of after. Placing the check in `Ghostscript()` rather than in `EpsImageFile.load()` is the single point where the rendered extent is decided, so it also covers direct callers of the module-level function. With the patch applied to a clean checkout the reproducer prints `OK` and `Tests/test_file_eps.py` passes. One cosmetic side effect: at `scale=1` the check re-emits the `DecompressionBombWarning` that `Image.open()` already issued for sizes between 1× and 2× the limit; guarding the call with `if scale \u003e 1:` would avoid the duplicate.\n\nThe patch also adds `test_load_scale_decompression_bomb` to `Tests/test_file_eps.py`, in the style of the WMF test: it sets `MAX_IMAGE_PIXELS` to `im.width * im.height` and expects `im.load(scale=2)` to raise `DecompressionBombError`. Like the rest of that file it is skipped without Ghostscript, because `has_ghostscript()` is consulted at the top of `Ghostscript()`; moving the check above that call would let the test run without it.\n\n## The patch\n\nAdd decompression bomb check on the scaled size in EpsImagePlugin.Ghostscript() before Ghostscript is invoked\n\nApplies to `src/PIL/EpsImagePlugin.py` at the commit above.\n\n```diff\ndiff --git a/Tests/test_file_eps.py b/Tests/test_file_eps.py\nindex 70eced62a..de331d97f 100644\n--- a/Tests/test_file_eps.py\n+++ b/Tests/test_file_eps.py\n@@ -98,6 +98,14 @@ def test_sanity(filename: str, size: tuple[int, int], scale: int) -\u003e None:\n         assert image.format == \"EPS\"\n \n \n+@pytest.mark.skipif(not HAS_GHOSTSCRIPT, reason=\"Ghostscript not available\")\n+def test_load_scale_decompression_bomb(monkeypatch: pytest.MonkeyPatch) -\u003e None:\n+    with Image.open(FILE1) as im:\n+        monkeypatch.setattr(Image, \"MAX_IMAGE_PIXELS\", im.width * im.height)\n+        with pytest.raises(Image.DecompressionBombError):\n+            im.load(scale=2)\n+\n+\n @pytest.mark.skipif(not HAS_GHOSTSCRIPT, reason=\"Ghostscript not available\")\n def test_load() -\u003e None:\n     with Image.open(FILE1) as im:\ndiff --git a/src/PIL/EpsImagePlugin.py b/src/PIL/EpsImagePlugin.py\nindex 5eaefe339..ccc6f1d85 100644\n--- a/src/PIL/EpsImagePlugin.py\n+++ b/src/PIL/EpsImagePlugin.py\n@@ -92,6 +92,7 @@ def Ghostscript(\n     scale = int(scale) or 1\n     width = size[0] * scale\n     height = size[1] * scale\n+    Image._decompression_bomb_check((width, height))\n     # resolution is dependent on bbox and size\n     res_x = 72.0 * width / (bbox[2] - bbox[0])\n     res_y = 72.0 * height / (bbox[3] - bbox[1])\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 1,845 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# EpsImagePlugin.Ghostscript(): load(scale=N) hands gs a -g geometry of\n# (W*N)x(H*N) with no _decompression_bomb_check on the scaled size; only the\n# unscaled WxH was checked by Image.open(). gs is not installed here, so we\n# set gs_binary and intercept subprocess.check_call to read the argv Pillow builds.\nimport os, subprocess, tempfile, warnings\nfrom PIL import Image, EpsImagePlugin\n\nEpsImagePlugin.gs_binary = \"gs\"  # skip the `gs --version` probe\npath = os.path.join(tempfile.mkdtemp(), \"a.eps\")\nwith open(path, \"w\") as f:  # 9000x9000 = 81 Mpx \u003c MAX_IMAGE_PIXELS (89.5 Mpx)\n    f.write(\"%!PS-Adobe-3.0 EPSF-3.0\\n%%BoundingBox: 0 0 9000 9000\\n%%EndComments\\nshowpage\\n\")\n\ncalls = []\ndef fake_check_call(cmd, **kw):\n    calls.append(cmd)\n    raise OSError(\"gs intercepted\")  # stop here; we only need the argv\nsubprocess.check_call = fake_check_call\n\nhard = 2 * Image.MAX_IMAGE_PIXELS\nbomb_before_gs = False\nwith warnings.catch_warnings():\n    warnings.simplefilter(\"error\", Image.DecompressionBombWarning)\n    try:\n        with Image.open(path) as im:\n            print(\"Image.open accepted\", os.path.getsize(path), \"byte EPS, size\", im.size)\n            im.load(scale=2)\n    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:\n        bomb_before_gs = not calls\n        print(\"bomb check fired\", \"before\" if bomb_before_gs else \"after\", \"gs:\", e)\n    except OSError as e:\n        print(\"load() reached gs:\", e)\n\nover = False\nfor c in calls:\n    g = next(a for a in c if a.startswith(\"-g\"))[2:]\n    w, h = map(int, g.split(\"x\"))\n    over |= w * h \u003e hard\n    print(f\"gs argv geometry -g{g} = {w*h} px ({w*h/Image.MAX_IMAGE_PIXELS:.1f}x MAX_IMAGE_PIXELS, \"\n          f\"hard limit {hard}); pnmraw output would be {w*h*3} bytes\")\nprint(\"BUG\" if calls and over and not bomb_before_gs else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.3.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-vx6w-vv9f-6gvg/GHSA-vx6w-vv9f-6gvg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-vx6w-vv9f-6gvg"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/3e8cc105588d1dfe062fcada0b6058c1b5f14b65"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}
