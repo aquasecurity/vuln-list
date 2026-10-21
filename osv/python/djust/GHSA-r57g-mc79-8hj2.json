@@ -1,0 +1,197 @@
+{
+  "id": "GHSA-r57g-mc79-8hj2",
+  "modified": "2026-10-21T17:35:19.934118290Z",
+  "published": "2026-10-21T17:21:15Z",
+  "aliases": [
+    "CVE-2026-113731"
+  ],
+  "summary": "djust: Arbitrary absolute-path file read in the find_handlers_for_template MCP tool",
+  "details": "### Affected version / file / line\nVersion: djust v1.1.4 (latest release, published 2026-09-23). File: python/djust/mcp/server.py:354-433 (MCP tool find_handlers_for_template). Confirmed identical on the commit used for triage, a7e4fafd1667b4db0b1465652d4a63cb17117a07.\n\n### Description\n```\n@mcp.tool()\ndef find_handlers_for_template(template_path: str) -\u003e str:\n    \"\"\"\n    Args:\n        template_path: Either a logical template name (e.g.\n            'demos/counter.html' — what you'd pass to `render`) OR\n            an absolute filesystem path. Both are searched.\n    \"\"\"\n    ...\n    resolved_path: str | None = None\n    if os.path.isabs(template_path) and os.path.isfile(template_path):\n        resolved_path = template_path\n    else:\n        ...  # logical-name resolution via Django's template loader\n    ...\n    with open(resolved_path, \"r\", encoding=\"utf-8\", errors=\"replace\") as f:\n        source = f.read()\n    handler_names_in_template = sorted({m.group(2) for m in dj_event_attr_re.finditer(source)})\n```\nWhen template_path is an absolute path to an existing file, it is used directly, with no confinement to the project/template directories — no realpath() + prefix check, no allowlist. open(resolved_path, ...) then reads the file.\n\nThis is inconsistent with the sibling tool in the same file (loaddata, ~line 290-303), which explicitly rejects paths outside the project directory for its own path-like parameter:\n```\ncandidate = os.path.realpath(...)\nif base_dir and not candidate.startswith(os.path.realpath(str(base_dir))):\n    return json.dumps({\"error\": f\"fixture path '{p}' resolves outside the project directory\", ...})\n```\nfind_handlers_for_template has no equivalent check for template_path before the open() call.\n\n### Impact\nAn MCP client with access to this tool (available whenever the Django project is running the MCP server via python manage.py djust_mcp — no separate opt-in flag gates this specific tool beyond that) can read the contents of any file on disk that the process has read permission to and that exists, by passing an absolute path — e.g. /etc/passwd, application .env files, SSH keys, or any other sensitive file reachable by the server process's user.\n\nMitigating factor (reduces this from High to Medium): the tool does not return the raw file content. It runs one fixed regex (dj-(?:click|submit|change|input|keydown|keyup)\\s*=\\s*['\"]([^'\"]+)['\"]) against the content and returns only the matched handler-name strings, plus confirmation that the file exists and is readable (an existence/readability oracle on its own, independent of the regex match). If the targeted file happens to contain text matching that HTML-attribute-like pattern (plausible for config files, logs, or any text file with key=\"value\"-shaped content), those substrings are returned in full — so the read is not purely blind, but it is not a general-purpose arbitrary-file-read primitive either.\n\nProof of Concept / Reproduction\nTraced via direct source read; no live Django project was exercised for this report (would require a full djust project scaffold, which was out of scope for this pass — see limitation below).\n\n1. MCP client calls: find_handlers_for_template(template_path=\"/etc/passwd\")\n2. server.py ~line 393:\n    ```\n       if os.path.isabs(template_path) and os.path.isfile(template_path):\n           resolved_path = template_path\n    ```\n   resolved_path == \"/etc/passwd\", unchanged, unconfined\n3. server.py ~line 430:\n    ```\n       with open(resolved_path, \"r\", encoding=\"utf-8\", errors=\"replace\") as f:\n           source = f.read()\n   ```\n   /etc/passwd is now fully read into `source`\n4. The regex dj_event_attr_re.finditer(source) is applied to the real\n   /etc/passwd content. /etc/passwd will not match this specific pattern, so\n   the response would report an empty handler list plus \"file exists and was\n   read\" - which already confirms the path-confinement bypass (compare with\n   passing a nonexistent absolute path, which correctly returns\n   \"Template file not found\").\n5. On a target where the absolute path points to a file that DOES contain\n   text shaped like `dj-click=\"...\"` (e.g. a copied HTML fragment, a stray\n   config value, or a crafted file placed by the attacker via another\n   vector), the matched substrings are returned verbatim in the JSON\n   response - full-content disclosure of just those substrings, not the\n   whole file.\n\n### Suggested Fix\nApply the same confinement loaddata already uses, before the os.path.isfile check:\n```\nif os.path.isabs(template_path):\n    candidate = os.path.realpath(template_path)\n    if base_dir and not candidate.startswith(os.path.realpath(str(base_dir))):\n        return json.dumps({\n            \"error\": f\"template path '{template_path}' resolves outside the project directory\",\n            \"resolved\": candidate,\n            \"project_dir\": str(base_dir),\n        })\n    if os.path.isfile(candidate):\n        resolved_path = candidate\n```\n### Limitations\nNot exercised against a live Django/djust project — this is a source-level trace of the exact executed branch (os.path.isabs + os.path.isfile + open()), not an end-to-end runtime capture.\nDid not verify whether any MCP-host-level confirmation/approval step (some MCP clients prompt the user before a tool call with a suspicious-looking path argument) would intercept this in practice - the vulnerability is in the server's own missing server-side guard regardless of client-side UX.\n\n### Disclosure Timeline\n2026-09-24: found during  audit, confirmed via source trace to the open() sink; classified Medium due to the response-content limitation (matched substrings only, not raw file content).\nPlease check the log file, and apply CVE once the fix is made.\n\n```\nlog:\n10  14:53:20.185935 openat(AT_FDCWD, \"/case/project/templates/nonexistent_inside_project.html\", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)\n10  14:53:20.187205 write(1, \"{\\\"error\\\": \\\"Could not resolve tem\"..., 204) = 204\n   ...\n10  14:53:20.191831 write(1, \"=== ATTACK: absolute path OUTSID\"..., 57) = 57\n10  14:53:20.194864 write(1, \"target path:\", 12) = 12\n10  14:53:20.198521 write(1, \"/case/outside/evil_content.html\", 31) = 31\n10  14:53:20.202290 newfstatat(AT_FDCWD, \"/case/outside/evil_content.html\", {st_mode=S_IFREG|0777, st_size=185, ...}, 0) = 0\n10  14:53:20.203762 write(1, \"exists on disk (from the contain\"..., 42) = 42\n10  14:53:20.207224 write(1, \"True\", 4) = 4\n10  14:53:20.210392 newfstatat(AT_FDCWD, \"/case/outside/evil_content.html\", {st_mode=S_IFREG|0777, st_size=185, ...}, 0) = 0\n10  14:53:20.211721 newfstatat(AT_FDCWD, \"/case/outside/evil_content.html\", {st_mode=S_IFREG|0777, st_size=185, ...}, 0) = 0\n10  14:53:20.213284 openat(AT_FDCWD, \"/case/outside/evil_content.html\", O_RDONLY|O_CLOEXEC) = 3\n10  14:53:20.215202 newfstatat(3, \"\", {st_mode=S_IFREG|0777, st_size=185, ...}, AT_EMPTY_PATH) = 0\n10  14:53:20.216994 ioctl(3, TCGETS, 0x7ffd68e26aa0) = -1 ENOTTY (Inappropriate ioctl for device)\n10  14:53:20.221797 read(3, \"\u003chtml\u003e\u003cbody\u003e\\n\u003c!-- This file live\"..., 186) = 185\n10  14:53:20.223610 read(3, \"\", 1) = 0\n10  14:53:20.224913 close(3) = 0\n```\n## Maintainer assessment\nThe djust MCP server (`manage.py djust_mcp`, `python -m djust.mcp`) only serves stdio to the MCP client that launched it, as the same OS user, on the developer's machine; there is no network listener. The realistic caller is a local AI agent acting on untrusted input. The tool returns only `dj-*`-attribute-shaped substrings and an existence answer, not file contents. We therefore rate this Low (CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N, 3.3).\n\nAffected: every release with the tool, 0.9.0 – 1.0.9, 1.1.0 – 1.1.6, 1.2.0 – 1.2.3, 1.3.0rc4 – 1.3.0rc7.\n\n## Patches\nFixed in 1.0.10, 1.1.7, 1.2.4 and 1.3.0rc8. `find_handlers_for_template` reads an absolute path only when it resolves (symlinks and `..` followed) inside a directory the template loaders serve or inside `BASE_DIR`, and answers any other absolute path like a missing template. The `seed_fixtures` guard compared paths with a string prefix (so `/app-data` passed for a `BASE_DIR` of `/app`) and skipped the check when `BASE_DIR` was unset; it now compares whole path components and refuses without `BASE_DIR`. Both use one containment helper.\n\n## Workarounds\nRun the MCP server only in projects whose agent you trust with file access, or pass logical template names only.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djust",
+        "purl": "pkg:pypi/djust"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.9.0"
+            },
+            {
+              "fixed": "1.0.10"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9.0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "1.0.0",
+        "1.0.0rc11",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.0.7",
+        "1.0.8",
+        "1.0.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.0.9",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r57g-mc79-8hj2/GHSA-r57g-mc79-8hj2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djust",
+        "purl": "pkg:pypi/djust"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.1.0"
+            },
+            {
+              "fixed": "1.1.7"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "1.1.3",
+        "1.1.4",
+        "1.1.5",
+        "1.1.6"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.1.6",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r57g-mc79-8hj2/GHSA-r57g-mc79-8hj2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djust",
+        "purl": "pkg:pypi/djust"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.2.0.dev0"
+            },
+            {
+              "fixed": "1.2.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.2.0",
+        "1.2.1",
+        "1.2.1rc1",
+        "1.2.1rc2",
+        "1.2.2",
+        "1.2.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.2.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r57g-mc79-8hj2/GHSA-r57g-mc79-8hj2.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djust",
+        "purl": "pkg:pypi/djust"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.3.0.dev0"
+            },
+            {
+              "fixed": "1.3.0rc8"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.3.0rc4",
+        "1.3.0rc5",
+        "1.3.0rc6",
+        "1.3.0rc7"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.3.0rc7",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r57g-mc79-8hj2/GHSA-r57g-mc79-8hj2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/security/advisories/GHSA-r57g-mc79-8hj2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-113731"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/commit/45a5045793ebe7c9c2df86b0ad34275af6822619"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/commit/744bccf699c65c815d9379b36236a7c5592a339b"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/commit/85eed7caaf620bdb08986f2f3bb79432c0d3d715"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/commit/a62caf6b4ef540ad688d4dfdfa407ff914c78728"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/djust-org/djust"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/releases/tag/v1.0.10"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/releases/tag/v1.1.7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/releases/tag/v1.2.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/djust-org/djust/releases/tag/v1.3.0rc8"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-26w4-8w32-4x3v",
+  "modified": "2026-10-21T16:45:04.128108390Z",
+  "published": "2026-10-21T16:38:47Z",
+  "aliases": [
+    "CVE-2026-113799"
+  ],
+  "summary": "Slack Morphism verifier errors disclose valid HMACs in the logs",
+  "details": "### Summary\n\nSlack Morphism exposes the correct Slack request HMAC when signature verification fails.\n\nFor an invalid request, `slack-morphism` computes the correct signature for the attacker-controlled timestamp and request body and stores it in `SlackEventWrongSignatureError.generated_hash`. The error's `Debug` and `Display` representations expose that value, and the default Axum listener error handler logs it at error level.\n\nAn attacker who can both reach the application's Slack callback endpoint and read its application/service logs can therefore use the verifier as a chosen-message HMAC oracle. The attacker can send an arbitrary request with an invalid signature, recover the correct signature from the resulting log entry, and resend the same request within the five-minute freshness window. The second request passes Slack Morphism's signature verification and reaches the protected application callback without the attacker knowing the Slack signing secret.\n\nI reproduced this end-to-end against both the Axum and Hyper integrations in `slack-morphism` 2.26.0 and 2.27.0.\n\n### Details\n\nThe vulnerability is in Slack Morphism's request signature verification error path.\n\nIn `src/signature_verifier.rs`, `SlackEventSignatureVerifier::verify` computes the expected signature before comparing it with the untrusted `X-Slack-Signature` supplied by the request.\n\nOn a mismatch, the implementation creates a `SlackEventWrongSignatureError` containing the complete correct signature in its public `generated_hash` field.\n\nRelevant source path:\n\n```text\nsrc/signature_verifier.rs:46-59\n```\n\nThe error type is defined around:\n\n```text\nsrc/signature_verifier.rs:182-199\n```\n\n`generated_hash` is a public `String`; the type derives `Debug`, and its `Display` implementation also prints the generated signature.\n\nThe resulting source-to-sink path is:\n\n1. `SlackEventSignatureVerifier::verify` computes the expected HMAC for the attacker-controlled timestamp and raw request body.\n2. Signature verification fails because the attacker initially sends an invalid signature.\n3. Slack Morphism places the correct expected value in `SlackEventWrongSignatureError.generated_hash`.\n4. The error's `Debug` and `Display` representations reveal that HMAC.\n5. The Axum middleware propagates/formats the error through `src/axum_support/slack_events_middleware.rs`.\n6. The default listener error handler in `src/listener.rs` logs the error at error level.\n7. The attacker reads the generated HMAC from the logs.\n8. The attacker resends the identical timestamp and body using the disclosed value as `X-Slack-Signature`.\n9. Slack Morphism accepts the request and executes the protected callback.\n\nThe Hyper path is also affected. `src/hyper_tokio/hyper_ext.rs` propagates the verifier error as a service error, and formatting that error similarly exposes the generated signature.\n\nThe disclosed value is exactly the credential required to authenticate the corresponding request:\n\n```text\nv0=hex(HMAC-SHA256(signing_secret, \"v0:\" || timestamp || \":\" || raw_body))\n```\n\nThere is no weakness in HMAC-SHA256 or the constant-time comparison itself. The vulnerability is that the expected authentication value is disclosed through the verifier's error path.\n\n#### Affected versions\n\nI reproduced the vulnerability against:\n\n- `slack-morphism` 2.26.0\n- `slack-morphism` 2.27.0\n- current `master` at audit time:\n  `e3b3ecabf99dfcf6c3548a42fba89fbfa510d21c`\n\nGit history indicates that the public `generated_hash` field was introduced in:\n\n```text\n9bf623bd51c6a9ef0cd22d842cc707a3311f1f22\n```\n\nand appears to have existed since v0.10.0. Since versions before 2.26.0 are unsupported and were not dynamically tested during this assessment, I am reporting the independently validated supported range as:\n\n```text\n\u003e= 2.26.0, \u003c= 2.27.0\n```\n\nNo patched release is currently available.\n\n### PoC\n\nThe PoC uses only localhost and a synthetic signing secret.\n\nTested environment:\n\n```text\nslack-morphism = 2.27.0\nRust 1.98.1\nLinux x86_64\nAxum and Hyper integrations\n```\n\nSynthetic signing secret:\n\n```text\nSLACK_MORPHISM_SYNTHETIC_SIGNING_SECRET_7c91\n```\n\nStart a Slack Morphism Axum callback endpoint using the normal Slack request signature verification middleware and the default listener error handling.\n\nSend a request using:\n\n```text\nBody:\n{\"type\":\"attacker_chosen\",\"action\":\"transfer\"}\n\nX-Slack-Request-Timestamp:\n\u003ccurrent Unix timestamp\u003e\n\nX-Slack-Signature:\nv0=0000000000000000000000000000000000000000000000000000000000000000\n```\n\nThe all-zero signature is deliberately invalid.\n\n#### First request\n\nThe first request is correctly rejected with HTTP 400.\n\nHowever, Slack Morphism's default error output contains an entry equivalent to:\n\n```text\nSlackEventWrongSignatureError {\n    ...\n    generated_hash: \"v0=\u003ccorrect-HMAC\u003e\"\n}\n```\n\nwhere `\u003ccorrect-HMAC\u003e` is the valid Slack request signature for the exact attacker-controlled timestamp and body.\n\nCopy that `generated_hash`.\n\nBefore the five-minute timestamp window expires, resend the **identical body and timestamp**, changing only the signature header:\n\n```text\nX-Slack-Signature: v0=\u003ccorrect-HMAC-from-error\u003e\n```\n\n#### Result\n\nThe second request returns HTTP 200 and the protected application callback executes.\n\nIn my end-to-end Axum reproduction the application observed:\n\n```text\nPROTECTED_CALLBACK_EXECUTED body={\"type\":\"attacker_chosen\",\"action\":\"transfer\"}\n```\n\nI independently reproduced the same primitive through the Hyper integration. The invalid request produces a service error containing:\n\n```text\nWrongSignatureError(... generated_hash: \"v0=\u003ccorrect-HMAC\u003e\")\n```\n\nand replaying that value with the same timestamp and body causes the protected callback to execute.\n\n#### Expected behavior\n\nAn invalid Slack request should be rejected without exposing any verifier-derived value that could authenticate a subsequent request.\n\nNeither verifier error objects nor application logs should contain the expected HMAC.\n\n#### Actual behavior\n\nThe invalid request is rejected, but Slack Morphism exposes the correct HMAC for the attacker-selected timestamp and body through the verifier error.\n\nReusing that disclosed HMAC within the freshness window causes the previously invalid attacker-controlled request to pass authentication and reach the protected callback.\n\n### Impact\n\nAn attacker requires:\n\n1. network access to a Slack Morphism Events API, slash-command, interaction, or equivalent signed callback endpoint; and\n2. lower-privilege read access to the application's/service's logs containing the verifier error.\n\nThe attacker does **not** need:\n\n- the Slack signing secret;\n- a Slack access token;\n- a Slack app token;\n- access to a Slack workspace; or\n- permission to modify the application's configuration.\n\nThe demonstrated impact is an authentication-boundary bypass: a lower-trust log reader can generate a valid signature for attacker-chosen request bytes and cause application functionality protected by Slack request authentication to execute.\n\nThe downstream consequences depend on the consuming application. A forged event, slash command, or interaction may trigger whatever business operations that application deliberately exposes to authenticated Slack callbacks. I am not claiming that the vulnerability itself grants access to Slack data or provides a specific application-level operation.\n\nThis is a Slack Morphism vulnerability rather than an Axum/Hyper or downstream application issue because Slack Morphism itself:\n\n- computes the correct HMAC;\n- places it into its own public error type;\n- exposes it through `Debug` and `Display`;\n- and, in the default Axum path, sends it to its own error logger.\n\nSignature verification is enabled and correctly configured in the reproduction.\n\n### Suggested remediation\n\nThe safest fix is to remove `generated_hash` from `SlackEventWrongSignatureError` entirely.\n\nThe expected HMAC should not be retained in a public error object because merely changing `Display` would still leave other disclosure paths such as derived `Debug`, callers inspecting the public field, or nested error formatting.\n\nSignature mismatch errors should contain only non-sensitive diagnostic information.\n\nI also recommend:\n\n- implementing sanitized `Debug` and `Display` representations for verification errors;\n- reviewing all Axum and Hyper signature-error sinks;\n- returning an ordinary sanitized HTTP authentication failure from the Hyper integration instead of exposing cryptographic verification state as a service error;\n- adding equivalent regression coverage for Events API, commands, and interactions; and\n- advising users whose logs exposed `generated_hash` values to rotate the Slack signing secret if those logs were accessible to an untrusted party.\n\nA regression test can directly assert that the expected HMAC is absent from both representations:\n\n```rust\nlet error = verifier.verify(BOGUS, BODY, TIMESTAMP).unwrap_err();\n\nassert!(!format!(\"{error:?}\").contains(CORRECT_HMAC));\nassert!(!format!(\"{error}\").contains(CORRECT_HMAC));\n```\n\nAn integration regression test should additionally verify that default listener logs do not contain the expected HMAC and that a request using the original invalid signature never reaches the application callback.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "slack-morphism",
+        "purl": "pkg:cargo/slack-morphism"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "2.28.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.27.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-26w4-8w32-4x3v/GHSA-26w4-8w32-4x3v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/abdolence/slack-morphism-rust/security/advisories/GHSA-26w4-8w32-4x3v"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/abdolence/slack-morphism-rust/pull/387"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/abdolence/slack-morphism-rust/commit/ac95d0d4539d0eac548a8db99c51c0c1ae832756"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/abdolence/slack-morphism-rust"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/abdolence/slack-morphism-rust/releases/tag/v2.28.0"
+    }
+  ]
+}
