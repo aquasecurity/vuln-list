@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-78g4-xqwv-q3g8",
+  "modified": "2026-10-22T17:15:04.326552524Z",
+  "published": "2026-10-22T17:01:08Z",
+  "summary": "Pillow: Bundled libopenjp2 2.5.4 in all wheels since 11.1.0 carries OSV-2025-219 heap-buffer-overflow write reachable from Image.open().load()",
+  "details": "### Summary\n\nEvery Pillow wheel from 11.1.0 onward bundles a libopenjp2 containing a heap-buffer-overflow **write** that is fixed upstream on master but has never appeared in an OpenJPEG release. See https://osv.dev/vulnerability/OSV-2025-219\n\nBecause the wheel bundles its own copy, a patched host OS does not help. It is reachable from `Image.open(fp); im.load()` with default settings.\n\nI am reporting it here rather than only upstream because Pillow is where the vulnerable binary actually reaches users.\n\nNote the inversion that makes this easy to miss: **OpenJPEG 2.5.2 and earlier are safe.** The bug was introduced in `954c6e3c` (2024-06-25), so keeping the dependency current is what creates the exposure.\n\n### Details\n\n## Affected wheels\n\nFrom `.github/dependencies.json` (`openjpeg`) at each tag:\n\n| Pillow | bundled OpenJPEG | status |\n|---|---|---|\n| 10.4.0 | 2.5.2 | safe |\n| 11.0.0 | 2.5.2 | safe |\n| **11.1.0, 11.2.1, 11.3.0** | **2.5.3** | **affected** |\n| **12.0.0 … 12.3.0** | **2.5.4** | **affected** |\n\nConfirmed on an installed wheel: `PIL.features.version_codec('jpg_2000')` → `2.5.4`, bundled file `pillow.libs/libopenjp2-*.so.2.5.4`. `main` still pins `2.5.4` as of 2026-10-06.\n\n## The defect\n\n`src/lib/openjp2/j2k.c`, in `opj_j2k_read_sod`:\n\n```c\nOPJ_UINT32 l_current_tile_part =\n    l_cstr_index-\u003etile_index[p_j2k-\u003em_current_tile_number].current_tpsno;\nl_cstr_index-\u003etile_index[...].tp_index[l_current_tile_part].end_header = l_current_pos;\nl_cstr_index-\u003etile_index[...].tp_index[l_current_tile_part].end_pos   =\n    l_current_pos + p_j2k-\u003em_specific_param.m_decoder.m_sot_length + 2;\n```\n\n`tp_index` is neither null-checked nor bounds-checked, and `l_current_tile_part` comes directly from the one-byte `TPsot` field of the SOT marker.\n\nThe correct guard already exists a few lines later in `opj_j2k_add_tlmarker` (j2k.c:8459), writing the **same array at the same index** behind `if (tp_index \u0026\u0026 l_current_tile_part \u003c nb_tps)`. One writer checked, its sibling not.\n\nReached by giving the codestream a *valid* TLM marker — so `tp_index` is allocated once by `opj_j2k_build_tp_index_from_tlm`, sized to the TLM entry count, and `opj_j2k_read_sot` then skips all resizing — while setting `TNsot = 0` in every SOT, which keeps the TLM \"valid\" and lets `TPsot` walk past the allocation.\n\n## Patch status\n\nFixed upstream in `91d08b11` (\"Fix heap buffer overlfow in opj_j2k_read_sod\", 2026-02-10).\n\nThe newest OpenJPEG tag is **v2.5.4 (2025-09-20)**, and `compare/v2.5.4...91d08b11` reports *ahead 6, behind 0* — the fix is **in no release, 8 months on**.\n\n## Suggested remediation\n\n1. Carry `91d08b11` as a patch in the wheel build until an OpenJPEG release includes it — three lines, identical to a guard already present in the same file.\n2. Consider asking OpenJPEG to cut a release; they have had an unreleased memory-corruption fix on master since February 2026, and every distro is shipping the vulnerable code.\n3. Your security handbook already tells applications to block EPS at the application layer. A similarly explicit note that `Image.open()` ignores filename/Content-Type and will reach any compiled-in codec unless `formats=` is passed would help downstream apps a lot.\n\n## Not a Pillow bug, but relevant: the extension allowlist most apps rely on does not apply\n\n`Image.open()` sniffs magic bytes, so a JPEG 2000 codestream in a file named `avatar.png` declared `Content-Type: image/png` reaches the JP2 decoder anyway.\n\nI verified this against a production service documenting PNG/JPEG-only uploads: it accepted and fully decoded a JP2 through exactly that path, with 16 formats reachable from one upload endpoint against 43 registered openers. That service has since fixed it by passing `formats=` and validating on the detected format rather than the client's `Content-Type`.\n\nThat is the reason a decoder-level issue like this one has much wider reach than downstream maintainers tend to assume.\n\n### Proof of concept\n\nASan build of OpenJPEG 2.5.4 interposed under a **stock Pillow 12.3.0**, running `Image.open(p); im.load()`:\n\n```\n==766332==ERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 8\n    #0 opj_j2k_read_sod          j2k.c:5086\n    #1 opj_j2k_read_tile_header  j2k.c:9912\n    #2 opj_read_tile_header      openjpeg.c:575\n    #3 j2k_decode_entry          src/libImaging/Jpeg2KDecode.c:793\n    #4 ImagingJpeg2KDecode       src/libImaging/Jpeg2KDecode.c:949\n    #5 _decode                   src/decode.c:132\nlocated 8 bytes to the right of a 24-byte region allocated by\n    opj_j2k_build_tp_index_from_tlm j2k.c:8939\n```\n\nFrames 3–5 are Pillow's own decoder, not a synthetic harness. No non-default decoder options are involved; strict mode is on, which is Pillow's behaviour since Pillow never calls `opj_decoder_set_strict_mode`. A benign twin image runs the same path cleanly and returns a valid image, so this is the payload and not a parse failure.\n\nI have deliberately **not** attached the PoC file to this initial report. I'm happy to attach the PoC, the builder script and the RIP-control harness here on request, or hold everything until a fix is ready.\n\nNo disclosure deadline from me; I will not publish anything while this is being worked on.\n\n### Impact\n\nAny application that calls `Image.open()` / `im.load()` on an image it did not produce — the overwhelmingly common case for upload handlers, thumbnailers and preview pipelines — can be made to perform an out-of-bounds heap write by supplying one crafted file.\n\n**Floor, already certain.** On a stock non-sanitised wheel the overflow performs 245 writes walking to +5856 bytes past a 24-byte allocation, and glibc's own heap-metadata checker aborts the process (`corrupted size vs. prev_size`, `corrupted double-linked list`, SIGABRT). One file reliably kills a long-lived worker.\n\n**Ceiling, demonstrated as a primitive but not as a finished exploit.** With same-size-class objects alive on both sides — an ordinary busy heap — the walk crosses `opj_event_mgr_t`, which holds three `opj_msg_callback` function pointers, and `opj_event_msg` then calls one (event.c:136):\n\n```\nrip  0x4000    \u003c- value chosen by the attacker's file layout\nrsi  0x3ff2    \u003c- m_error_data, written by the same walk\n```\n\nShifting the codestream with a COM marker moves `rip` with it (`0x16ce` → `0x4000`), so the instruction pointer is attacker-**chosen** rather than incidentally invalid. A benign control image leaves the same groomed heap untouched.\n\nTo be explicit about what I did not do: I have **not** built a working exploit. That additionally needs remote heap grooming and an ASLR defeat, and I attempted neither. I am reporting a controlled control-flow primitive, not a finished chain. The CVSS AC:H reflects that.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "11.1.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-78g4-xqwv-q3g8/GHSA-78g4-xqwv-q3g8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-78g4-xqwv-q3g8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/5f8114c8096b181fae493543cd3837d9f9a971cc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/d3470c327840f4c216a1610f30e7091dfd0b97c0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/uclouvain/openjpeg/commit/91d08b11a72764f6d199f32fa0c1b1abd4edc2ad"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://osv.dev/vulnerability/OSV-2025-219"
+    }
+  ]
+}

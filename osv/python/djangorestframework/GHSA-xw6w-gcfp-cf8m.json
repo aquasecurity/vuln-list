@@ -1,0 +1,77 @@
+{
+  "id": "GHSA-xw6w-gcfp-cf8m",
+  "modified": "2026-10-22T16:30:41.596167286Z",
+  "published": "2026-10-22T16:18:05Z",
+  "aliases": [
+    "CVE-2026-114137"
+  ],
+  "summary": "Django REST framework: TokenProxy.delete() reports success and revokes nothing",
+  "details": "### Summary\n\nDeleting an authentication token through `TokenProxy` silently deletes nothing. The call raises no\nexception and reports success, the database row survives, and the token keeps authenticating. Any\napplication, admin integration or operational script that revokes credentials by calling `.delete()`\non a `TokenProxy` instance believes it has revoked a token that is still live.\n\n### Details\n\n`TokenProxy` overrides `pk` to return the user id (`rest_framework/authtoken/models.py:49-63`):\n\n```python\n@property\ndef pk(self):\n    return self.user_id\n```\n\nThe concrete `Token` model keys on `key`, not on an integer id. `Model.delete()` builds its delete\nquery from `pk`, so it emits:\n\n```sql\nDELETE FROM \"authtoken_token\" WHERE \"authtoken_token\".\"key\" IN ('1')\n```\n\nThat matches a user id against the 40-character key column. Nothing matches, nothing raises, and the\ncall returns `(0, {'authtoken.TokenProxy': 0})`.\n\nDRF already ships two workarounds for this same identity mismatch instead of a fix. In\n`rest_framework/authtoken/admin.py`, `TokenAdmin.delete_model` re-fetches the concrete row:\n\n```python\ndef delete_model(self, request, obj):\n    Token.objects.get(key=obj.key).delete()   # admin.py:30\n```\n\nand `TokenAdmin` sets `actions = None` with the comment \"Actions not compatible with mapped IDs\"\n(`admin.py:50-53`). The shipped admin path is therefore safe, and every other caller of\n`TokenProxy.delete()` is not. Nothing in the API signals the difference.\n\n`TokenProxy` was added by `e2bd3b6a` (PR #7341, \"Adjusted token admin to map to user ID\"), first\nreleased in 3.12.0.\n\nA fix would drop the `pk` override, or give `TokenProxy` a `delete()` that operates on the concrete\nrow, or raise instead of silently reporting zero deletions.\n\n### PoC\n\nSave as `poc_tokenproxy_revocation.py` and run it.\n\n```python\n#!/usr/bin/env python\n\"\"\"\ndjango-rest-framework: TokenProxy.delete() reports success and revokes nothing.\n\n  baseline  token exists                        -\u003e 200\n  TRIGGER   TokenProxy.objects.get(...).delete() -\u003e no exception, row survives, still 200\n  CONTROL   Token.objects.get(key=...).delete()  -\u003e row gone, 401\n\nThe control is what makes the trigger meaningful: it proves the row was\ndeletable and the credential check live, so the 200 after the proxy delete is a\nfailed revocation and not a broken harness.\n\nRequires: django, djangorestframework importable. No arguments.\n    python poc_tokenproxy_revocation.py\nExit status 0 means the revocation failure reproduced.\n\"\"\"\nimport sys\n\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=False,\n    SECRET_KEY=\"poc\",\n    ALLOWED_HOSTS=[\"*\"],\n    ROOT_URLCONF=__name__,\n    INSTALLED_APPS=[\n        \"django.contrib.contenttypes\",\n        \"django.contrib.auth\",\n        \"rest_framework\",\n        \"rest_framework.authtoken\",\n    ],\n    DATABASES={\"default\": {\"ENGINE\": \"django.db.backends.sqlite3\", \"NAME\": \":memory:\"}},\n    DEFAULT_AUTO_FIELD=\"django.db.models.AutoField\",\n    USE_TZ=True,\n)\ndjango.setup()\n\nfrom django.contrib.auth import get_user_model  # noqa: E402\nfrom django.core.management import call_command  # noqa: E402\nfrom django.db import connection  # noqa: E402\nfrom django.test import Client  # noqa: E402\nfrom django.test.utils import CaptureQueriesContext  # noqa: E402\nfrom django.urls import path  # noqa: E402\n\nfrom rest_framework.authentication import TokenAuthentication  # noqa: E402\nfrom rest_framework.authtoken.models import Token, TokenProxy  # noqa: E402\nfrom rest_framework.permissions import IsAuthenticated  # noqa: E402\nfrom rest_framework.response import Response  # noqa: E402\nfrom rest_framework.views import APIView  # noqa: E402\n\n\nclass Whoami(APIView):\n    authentication_classes = [TokenAuthentication]\n    permission_classes = [IsAuthenticated]\n\n    def get(self, request):\n        return Response({\"user\": request.user.get_username()})\n\n\nurlpatterns = [path(\"\", Whoami.as_view())]\n\n\ndef probe(client, key):\n    response = client.get(\"/\", headers={\"authorization\": \"Token %s\" % key})\n    return response.status_code\n\n\ndef main():\n    call_command(\"migrate\", run_syncdb=True, verbosity=0)\n    user = get_user_model().objects.create_user(username=\"revoke-user\", password=\"pw\")\n    key = Token.objects.create(user=user).key\n    client = Client()\n\n    print(\"TokenProxy._meta.proxy   =\", TokenProxy._meta.proxy)\n    print(\"Token._meta.pk.attname   =\", Token._meta.pk.attname)\n    print(\"user.pk                  =\", user.pk)\n    print(\"token key                =\", key)\n\n    print(\"\\n--- baseline\")\n    print(\"rows                     =\", Token.objects.count())\n    baseline = probe(client, key)\n    print(\"GET / with token         -\u003e\", baseline)\n\n    print(\"\\n--- TRIGGER: delete through the proxy\")\n    proxy = TokenProxy.objects.get(user=user)\n    print(\"proxy.pk                 =\", proxy.pk, \"(TokenProxy.pk property)\")\n    raised = None\n    with CaptureQueriesContext(connection) as ctx:\n        try:\n            returned = proxy.delete()\n        except Exception as exc:  # noqa: BLE001\n            raised, returned = exc, None\n    for q in ctx.captured_queries:\n        if \"DELETE\" in q[\"sql\"]:\n            print(\"    SQL:\", q[\"sql\"])\n    print(\"raised                   =\", repr(raised))\n    print(\"returned                 =\", returned)\n    print(\"rows                     =\", Token.objects.count())\n    after_proxy = probe(client, key)\n    print(\"GET / with token         -\u003e\", after_proxy)\n\n    print(\"\\n--- CONTROL: delete the same row through the concrete model\")\n    with CaptureQueriesContext(connection) as ctx2:\n        returned2 = Token.objects.get(key=key).delete()\n    for q in ctx2.captured_queries:\n        if \"DELETE\" in q[\"sql\"]:\n            print(\"    SQL:\", q[\"sql\"])\n    print(\"returned                 =\", returned2)\n    print(\"rows                     =\", Token.objects.count())\n    after_real = probe(client, key)\n    print(\"GET / with token         -\u003e\", after_real)\n\n    ok = baseline == 200 and raised is None and after_proxy == 200 and after_real == 401\n    print(\n        \"\\nrevocation failure reproduced:\", ok,\n        \"(baseline 200, still 200 after proxy delete, 401 after real delete)\",\n    )\n    return 0 if ok else 1\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```\n\nObserved output:\n\n```\nTokenProxy._meta.proxy   = True\nToken._meta.pk.attname   = key\nuser.pk                  = 1\ntoken key                = 6a644878f252175d39205804c5a6faf16df67c10\n\n--- baseline\nrows                     = 1\nGET / with token         -\u003e 200\n\n--- TRIGGER: delete through the proxy\nproxy.pk                 = 1 (TokenProxy.pk property)\n    SQL: DELETE FROM \"authtoken_token\" WHERE \"authtoken_token\".\"key\" IN ('1')\nraised                   = None\nreturned                 = (0, {'authtoken.TokenProxy': 0})\nrows                     = 1\nGET / with token         -\u003e 200\n\n--- CONTROL: delete the same row through the concrete model\n    SQL: DELETE FROM \"authtoken_token\" WHERE \"authtoken_token\".\"key\" IN ('6a644878...')\nreturned                 = (1, {'authtoken.Token': 1})\nrows                     = 0\nGET / with token         -\u003e 401\n\nrevocation failure reproduced: True\n```\n\nThe control is what makes the trigger meaningful: it proves the row was deletable and the credential\ncheck live, so the 200 after the proxy delete is a failed revocation and not a broken harness.\nReproduced identically on Django 6.1 and 5.2.17 LTS, so this is not a recent Django regression.\n\n### Impact\n\nFailed credential revocation. An operator who revokes a token through a `TokenProxy` instance, and\nreceives no error, leaves a live credential in circulation indefinitely, because DRF auth tokens do\nnot expire on their own. Whoever holds that token benefits: a departed employee, a rotated\nintegration, a device believed to be deprovisioned, or an attacker whose access was thought to have\nbeen cut during incident response.\n\nNo untrusted input reaches this code path, which is why the vector is scored `AC:H`. Exploitation\ndepends on the deployment revoking through the proxy, which is a natural thing to do given\n`TokenProxy` is the model registered in the admin and the one most code will reach for. Any\ndeployment on 3.12.0 or later that revokes tokens outside DRF's own `TokenAdmin.delete_model` should\naudit whether its revocations took effect.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djangorestframework",
+        "purl": "pkg:pypi/djangorestframework"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.12.0"
+            },
+            {
+              "fixed": "3.18.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.13.0",
+        "3.13.1",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.16.0",
+        "3.16.1",
+        "3.17.0",
+        "3.17.1",
+        "3.17.2",
+        "3.18.0",
+        "3.18.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-xw6w-gcfp-cf8m/GHSA-xw6w-gcfp-cf8m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/security/advisories/GHSA-xw6w-gcfp-cf8m"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114137"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/commit/af3fabfd517307fbc5d500fba1ab8f6e25f220b0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/encode/django-rest-framework"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/releases/tag/3.18.2"
+    }
+  ]
+}

