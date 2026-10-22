@@ -1,0 +1,171 @@
+{
+  "id": "GHSA-4558-3h8r-v8xp",
+  "modified": "2026-10-21T20:15:04.190082872Z",
+  "published": "2026-10-21T20:00:32Z",
+  "aliases": [
+    "CVE-2026-112394"
+  ],
+  "summary": "Pillow: P;2L and P;4L decoders may read 1 to 3 bytes past the passed buffer size",
+  "details": "### Summary\n\nOn `main`, even with the guard in #9725, it's possible to have these decoders read 1 to 3 bytes past the end of the passed buffer with a suitable width/height.\n\n### Details\n\n`ImagingRawDecode` and the `P;2L` / `P;4L` unpackers disagree about how many bytes a line of data occupies.\n\nThe raw decoder derives the line size from the bits per pixel\n\n```c\nstate-\u003ebytes = (state-\u003exsize * state-\u003ebits + 7) / 8;\n```\n\nand uses it both for the bounds check and to advance to the next line. For `P;2L` and `P;4L`, `bits` is 2 and 4 respectively.\n\nBut these two rawmodes are not packed pixels but 2 or 4 *bit planes*, each padded to a whole number of bytes. `unpackP2L` computes `s = (pixels + 7) / 8` and reads plane *k* at offset `k * s`, and `unpackP4L` does the same across four planes. Their real footprint is therefore `planes * ((xsize + 7) / 8)`.\n\nFor some widths, padding each plane separately makes this footprint larger than `state-\u003ebytes`. For example, at width 1, the decoder accounts for one byte, while the unpackers read two or four bytes. The decoder accepts data that is too short for the last line and on the other hand advances to subsequent lines by less than a line, so every line after the first is also read from the wrong offset.\n\n#9725's check is misshapen for this:\n\n* It can reject data of the right length: 8x1 `P;2L` image is 2 bytes but is not accepted.\n* It still accepts buffers shorter than the unpackers require for a given image shape.\n* It measures the length with `len(data)`, which is an element count rather than a byte count; e.g. `memoryview(array(\"I\", [0,0,0,0,0]))` (20 bytes) is rejected while `mv.tobytes()` is accepted.\n\n### PoC ( `ghsa_p2l_p4l.py`)\n\n```python\nfrom array import array\nfrom PIL import Image\n\n# 1 byte past\nImage.frombytes(\"P\", (1, 4), array(\"B\", [0] * 4), \"raw\", \"P;2L\")\n\n# 3 bytes past\nImage.frombytes(\"P\", (1, 8), array(\"B\", [0] * 8), \"raw\", \"P;4L\")\n```\nis the almost-simplest reproducer.\n\n(`array` is needed to get ASan to reliably scream, but the overread is observable with e.g. bytes literals. Python allocates `bytes`es with an extra trailing null byte, from an arena by default to boot, so ASan doesn't see the overread.)\n\nOn my Mac, I can get ASan to scream about this with\n\n```bash\nexport asan=$(clang -print-file-name=libclang_rt.asan_osx_dynamic.dylib)\nenv CFLAGS=\"-fsanitize=address -fno-omit-frame-pointer -g -O1\" LDFLAGS=\"-fsanitize=address\" uv pip install -e .\nenv DYLD_INSERT_LIBRARIES=$asan PYTHONMALLOC=malloc ASAN_OPTIONS=detect_leaks=0 python3 ghsa_p2l_p4l.py\n```\n\nlike so:\n\n\u003cdetails\u003e\n\n```\npython3(29144,0x202fea2c0) malloc: nano zone abandoned due to inability to reserve vm space.\nunpackP2L: in=0x602000037370 i=0 j=0 pixels=1 reads 0x602000037370 0x602000037371\nunpackP2L: in=0x602000037371 i=0 j=0 pixels=1 reads 0x602000037371 0x602000037372\nunpackP2L: in=0x602000037372 i=0 j=0 pixels=1 reads 0x602000037372 0x602000037373\nunpackP2L: in=0x602000037373 i=0 j=0 pixels=1 reads 0x602000037373 0x602000037374\n=================================================================\n==29144==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000037374 at pc 0x00010778c684 bp 0x00016d029f40 sp 0x00016d029f38\nREAD of size 1 at 0x602000037374 thread T0\n    #0 0x00010778c680 in unpackP2L+0x17c (_imaging.cpython-314-darwin.so:arm64+0xb4680)\n    #1 0x000107765360 in ImagingRawDecode+0x348 (_imaging.cpython-314-darwin.so:arm64+0x8d360)\n    #2 0x0001076f259c in _decode+0x15c (_imaging.cpython-314-darwin.so:arm64+0x1a59c)\n    #3 0x0001030d921c in method_vectorcall_VARARGS.llvm.8905850704545875072+0x84 (python3.14:arm64+0x10030521c)\n    #4 0x000102e585b8 in _TAIL_CALL_CALL.llvm.12785051352303791014+0x13c (python3.14:arm64+0x1000845b8)\n    #5 0x000102f1c17c in _PyEval_Vector+0x308 (python3.14:arm64+0x10014817c)\n    #6 0x000102f31864 in PyEval_EvalCode+0x9c (python3.14:arm64+0x10015d864)\n    #7 0x000102f3fa14 in run_mod.llvm.1224844961852478530+0x120 (python3.14:arm64+0x10016ba14)\n    #8 0x000103063eb0 in pyrun_file+0xa0 (python3.14:arm64+0x10028feb0)\n    #9 0x000102dfe834 in _PyRun_SimpleFileObject+0xfc (python3.14:arm64+0x10002a834)\n    #10 0x00010306cb60 in _PyRun_AnyFileObject+0x4c (python3.14:arm64+0x100298b60)\n    #11 0x00010306ca54 in pymain_run_file_obj+0xa0 (python3.14:arm64+0x100298a54)\n    #12 0x000102ffb80c in pymain_run_file+0x44 (python3.14:arm64+0x10022780c)\n    #13 0x000102ff7d0c in Py_RunMain+0x46c (python3.14:arm64+0x100223d0c)\n    #14 0x000102fb0820 in pymain_main.llvm.7308572997346072671+0x1cc (python3.14:arm64+0x1001dc820)\n    #15 0x000102fb0644 in main+0x20 (python3.14:arm64+0x1001dc644)\n    #16 0x000194c86b94  (\u003cunknown module\u003e)\n\n0x602000037374 is located 0 bytes after 4-byte region [0x602000037370,0x602000037374)\nallocated by thread T0 here:\n    #0 0x0001044a130c in malloc+0x78 (libclang_rt.asan_osx_dynamic.dylib:arm64e+0x3d30c)\n    #1 0x000102f22324 in newarrayobject+0x6c (python3.14:arm64+0x10014e324)\n    #2 0x000102f21b4c in array_new+0x320 (python3.14:arm64+0x10014db4c)\n    #3 0x0001030fc390 in type_call+0x5c (python3.14:arm64+0x100328390)\n    #4 0x000102e58ae4 in _TAIL_CALL_CALL.llvm.12785051352303791014+0x668 (python3.14:arm64+0x100084ae4)\n    #5 0x000102f1c17c in _PyEval_Vector+0x308 (python3.14:arm64+0x10014817c)\n    #6 0x000102f31864 in PyEval_EvalCode+0x9c (python3.14:arm64+0x10015d864)\n    #7 0x000102f3fa14 in run_mod.llvm.1224844961852478530+0x120 (python3.14:arm64+0x10016ba14)\n    #8 0x000103063eb0 in pyrun_file+0xa0 (python3.14:arm64+0x10028feb0)\n    #9 0x000102dfe834 in _PyRun_SimpleFileObject+0xfc (python3.14:arm64+0x10002a834)\n    #10 0x00010306cb60 in _PyRun_AnyFileObject+0x4c (python3.14:arm64+0x100298b60)\n    #11 0x00010306ca54 in pymain_run_file_obj+0xa0 (python3.14:arm64+0x100298a54)\n    #12 0x000102ffb80c in pymain_run_file+0x44 (python3.14:arm64+0x10022780c)\n    #13 0x000102ff7d0c in Py_RunMain+0x46c (python3.14:arm64+0x100223d0c)\n    #14 0x000102fb0820 in pymain_main.llvm.7308572997346072671+0x1cc (python3.14:arm64+0x1001dc820)\n    #15 0x000102fb0644 in main+0x20 (python3.14:arm64+0x1001dc644)\n    #16 0x000194c86b94  (\u003cunknown module\u003e)\n\nSUMMARY: AddressSanitizer: heap-buffer-overflow (_imaging.cpython-314-darwin.so:arm64+0xb4680) in unpackP2L+0x17c\nShadow bytes around the buggy address:\n  0x602000037080: fa fa fd fa fa fa fd fa fa fa fd fa fa fa fd fa\n  0x602000037100: fa fa fd fa fa fa fd fa fa fa fd fa fa fa fd fa\n  0x602000037180: fa fa fd fa fa fa fd fa fa fa fd fa fa fa fd fa\n  0x602000037200: fa fa fd fa fa fa fd fa fa fa fd fa fa fa fd fa\n  0x602000037280: fa fa fd fa fa fa fd fa fa fa fd fa fa fa fd fa\n=\u003e0x602000037300: fa fa 00 fa fa fa 00 00 fa fa fd fa fa fa[04]fa\n  0x602000037380: fa fa 04 fa fa fa fd fd fa fa fd fd fa fa fd fd\n  0x602000037400: fa fa fd fd fa fa fd fd fa fa fd fa fa fa 00 fa\n  0x602000037480: fa fa 01 fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x602000037500: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x602000037580: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07\n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n```\n\u003c/details\u003e\n\n(To get it to scream differently about `unpackP4L`, comment out the P;2L case.)\n\nThe above output is with `unpackP2L` and `unpackP4L` off 5eee92031a1986dfdaac7c78cdf0b764c0697118 lazily instrumented to print out what it's reading:\n\n\u003cdetails\u003e\n\n```patch\ndiff --git a/src/libImaging/Unpack.c b/src/libImaging/Unpack.c\nindex a51568209..4f867737a 100644\n--- a/src/libImaging/Unpack.c\n+++ b/src/libImaging/Unpack.c\n@@ -548,6 +548,8 @@ unpackP4(UINT8 *out, const UINT8 *in, int pixels) {\n     }\n }\n \n+#include \u003cstdio.h\u003e\n+\n static void\n unpackP2L(UINT8 *out, const UINT8 *in, int pixels) {\n     int i, j, m, s;\n@@ -555,6 +557,8 @@ unpackP2L(UINT8 *out, const UINT8 *in, int pixels) {\n     m = 128;\n     s = (pixels + 7) / 8;\n     for (i = j = 0; i \u003c pixels; i++) {\n+        fprintf(stderr, \"unpackP2L: in=%p i=%d j=%d pixels=%d reads %p %p\\n\",\n+            in, i, j, pixels, in + j, in + j + s);\n         out[i] = ((in[j] \u0026 m) ? 1 : 0) + ((in[j + s] \u0026 m) ? 2 : 0);\n         if ((m \u003e\u003e= 1) == 0) {\n             m = 128;\n@@ -570,6 +574,8 @@ unpackP4L(UINT8 *out, const UINT8 *in, int pixels) {\n     m = 128;\n     s = (pixels + 7) / 8;\n     for (i = j = 0; i \u003c pixels; i++) {\n+        fprintf(stderr, \"unpackP4L: in=%p i=%d j=%d pixels=%d reads %p %p %p %p\\n\",\n+            in, i, j, pixels, in + j, in + j + s, in + j + 2 * s, in + j + 3 * s);\n         out[i] = ((in[j] \u0026 m) ? 1 : 0) + ((in[j + s] \u0026 m) ? 2 : 0) +\n                  ((in[j + 2 * s] \u0026 m) ? 4 : 0) + ((in[j + 3 * s] \u0026 m) ? 8 : 0);\n         if ((m \u003e\u003e= 1) == 0) {\n```\n\u003c/details\u003e\n\n### Impact\n\nOnly a very specific use case is affected: `Image.frombytes()` or `Image.frombuffer()` calls of the shape above.\nThe PCX decoder, which is the only Pillow-internal user of the P;2L and P;4L unpackers, already re-packs PCX rows into a format where overreads aren't an issue.\n\nThe impact is that up to 1 byte (`P;2L`) or 3 bytes (`P;4L`) of heap memory following the caller's buffer are read and mixed into the pixel values of the last decoded row(s), one bit per affected plane per pixel. A crash is also possible if the read reaches unmapped memory.\n\nAs far as I can tell, all published Pillow versions are affected.\n\n### Notes\n\nThese findings were momentarily public (though in no detail) in https://github.com/python-pillow/Pillow/pull/9723#issuecomment-5566006996; Andrew asked to retract the comment and post this instead.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4558-3h8r-v8xp/GHSA-4558-3h8r-v8xp.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-4558-3h8r-v8xp"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112394"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/pull/9723"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/392ee6f0d19a4adb766a63e9a99f3c28193b8d31"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

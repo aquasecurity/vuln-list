@@ -1,0 +1,108 @@
+{
+  "id": "GHSA-jg86-v3jv-hrpm",
+  "modified": "2026-10-21T21:30:26.940437731Z",
+  "published": "2026-10-21T21:11:44Z",
+  "aliases": [
+    "CVE-2026-112894"
+  ],
+  "summary": "Pillow: Quadratic-time DoS in PDF save_all (PdfParser.next_object_id)",
+  "details": "```\n============================================================================\nQuadratic-time DoS in PDF save_all (PdfParser.next_object_id)\nLocation: src/PIL/PdfParser.py:629  in next_object_id()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nPillow's PDF writer takes time proportional to the square of the number of frames when it saves a multi-frame image as a multi-page PDF. Anyone who can get an application to convert their uploaded image this way can tie up a worker at full CPU for minutes with a small file. A 240 KB animated image takes about 70 seconds, a 720 KB one an estimated 10 minutes, and a 125-byte animated PNG that merely *declares* a large frame count triggers the same slowdown with no upper bound short of 2³¹ frames. Memory stays under 100 MB and the decompression-bomb limit never applies.\n\nThe cause is `PdfParser.next_object_id()` in `src/PIL/PdfParser.py`, which finds the next free id by computing `max(self.xref_table.keys())`. `XrefTable.keys()` rebuilds three sets over every id reserved so far on each call. `PdfImagePlugin._save()` calls it three times (four for palette images with transparency) per frame, for `n_frames` frames, before any page is written. That makes the id-reservation loop alone O(N²). Because `n_frames` is taken from the file before any frame is seeked, APNG's `acTL` count drives the loop even when the frames don't exist. In that case the save raises `OSError` only after the full delay.\n\nThe precondition is that the application calls `im.save(..., \"PDF\", save_all=True)` on the attacker's file; `Image.open()` and `load()` alone do not reach this code. The attached reproducer shows 4× the frames costing about 11× the CPU for a valid GIF and about 16× for a fixed 125-byte APNG. The behaviour was introduced in `6207b44ab1ff` (2018-01-18) and first shipped in Pillow 5.1.0. A small patch that tracks the highest id in `XrefTable` makes the save linear.\n\n## Details\n\nSaving a multi-frame image as a multi-page PDF (`im.save(fp, \"PDF\", save_all=True)`) costs CPU time proportional to the square of the frame count, independent of pixel content, because every object id the PDF writer reserves is found by rebuilding and scanning the set of all ids reserved so far.\n\nA 1×1-pixel animated GIF made of N identical 15-byte frames (built by the reproducer) gives, on a 2-CPU container with the stock build at this commit (absolute timings vary by machine; the growth rate does not):\n\n| frames | GIF size | `im.save(BytesIO(), \"PDF\", save_all=True)` | peak RSS |\n|---|---|---|---|\n| 2 000 | 30 KB | 1.1 s | |\n| 8 000 | 120 KB | 14.7 s | |\n| 16 000 | 240 KB | 70 s | 60 MB |\n| 32 000 | 480 KB | 262 s | 95 MB |\n| 48 000 | 720 KB | still running at 120 s (extrapolated ≈ 10 min) | |\n\nEach doubling of the input roughly quadruples the time. `cProfile` of the 8 000-frame save attributes 13.5 s of 17.6 s to 24 003 calls of `PdfParser.next_object_id` (8.9 s inside `XrefTable.keys`, 3.9 s inside `max`); encoding and writing the 8 000 pages is the remaining ~4 s and scales linearly.\n\nThe per-page id reservation loop runs before any page is written:\n\n```python\n# src/PIL/PdfImagePlugin.py:247-259  (_save)\n    for im in ims:\n        im_number_of_pages = 1\n        if save_all:\n            im_number_of_pages = getattr(im, \"n_frames\", 1)\n        …\n        for i in range(im_number_of_pages):\n            image_refs.append(existing_pdf.next_object_id(0))\n            if im.mode == \"P\" and \"transparency\" in im.info:\n                image_refs.append(existing_pdf.next_object_id(0))\n\n            page_refs.append(existing_pdf.next_object_id(0))\n            contents_refs.append(existing_pdf.next_object_id(0))\n```\n\n`n_frames` comes straight from the file (for GIF it is the number of image blocks; the GIF plugin counts them by walking block headers, which is cheap). The frames do not even have to exist: the loop runs on `n_frames` before any frame is seeked, and for APNG `n_frames` is the `num_frames` value declared in the `acTL` chunk, rejected only if it is 0 or above `0x80000000` (`src/PIL/PngImagePlugin.py:716-720`). A 125-byte APNG declaring 8 000 frames therefore costs the same ~10–13 s as the 120 KB GIF, and more without bound as the declared count grows. Each of the 3 (or 4, for `P` images with transparency) calls per frame lands here:\n\n```python\n# src/PIL/PdfParser.py:626-634\n    def next_object_id(self, offset: int | None = None) -\u003e IndirectReference:\n        try:\n            # TODO: support reuse of deleted objects\n            reference = IndirectReference(max(self.xref_table.keys()) + 1, 0)\n        except ValueError:\n            reference = IndirectReference(1, 0)\n        if offset is not None:\n            self.xref_table[reference.object_id] = (offset, 0)\n        return reference\n\n# src/PIL/PdfParser.py:175-178  (XrefTable)\n    def keys(self) -\u003e set[int]:\n        return (\n            set(self.existing_entries.keys()) - set(self.deleted_entries.keys())\n        ) | set(self.new_entries.keys())\n```\n\n`_save` passes `offset=0`, so every reserved id is inserted into `xref_table.new_entries`. The k-th call therefore materialises three sets covering all k−1 previous ids, computes a difference and a union, and then `max()` scans the result — O(k) work to produce the integer k. Summed over 3N calls this is O(N²): for 48 000 frames, 144 002 calls over sets growing to 144 002 elements, on the order of 10¹⁰ set-element operations, all spent before `_write_image` is reached for the first frame. Nothing on this path consults `MAX_IMAGE_PIXELS` (the frames are 1×1) and nothing raises; for the GIF the save eventually completes and produces a valid PDF, and for the declared-only APNG it raises `OSError` only once the id loop has finished and the first missing frame is seeked.\n\nThis reservation scheme was introduced in `6207b44ab1ff` (\"issue #2959: support appending to existing PDFs\", 2018-01-18) and first shipped in Pillow 5.1.0; before it, the writer numbered objects arithmetically.\n\nFor contrast, `write_obj(ref, …)` with an already-reserved `ref` (`src/PIL/PdfParser.py:548-555`) only does a dict store, which is why the page-writing phase that follows is linear; the super-linear cost is entirely in how the next free id is computed.\n\n## Impact\n\nThe precondition is that the application saves the attacker's image as PDF with `save_all=True`; `Image.open()` and `load()` alone do not reach this code. An application that converts uploaded images to PDF this way — the documented way to get one page per frame from animated GIF/APNG/WebP or multi-page TIFF input — can have a worker held at 100 % CPU for about 10 minutes by a 720 KB GIF, about 4½ minutes by a 480 KB one, with the cost continuing to grow quadratically with upload size. With APNG the file size does not matter at all: a 125-byte file declaring N frames in `acTL` drives the same quadratic loop, up to the 2³¹ cap. The attacker controls only the file bytes; no unusual dimensions, modes or options are needed, memory use stays under 100 MB so memory limits do not intervene, and the decompression-bomb guard is not applicable. The consequence is denial of service of the process performing the conversion. Single-image PDF saves, and `save_all` saves of images with tens or hundreds of frames, are unaffected in practice.\n\nThis is the same family as earlier accidentally-quadratic parsing issues fixed in Pillow (e.g. CVE-2021-28677, EPS `readline`), but on the PDF *writer* side, reached only through a save rather than on open, and driven by frame count rather than by line structure.\n\n## Reproducing\n\n`repro` is a single Python script. Run it with the Python that has Pillow installed (`./repro`). It uses under 100 MB of RAM and writes no files.\n\n**Input.** Two kinds of file are built in memory, each with 2 000 and 8 000 frames:\n\n- `gif(n)`: a valid animated GIF — a `GIF89a` header with a 1×1 logical screen and a 2-colour global palette, then `n` copies of one 15-byte frame (a 1×1 image descriptor plus the LZW data for one pixel), then the trailer (30 and 120 KB). The only unusual thing about it is how many frames it has.\n- `apng(n)`: a 125-byte APNG — a 1×1 greyscale `IHDR`, an `acTL` chunk declaring `n` frames, one `fcTL`, one `IDAT` and `IEND`. Only the first frame exists; the other `n − 1` are merely declared.\n\n**Action.** Each file goes through what an upload-to-PDF converter would do: `Image.open(BytesIO(data))`, then `im.save(BytesIO(), \"PDF\", save_all=True)`, timed with `time.process_time()`. For the APNG the save raises `OSError` once the writer tries to seek to the second frame; that happens after the id-reservation loop has run for all `n` declared frames, so the exception is caught and the CPU time up to it is recorded.\n\n**Expected output** (stock build at this commit):\n\n```\nGIF  frames= 2000 file= 30020 B  save CPU=  1.03s  result=ok\nGIF  frames= 8000 file=120020 B  save CPU= 11.68s  result=ok\nGIF: 4x frames -\u003e 11.3x CPU (linear ~4x, quadratic ~16x)\nAPNG frames= 2000 file=   125 B  save CPU=  0.65s  result=OSError(Truncated File Read)\nAPNG frames= 8000 file=   125 B  save CPU= 10.48s  result=OSError(Truncated File Read)\nAPNG: 4x frames -\u003e 16.1x CPU (linear ~4x, quadratic ~16x)\nBUG\n```\n\nA linear save would take about 4× as long for 4× the frames; here the GIF save grows ~11× and the APNG save ~16×, the latter with the file size fixed at 125 bytes. The script prints `BUG` when the save CPU for either format grows at least 8× for 4× the frames (twice the linear expectation), otherwise `OK`. Extending the same curve gives the figures in the table above: about 70 s at 16 000 frames (240 KB GIF), and about 10 minutes for a 720 KB file.\n\nWith the attached patch applied, the GIF save takes 0.32 s / 1.20 s (3.7×) and the APNG save 0.01 s / 0.03 s, and the script prints `OK`.\n\n## Suggested fix\n\nMake `next_object_id()` O(1) by tracking the highest object id ever stored in `XrefTable` instead of rebuilding the key set on every call. The attached patch does this in `src/PIL/PdfParser.py`:\n\n```diff\n--- a/src/PIL/PdfParser.py\n+++ b/src/PIL/PdfParser.py\n@@ class XrefTable:\n         self.deleted_entries = {0: 65536}  # object ID =\u003e generation\n         self.reading_finished = False\n+        self.max_object_id = 0  # highest object ID ever stored, deleted or not\n\n     def __setitem__(self, key: int, value: tuple[int, int]) -\u003e None:\n         if self.reading_finished:\n             self.new_entries[key] = value\n         else:\n             self.existing_entries[key] = value\n+        if key \u003e self.max_object_id:\n+            self.max_object_id = key\n         if key in self.deleted_entries:\n             del self.deleted_entries[key]\n@@ class PdfParser:\n     def next_object_id(self, offset: int | None = None) -\u003e IndirectReference:\n-        try:\n-            # TODO: support reuse of deleted objects\n-            reference = IndirectReference(max(self.xref_table.keys()) + 1, 0)\n-        except ValueError:\n-            reference = IndirectReference(1, 0)\n+        # TODO: support reuse of deleted objects\n+        reference = IndirectReference(self.xref_table.max_object_id + 1, 0)\n         if offset is not None:\n             self.xref_table[reference.object_id] = (offset, 0)\n         return reference\n```\n\n`existing_entries` is only ever populated through `__setitem__` (from `read_xref_table` / `read_prev_trailer`), so the counter also covers ids read from an existing file in `append=True` mode. The one behavioural difference: when the highest-numbered existing object has just been deleted (`del_root()` / `rewrite_pages()` in append mode), the current code hands that id out again with generation 0, whereas the patch moves on to the next unused id — the more conservative choice for an xref table, and the one the existing `TODO: support reuse of deleted objects` comment points at. With the patch applied and Pillow rebuilt, the 16 000-frame save drops from ~70 s to ~2.5 s, fresh PDF output is unchanged, `Tests/test_file_pdf.py` and `Tests/test_pdfparser.py` pass, and the reproducer prints `OK`.\n\nAn alternative limited to the writer would be to reserve the `3 × number_of_pages` ids in `PdfImagePlugin._save()` arithmetically from a single `next_object_id()` call, but fixing the allocator also covers `write_obj(None, …)` callers.\n\nThe patch does not address a separate, linear issue: `PdfImagePlugin._save()` still trusts `n_frames` before any frame is decoded, so a tiny file whose format reports a declared-only frame count (APNG `acTL` up to 2³¹) still makes it loop `3 × n_frames` times before the first failing seek. Reserving ids per successfully seeked frame, or validating `n_frames` in such plugins, would close that.\n\n## The patch\n\nTrack the highest object ID in XrefTable so PdfParser.next_object_id() is O(1) instead of rebuilding and scanning the key set\n\nApplies to `src/PIL/PdfParser.py` at the commit above.\n\n```diff\ndiff --git a/src/PIL/PdfParser.py b/src/PIL/PdfParser.py\nindex 672557190..82ebfb867 100644\n--- a/src/PIL/PdfParser.py\n+++ b/src/PIL/PdfParser.py\n@@ -133,12 +133,15 @@ class XrefTable:\n         )  # object ID =\u003e (offset, generation)\n         self.deleted_entries = {0: 65536}  # object ID =\u003e generation\n         self.reading_finished = False\n+        self.max_object_id = 0  # highest object ID ever stored, deleted or not\n \n     def __setitem__(self, key: int, value: tuple[int, int]) -\u003e None:\n         if self.reading_finished:\n             self.new_entries[key] = value\n         else:\n             self.existing_entries[key] = value\n+        if key \u003e self.max_object_id:\n+            self.max_object_id = key\n         if key in self.deleted_entries:\n             del self.deleted_entries[key]\n \n@@ -624,11 +627,8 @@ class PdfParser:\n         self.orig_pages = self.pages[:]\n \n     def next_object_id(self, offset: int | None = None) -\u003e IndirectReference:\n-        try:\n-            # TODO: support reuse of deleted objects\n-            reference = IndirectReference(max(self.xref_table.keys()) + 1, 0)\n-        except ValueError:\n-            reference = IndirectReference(1, 0)\n+        # TODO: support reuse of deleted objects\n+        reference = IndirectReference(self.xref_table.max_object_id + 1, 0)\n         if offset is not None:\n             self.xref_table[reference.object_id] = (offset, 0)\n         return reference\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 1,791 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# PDF save_all is O(frames^2): PdfParser.next_object_id() does max(XrefTable.keys()),\n# and keys() rebuilds sets of every id reserved so far, 3 calls per frame.\n# (a) valid 1x1 animated GIF, 15 bytes/frame; (b) 125-byte APNG whose acTL merely\n# *declares* N frames - ids are reserved for all N before the first seek fails.\nimport io, struct, time, zlib\nfrom PIL import Image\n\ndef gif(n):\n    return (b\"GIF89a\\x01\\x00\\x01\\x00\\x80\\x00\\x00\\x00\\x00\\x00\\xff\\xff\\xff\"\n            + b\"\\x2c\\x00\\x00\\x00\\x00\\x01\\x00\\x01\\x00\\x00\\x02\\x02\\x44\\x01\\x00\" * n + b\"\\x3b\")\n\ndef apng(n):\n    def chunk(t, d):\n        return struct.pack(\"\u003eI\", len(d)) + t + d + struct.pack(\"\u003eI\", zlib.crc32(t + d))\n    return (b\"\\x89PNG\\r\\n\\x1a\\n\"\n            + chunk(b\"IHDR\", struct.pack(\"\u003eIIBBBBB\", 1, 1, 8, 0, 0, 0, 0))\n            + chunk(b\"acTL\", struct.pack(\"\u003eII\", n, 0))\n            + chunk(b\"fcTL\", struct.pack(\"\u003eIIIIIHHBB\", 0, 1, 1, 0, 0, 1, 1, 0, 0))\n            + chunk(b\"IDAT\", zlib.compress(b\"\\x00\\x00\")) + chunk(b\"IEND\", b\"\"))\n\ndef save_pdf(data):\n    im = Image.open(io.BytesIO(data))\n    t = time.process_time()\n    try:\n        im.save(io.BytesIO(), \"PDF\", save_all=True)\n        res = \"ok\"\n    except OSError as e:          # APNG: frames don't exist, fails *after* the id loop\n        res = f\"OSError({e})\"\n    return time.process_time() - t, res\n\nbug = False\nfor name, make in ((\"GIF\", gif), (\"APNG\", apng)):\n    t = {}\n    for n in (2000, 8000):\n        data = make(n)\n        t[n], res = save_pdf(data)\n        print(f\"{name:4} frames={n:5} file={len(data):6} B  save CPU={t[n]:6.2f}s  result={res}\")\n    growth = t[8000] / t[2000]\n    print(f\"{name}: 4x frames -\u003e {growth:.1f}x CPU (linear ~4x, quadratic ~16x)\")\n    if growth \u003e= 8:\n        bug = True\nprint(\"BUG\" if bug else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.1.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-jg86-v3jv-hrpm/GHSA-jg86-v3jv-hrpm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-jg86-v3jv-hrpm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112894"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/f6a852555f1a1bdff7781abf25f1a3b8bd6ce6cb"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

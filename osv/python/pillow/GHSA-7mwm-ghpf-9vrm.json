@@ -1,0 +1,167 @@
+{
+  "id": "GHSA-7mwm-ghpf-9vrm",
+  "modified": "2026-10-21T20:15:04.188796447Z",
+  "published": "2026-10-21T20:03:56Z",
+  "aliases": [
+    "CVE-2026-112402"
+  ],
+  "summary": "Pillow: Double free in ImagingScaleAffine on calloc failure via Image.transform",
+  "details": "```\n============================================================================\nDouble free in ImagingScaleAffine on calloc failure via Image.transform\nLocation: src/libImaging/Geometry.c:866  in ImagingScaleAffine()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nThere is a double free in Pillow's `Image.transform()` that crashes the process when an oversized transform runs out of memory. Instead of only raising `MemoryError`, Pillow frees the output image's memory once while handling the error and then again when the Python object is cleaned up. Anyone who can choose the output size of `Image.transform()` can trigger it, but only on a worker with a memory limit (a common hardening for image workers) or a 32-bit process. The result is a crash of the worker, plus corruption of its heap that has not been shown to be controllable.\n\nThe bug is in `ImagingScaleAffine()` in `src/libImaging/Geometry.c` (line 866). When its `calloc()` for the per-column lookup table of `4 × width` bytes fails, it calls `ImagingDelete(imOut)`. When the call comes from `Image.transform()`, `imOut` is the `Imaging` struct owned by the live Python `ImagingCore` output object. `_dealloc()` in `src/_imaging.c` later runs `ImagingDelete()` on the freed struct again, writing its mutex and refcount in freed memory and freeing the pixel blocks a second time. The path is reached with `Transform.EXTENT`, or `Transform.AFFINE` with a pure scale/translate matrix, under the default NEAREST resampling. A very wide, 1-row output size makes the lookup table the allocation that fails while the image itself still fits. On 64-bit Linux with default overcommit, that requires an address-space limit such as `ulimit -v`, `uwsgi --limit-as` or `systemd LimitAS=`. `resize()`, `thumbnail()` and `rotate()` are not affected. The attached reproducer runs on a stock build with a 1 GB limit: `transform((300000000, 1), EXTENT)` raises and catches `MemoryError`, then the process dies with SIGSEGV in `free()` called from `_dealloc()`. A memory-checking build reports the same path as a heap use-after-free. The faulty line was inherited from PIL 1.1.7 in the original fork commit, so every Pillow release since 1.0 is affected. A patch is attached.\n\n## Details\n\n`ImagingScaleAffine()` frees an image it does not own. On the one error path where its `calloc()` for the per-column lookup table fails, it calls `ImagingDelete(imOut)`. When reached through `Image.transform()`, `imOut` is the `Imaging` struct held by a live Python `ImagingCore` object; that object's `_dealloc()` later calls `ImagingDelete()` on the already-freed struct and frees its pixel blocks a second time.\n\nShortest demonstration on the stock build (the address-space limit stands in for `ulimit -v` / `uwsgi --limit-as` / `systemd LimitAS=` on a worker):\n\n```python\nimport resource, gc\nfrom PIL import Image\nresource.setrlimit(resource.RLIMIT_AS, (1_000_000_000,) * 2)\nsrc = Image.new(\"L\", (8, 8))\ntry:\n    src.transform((300_000_000, 1), Image.Transform.EXTENT, (0, 0, 8, 8))\nexcept MemoryError:\n    pass                      # expected, and the process should carry on\ngc.collect()                  # instead: SIGSEGV in _dealloc -\u003e ImagingDelete -\u003e free()\n```\n\nThe 300 MB output image allocates; `calloc(300000000, 4)` (1.2 GB) does not. `MemoryError` is raised as intended, but the interpreter then dies with SIGSEGV, gdb showing `free()` ← `memory_return_block`/`ImagingDestroyArray` (`src/libImaging/Storage.c:396,408`) ← `ImagingDelete` (`Storage.c:271`) ← `_dealloc` (`src/_imaging.c:188`). An AddressSanitizer build of the same sources (with `max_allocation_size_mb` used to make the `calloc` fail instead of an rlimit) reports `heap-use-after-free` in `ImagingDelete src/libImaging/Storage.c:257` called from `_dealloc src/_imaging.c:188`, on a 128-byte region \"freed by\" `ImagingDelete` ← `ImagingScaleAffine src/libImaging/Geometry.c:866` ← `ImagingTransformAffine Geometry.c:1043` ← `ImagingTransform Geometry.c:1135` ← `_transform src/_imaging.c:2153`, \"previously allocated by\" `ImagingNewPrologueSubtype Storage.c:53` ← … ← `_new src/_imaging.c:756`.\n\n### Code path\n\n`Image.transform()` creates the output image as an ordinary Python-owned image and then transforms *into* it:\n\n```python\n# src/PIL/Image.py:3008…3021\n        im = new(self.mode, size, fillcolor)\n        …\n            im.__transformer(\n                (0, 0, *size), self, method, data, resample, fillcolor is None\n            )\n```\n\n`__transformer()` rewrites `Transform.EXTENT` into an axis-aligned affine matrix (`src/PIL/Image.py:3040-3046`: `data = (xs, 0, x0, 0, ys, y0)`, `method = Transform.AFFINE`) and calls `self.im.transform(box, image.im, method, data, resample, fill)` (`Image.py:3117`). `resample` defaults to `Resampling.NEAREST` (`Image.py:2936`).\n\nIn C, `_transform()` passes its *own* image as the destination:\n\n```c\n/* src/_imaging.c:2153 */\n    imOut = ImagingTransform(\n        self-\u003eimage, imagep-\u003eimage, method, x0, y0, x1, y1, a, filter, fill\n    );\n```\n\n`ImagingTransformAffine()` takes the scaling fast path because the filter is NEAREST and the matrix has no shear:\n\n```c\n/* src/libImaging/Geometry.c:1035-1043 */\n    if (filterid || imIn-\u003etype == IMAGING_TYPE_I16) {\n        return ImagingGenericTransform(…);\n    }\n    if (a[1] == 0 \u0026\u0026 a[3] == 0) {\n        /* Scaling */\n        return ImagingScaleAffine(imOut, imIn, x0, y0, x1, y1, a, fill);\n    }\n```\n\nand `ImagingScaleAffine()` allocates a table of `imOut-\u003exsize` ints:\n\n```c\n/* src/libImaging/Geometry.c:863-868 */\n    /* malloc check ok, uses calloc for overflow */\n    xintab = (int *)calloc(imOut-\u003exsize, sizeof(int));\n    if (!xintab) {\n        ImagingDelete(imOut);                         /* \u003c-- imOut belongs to the caller */\n        return (Imaging)ImagingError_MemoryError();\n    }\n```\n\n`ImagingDelete()` (`src/libImaging/Storage.c:250-279`) drops the refcount to 0, returns the pixel blocks to the arena / `free()`s them via `im-\u003edestroy`, and `free(im)`. `self-\u003eimage` in the `ImagingCore` object still points at the freed struct. `_transform()` returns `NULL`, `Image.transform()` propagates `MemoryError`, the half-built output `Image` loses its last reference, and `_dealloc()` (`src/_imaging.c:188`) calls `ImagingDelete(imagep-\u003eimage)` again: it locks `im-\u003emutex` and decrements `im-\u003erefcount` inside freed memory, then walks `im-\u003eblocks` (already freed, typically reused by then) and frees every entry a second time. In the observed stock-build runs the freed `blocks` array had been overwritten, so `free()` receives a mangled pointer and the process segfaults; with other heap states it is a plain double free of a 300 MB block.\n\nEvery other error return in `Geometry.c` (`ImagingError_ModeError`, `ImagingError_Mismatch`, `\"bad filter number\"`, `\"bad transform method\"`) leaves `imOut` alone; line 866 is the only one that deletes it. The delete is only correct for the other caller, `_resize()` (`src/_imaging.c:2026-2030`), where `imOut` is a fresh `ImagingNewDirty()` temporary that nothing else references. The delete predates Pillow's git history: it came in with the PIL 1.1.7 import, `9a640e315715` (\"Forking PIL\", 2010-07-30), so every release since Pillow 1.0 is affected.\n\nThe output width is what decides whether the path is hit: the output image costs `width × height × pixelsize` bytes, the table an additional `4 × width`. A very wide, 1-row output (300 000 000 × 1 \"L\": 300 MB image, 1.2 GB table) makes the table the allocation that fails. `ImagingNewPrologueSubtype()` caps `xsize` at `INT_MAX/4 - 1`, so the table is at most ~2 GB.\n\n## Impact\n\nApplications that let a user choose the output size of `Image.transform()` — `Transform.EXTENT` (crop-and-scale), `Transform.AFFINE` with a pure scale/translate matrix, or the `ImageTransform.ExtentTransform`/`AffineTransform` helpers, all with the default NEAREST resampling — can have an allocation failure turned into a use-after-free and double free inside the worker process instead of the `MemoryError` the API is meant to raise. `resize()`, `thumbnail()` and `rotate()` do not reach this path; `Image.resize(..., NEAREST, box=...)` goes through `ImagingScaleAffine()` but owns its output, and raises a clean `MemoryError`. The second precondition is that the output image itself allocates but the extra `4 × width` bytes do not; on 64-bit Linux with default overcommit this requires an address-space limit on the process (`ulimit -v`, `uwsgi --limit-as`, `systemd LimitAS=`, an in-app `setrlimit`), which is a common hardening for image workers; 32-bit processes can reach it through ordinary address-space exhaustion. The demonstrated consequence is a crash of the process handling the request after `MemoryError` has already been raised and possibly handled. The second `ImagingDelete()` also writes into the freed 128-byte struct (mutex, refcount) and double-frees an attacker-sized block, which is heap corruption rather than a clean abort, but no control over the written data is shown.\n\n## Reproducing\n\nRun `repro` (a self-contained Python script) from any directory. It uses the installed stock build, so nothing is rebuilt, and has no companion files. It runs the demonstration above in a child interpreter (`python3 -c`, taking `WIDTH` as an argument): the child disables core files, sets `RLIMIT_AS` to 1 GB (the kind of limit image workers are commonly given), creates an 8×8 \"L\" image, calls `src.transform((WIDTH, 1), Image.Transform.EXTENT, (0, 0, 8, 8))` with the default NEAREST resampling, prints `MemoryError caught` if that raises, then runs `gc.collect()` and prints `alive`. EXTENT with NEAREST is a pure scale, so the call goes through `ImagingScaleAffine()`, which callocs a `4 × WIDTH`-byte table in addition to the `WIDTH`-byte output image.\n\nThe script runs the child twice:\n\n- **Control:** width 50 000 000. The 50 MB image and the 200 MB table both fit under the limit, and the transform succeeds, which shows the limit itself is harmless.\n- **Attack:** width 300 000 000. The 300 MB output image is allocated, but `calloc(300000000, 4)` (1.2 GB) fails. Pillow correctly raises `MemoryError`, and the child catches it. But `ImagingScaleAffine()` has already called `ImagingDelete()` on the output image it does not own. When the output image is released, it is freed again. The child prints `MemoryError caught` and then dies with SIGSEGV instead of printing `alive`.\n\nIf the attack child was killed by a signal and `gdb` is installed, the script runs the attack again under `gdb` and prints the backtrace. The crash is in `free()` ← `memory_return_block`/`ImagingDestroyArray` (`Storage.c:396,408`) ← `ImagingDelete` (`Storage.c:271`) ← `_dealloc` (`_imaging.c:188`). In other words, the Python object's destructor is deleting the already-freed struct a second time. The verdict does not depend on this step.\n\nThe last line is `BUG` when the control exits 0 and the attack prints `MemoryError caught` and then dies from a signal without printing `alive`. Otherwise it is `OK`. With the attached patch applied, the attack prints `MemoryError caught`, then `alive`, exits 0, and the script prints `OK`.\n\n## Suggested fix\n\n`ImagingScaleAffine()` never owns `imOut`. The attached patch removes the `ImagingDelete()` at `src/libImaging/Geometry.c:866` and makes the one caller that relied on it, `_resize()` in `src/_imaging.c`, clean up its own temporary, the same idiom `_gaussian_blur()`/`_unsharp_mask()` already use. This also fixes `_resize()` passing a possible `NULL` from `ImagingNewDirty()` into `ImagingTransform()`, and leaking the temporary on the other `ImagingTransform()` error returns:\n\n```diff\n--- a/src/libImaging/Geometry.c\n+++ b/src/libImaging/Geometry.c\n@@ -863,7 +863,7 @@ ImagingScaleAffine(\n     /* malloc check ok, uses calloc for overflow */\n     xintab = (int *)calloc(imOut-\u003exsize, sizeof(int));\n     if (!xintab) {\n-        ImagingDelete(imOut);\n+        /* imOut is owned by the caller; don't delete it here */\n         return (Imaging)ImagingError_MemoryError();\n     }\n--- a/src/_imaging.c\n+++ b/src/_imaging.c\n@@ -2024,10 +2024,16 @@ _resize(ImagingObject *self, PyObject *args) {\n         a[5] = box[1];\n \n         imOut = ImagingNewDirty(imIn-\u003emode, xsize, ysize);\n+        if (!imOut) {\n+            return NULL;\n+        }\n \n-        imOut = ImagingTransform(\n-            imOut, imIn, IMAGING_TRANSFORM_AFFINE, 0, 0, xsize, ysize, a, filter, 1\n-        );\n+        if (!ImagingTransform(\n+                imOut, imIn, IMAGING_TRANSFORM_AFFINE, 0, 0, xsize, ysize, a, filter, 1\n+            )) {\n+            ImagingDelete(imOut);\n+            return NULL;\n+        }\n     } else {\n```\n\nEvery `ImagingTransform*()` path returns the same `imOut` on success, so wrapping the original pointer in `PyImagingNew()` in `_resize()` is unchanged behaviour. With the patch applied to a clean checkout and rebuilt, the reproducer prints `OK` and `Image.resize(..., NEAREST, box=...)` under the same limit raises a clean `MemoryError`.\n\n## The patch\n\nStop ImagingScaleAffine() deleting the caller-owned output image on calloc failure; make _resize() free its own temporary instead\n\nApplies to `src/libImaging/Geometry.c` at the commit above.\n\n```diff\ndiff --git a/src/_imaging.c b/src/_imaging.c\nindex 7e9c0e391..ac1873292 100644\n--- a/src/_imaging.c\n+++ b/src/_imaging.c\n@@ -2024,10 +2024,16 @@ _resize(ImagingObject *self, PyObject *args) {\n         a[5] = box[1];\n \n         imOut = ImagingNewDirty(imIn-\u003emode, xsize, ysize);\n+        if (!imOut) {\n+            return NULL;\n+        }\n \n-        imOut = ImagingTransform(\n-            imOut, imIn, IMAGING_TRANSFORM_AFFINE, 0, 0, xsize, ysize, a, filter, 1\n-        );\n+        if (!ImagingTransform(\n+                imOut, imIn, IMAGING_TRANSFORM_AFFINE, 0, 0, xsize, ysize, a, filter, 1\n+            )) {\n+            ImagingDelete(imOut);\n+            return NULL;\n+        }\n     } else {\n         imOut = ImagingResample(imIn, xsize, ysize, filter, box);\n     }\ndiff --git a/src/libImaging/Geometry.c b/src/libImaging/Geometry.c\nindex 1bf92e26e..2baf000a5 100644\n--- a/src/libImaging/Geometry.c\n+++ b/src/libImaging/Geometry.c\n@@ -863,7 +863,7 @@ ImagingScaleAffine(\n     /* malloc check ok, uses calloc for overflow */\n     xintab = (int *)calloc(imOut-\u003exsize, sizeof(int));\n     if (!xintab) {\n-        ImagingDelete(imOut);\n+        /* imOut is owned by the caller; don't delete it here */\n         return (Imaging)ImagingError_MemoryError();\n     }\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 2,064 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# UAF/double free in ImagingScaleAffine() (src/libImaging/Geometry.c:866):\n# on calloc() failure it ImagingDelete()s imOut, which for Image.transform()\n# is the Imaging struct owned by the live Python output image; that image's\n# _dealloc then ImagingDelete()s it again. Stock /src build, no rebuild.\n# A 1 GB RLIMIT_AS makes the 300 MB output image fit but the 1.2 GB\n# 4*width lookup table fail. Expected: MemoryError, process survives.\nimport subprocess, sys, textwrap, signal\n\nchild = textwrap.dedent('''\n    import resource, gc, sys\n    from PIL import Image\n    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n    resource.setrlimit(resource.RLIMIT_AS, (1_000_000_000,) * 2)\n    w = int(sys.argv[1])\n    src = Image.new(\"L\", (8, 8))\n    try:\n        src.transform((w, 1), Image.Transform.EXTENT, (0, 0, 8, 8))\n        print(\"transform ok\")\n    except MemoryError:\n        print(\"MemoryError caught\")\n    gc.collect()\n    print(\"alive\")\n''')\n\ndef run(width):\n    p = subprocess.run([sys.executable, \"-u\", \"-c\", child, str(width)],\n                       capture_output=True, text=True, timeout=50)\n    print(f\"-- width={width}: rc={p.returncode}\\n{p.stdout.rstrip()}\")\n    return p\n\nctrl = run(50_000_000)      # 50 MB image + 200 MB table fit under the limit\natt = run(300_000_000)      # 300 MB image fits, 1.2 GB table does not\nbug = (ctrl.returncode == 0 and \"MemoryError caught\" in att.stdout\n       and \"alive\" not in att.stdout and att.returncode \u003c 0)\nif att.returncode \u003c 0:\n    print(\"attack child killed by\", signal.Signals(-att.returncode).name)\n    import shutil\n    if shutil.which(\"gdb\"):   # evidence only; verdict does not depend on it\n        g = subprocess.run([\"gdb\", \"-q\", \"-batch\", \"-ex\", \"run\", \"-ex\", \"bt 6\", \"--args\",\n                            sys.executable, \"-c\", child, \"300000000\"],\n                           capture_output=True, text=True, timeout=120)\n        print(\"\\n\".join(l for l in g.stdout.splitlines()\n                        if l.startswith(\"#\") or \"signal\" in l))\nprint(\"BUG\" if bug else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-7mwm-ghpf-9vrm/GHSA-7mwm-ghpf-9vrm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-7mwm-ghpf-9vrm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112402"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/aafa6c75f7cdabb9f409a8aac7c780bea31d08d9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

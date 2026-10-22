@@ -1,0 +1,104 @@
+{
+  "id": "GHSA-74r2-7ff9-mjj2",
+  "modified": "2026-10-21T21:00:06.702560170Z",
+  "published": "2026-10-21T20:42:11Z",
+  "aliases": [
+    "CVE-2026-112401"
+  ],
+  "summary": "Pillow: Quadratic GIF comment concatenation allows DoS in Image.open()",
+  "details": "```\n============================================================================\nQuadratic GIF comment concatenation allows DoS in Image.open()\nLocation: src/PIL/GifImagePlugin.py:266  in GifImageFile._seek()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nOpening a crafted GIF file with `Image.open()` takes time that grows with the square of the file's size, so anyone who can submit an image to a service that uses Pillow can keep one worker busy at full processor load for a long time with a small file. A 2 MB file takes about 5 seconds to open, a 4 MB file about 35 seconds, and an 8 MB file about 3 minutes. An ordinary GIF of the same size opens in well under a second. The cost is paid inside `Image.open()` itself, with default settings, before the application has seen the image's size or format.\n\nThe bug is in `GifImageFile._seek()` in `src/PIL/GifImagePlugin.py`, which builds `info[\"comment\"]` by appending to an immutable `bytes` object with no size limit. It appends once per 255-byte sub-block (`comment += block`, line 261) and once per comment extension (`info[\"comment\"] += b\"\\n\" + comment`, line 266). Each append copies everything collected so far. A file made of many tiny comment extensions forces a full re-copy for each one. Because `_open()` ends with `self._seek(0)`, any code that only opens an uploaded file to identify it, read its dimensions, or make a thumbnail pays the full cost. The decompression-bomb check does not help, since the image is 1×1. Memory use stays linear, so the effect is processor exhaustion and latency, bounded by whatever upload size the service allows (about 1 second at 1 MB). This is the same kind of issue as the EPS open-phase slowdown fixed as CVE-2021-28677, here in the GIF comment handling. The quadratic pattern was introduced in commit b2b737b68b06 (\"Allow arbitrary number of comment extension subblocks\", November 2018) and has shipped since Pillow 5.4.0. The attached script builds 2 MB and 4 MB test files and compares each against a byte-identical control whose extensions are labelled as plain text instead of comment. The 4 MB comment file took about 34 seconds to open, against 0.26 seconds for its control. A patch that collects the pieces in a list and joins them once is also attached.\n\n## Details\n\n`GifImageFile._seek()` collects GIF comment extensions into `info[\"comment\"]` using `bytes` concatenation, once per 255-byte sub-block and once per comment extension, with no limit on the total. `bytes` is immutable, so every `+=` allocates a new object and copies everything accumulated so far; the work done by `Image.open()` is therefore quadratic in the amount of comment data in frame 0.\n\nA 1×1 GIF89a whose body is nothing but the 5-byte comment extension `21 FE 01 41 00` repeated makes this directly observable. `Image.open(BytesIO(data))` on such a file, stock build at this commit, 2-CPU machine:\n\n| file size | comment extensions (`21 FE …`) | same bytes labelled plain-text extension (`21 01 …`) |\n|---|---|---|\n| 1 MB | 1.2 s | 0.09 s |\n| 2 MB | 4.9 s | 0.13 s |\n| 4 MB | 35 s | 0.26 s |\n| 8 MB | 183 s | — |\n\nThe control column is the identical byte stream with the extension label changed from `0xFE` to `0x01`; it goes through the same loop and the same `self.data()` reads but is discarded instead of concatenated, and scales linearly. No `load()` is needed and no warning or exception is raised; `im.info[\"comment\"]` simply ends up holding the multi-megabyte blob.\n\nThe code, `src/PIL/GifImagePlugin.py:229-281` (trimmed):\n\n```python\n            elif s == b\"!\":\n                s = self.fp.read(1)\n                block = self.data()\n                …\n                elif s[0] == 254:\n                    #\n                    # comment extension\n                    #\n                    comment = b\"\"\n\n                    # Read this comment block\n                    while block:\n                        comment += block                      # :261  one copy per sub-block\n                        block = self.data()\n\n                    if \"comment\" in info:\n                        # If multiple comment blocks in frame, separate with \\n\n                        info[\"comment\"] += b\"\\n\" + comment    # :266  one copy per extension\n                    else:\n                        info[\"comment\"] = comment\n                    s = b\"\"\n                    continue\n                …\n                while self.data():                            # every other extension: read and drop\n                    pass\n```\n\n`self.data()` (`:97-102`) reads one length byte and then that many bytes, so each call is cheap and bounded; the cost is entirely in the two `+=` lines. For a single comment extension of N bytes delivered as N/255 sub-blocks, line 261 copies about N²/510 bytes in total (4 MB → 2.3 s, 8 MB → 9.5 s, 16 MB → 38 s measured). Splitting the same data into many small comment extensions is worse, because line 266 re-copies the whole of `info[\"comment\"]` once per extension: with 1-byte extensions a file of F bytes causes roughly F²/25 bytes of copying, which is the table above (growth ×4–7 per doubling once the buffer outgrows the CPU caches).\n\nThis runs during `Image.open()`: `_open()` ends with `self._seek(0)` (`:135`), so any application that merely opens an uploaded file to identify it, read its size, or thumbnail it pays the full cost before it has made any decision about the image. `Image._decompression_bomb_check` is not involved (the image is 1×1), and unlike PNG text chunks (`PngImagePlugin.MAX_TEXT_CHUNK` / `MAX_TEXT_MEMORY`) there is no cap on GIF comment size. Later frames repeat the same loop for their own comments via `seek()` / `n_frames`.\n\nWith both `+=` sites replaced by list-append and a single `b\"\".join()` (as in the attached patch), the same 16 MB single-extension file opens in 0.03 s, confirming the concatenation is the whole cost.\n\n## Impact\n\nAnyone who can get a GIF to a service that calls `PIL.Image.open()` on it — avatar/media uploads, thumbnailers, format sniffing, anything using `ImageOps`/`thumbnail()` on user files — can pin one worker process at 100 % CPU for about 5 s with a 2 MB file, 35 s with a 4 MB file and 3 minutes with an 8 MB file, under default settings, with the time growing quadratically in the permitted upload size. A benign GIF of the same size opens in well under a second, so request-cost assumptions based on file size do not hold. Memory use is only linear (the comment is retained in `im.info[\"comment\"]`), so the effect is CPU/latency denial of service of the worker pool rather than memory exhaustion; a handful of concurrent uploads is enough to saturate a typical pool. Upload size limits bound it (≈1 s at 1 MB).\n\nThis is the same shape as CVE-2021-28677 (\"EPS DOS on _open\", `docs/releasenotes/8.2.0.rst`), where a quadratic method of accumulating data in the open phase, before the image was accepted, was treated as a denial-of-service vulnerability; here the format is GIF and the accumulator is the comment extension.\n\nThe quadratic accumulation was introduced in `b2b737b68b06` (\"Allow arbitrary number of comment extension subblocks\", 2018-11-27), first released in Pillow 5.4.0.\n\n## Reproducing\n\n`repro` is a single Python script that uses the installed Pillow. Run it with no arguments. It needs no files, no network and no rebuild.\n\nIt builds two GIFs of the same length, at 2 MB and at 4 MB. Each is the 13-byte GIF89a header for a 1×1 screen, followed by `size/5` copies of the 5-byte extension `21 \u003clabel\u003e 01 41 00`, then a minimal 1×1 image and the trailer:\n\n- **comments**: label `0xFE`. Each extension is a 1-byte comment, so `_seek()` appends each one to `info[\"comment\"]` with `+=` (`GifImagePlugin.py:266`).\n- **control**: label `0x01` (plain-text extension). The bytes are the same apart from the label. `_seek()` reads them through the same loop and the same `self.data()` calls, then throws them away.\n\nThe script times `Image.open(io.BytesIO(data))` on each file. It does not call `load()`, because `_open()` already parses frame 0. It checks that the image came out as 1×1. Typical output on a 2-CPU machine:\n\n```\n2 MB GIF   control (0x01):   0.16 s   comments (0xFE):   5.14 s\n4 MB GIF   control (0x01):   0.26 s   comments (0xFE):  33.53 s\ndoubling 2 MB -\u003e 4 MB multiplied open() time by x6.5 (linear: ~x2)\n4 MB comment GIF took x129 as long as the same-size control\nBUG\n```\n\nFor a linear parser, doubling the file would roughly double the time, and the two files would take about the same time. The script prints `BUG` when all three of these hold:\n\n- doubling the comment file from 2 MB to 4 MB multiplies its open time by at least 3×;\n- the 4 MB comment file takes at least 20× as long as its control;\n- the 4 MB comment file takes at least 8 s.\n\nOtherwise it prints `OK`. The run is deterministic, CPU-bound on one core, and takes about 40 s.\n\n## Suggested fix\n\nThe attached patch changes `GifImageFile._seek()` in `src/PIL/GifImagePlugin.py` to accumulate comment data in a local list instead of with `bytes` concatenation, and to join it once when the frame's info is committed:\n\n```diff\n@@ def _seek(self, frame: int, update_image: bool = True) -\u003e None:\n         info: dict[str, Any] = {}\n+        comment_blocks: list[bytes] | None = None\n         frame_transparency = None\n@@\n                 elif s[0] == 254:\n                     #\n                     # comment extension\n                     #\n-                    comment = b\"\"\n+                    if comment_blocks is None:\n+                        comment_blocks = []\n+                    else:\n+                        # If multiple comment blocks in frame, separate with \\n\n+                        comment_blocks.append(b\"\\n\")\n \n                     # Read this comment block\n                     while block:\n-                        comment += block\n+                        comment_blocks.append(block)\n                         block = self.data()\n-\n-                    if \"comment\" in info:\n-                        # If multiple comment blocks in frame, separate with \\n\n-                        info[\"comment\"] += b\"\\n\" + comment\n-                    else:\n-                        info[\"comment\"] = comment\n                     s = b\"\"\n                     continue\n@@\n-        if info.get(\"comment\"):\n-            self.info[\"comment\"] = info[\"comment\"]\n+        if comment_blocks:\n+            comment = b\"\".join(comment_blocks)\n+            if comment:\n+                self.info[\"comment\"] = comment\n         for k in [\"duration\", \"extension\"]:\n```\n\nThis removes the quadratic copying at both sites (`:261` per sub-block and `:266` per extension); the 4 MB reproducer file opens in about 0.3 s, the same as its control, and the reproducer no longer prints `BUG` on a patched build. The resulting `info[\"comment\"]` is unchanged for empty, multi-sub-block, multi-extension and later-frame comments — including `Tests/images/multiple_comments.gif` → `b\"Test comment 1\\nTest comment 2\"` — and `Tests/test_file_gif.py` passes unchanged. The GIF writer (`_write_local_header` / `_save`) is not affected.\n\nThe patch deliberately adds no size cap. Unlike PNG `zTXt`, which `PngImagePlugin.MAX_TEXT_CHUNK` guards against decompression amplification, a GIF comment can be no larger than the file that carries it, so once the copy is linear there is nothing left to bound, and a hard cap would reject valid files with large comments. If a limit is wanted anyway, a `MAX_COMMENT_SIZE` check inside the sub-block loop is a small policy addition on top of this patch.\n\n## The patch\n\nGIF: collect comment extension sub-blocks in a list and join once per frame instead of repeated bytes += in GifImageFile._seek()\n\nApplies to `src/PIL/GifImagePlugin.py` at the commit above.\n\n```diff\ndiff --git a/src/PIL/GifImagePlugin.py b/src/PIL/GifImagePlugin.py\nindex 11fb180fc..05007d2ac 100644\n--- a/src/PIL/GifImagePlugin.py\n+++ b/src/PIL/GifImagePlugin.py\n@@ -217,6 +217,7 @@ class GifImageFile(ImageFile.ImageFile):\n         palette: ImagePalette.ImagePalette | Literal[False] | None = None\n \n         info: dict[str, Any] = {}\n+        comment_blocks: list[bytes] | None = None\n         frame_transparency = None\n         interlace = None\n         frame_dispose_extent = None\n@@ -254,18 +255,16 @@ class GifImageFile(ImageFile.ImageFile):\n                     #\n                     # comment extension\n                     #\n-                    comment = b\"\"\n+                    if comment_blocks is None:\n+                        comment_blocks = []\n+                    else:\n+                        # If multiple comment blocks in frame, separate with \\n\n+                        comment_blocks.append(b\"\\n\")\n \n                     # Read this comment block\n                     while block:\n-                        comment += block\n+                        comment_blocks.append(block)\n                         block = self.data()\n-\n-                    if \"comment\" in info:\n-                        # If multiple comment blocks in frame, separate with \\n\n-                        info[\"comment\"] += b\"\\n\" + comment\n-                    else:\n-                        info[\"comment\"] = comment\n                     s = b\"\"\n                     continue\n                 elif s[0] == 255 and frame == 0 and block is not None:\n@@ -433,8 +432,10 @@ class GifImageFile(ImageFile.ImageFile):\n                 )\n             ]\n \n-        if info.get(\"comment\"):\n-            self.info[\"comment\"] = info[\"comment\"]\n+        if comment_blocks:\n+            comment = b\"\".join(comment_blocks)\n+            if comment:\n+                self.info[\"comment\"] = comment\n         for k in [\"duration\", \"extension\"]:\n             if k in info:\n                 self.info[k] = info[k]\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 2,263 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n\"\"\"Quadratic CPU in Image.open() on GIF comment extensions.\n\nGifImageFile._seek() appends every comment extension to info[\"comment\"] with\nbytes `+=` (src/PIL/GifImagePlugin.py:266), copying the whole accumulated\ncomment each time.  Image.open() runs _seek(0) eagerly, so merely opening a GIF\nmade of many tiny comment extensions costs O(size^2) CPU.\n\nWe time Image.open() on two files of identical length:\n  ATTACK  - a 1x1 GIF whose body is thousands of 1-byte comment extensions (label 0xFE)\n  CONTROL - the same bytes with label 0x01 (plain-text extension), which _seek()\n            reads through the same loop but discards instead of concatenating.\nA linear parser would take ~2x longer when the file doubles, and the two files\nwould cost about the same.\n\"\"\"\nimport io\nimport time\n\nfrom PIL import Image\n\nHEADER = b\"GIF89a\" + b\"\\x01\\x00\\x01\\x00\" + b\"\\x00\\x00\\x00\"  # 1x1 screen, no palette\nIMAGE = b\",\\x00\\x00\\x00\\x00\\x01\\x00\\x01\\x00\\x00\" + b\"\\x02\\x02\\x44\\x01\\x00\"  # 1x1 frame\nTRAILER = b\";\"\n\n\ndef make_gif(size: int, label: int) -\u003e bytes:\n    # each extension is `21 \u003clabel\u003e 01 'A' 00`: one 1-byte sub-block, then terminator\n    extension = b\"!\" + bytes([label]) + b\"\\x01A\\x00\"\n    return HEADER + extension * (size // 5) + IMAGE + TRAILER\n\n\ndef time_open(data: bytes) -\u003e float:\n    start = time.perf_counter()\n    with Image.open(io.BytesIO(data)) as im:  # no load(): the cost is in open()\n        elapsed = time.perf_counter() - start\n        assert im.size == (1, 1)\n    return elapsed\n\n\nMB = 1 \u003c\u003c 20\nattack, control = {}, {}\nfor size in (2 * MB, 4 * MB):\n    control[size] = time_open(make_gif(size, 0x01))\n    attack[size] = time_open(make_gif(size, 0xFE))\n    print(f\"{size // MB} MB GIF   control (0x01): {control[size]:6.2f} s   \"\n          f\"comments (0xFE): {attack[size]:6.2f} s\", flush=True)\n\ngrowth = attack[4 * MB] / attack[2 * MB]\nvs_control = attack[4 * MB] / control[4 * MB]\nprint(f\"doubling 2 MB -\u003e 4 MB multiplied open() time by x{growth:.1f} (linear: ~x2)\")\nprint(f\"4 MB comment GIF took x{vs_control:.0f} as long as the same-size control\")\n\n# BUG: super-linear growth, far slower than the control, and seconds of CPU per open()\nprint(\"BUG\" if growth \u003e= 3 and vs_control \u003e= 20 and attack[4 * MB] \u003e= 8 else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.4.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "5.4.0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-74r2-7ff9-mjj2/GHSA-74r2-7ff9-mjj2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-74r2-7ff9-mjj2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112401"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/68a3fe957d8a4d552e8c69d96066d749f0614c7e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

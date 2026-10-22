@@ -1,0 +1,93 @@
+{
+  "id": "GHSA-22hg-r758-rrw9",
+  "modified": "2026-10-21T20:45:04.649560684Z",
+  "published": "2026-10-21T20:39:49Z",
+  "aliases": [
+    "CVE-2026-112390"
+  ],
+  "summary": "Pillow: Infinite loop in MIC n_frames when the embedded TIFF",
+  "details": "```\n============================================================================\nInfinite loop in MIC n_frames when the embedded TIFF has 3+ IFDs\nLocation: src/PIL/MicImagePlugin.py:86  in MicImageFile.tell()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nA crafted 5.6 KB image file makes Pillow loop forever at 100% CPU when an application asks how many frames the image has. This only affects installations that have the optional `olefile` package. Any application that opens an untrusted image and then reads `im.n_frames` can have one worker tied up indefinitely. That includes the common \"is this image animated?\" check and re-saving with `save_all=True` to TIFF, PDF or WebP. The call never returns, raises no exception, and does not grow memory, so only an external watchdog stops it.\n\nThe file is a Microsoft Image Composer (MIC) container, which Pillow recognises by its magic bytes with no extension needed. Inside it is a TIFF stream with three chained image directories. `MicImageFile` subclasses `TiffImageFile` and overrides `seek()` and `tell()` so that a \"frame\" means one stream in the container. It still inherits `TiffImageFile.n_frames` (`src/PIL/TiffImagePlugin.py:1212`), which walks the embedded TIFF's directory chain with `self._seek(self.tell() + 1)` until `_n_frames` is set. Two things stop that walk from making progress:\n\n- `MicImageFile.tell()` (`src/PIL/MicImagePlugin.py:86`) returns the constant stream index.\n- `MicImageFile.seek()` calls `TiffImageFile._open()`, which resets `_n_frames` to `None`.\n\nAs a result, the loop re-parses the second directory forever whenever the embedded stream has three or more directories. `Image.open()`, `load()`, `thumbnail()`, `convert()`, `is_animated` and `ImageSequence` iteration do not hang on this file. The regression was introduced in 0b33a87b0d15 (April 2020, first released in 7.2.0), which removed `MicImageFile`'s own `n_frames` property. The attached reproducer builds the file in code and checks two controls, which return 3 and 1 frames as expected; the malicious file is still running when it is killed after 20 seconds.\n\n## Details\n\n`MicImageFile` (registered for `Image.open` whenever `olefile` is installed) subclasses `TiffImageFile` and redefines a \"frame\" as one OLE `*.ACI/Image` stream, overriding `seek()` and `tell()` accordingly. It does not override the `n_frames` property, so the inherited TIFF implementation runs, and that implementation relies on `tell()` advancing as IFDs are loaded. `MicImageFile.tell()` returns the OLE stream index, which never changes inside `n_frames`, so the loop re-parses the same IFD forever.\n\nA 5632-byte OLE2 compound file whose `img0.ACI/Image` stream is a 351-byte TIFF with three chained 1×1 IFDs is enough. `Image.open()` on it succeeds (format `MIC`, detected by the OLE magic, no extension needed); evaluating `im.n_frames` then never returns and keeps one core at 100 %. A Python stack taken 27 s in is\n\n```\n  File \"src/PIL/TiffImagePlugin.py\", line 1622 in _setup\n  File \"src/PIL/TiffImagePlugin.py\", line 1271 in _seek\n  File \"src/PIL/TiffImagePlugin.py\", line 1219 in n_frames\n```\n\nand instrumenting `_seek` shows it being called with `frame=1`, `tell()==0`, `_frame_pos==[8, 122]`, `_n_frames is None` on every iteration — identical state, so the loop is non-terminating, not merely slow. The same 351 TIFF bytes opened directly give `n_frames == 3` in milliseconds, and the same container around a 1-IFD TIFF gives `n_frames == 1`.\n\nThe loop, `src/PIL/TiffImagePlugin.py:1212`:\n\n```python\n    @property\n    def n_frames(self) -\u003e int:\n        current_n_frames = self._n_frames\n        if current_n_frames is None:\n            current = self.tell()\n            self._seek(len(self._frame_pos))\n            while self._n_frames is None:\n                self._seek(self.tell() + 1)      # 1219\n            self.seek(current)\n```\n\nand the overrides that break its progress assumption, `src/PIL/MicImagePlugin.py:76`:\n\n```python\n    def seek(self, frame: int) -\u003e None:\n        …\n        self.fp = self.ole.openstream(filename)\n        TiffImagePlugin.TiffImageFile._open(self)   # 82: resets _n_frames to None\n        self.frame = frame\n\n    def tell(self) -\u003e int:\n        return self.frame                            # 87: OLE stream index, not TIFF __frame\n```\n\nFor a plain TIFF, `_seek(k)` (`TiffImagePlugin.py:1236`) loads IFDs up to `k`, appending each offset to `_frame_pos`, setting `_n_frames` when an IFD's next-pointer is 0 (or already seen), and setting the private `__frame = k`; `TiffImageFile.tell()` returns `__frame`, so `self.tell() + 1` walks the chain to its end.\n\nFor a MIC file, `Image.open` → `MicImageFile._open` sets `self._n_frames = len(self.images)` at line 69, but then calls `self.seek(0)` → `TiffImageFile._open` (line 82), which unconditionally sets `self._n_frames = None` (`TiffImagePlugin.py:1203`) and `_seek(0)`s into the embedded stream. With the 3-IFD stream, IFD 0 has a non-zero next pointer, so `_n_frames` stays `None` after open. `n_frames` then runs: `current = self.tell()` is `0` (the OLE index); `_seek(len(_frame_pos))` = `_seek(1)` loads IFD 1, whose next pointer is also non-zero and not yet in `_frame_pos`, so `_n_frames` is still `None`. The `while` body computes `self.tell() + 1` = `0 + 1` and calls `_seek(1)` again; `len(_frame_pos)` is already 2, so nothing new is loaded — IFD 1 is re-read via `tag_v2.load` and `_setup()` and the state is unchanged. This repeats indefinitely; IFD 2 is never reached. Two chained IFDs are not enough (IFD 1's next pointer of 0 sets `_n_frames = 2` on the first `_seek(1)`); three or more are.\n\n`Tests/test_file_mic.py::test_n_frames` passes only because `hopper.mic`'s stream has a single IFD, so `_seek(0)` sets `_n_frames = 1` and the loop is never entered; the `len(self.images)` assignment at line 69 is only consumed by the initial `_seek_check(0)` and is overwritten before any caller can read `n_frames`.\n\nA side effect of the same mismatch: with a 2-IFD stream `n_frames` returns 2 (TIFF IFDs) while `seek(1)` indexes `self.images[1]` (OLE streams) and raises `IndexError` — visible with `save_all=True`.\n\n## Impact\n\nAny application that lets Pillow open an uploaded file and then reads `im.n_frames` — the usual way to decide whether an image is animated (`getattr(im, \"n_frames\", 1) \u003e 1`), and also what `hasattr(im, \"n_frames\")`/`getattr(im, \"n_frames\", 1)` in Pillow's own `TiffImagePlugin._save_all` (`:2333`), `PdfImagePlugin._save` (`:250`) and `WebPImagePlugin._save_all` (`:171`) evaluate when the app re-saves with `save_all=True` — can be made to spin one worker at 100 % CPU indefinitely with a 5.6 KB upload. The file needs no particular extension (OLE magic; `FpxImagePlugin` rejects it on CLSID and `MicImagePlugin` accepts it), default limits do not intervene, memory does not grow, and no exception is raised, so only an external watchdog ends it. Preconditions: `olefile` installed (it is an optional dependency; without it the MIC plugin is not registered) and the application touching `n_frames` or a `save_all` path. `Image.open()` itself, `load()`, `thumbnail()`, `convert()`, `is_animated` and `ImageSequence` iteration do not hang on this file. This is the same class of tiny-file, pure-Python non-termination as CVE-2021-28676 (FLI) and CVE-2021-28677 (EPS), and like CVE-2019-19911 (FPX) it depends on `olefile`; it differs in not being reached by the default open/load path. The regression was introduced in `0b33a87b0d15` (\"Replaced property methods for n_frames and is_animated with normal properties\", 2020-04-13), first released in 7.2.0, which replaced `MicImageFile`'s own `n_frames` property with the `_n_frames` attribute that `TiffImageFile._open` overwrites.\n\n## Reproducing\n\n`repro` is a single Python script that runs against the installed Pillow (with `olefile`, which is what registers the MIC plugin). It builds every input in code, writes each one to a temporary file named `x` with no extension (so Pillow identifies the format from its magic bytes), and opens it in a child Python process that runs `Image.open(path)` and prints `im.format` and `im.n_frames`.\n\nIt builds two things in code:\n\n- `tiff(n)`: an `n`-page TIFF of 4×4 greyscale frames written by Pillow itself (`save_all=True`), so the IFDs are chained exactly as Pillow's own writer chains them. The last next-IFD pointer is 0.\n- `mic(stream)`: a minimal OLE2 compound file with a storage named `img0.ACI` that contains a stream named `Image`, which is the layout `MicImageFile._open` looks for. Sector 0 is the FAT and sector 1 is the directory. The stream starts at sector 2 and is padded to 4096 bytes, so the file doesn't need a mini-FAT. The result is 5632 bytes.\n\nIt runs three inputs, each in its own child process with a hard 20-second kill:\n\n1. control: the plain 3-page TIFF. Expected `TIFF n_frames = 3`.\n2. control: a MIC wrapping a 1-page TIFF. Expected `MIC n_frames = 1`.\n3. attack: the same MIC container wrapping the 3-page TIFF.\n\nThe timeout is enforced by killing the child rather than by an in-process alarm, because a `TimeoutError` raised while `ImageFileDirectory_v2.load()` is parsing would be caught by its `except OSError` (`TiffImagePlugin.py:958`) and leave the IFD half-parsed instead of stopping the loop.\n\nThe script prints `BUG` when both controls return and the attack child is still running after 20 seconds; otherwise it prints `OK`. With the attached patch applied, the attack case prints `MIC n_frames = 1` and the script prints `OK`.\n\n## Suggested fix\n\nThe attached patch restores the OLE-level frame count after the embedded TIFF stream has been opened, so the inherited `n_frames` never enters its IFD-walking loop and `n_frames`/`seek()` agree on what a frame is. In `MicImageFile.seek`, `src/PIL/MicImagePlugin.py:82`, right after `TiffImagePlugin.TiffImageFile._open(self)`:\n\n```diff\n         TiffImagePlugin.TiffImageFile._open(self)\n \n+        # TiffImageFile._open() resets the frame count to that of the\n+        # embedded TIFF stream, but the frames of an MIC file are its streams\n+        self._n_frames = len(self.images)\n+        self.is_animated = self._n_frames \u003e 1\n+\n         self.frame = frame\n```\n\nDoing this in `seek()` restores the invariant on every seek, not only the first. The existing assignments at lines 69–70 of `_open` are kept: the initial `seek(0)` → `_seek_check(0)` reads `n_frames` before `TiffImageFile._open` has run, so they are still needed. Plain read-only `n_frames`/`is_animated` properties, as before 0b33a87b0, are no longer a drop-in option because `TiffImageFile._seek` assigns `self.is_animated`. With the patch applied to a clean tree and rebuilt, the attack file returns `n_frames == 1` immediately, a 2-IFD stream raises `EOFError` on `seek(1)` instead of `IndexError`, `save_all=True` to TIFF and PDF completes, and `Tests/test_file_mic.py` and `Tests/test_file_tiff.py` pass. No regression test is included, since one would need a new binary MIC fixture in `Tests/images`.\n\nThe patch passed that check but has not been reviewed beyond it as the final form of the fix. Two things it leaves alone: it does not add the `_im` reset that `TiffImageFile.seek` performs after `_seek` (`TiffImagePlugin.py:1229`), which matters when switching between OLE streams of different size or mode; and `TiffImageFile.n_frames` still advances via the overridable `tell()` rather than its private `__frame`, so making it iterate on `__frame` would protect any other subclass that redefines `tell()`.\n\n## The patch\n\nRestore the OLE stream frame count in MicImageFile.seek() after TiffImageFile._open() resets it, so n_frames cannot loop forever\n\nApplies to `src/PIL/MicImagePlugin.py` at the commit above. It passed the mechanical check — applied to a clean tree, rebuilt, the reproducer stopped firing — but a reviewer did not endorse it as the right fix.\n\n```diff\ndiff --git a/src/PIL/MicImagePlugin.py b/src/PIL/MicImagePlugin.py\nindex f8cf3a76f..2bb0109ce 100644\n--- a/src/PIL/MicImagePlugin.py\n+++ b/src/PIL/MicImagePlugin.py\n@@ -81,6 +81,11 @@ class MicImageFile(TiffImagePlugin.TiffImageFile):\n \n         TiffImagePlugin.TiffImageFile._open(self)\n \n+        # TiffImageFile._open() resets the frame count to that of the\n+        # embedded TIFF stream, but the frames of an MIC file are its streams\n+        self._n_frames = len(self.images)\n+        self.is_animated = self._n_frames \u003e 1\n+\n         self.frame = frame\n \n     def tell(self) -\u003e int:\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 2,330 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# MicImageFile inherits TiffImageFile.n_frames, whose loop `self._seek(self.tell()+1)`\n# relies on tell() advancing; MicImageFile.tell() returns the OLE stream index (constant),\n# so a MIC file whose Image stream is a TIFF with \u003e=3 chained IFDs makes im.n_frames spin forever.\nimport io, struct, subprocess, sys, tempfile, os\nfrom PIL import Image\n\ndef tiff(n):  # n-page TIFF written by Pillow itself\n    b = io.BytesIO(); fr = [Image.new(\"L\", (4, 4), i) for i in range(n)]\n    fr[0].save(b, \"TIFF\", save_all=True, append_images=fr[1:]); return b.getvalue()\n\ndef mic(stream):  # minimal OLE2 file: storage \"img0.ACI\" containing stream \"Image\"\n    END, FREE, FATSECT = 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD\n    data = stream.ljust(4096, b\"\\0\"); n = len(data) // 512\n    fat = [FATSECT, END] + [3 + k for k in range(n - 1)] + [END]; fat += [FREE] * (128 - len(fat))\n    def entry(name, kind, child, start, size):\n        raw = name.encode(\"utf-16-le\") + b\"\\0\\0\"\n        return raw.ljust(64, b\"\\0\") + struct.pack(\"\u003cHBBiii\", len(raw), kind, 1, -1, -1, child) + b\"\\0\"*36 + struct.pack(\"\u003cIII\", start, size, 0)\n    d = entry(\"Root Entry\", 5, 1, END, 0) + entry(\"img0.ACI\", 1, 2, 0, 0) + entry(\"Image\", 2, -1, 2, len(data)) + b\"\\0\"*128\n    hdr = (b\"\\xd0\\xcf\\x11\\xe0\\xa1\\xb1\\x1a\\xe1\" + b\"\\0\"*16 + struct.pack(\"\u003cHHHHH6x\", 0x3E, 3, 0xFFFE, 9, 6)\n           + struct.pack(\"\u003c9I\", 0, 1, 1, 0, 4096, END, 0, END, 0) + struct.pack(\"\u003cI\", 0) + b\"\\xff\"*432)\n    return hdr + struct.pack(\"\u003c128I\", *fat) + d + data\n\nCHILD = \"import sys;from PIL import Image;im=Image.open(sys.argv[1]);print(im.format, 'n_frames =', im.n_frames)\"\ndef run(label, data, limit=20):\n    p = os.path.join(tempfile.mkdtemp(), \"x\"); open(p, \"wb\").write(data)\n    try:\n        r = subprocess.run([sys.executable, \"-c\", CHILD, p], capture_output=True, text=True, timeout=limit)\n        out = (r.stdout.strip() or r.stderr.strip().splitlines()[-1]); hung = False\n    except subprocess.TimeoutExpired:\n        out, hung = f\"STILL RUNNING after {limit}s (killed)\", True\n    print(f\"{label:32s} {len(data):6d} bytes -\u003e {out}\"); return hung\n\nc1 = run(\"control: 3-page TIFF, direct\", tiff(3))\nc2 = run(\"control: MIC around 1-page TIFF\", mic(tiff(1)))\nbug = run(\"attack:  MIC around 3-page TIFF\", mic(tiff(3)))\nprint(\"BUG\" if bug and not c1 and not c2 else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "7.2.0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-22hg-r758-rrw9/GHSA-22hg-r758-rrw9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-22hg-r758-rrw9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112390"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/26cb3ed061173b817b9ee4b6f507cb0e1e293218"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}
