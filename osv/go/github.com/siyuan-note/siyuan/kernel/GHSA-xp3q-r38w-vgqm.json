@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-xp3q-r38w-vgqm",
+  "modified": "2026-10-23T18:45:08.575715071Z",
+  "published": "2026-10-23T18:29:45Z",
+  "summary": "SiYuan: The publish filter for local storage returns the administrator's entire storage map with only three keys sanitized",
+  "details": "### Relationship to GHSA-hgfg-j9pg-43xw\n\nThat advisory concerned the administrator's live UI layout, and commit `63c7d5474` resolved it by removing `FilterUILayoutByPublishIgnore` and nulling `Conf.UILayout` for readers. That fix is correct and complete for the live layout.\n\nThis report concerns a different endpoint, a different filter function and a different storage backing. `/api/storage/getLocalStorage` reads `data/storage/local.json` rather than `Conf.UILayout`, and its filter `FilterLocalStorageByPublishAccess` was not touched by that commit. The consequence is that the same serialized tab objects the earlier fix withheld continue to be served, from the closed-tab history rather than the live layout.\n\n### Summary\n\nThree routes, `/api/storage/getLocalStorage`, `getLocalStorageVal` and `getLocalStorageVals`, are registered with `CheckAuth` only and are reachable by the publish `RoleReader` token and anonymously when `Publish.Auth.Enable` is `false`. All three call `model.GetLocalStorage()` and then, for read-only roles, `FilterLocalStorageByPublishAccess`.\n\nThat filter begins by assigning the administrator's entire storage map to its return value and then removes three specific fields. Everything else in the map is returned unmodified. A single unauthenticated POST with an empty body returns the administrator's recently closed tabs with their document titles and identifiers, their current search keywords and the paths those searches cover, the expanded private paths in their file tree, and per-document identifiers from several other keys.\n\n### Details\n\n**Routes.** `kernel/api/router.go:87-89` on master, the same block on the development branch:\n\n```go\nginServer.Handle(\"POST\", \"/api/storage/getLocalStorage\",     model.CheckAuth, getLocalStorage)\nginServer.Handle(\"POST\", \"/api/storage/getLocalStorageVal\",  model.CheckAuth, getLocalStorageVal)\nginServer.Handle(\"POST\", \"/api/storage/getLocalStorageVals\", model.CheckAuth, getLocalStorageVals)\n```\n\nNo `CheckAdminRole`, no `CheckReadonly`.\n\n**The filter is an allowlist inverted into a blocklist.** `kernel/model/publish_access.go:911` on master and `:1481` on the development branch, byte-identical on both:\n\n```go\nfunc FilterLocalStorageByPublishAccess(publishAccess PublishAccess, localStorage map[string]any) (ret map[string]any) {\n    ret = localStorage            // the entire administrator map\n    publishIgnore := GetInvisiblePublishAccess(publishAccess)\n    // clears local-searchkeys[\"keys\"]\n    // clears local-searchasset[\"k\"] and [\"keys\"]\n    // blanks local-docinfo[\"id\"], only when bt != nil, visible tier only, no password check\n    return\n}\n```\n\n`local.json` holds roughly thirty keys. Three are sanitized. The rest are returned as stored.\n\n**What survives.** Taking the client's own list of keys it round-trips through this endpoint (`app/src/protyle/util/compatibility.ts:563`), the notable survivors are:\n\n- `local-closed-tabs`. Up to `SIZE_UNDO` entries, each produced by `layoutToJSON(item, tabJSON)` at `app/src/layout/Wnd.ts:779`. This is the same serializer that produced the data in the earlier advisory: tab title, `docIcon`, `rootId`, `notebookId`, `blockId`, `mode`, `action`, and for a Search tab the entire config object. Unfiltered.\n- `local-searchdata`. The live document-search configuration, including `k` (the search text), `r` (replace text), `hPath`, `idPath` (the paths the search was scoped to) and `types`. Note the filter clears the search *history* array and the *asset*-search keyword, but leaves the document-search keyword itself. The project's own standard is applied to two of the three related fields.\n- `local-filespaths`. `IFilesPath[]` of `{notebookId, openPaths[]}`, the expanded private notebook and folder paths in the file-tree dock.\n- `local-fileposition`, `local-outline`, `local-zoom`. Keyed by document or block identifier, so each discloses private document identifiers.\n- `local-move-path`. `{keys[], k}`, the move-document dialog's path history and last keyword.\n- `local-recent-docs`, `local-history`, `local-flashcard`, `local-dailynoteid`, `local-layouts`.\n\n**The asymmetry is visible in the function signature.** In the same file, `kernel/api/storage.go`:\n\n| Handler | Filter | Receives `*gin.Context` |\n|---|---|---|\n| `getCriteria` | `FilterCriteriaByPublishAccess(c, ...)` | yes |\n| `getRecentDocs` | `FilterRecentDocsByPublishAccess(c, ...)` | yes |\n| `getLocalStorage` / `Val` / `Vals` | `FilterLocalStorageByPublishAccess(publishAccess, data)` | no |\n\nThe two sibling filters take the request context and can therefore call `CheckPublishAuthCookie` to evaluate the password tier. `FilterLocalStorageByPublishAccess` does not receive the context, so it cannot perform that check at all. The visible-only limitation is fixed in the parameter list rather than in the body.\n\nSeparately, `local-recent-docs` passes through this endpoint unfiltered, which bypasses the dedicated `FilterRecentDocsByPublishAccess` that guards the same data on `getRecentDocs`.\n\n**Note on a prior assessment.** `getLocalStorage` appears on lists of endpoints considered correctly filtered, on the basis that it calls a `Filter*ByPublishAccess` function. That observation is accurate and this report does not contradict it. The filter is called. What it does is assign the whole map and remove three fields.\n\n**No persistence side effect.** The in-place mutations the filter performs do not corrupt the administrator's stored state, because `GetLocalStorage` re-reads and unmarshals `storage/local.json` on each call (`kernel/model/storage.go:82`), so the map is per-request. This is noted to pre-empt the concern rather than as part of the finding.\n\n### Proof of Concept\n\nPrecondition: publish mode enabled (default port 6808), anonymous when `Publish.Auth.Enable` is `false`, otherwise any publish reader account. An administrator who has used the client normally, closing some document tabs and running a search.\n\n```\nPOST http://127.0.0.1:6808/api/storage/getLocalStorage\n{}\n\n→ 200. The returned map includes, among others:\n     local-closed-tabs   entries carrying title, docIcon, rootId, notebookId,\n                         blockId for recently closed documents, including\n                         documents the reader has no publish access to\n     local-searchdata    k, r, hPath, idPath for the administrator's current\n                         document search\n     local-filespaths    notebookId and openPaths for expanded private folders\n     local-fileposition  keys are private document identifiers\n```\n\n`getLocalStorageVal` returns any single key by name, so a caller who only wants the closed-tab history can request it directly.\n\nFor contrast, requesting the same underlying data through the sibling endpoint shows the filtering that is applied elsewhere:\n\n```\nPOST http://127.0.0.1:6808/api/storage/getRecentDocs\n{}\n\n→ 200, filtered by FilterRecentDocsByPublishAccess\n```\n\nwhile `local-recent-docs` inside the storage response is not.\n\n### Impact\n\nAn anonymous reader in publish mode, or any publish `RoleReader`, obtains the administrator's working context: the titles and identifiers of documents they recently had open, what they have been searching for and where, which private folders they have expanded, and per-document identifiers across several other keys. Titles and search keywords are author-written text and routinely describe the subject of the documents they refer to.\n\nThe document and notebook identifiers disclosed here are also the input required by identifier-to-path and path-to-content resolution, so the value is not limited to the metadata itself.\n\nNo document bodies are returned, and nothing is written. Confidentiality only.\n\n### Suggested fix\n\nInvert the filter into an actual allowlist. Return only the keys a publish reader needs to render published content, which is a short list along the lines of `local-images`, `local-emojis`, `local-pdftheme`, `local-fontstyles` and the theme and zoom preferences, and drop everything else by default. New keys added in future then default to withheld rather than exposed.\n\nAdditionally, pass `*gin.Context` into `FilterLocalStorageByPublishAccess` so that any retained per-document entry can be gated with the full `CheckBlockIdAccessableByPublishAccess` including the password tier, matching the sibling filters in the same file.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260729005258-4daee87d4152"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-xp3q-r38w-vgqm/GHSA-xp3q-r38w-vgqm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-xp3q-r38w-vgqm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/4daee87d41521d119979f2edda67e87f2be7b6ef"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.3"
+    }
+  ]
+}

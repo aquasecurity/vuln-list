@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-c8w8-3pqp-wr83",
+  "modified": "2026-10-23T18:45:09.519798674Z",
+  "published": "2026-10-23T18:34:09Z",
+  "aliases": [
+    "CVE-2026-73054"
+  ],
+  "summary": "SiYuan: A parser differential between the WebSocket keepalive exemption and the session quarantine allows unauthenticated access to the broadcast event stream",
+  "details": "### Summary\n\nTwo checks on the same WebSocket request URI parse it differently. The authentication exemption for keepalive sessions matches raw substrings, while the quarantine introduced to contain those sessions reads a parsed query parameter. Because Go's `url.Values.Get` returns only the first value for a repeated key, a single URI can satisfy the exemption and still resolve to a non-auth session identity.\n\nThe result is that an unauthenticated remote caller connects to the kernel WebSocket with a valid access auth code configured, is placed in the general broadcast pool rather than the quarantined pool, and receives the live event stream.\n\n### Details\n\n**The exemption matches substrings.** `kernel/server/serve.go:1222` on the development branch, `:1074` on master:\n\n```go\nauthOk = strings.Contains(s.Request.RequestURI, \"/ws?app=siyuan\") \u0026\u0026\n         strings.Contains(s.Request.RequestURI, \"\u0026id=auth\u0026type=auth\")\n```\n\nNeither operand is parsed. Any URI containing both literals is exempted, regardless of what the query actually resolves to.\n\n**The quarantine parses.** Commit `1e370e373` added the containment for exempted sessions at `kernel/util/websocket.go:171`:\n\n```go\nid = session.Request.URL.Query().Get(\"id\")\nreturn \"auth\" == id\n```\n\n`url.Values.Get` returns the first value for a repeated key.\n\n**The differential.** For the URI:\n\n```\n/ws?app=siyuan\u0026id=main\u0026type=main\u0026id=auth\u0026type=auth\n```\n\n- It contains `/ws?app=siyuan` and `\u0026id=auth\u0026type=auth`, so `authOk` is true. No cookie, no JWT and no access auth code are required.\n- `Query().Get(\"id\")` returns `main`, so `IsAuthSession` is false. `AddPushChan` files the session in `sessions`, the broadcast pool, rather than in `authSessions`.\n- `Query().Get(\"type\")` returns `main`, so the session matches `BroadcastByType(\"main\", ...)`.\n- Without a valid `X-Auth-Token` the publish flag is never set, so `isPublishSession()` does not exclude it either.\n\nEvery guard that should have caught the session keys off a different parse than the one that admitted it.\n\n**No origin validation.** `CheckOrigin` does not appear on the `/ws` path, so the cross-origin vector described in the parent advisory also remains available.\n\n**Distinction from the existing broadcast-pool advisory.** GHSA-mw8r-mw84-88v2 concerns the publish port, where an anonymous session is expected to connect and the defect is that broadcast content is not gated for it afterwards. This report concerns the kernel port with an access auth code configured, where the session should never be admitted in the first place. The leaked data overlaps because both end in the same broadcast pool, but the mechanisms and the affected deployments are different, and gating publish sessions does not close this path.\n\n### Proof of Concept\n\nKernel port, `--accessAuthCode` set. Three WebSocket connections, none carrying credentials of any kind.\n\n| Socket | Query | Result |\n|---|---|---|\n| A, baseline | `?app=siyuan\u0026id=main\u0026type=main` | Rejected, closed 1002, 0 frames |\n| B, control | `?app=siyuan\u0026id=auth\u0026type=auth` | Connects, 0 frames |\n| C, attack | `?app=siyuan\u0026id=main\u0026type=main\u0026id=auth\u0026type=auth` | Connects, 19 to 30 frames across two runs |\n\nSocket A establishes that the access auth code is enforced. Socket B establishes that the existing quarantine works exactly as intended, admitting the keepalive session but delivering nothing to it. Socket C differs from B only in the duplicated parameters, and receives the event stream.\n\nFrames observed on socket C included `savedoc` (`\"action\":\"create\",\"data\":{\"Root\":{\"ID\": ...`), `transactions` (`\"action\":\"updateAttrs\"` carrying document titles), `filetreeSortChanged` (the notebook's complete ordered `childIDs`), `create` (a notebook object including its `name`), and `backgroundtask`.\n\nA canary string placed inside a document body did not appear in any frame, on a full-text search of all captured frames.\n\n### Impact\n\nAn unauthenticated remote caller obtains the kernel's live event stream on a deployment protected by an access auth code, with no user interaction and no prior knowledge of the instance.\n\nPrecisely what is disclosed: document identifiers and titles, notebook identifiers and names, file paths, the complete ordered child structure of notebooks, and the full stream of create, update and delete operations as they occur. Document body content is not present in the observed frames.\n\nThat set corresponds to the disclosure claimed by GHSA-xp2m-98x8-rpj6, which means the remediation for that advisory is bypassable rather than incomplete in scope. The absence of origin validation on the endpoint additionally preserves the cross-origin reachability described there.\n\nConfidentiality only. No frames observed permitted writes.\n\n### Suggested fix\n\nMake both checks agree, and stop re-parsing attacker-controlled input after admission.\n\n1. In the exemption, parse the query rather than matching substrings, and require `id` and `type` each to equal `auth` exactly.\n2. Reject requests carrying duplicated query keys on this endpoint, so no URI can present two identities.\n3. Record the exemption as a flag on the session at connect time, and have `IsAuthSession` read that flag rather than re-parsing the request. A session admitted under the keepalive exemption is then quarantined by construction, independent of how its URI is read later.\n\nAdding origin validation to `/ws` would additionally close the cross-origin vector.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260731131820-67bc300b6ea6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-c8w8-3pqp-wr83/GHSA-c8w8-3pqp-wr83.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-c8w8-3pqp-wr83"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-73054"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/67bc300b6ea6650d99dae55c827aeced419c8ac4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.7.4-alpha.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/siyuan-before-authentication-bypass-via-websocket"
+    }
+  ]
+}

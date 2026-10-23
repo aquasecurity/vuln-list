@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-rpx2-p6hp-x5gj",
+  "modified": "2026-10-23T18:45:08.585065959Z",
+  "published": "2026-10-23T18:38:25Z",
+  "aliases": [
+    "CVE-2026-62204"
+  ],
+  "summary": "SiYuan: Missing consistency check between packageName and repoURL/repoHash in bazaar package install allows overwriting an existing, trusted plugin",
+  "details": "## Summary\n\n`installBazaarPlugin` (and the equivalent endpoints for widgets/icons/templates/themes) accept\n`packageName`, `repoURL`, and `repoHash` as independent request fields with no validation that\nthey refer to the same package. `packageName` alone determines the install destination;\n`repoURL`/`repoHash` alone determine what content gets downloaded and written there. A request\ncan name an already-installed, already-enabled plugin as `packageName` while pointing `repoURL`/\n`repoHash` at different, attacker-influenced content, silently overwriting the existing plugin's\nfiles.\n\n## Affected code\n\n`kernel/api/bazaar.go`:\n```go\nutil.BindJsonArg(\"packageName\", \u0026packageName, true, true)\nutil.BindJsonArg(\"repoURL\", \u0026repoURL, true, true)\nutil.BindJsonArg(\"repoHash\", \u0026repoHash, true, true)\nerr := model.InstallBazaarPackage(\"plugins\", repoURL, repoHash, packageName, 0)\n```\n\n`kernel/model/bazaar.go`:\n```go\nfunc getPackageInstallPath(pkgType, packageName string) (string, string, error) {\n    case \"plugins\":\n        return filepath.Join(util.DataDir, \"plugins\", packageName), \"plugin.json\", nil\n```\n\n`kernel/bazaar/install.go`:\n```go\nfunc installPackage(data []byte, installPath string) (err error) {\n    ...\n    if err = filelock.Copy(srcPath, installPath); err != nil { return }\n    return\n}\n```\n\n`installPath` is derived solely from `packageName`; the downloaded `data` is derived solely from\n`repoURL`/`repoHash`; nothing cross-validates them, and `installPackage` performs no check for\nwhether `installPath` already contains an existing package before copying into it. The same\npattern applies to the widget/icon/template/theme install endpoints, which share\n`getPackageInstallPath`.\n\nThis does not involve path traversal — `installPath` always resolves inside\n`DataDir/plugins/` (or the corresponding directory for other package types), so this is not an\ninstance of \"arbitrary file write outside the workspace path\" (excluded by this project's\nSECURITY.md). The issue is that the write lands in the *wrong, existing* location within the\nintended directory, not outside it — an authorization/identity-verification gap, not a path\ntraversal.\n\n## Reachability / why this is not trivially remote\n\nThe bazaar endpoints are gated by `model.CheckAuth`, `model.CheckAdminRole`, `model.CheckReadonly`.\nWhen no lock-screen password is configured (the common desktop default), `CheckAuth` still\nenforces a same-origin check:\n```go\nif !localhost || ... || (\"\" != origin \u0026\u0026 !util.IsLocalOrigin(origin)) || ... {\n    // reject with 401\n}\n```\nI verified `IsLocalOrigin`/`IsLocalHostname` correctly parse the `Origin` header via `url.Parse`\nand check exact hostname / loopback IP:\n```go\nfunc IsLocalOrigin(origin string) bool {\n    if u, err := url.Parse(origin); err == nil {\n        return IsLocalHostname(u.Hostname())\n    }\n    return false\n}\nfunc IsLocalHostname(hostname string) bool {\n    if \"localhost\" == hostname || strings.HasSuffix(hostname, \".localhost\") {\n        return true\n    }\n    if ip := net.ParseIP(hostname); nil != ip {\n        return ip.IsLoopback()\n    }\n    return false\n}\n```\nThis was tested against common bypass patterns (subdomain-suffix tricks like\n`localhost.attacker.com`, and `Origin: null` as sent by sandboxed iframes) and found no bypass —\nthis is a correctly-implemented check. This means a purely remote attacker (e.g. a malicious\nwebsite) cannot invoke this endpoint via CSRF; a request must originate from SiYuan's own\nrenderer origin.\n\n## Realistic impact\n\nGiven SiYuan runs as an Electron app with `nodeIntegration: true` (per prior advisories in this\nrepository), a same-origin script-execution primitive (e.g. an XSS bug in the renderer, of which\nseveral have been fixed in this repository recently) is typically already sufficient for direct\ncode execution. This bug's marginal value is **persistence**: a transient XSS-driven compromise\ncan use this endpoint to overwrite an existing, trusted, already-enabled plugin's `index.js`,\nconverting a one-time compromise into code that runs on every future launch of the application,\nsurviving after the original XSS vector is closed.\n\nThe overwrite does not effect immediately, via this specific\nendpoint. `PushReloadPlugin` (the websocket event that triggers frontend hot-reload without\nrestart) is only called from the batch-update path (`InstallBazaarPackages`, used by\n`batchUpdatePackage`), which explicitly checks `if petal != nil \u0026\u0026 petal.Enabled` before forcing\na reload via `SetPetalEnabled`. The single-package install endpoint (`installBazaarPlugin`) does\nnot call `PushReloadPlugin` at all — it only pushes a generic success toast. So an overwrite via\nthis endpoint activates on the next app restart or manual plugin toggle, rather than instantly \nstill a realistic and frequent event for a desktop application, but not an instant hot-reload.\n\n## Suggested fix\n\nVerify that `packageName` matches the package name declared in the downloaded package's own\n`plugin.json`/`theme.json`/etc. before copying into `installPath`, and/or refuse to install over\nan existing, non-empty destination directory unless the request is explicitly an update of that\nsame package (matching by source repo identity, not just by request-supplied name).\n\n## Verification notes\n\nConfirmed via static source review of `kernel/api/bazaar.go`, `kernel/model/bazaar.go`,\n`kernel/bazaar/install.go`, `kernel/model/session.go` (CheckAuth), `kernel/util/net.go`\n(IsLocalOrigin/IsLocalHostname), and `kernel/model/push_reload.go` /\n`app/src/plugin/loader.ts` (reload trigger wiring). I do not have a running SiYuan instance\nin this environment to execute an end-to-end proof of concept; findings are based on tracing\nthe actual, unmodified control flow across these files rather than assumption.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/siyuan-note/siyuan/kernel",
+        "purl": "pkg:golang/github.com/siyuan-note/siyuan/kernel"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260808010544-26ccb40d390e"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rpx2-p6hp-x5gj/GHSA-rpx2-p6hp-x5gj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-rpx2-p6hp-x5gj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-62204"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/commit/26ccb40d390eb7d9b04673629a58ab1d69cc7e53"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/siyuan-note/siyuan"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/siyuan-note/siyuan/releases/tag/v3.8.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/siyuan-before-plugin-overwrite-via-bazaar-install"
+    }
+  ]
+}
