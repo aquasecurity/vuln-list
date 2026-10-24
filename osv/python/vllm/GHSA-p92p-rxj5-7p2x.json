@@ -1,0 +1,165 @@
+{
+  "id": "GHSA-p92p-rxj5-7p2x",
+  "modified": "2026-10-23T21:00:05.244406085Z",
+  "published": "2026-10-23T20:43:44Z",
+  "aliases": [
+    "CVE-2026-114050"
+  ],
+  "summary": "vLLM: Forged multimodal UUID + P0/P1 processor-cache eviction drift: unauthenticated remote crash of the whole vLLM engine",
+  "details": "## Summary\n\nMultimodal content parts (`image_url`, `video_url`, `input_audio`, ...) accept a user-supplied `uuid` field that vLLM uses **verbatim as the item's cache identity** (`mm_hash`). The two frontend/engine processor caches (P0 \"sender\" cache in the API process, P1 \"receiver\" cache in the EngineCore process) are independent LRU caches whose evictions are **not synchronized**, and the P1 hit path performs **zero consistency validation** — it silently substitutes the cached item's tensor data for whatever the current request actually contains.\n\nA single unauthenticated client can exploit this to kill the entire engine, deterministically, with default server flags:\n\n1. **Seed**: send a small image with `uuid=\"U\"`. Both caches now map `U` to an item with **N_A** visual tokens (e.g. 4).\n2. **Drift**: send ~70 requests, each carrying a *unique* uuid, a max-size image, and an over-long text prompt. Each request is rejected with 400 — but **after** its image has been inserted into the P0 cache (insertion happens during chat rendering, before prompt-length validation), so these requests fill P0 **without ever reaching the engine/P1**. `U` is evicted from P0 only.\n3. **Kill**: send a *large* image with `uuid=\"U\"`. P0 misses → the image is freshly processed and the prompt is spliced with **N_B** (e.g. 2048+) placeholder tokens; the request carries full data to the engine, but P1 still has `U` → the engine **discards the fresh data and substitutes the stale N_A-row tensor**. The scheduler plans for N_B encoder slots while the worker merges N_A embeddings into N_B placeholders → `ValueError: Attempted to assign 4 = 4 multimodal tokens to 2048 placeholders` at `vllm/model_executor/models/utils.py:711` → uncaught in the EngineCore busy loop → `_send_engine_dead()` → the EngineCore process dies, every API server reports `EngineDeadError` and shuts down. `/health` never recovers; the deployment needs a full restart.\n\nVerified end-to-end on the official `vllm/vllm-openai:v0.29.0` image with Qwen2.5-VL-3B-Instruct, default configuration (no flags beyond `--served-model-name`/`--gpu-memory-utilization`): after 70 flood requests the kill request returned `500 EngineCore encountered an issue` and `/health` went dead permanently. The vulnerable code is byte-identical on `main` (post-0.29.0).\n\n## Details\n\n**1. The client-controlled `uuid` becomes the cache hash verbatim.** `vllm/entrypoints/chat_utils.py:1677` / `:1884-1886` read `part[\"uuid\"]` per content part and pass it through as `mm_uuids`. In `vllm/multimodal/processing/inputs.py:62-63`, when no `hf_processor_mm_kwargs` are present (the default for chat requests), the uuid string **is** the item hash — no content binding at all:\n\n```python\n# vllm/multimodal/processing/inputs.py:62-63\nelse:\n    hashes.append(uuid_item)        # client string used verbatim as mm_hash\n```\n\n**2. P0 insertion happens before request validation.** In the serving path, `render_chat_request` (`vllm/entrypoints/openai/chat_completion/serving.py:275`) runs full mm processing — `mm_processor.apply` (`vllm/renderers/base.py:759`) → `_cached_apply_hf_processor` → `_merge_mm_kwargs` → `cache.get_and_update_item` (`vllm/multimodal/processing/processor.py:1338`), which inserts the processed item into the P0 sender cache (default `mm_processor_cache_type=\"lru\"`, 4 GiB). Only afterwards does `get_max_tokens` (`vllm/entrypoints/serve/utils/api_utils.py:183-186`) reject over-long prompts with 400. **A request can therefore write to P0 while never reaching the engine** — the primitive that desynchronizes P0 from P1. (Public issue #43941 documented this same asymmetry for the opposite drift direction, which was later handled via `MultiModalCacheMissError`; the P0-miss/P1-hit direction below was never addressed.)\n\n**3. P1 substitutes cached data on hash hit with no consistency check.** In the EngineCore input thread, `preprocess_add_request` (`vllm/v1/engine/core.py:997-1000`) calls `mm_receiver_cache.get_and_update_features`, which only replaces `feature.data` (`vllm/multimodal/cache.py:673-690`) and keeps the request's own `mm_position` (placeholder layout). On a cache hit the receiver cache returns the stale item wholesale:\n\n```python\n# vllm/multimodal/cache.py:739-740  (MultiModalReceiverCache.get_and_update_item)\nif (cached_item := self._cache.get(mm_hash)) is not None:\n    return cached_item              # fresh data silently discarded; no size/modality check\n```\n\nOnly the opposite drift (P0 hit / P1 miss, `data=None`) is handled, via the retryable `MultiModalCacheMissError`. Nothing validates that the cached item's modality, shape, or token count matches the current request's placeholders.\n\n**4. The mismatch is fatal to the engine.** The scheduler plans encoder work from the request's (fresh) placeholder count N_B, while the worker gathers embeddings from the stale N_A-row tensor (encoder-cache hit under the same forged hash, or re-encoding the stale data — both yield N_A rows). `_merge_multimodal_embeddings` then raises:\n\n```python\n# vllm/model_executor/models/utils.py:703-714\ninputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)   # RuntimeError\n...\nraise ValueError(\n    f\"Attempted to assign {expr} = {num_actual_tokens} \"\n    f\"multimodal tokens to {num_expected_tokens} placeholders\") from e\n```\n\nThis exception is raised inside the worker's input preparation with no per-request containment, propagates to the EngineCore busy loop's top-level handler (`vllm/v1/engine/core.py:1372`), and triggers `_send_engine_dead()`. The API server's `output_handler` receives `EngineDeadError` (`vllm/v1/engine/async_llm.py:819`) and the whole process tree shuts down. (Issue #55546 independently reported this sink — \"one bad multimodal item kills the entire V1 engine tree\" — from an organically occurring stale cache entry; this report provides the missing deterministic, remote, single-attacker trigger.)\n\n**Cost of the attack.** With the default `mm_processor_cache_gb=4`, one max-size Qwen2.5-VL image (12845056 pixels) caches as ~77 MB, so ~56 flood requests suffice; we used 70. Flood requests are CPU-only image decodes (~0.3 s each here) and can be issued sequentially or concurrently; the total wall-clock cost of the kill was under one minute. Models with larger `max_pixels` fill the cache in even fewer requests. Note that issuing the flood with *successful* requests does not work — they would populate P1 as well; rejection after P0 insertion is essential, and the over-long-prompt 400 is one always-available way to get it (no size limits depend on non-default flags).\n\n\n## Impact\n\nAny unauthenticated client that can reach a multimodal vLLM endpoint (`/v1/chat/completions`, `/v1/responses`, etc. — all accept content-part `uuid`) can **deterministically crash the entire serving instance**: the EngineCore process dies, every in-flight request fails, and the API server exits; the deployment stays down until restarted. In data-parallel or multi-API-server deployments the blast radius extends to the whole engine group (cf. the DP8 outage in #55546). The attack requires no special privileges, no non-default server flags, no race conditions, and costs under a minute of sequential requests at default cache sizes.\n\nThis is distinct from the documented \"Multimodal Media UUID Security\" guidance in `docs/usage/security.md`, which covers only **integrity/confidentiality** consequences of uuid collisions (a caller silently receiving another caller's media). The guidance does not mention availability, and following it does not help: the attacker here deliberately collides with *their own* uuid, and the fatal element is the missing consistency check on the P1 hit path plus the unsynchronized eviction of the two caches.\n\n**Suggested remediation** (any one of these breaks the kill chain):\n\n1. On a P1 receiver-cache hit, validate the cached item against the request's `mm_position` (modality and expected embedding count); on mismatch, treat it as a miss (`MultiModalCacheMissError`) or reject the request — never substitute silently.\n2. Make the feature/placeholder count mismatch in `_merge_multimodal_embeddings` a per-request error instead of a fatal engine exception (also requested by #55546).\n3. Bind server-side cache identity to content even when a uuid is provided (e.g. `hash(content) + uuid`), eliminating forged-hash cache hits entirely.\n4. Synchronize P0/P1 evictions (the engine already pushes `invalidate` to P0 on cache-miss; eviction-direction sync would close the remaining drift).\n\nA public fix is available here: https://github.com/vllm-project/vllm/pull/57833",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.31.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.30.0",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-p92p-rxj5-7p2x/GHSA-p92p-rxj5-7p2x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-p92p-rxj5-7p2x"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/57833"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/7268f6e38ebbb3d61700f16c638c6eba0c88bb0c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.31.0"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/cve-2026-114050"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vllm-before-0.31.0-remote-engine-crash-via-forged-multimodal-uuid"
+    }
+  ]
+}

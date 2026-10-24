@@ -1,0 +1,113 @@
+{
+  "id": "GHSA-9vhv-jxww-xfm5",
+  "modified": "2026-10-23T22:45:03.439584635Z",
+  "published": "2026-10-23T22:28:19Z",
+  "aliases": [
+    "CVE-2026-112913"
+  ],
+  "summary": "filelock: ReadWriteLock on Windows acts on SQLite side files another local user places beside its database",
+  "details": "On Windows, `ReadWriteLock` and `AsyncReadWriteLock` (the SQLite-backed reader/writer lock) connect SQLite to the lock database by its path, in every directory. SQLite derives three side files from that path: `\u003cdatabase\u003e-journal`, the rollback journal (pages saved to undo an interrupted write); `\u003cdatabase\u003e-wal`, the write-ahead log (changes kept outside the main file); and `\u003cdatabase\u003e-shm`, the shared-memory index of the WAL. SQLite acts on whichever of these it finds beside the database before the lock runs any statement. Another local account that can create files in the database's directory, but not delete files of other accounts there, places such a side file beside the database and denies everyone `DELETE` on it, which a file's creator may do. `C:\\Windows\\Temp` (the temporary directory of services, granting `BUILTIN\\Users` create but not delete) and `C:\\Users\\Public` are such directories.\n\nWith a `-wal` in place, every `read_lock()` and `write_lock()` of the user running the lock (below: the lock user) raises `sqlite3.OperationalError: disk I/O error` at once, whatever `timeout` says, until that account removes its file; the lock user cannot. With a `-journal` beside a lock database that holds a table, SQLite replays the journal and deletes the file the journal names, a file of the lock user, and the acquire reports success. Affected versions are filelock 3.20.4 through 4.2.0 on Windows. The maintainers found this while reviewing the fix for the POSIX form of the defect, GHSA-v4x8-3wr5-3wq8, whose text says \"Windows does not take this path\" (review round 4, finding F2 of set D). It is not among the findings of the report Anthropic's OSS Scanner sent on 15 October 2026.\n\n## Severity\n\n**CVSS 3.1 `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L` scores 3.3 (Low).**\n\n`AV:L` (local): the other account needs a logon on the same host. `AC:L` (low attack complexity): create one file beside the database and set its ACL (access control list); no race, and the other account can place the file days earlier. `PR:L` (low privileges): an ordinary account that can create files in the directory is enough. `UI:N` (no user interaction). `S:U` (scope unchanged). `C:N` (no confidentiality impact): the other account learns nothing. `I:N` (no integrity impact in the scored variant): see the scoring note. `A:L` (partial availability impact): every acquire fails with an exception that `Timeout` handlers do not catch, until the other account removes its file; no crash, and the lock's own data is not changed.\n\nScoring note. The deletion variant reads `CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:L` (3.6): `I:L` because the lock user's process deletes one file the journal names, `AC:H` because it needs a lock database that holds a table, which filelock does not create, and a journal the lock user can open for writing. The lower-reading rule of this advisory set scores the variant that reaches every `ReadWriteLock` on Windows in such a directory, 3.3, and describes the deletion variant under Mechanism. Classification from the review: **security** (another account), availability for the scored variant.\n\n## Scope and preconditions\n\n- Platform and classes: Windows only. `ReadWriteLock` and `AsyncReadWriteLock`, both of which connect through `_connect`. On Linux and macOS the lock takes other routes, covered by GHSA-v4x8-3wr5-3wq8.\n- Directory: one where another account can create files but cannot delete the lock user's. `C:\\Windows\\Temp` carries `BUILTIN\\Users:(CI)(S,WD,AD,X)` (create file and create subdirectory, no delete child); `C:\\Users\\Public` and any directory with such an entry qualify. A directory only the lock user can write, such as `%LOCALAPPDATA%` or the per-user temporary directory, is not affected.\n- The other account creates `\u003cdatabase\u003e-wal`, grants everyone modify and denies everyone `DELETE` on it. A file's creator may set both. The lock user can open and read the file but not delete it.\n- Deletion variant: the lock database holds at least one table (filelock creates an empty database, and the review's reproducer has the lock account create the table), and the other account's `\u003cdatabase\u003e-journal` grants the lock account modify rights. The journal's tail names a file the lock user can delete.\n- What the lock user sees: `write_lock(timeout=1)` raised `sqlite3.OperationalError: disk I/O error` with the undeletable `-wal` in place; with the writable journal the acquire succeeded and the named file was gone; with an undeletable journal every acquire raised `sqlite3.OperationalError: unable to open database file`.\n- The documentation at the scanned commit states \"the lock directory must not be writable by untrusted users\" for `WindowsFileLock`, in its symlink paragraph; the `ReadWriteLock` documentation names no directory requirement on Windows.\n\n## Affected code\n\nScanned commit `b831496b0273`: the [Windows branch of `_connect`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L951-L965) checks the database through a handle and then calls `sqlite3.connect(database, ...)` with the path. [`_open_lock_database`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L1079-L1091) and [`_raise_if_wal`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L1094-L1101) inspect that handle, not the side files. The first statement is [`PRAGMA busy_timeout=...; PRAGMA journal_mode=MEMORY;` at L816](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L816). [`_do_acquire_inner` at L763](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L763) turns only `\"database is locked\"` into `Timeout`; any other `sqlite3.OperationalError` leaves the acquire.\n\n## Introduced\n\n[cfd4446](https://github.com/tox-dev/filelock/commit/cfd4446) \"feat(lock): add SQLite-based ReadWriteLock\" ([#399](https://github.com/tox-dev/filelock/pull/399), 2026-02-12), first tag 3.20.4 (verified with `git tag --contains`), passed the lock path to `sqlite3.connect` on every platform. The Linux descriptor route (4.0.9) and the macOS hard-link route (4.1.1) did not change Windows, where the connect has been by name in every release since. The reproducer ran against the head of PR #834 at `1f9e415`, whose Windows branch of `_connect` is the same code as at `b831496b0273`.\n\n## Mechanism\n\n`_connect` on Windows opens the database with `_open_non_reparse_fd`, checks through that handle that the file is a regular file, not a reparse point, and that its header does not declare WAL mode, and keeps the handle open while `sqlite3.connect(database)` opens the same name. The check covers the database, not the names beside it. On the first statement, `PRAGMA journal_mode=MEMORY`, SQLite takes its first lock on the database and looks for `\u003cdatabase\u003e-wal`. A non-empty `-wal` beside a database that is not in WAL mode is a leftover SQLite deletes. The other account's file denies `DELETE`, so the pragma raises `SQLITE_IOERR_DELETE`, which reaches the caller as `sqlite3.OperationalError: disk I/O error`. `_do_acquire_inner` converts only \"database is locked\" into `Timeout`, so `acquire_read()`, `acquire_write()` and the async forms raise at once, on every call, until the file is gone. The lock user has no right to delete it.\n\nThe journal variant needs a database with content. Beside a non-empty database SQLite treats a `\u003cdatabase\u003e-journal` with a valid header as hot (left by an interrupted write) and replays it before the first statement runs. The review's journal is 46 bytes: a file path, its 4-byte length, the 4-byte sum of its bytes and SQLite's journal magic. That tail names a super-journal, and recovery ends by deleting the file it names. The lock user's `write_lock()` therefore deletes one file the other account chose, provided the lock user can delete it, and returns without error. SQLite opens a hot journal for writing, so the other account's journal must grant the lock account modify rights; a read-only journal makes every acquire raise `sqlite3.OperationalError: unable to open database file` instead. GHSA-v4x8-3wr5-3wq8 describes the same side-file behavior on POSIX, where the sticky bit plays the part the directory ACL plays here.\n\n## Reproduction\n\nThe review's reproducer, quoted as received except for the second account's password on line 2, replaced by `\u003cpassword\u003e`. It ran on a Windows 11 VM (NTFS, CPython 3.14, SQLite 3.53.1) against the head of PR #834 at `1f9e415`, as the administrator account `bernat`, which stands in for the other account that creates the side files; the lock account is `fltester`, a member of `Users`, whose database lives in `C:\\Windows\\Temp`.\n\n**`win_two_accounts.py`**\n\n```python\n# Run from /tmp/claude-1000/-home-bernat-git-filelock-filelock-main/3ccf38c2-14f9-4acc-a05f-18230504d7cd/scratchpad/review4/D/834 (the script is staged there):\n#   winvm up \u0026\u0026 winvm sync \u0026\u0026 winvm run \"python3.14 -I win_two_accounts.py . fltester '\u003cpassword\u003e'\"\n# which runs, as the administrator account on the VM:\n#   python3.14 -I win_two_accounts.py \u003cworktree\u003e \u003csecond-user\u003e \u003cpassword\u003e\n# The second (non-administrator) account is the lock user. Its database lives in C:\\Windows\\Temp, where every account\n# may create files but not delete another account's. This administrator account stands in for the other account that\n# plants SQLite side files there: it creates them, grants everyone read, and denies everyone delete, all of which the\n# file's creator may do.\nimport ctypes\nimport os\nimport pathlib\nimport sqlite3\nimport struct\nimport subprocess\nimport sys\nfrom ctypes import wintypes\n\nsys.path.insert(0, sys.argv[1] + \"/src\")\nfrom filelock import ReadWriteLock\n\nuser, password = sys.argv[2], sys.argv[3]\nbase = pathlib.Path(os.environ[\"SYSTEMROOT\"]) / \"Temp\"\nicacls = os.path.join(os.environ[\"SYSTEMROOT\"], \"System32\", \"icacls.exe\")\ntag = f\"rw834-{os.getpid()}\"\nadvapi32 = ctypes.WinDLL(\"advapi32\", use_last_error=True)\nadvapi32.LogonUserW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]\nadvapi32.GetUserNameW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]\ntoken = wintypes.HANDLE()\nif not advapi32.LogonUserW(user, \".\", password, 3, 0, ctypes.byref(token)):\n    raise ctypes.WinError(ctypes.get_last_error())\n\n\ndef current_user() -\u003e str:\n    size = wintypes.DWORD(256)\n    buffer = ctypes.create_unicode_buffer(size.value)\n    advapi32.GetUserNameW(buffer, ctypes.byref(size))\n    return buffer.value\n\n\ndef as_lock_user(action):\n    if not advapi32.ImpersonateLoggedOnUser(token):\n        raise ctypes.WinError(ctypes.get_last_error())\n    try:\n        return action()\n    finally:\n        advapi32.RevertToSelf()\n\n\ndef plant(path: pathlib.Path, data: bytes, *, deletable: bool) -\u003e None:\n    path.write_bytes(data)\n    subprocess.run([icacls, str(path), \"/grant\", \"*S-1-1-0:(M)\"], check=True, capture_output=True)\n    if not deletable:\n        subprocess.run([icacls, str(path), \"/deny\", \"*S-1-1-0:(D)\"], check=True, capture_output=True)\n\n\ndef acquire(db: pathlib.Path) -\u003e str:\n    try:\n        with ReadWriteLock(db, is_singleton=False).write_lock(timeout=1):\n            pass\n    except Exception as error:\n        return f\"acquire failed: {type(error).__name__}: {error}\"\n    return \"acquired\"\n\n\ndef hot_journal(super_journal: pathlib.Path) -\u003e bytes:\n    name = os.fsencode(str(super_journal))\n    return name + struct.pack(\"\u003eII\", len(name), sum(name)) + bytes.fromhex(\"d9d505f920a163d7\")\n\n\nprint(\"planting account:\", current_user(), \"| lock account:\", as_lock_user(current_user))\n\ndb = base / f\"{tag}-empty.db\"\nas_lock_user(lambda: db.touch())\nplant(pathlib.Path(f\"{db}-wal\"), b\"\\0\" * 32, deletable=False)\nprint(\"empty database, undeletable -wal:\", as_lock_user(lambda: acquire(db)), \"| -wal still exists:\", pathlib.Path(f\"{db}-wal\").exists())\n\nfor deletable in (True, False):\n    db = base / f\"{tag}-tables-{deletable}.db\"\n    notes = base / f\"{tag}-notes-{deletable}.txt\"\n\n    def prepare() -\u003e None:\n        with sqlite3.connect(db) as connection:\n            connection.execute(\"CREATE TABLE application (value)\")\n        connection.close()\n        notes.write_text(\"keep\")\n\n    as_lock_user(prepare)\n    plant(pathlib.Path(f\"{db}-journal\"), hot_journal(notes), deletable=deletable)\n    print(f\"database with a table, {'deletable' if deletable else 'undeletable'} -journal naming the lock account's file:\",\n          as_lock_user(lambda: acquire(db)), \"| named file still exists:\", notes.exists(), \"| -journal still exists:\", pathlib.Path(f\"{db}-journal\").exists())\n```\n\nRecorded output on the VM:\n\n```text\nplanting account: bernat | lock account: fltester\nempty database, undeletable -wal: acquire failed: OperationalError: disk I/O error | -wal still exists: True\ndatabase with a table, deletable -journal naming the lock account's file: acquired | named file still exists: False | -journal still exists: False\ndatabase with a table, undeletable -journal naming the lock account's file: acquire failed: OperationalError: unable to open database file | named file still exists: True | -journal still exists: True\n```\n\n## Failure sequence\n\n```mermaid\nflowchart TD\n    P[\"other account: create lock.db-wal (or lock.db-journal) beside lock.db in C:/Windows/Temp, grant everyone modify, deny everyone DELETE\"] --\u003e C[\"lock user: ReadWriteLock(lock.db).write_lock(timeout=1)\"]\n    C --\u003e O[\"_open_lock_database checks the handle: regular file, no reparse point, header not WAL\"]\n    O --\u003e S[\"sqlite3.connect(lock.db) by path, then PRAGMA journal_mode=MEMORY\"]\n    S -- \"empty database, undeletable -wal\" --\u003e E1[\"SQLite cannot delete the leftover -wal: OperationalError disk I/O error on every acquire, timeout not consulted\"]\n    S -- \"database with a table, writable -journal\" --\u003e E2[\"SQLite treats the journal as hot, replays it and deletes the file its tail names, acquire succeeds\"]\n    S -- \"database with a table, read-only -journal\" --\u003e E3[\"OperationalError unable to open database file on every acquire\"]\n    classDef ok fill:#d8f3dc,stroke:#2d6a4f,color:#1b4332;\n    classDef bad fill:#ffd6d6,stroke:#c1121f,color:#5c0000;\n    classDef info fill:#cfe4ff,stroke:#1f6feb,color:#0b1f3a;\n    class P,C,O,S info;\n    class E1,E2,E3 bad;\n```\n\n## Evidence\n\nThe reproducer printed the three lines above on the VM: the undeletable `-wal` beside an empty database made `write_lock(timeout=1)` fail with `OperationalError: disk I/O error` and left the file in place; the writable journal beside a database with one table let the acquire succeed while the file the journal named, created by the lock account with the content `keep`, was gone along with the journal; the read-only journal made the acquire fail with `OperationalError: unable to open database file` and left both files. The review notes that the Windows branch of `_connect` is unchanged since #399, so the behavior is the same at `b831496b0273` and in 4.2.0. The scanner and the maintainers measured the same side-file effects on Linux for GHSA-v4x8-3wr5-3wq8.\n\n## Impact\n\nIn a directory such as `C:\\Windows\\Temp`, another local account turns every `read_lock()` and `write_lock()` on a `ReadWriteLock` database into an immediate `sqlite3.OperationalError`, for as long as its file stays. Callers that handle `Timeout` or `OSError` do not catch it, and the lock user cannot remove the file. With a lock database that holds a table and a journal the lock user can write, the lock user's process deletes one file of the other account's choosing, among the files the lock user may delete, and the acquire reports success. The lock's own database is not changed, nothing is read, and mutual exclusion between processes that acquire the lock holds.\n\n## Workarounds\n\n- Keep the `ReadWriteLock` database in a directory other accounts cannot create files in: `%LOCALAPPDATA%`, the per-user temporary directory (`%TEMP%` of a user session), or a directory with inheritance removed and only the owner, `SYSTEM` and `Administrators` granted. `C:\\Windows\\Temp` and `C:\\Users\\Public` do not qualify.\n- Treat `sqlite3.OperationalError: disk I/O error` on every acquire as a foreign `\u003cdatabase\u003e-wal` beside the database, which only its creator or an administrator can remove.\n\n## Patched version\n\n4.2.1.\n\nFix: https://github.com/tox-dev/filelock/pull/854\n\n## Credits\n\nFound by the maintainers while reviewing the fix for the POSIX form of this defect, GHSA-v4x8-3wr5-3wq8, reported by Anthropic's OSS Scanner on 15 October 2026 (review round 4, set D, finding F2).\n\n- 2026-10-15 23:08 UTC: report received (36 findings; the Windows side-file effect is not among them)\n- 2026-10-16 01:15 UTC: PR #834 opened, for the POSIX routes\n- 2026-10-16 08:31 UTC: finding identified in the maintainers' review of PR #834\n- 2026-10-16 22:43 UTC: draft advisory created",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "filelock",
+        "purl": "pkg:pypi/filelock"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.20.4"
+            },
+            {
+              "fixed": "4.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.20.4",
+        "3.21.0",
+        "3.21.1",
+        "3.21.2",
+        "3.22.0",
+        "3.23.0",
+        "3.24.0",
+        "3.24.1",
+        "3.24.2",
+        "3.24.3",
+        "3.25.0",
+        "3.25.1",
+        "3.25.2",
+        "3.28.0",
+        "3.29.0",
+        "3.29.1",
+        "3.29.2",
+        "3.29.3",
+        "3.29.4",
+        "3.29.5",
+        "3.29.6",
+        "3.29.7",
+        "3.30.0",
+        "3.30.1",
+        "3.30.2",
+        "3.30.3",
+        "3.31.0",
+        "3.31.1",
+        "3.31.2",
+        "3.32.0",
+        "3.32.2",
+        "3.32.3",
+        "3.32.4",
+        "3.32.5",
+        "3.32.6",
+        "3.32.7",
+        "4.0.0",
+        "4.0.1",
+        "4.0.10",
+        "4.0.11",
+        "4.0.12",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.0.9",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-9vhv-jxww-xfm5/GHSA-9vhv-jxww-xfm5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/security/advisories/GHSA-9vhv-jxww-xfm5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/pull/834"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/commit/5e3f2ec0c5fb17cb2635b60b2b68bc63ab81ca2d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tox-dev/filelock"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/releases/tag/4.2.1"
+    }
+  ]
+}

