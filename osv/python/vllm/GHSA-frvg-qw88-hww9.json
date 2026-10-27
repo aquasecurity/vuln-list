@@ -1,0 +1,179 @@
+{
+  "id": "GHSA-frvg-qw88-hww9",
+  "modified": "2026-10-27T15:10:41.344077240Z",
+  "published": "2026-10-27T14:45:53Z",
+  "aliases": [
+    "CVE-2026-94624",
+    "PYSEC-2026-4006"
+  ],
+  "summary": "vllm p2p never connected zmq_exhaustion",
+  "details": "### Summary\n\nWhen the `OffloadingConnector` uses `TieringOffloadingSpec` with a P2P secondary tier, an API client can submit many unique non-listening peer addresses through `kv_transfer_params.prefill`. vLLM keeps every never-established P2P session and its ZeroMQ sockets after the request finishes. On vLLM 0.26.0, 340 such peers filled the default ZeroMQ context socket quota; creating the next peer raised an uncaught `ZMQError`, terminated `EngineCore`, and shut down the API server. The path was reproduced with a normal API key and no access to the internal P2P listener.\n\n### Details\n\n#### Root cause\n\nIn vLLM 0.26.0, `P2PSecondaryTierManager.on_new_request()` reads the following request-controlled fields:\n\n```json\n{\n  \"kv_transfer_params\": {\n    \"prefill\": {\n      \"kv_request_id\": \"id\",\n      \"remote_host\": \"127.0.0.1\",\n      \"remote_port\": 49101\n    }\n  }\n}\n```\n\n`on_new_request()` calls `_get_or_create_session(peer_id)`. This calls `ZmqTransport.connect()`, creates a `P2PSession`, and stores it in `_sessions` before the asynchronous ZeroMQ connection has been established.\n\n`ZmqTransport._open_connection()` creates a DEALER, enables a libzmq monitor, creates a PAIR socket for that monitor, calls `dealer.connect()`, and immediately stores the resulting `ZmqConnection` in `_connections`. Returning from `dealer.connect()` does not prove that the peer is reachable.\n\nThe monitor subscribes only to `zmq.EVENT_DISCONNECTED`. A peer that never accepts the initial connection produced `EVENT_CONNECT_DELAYED`, `EVENT_CONNECT_RETRIED`, and `EVENT_CLOSED`, but no `EVENT_DISCONNECTED` during a 60-second observation. The production monitor therefore never calls `mark_dead()`, and `ZmqConnection.alive` remains true.\n\nRequest completion calls `session.finish_request()`, but does not close or remove the peer session. The manager reaps only a session for which `session.connected and not session.alive` is true. A never-established peer remains `connected=True`, `alive=True`, and `ready=False`. There is no establishment deadline, idle eviction, or limit on pending or total peers.\n\nEach unique retained peer uses about three sockets in the same ZeroMQ context: the DEALER, the monitor endpoint created by libzmq, and the PAIR monitor client. With the measured default `MAX_SOCKETS=1023`, 340 peers use approximately 1,020 sockets in addition to the local ROUTER. The next peer fails while creating its monitor PAIR. The exception escapes through `on_new_request()` and the scheduler into the EngineCore loop:\n\n```text\nP2PSecondaryTierManager._get_or_create_session()\n  -\u003e ZmqTransport.connect()\n  -\u003e ZmqTransport._open_connection()\n  -\u003e monitor_sock = self._zmq_ctx.socket(zmq.PAIR)\n  -\u003e zmq.error.ZMQError: Too many open files\n  -\u003e EngineDeadError\n```\n\nThe process open-files limit was 65,536. The EngineCore had about 1,215 file descriptors at the failure point, so the failure was not the operating-system FD limit.\n\n#### Boundary and controls\n\nEach row below used a fresh vLLM process and pre-generated unique non-listening loopback ports.\n\n| Test | Result |\n|---|---|\n| Default `MAX_SOCKETS=1023`, 340 unique peers | 340 HTTP 200 responses; 340 active peers; service healthy |\n| Default limit, 344 unique peers, concurrency 4 | 340 HTTP 200 and 4 HTTP 500 responses; EngineCore and API exited |\n| Default limit, 344 unique peers, concurrency 1 | Same 340-peer ceiling and service exit |\n| Same endpoint repeated 512 times | 512 HTTP 200 responses; one active peer; service healthy |\n| 512 requests without P2P parameters | 512 HTTP 200 responses; no active peers; service healthy |\n\nA diagnostic A/B changed only the context `MAX_SOCKETS` value. Raising it from 1,023 to 2,048 moved the last fully successful point from 340 to 682 peers. The 683rd peer then raised the same `ZMQError` and terminated the service. The approximately 2.01x movement in the boundary identifies the ZeroMQ context quota as the exhausted resource.\n\nThe failure runs used logging-only instrumentation around `_open_connection()` to record the context limit, peer count, and process FD count. It did not add or close any ZeroMQ socket and re-raised the original exception.\n\n#### Related public work\n\n[PR #47843](https://github.com/vllm-project/vllm/pull/47843) is an open, unmerged proposal that identifies client-supplied P2P peer addresses as an SSRF risk and proposes API sanitization plus a configured peer allowlist. Those changes would block this public API trigger, but the PR does not add a connection deadline, session cleanup, or a capacity limit for never-established peers. This report adds the deterministic resource-exhaustion and service-exit impact of the retained state.\n\n[PR #49823](https://github.com/vllm-project/vllm/pull/49823) fixes cleanup and reconnection after a connection has been marked dead. A peer that never establishes does not receive the subscribed `EVENT_DISCONNECTED` event, so it never enters that dead-state cleanup path.\n\n### Impact\n\nThis is uncontrolled resource consumption leading to denial of service. An attacker needs network access to an OpenAI-compatible inference endpoint and a normal API key when `--api-key` is enabled. The attacker does not need access to the internal P2P control or data ports and does not need any peer to answer.\n\nOnly deployments that explicitly enable `OffloadingConnector`, `TieringOffloadingSpec`, and a P2P secondary tier are affected. Repeating a cheap one-token request with unique non-listening endpoints steadily consumes scheduler and ZeroMQ resources. In the tested default context, about 341 requests were enough to terminate EngineCore and stop all inference on the instance until restart. Confidentiality and integrity were not affected; the demonstrated impact is availability loss.\n\nThis advisory was fixed in [MR51504](https://github.com/vllm-project/vllm/pull/51504).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.32.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.30.0",
+        "0.31.0",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-frvg-qw88-hww9/GHSA-frvg-qw88-hww9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-frvg-qw88-hww9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-94624"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/51504"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/93d2cab35e8ae66bbaa1dea1c077986d5a79eb80"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pypa/advisory-database/tree/main/vulns/vllm/PYSEC-2026-4006.yaml"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/v1/kv_offload/tiering/p2p/control/zmq.py#L240-L260"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/v1/kv_offload/tiering/p2p/manager.py#L667-L677"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.32.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/vllm-through-0.29.0-denial-of-service-via-unbounded-p2p-kv-offloading-sessions"
+    }
+  ]
+}

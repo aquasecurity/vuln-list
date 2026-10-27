@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-x4rv-c3wx-4cr8",
+  "modified": "2026-10-27T15:47:25.081805715Z",
+  "published": "2026-10-27T15:39:18Z",
+  "aliases": [
+    "CVE-2026-114620"
+  ],
+  "summary": "Authlib: Unvalidated request_uri fetch in JWT-secured authorization request (JAR) leading to SSRF",
+  "details": "### Summary\n\nAuthlib's RFC 9101 (JAR) extension passes the attacker-controlled `request_uri` authorization parameter straight to the `get_request_object()` fetch hook with no validation, at a pre-authentication endpoint. Authlib already defines the pre-registration allowlist for this (`request_uris` client metadata and `require_request_uri_registration` server metadata) but the extension never consults it, and both docstrings instruct integrators to implement the hook as an unrestricted `requests.get(request_uri)`. Deployments following the documented pattern get an unauthenticated SSRF primitive. \n### Details\n\nVerified against authlib 1.7.2 and current `main`. All line numbers below are from `authlib/oauth2/rfc9101/authorization_server.py`.\n\nThe extension registers itself on the `before_get_authorization_grant` hook (lines 62-65), so it runs on every authorization request before any user or client authentication. `support_request_uri` defaults to `True` (line 58).\n\nThe only gate before the sink is that `client_id` names an existing client (lines 91-103). A `client_id` is a public, non-secret identifier.\n\nThe sink at line 159 forwards the raw parameter with no scheme, host, or allowlist check:\n\n```python\ndef _get_raw_request_object(self, request: OAuth2Request) -\u003e str:\n    if \"request_uri\" in request.payload.data:\n        raw_request_object = self.get_request_object(\n            request.payload.data[\"request_uri\"]\n        )\n        if not raw_request_object:\n            raise InvalidRequestUriError(state=request.payload.state)\n```\n\n`get_request_object` is abstract (line 213, `raise NotImplementedError()` at line 225), so authlib itself performs no outbound request. The defect is that authlib supplies unvalidated attacker input to that extension point and then documents the insecure implementation twice — in the class docstring (lines 34-38) and in the hook's own docstring (lines 218-223):\n\n```python\ndef get_request_object(self, request_uri: str):\n    try:\n        return requests.get(request_uri).text\n    except requests.Exception:\n        return None\n```\n\nTwo points sharpen this beyond a generic documentation issue:\n\n- **The allowlist already exists and is ignored.** Authlib validates `request_uris` as client metadata (`authlib/oauth2/rfc7591/claims.py:319`) and `require_request_uri_registration` as server metadata (`authlib/oauth2/rfc8414/models.py:263`). The `rfc9101` package contains zero references to either name, so the pre-registration model is never enforced at the point of use.\n- **RFC 9101 §10.4.1 asks for controls that are absent.** It states the server should \"a) check that the value of the `request_uri` parameter does not point to an unexpected location, b) check that the media type of the response is `application/oauth-authz-req+jwt`, c) implement a timeout for obtaining the content of `request_uri`, and d) not perform recursive GET on the `request_uri`.\" The extension implements none of these and the documented example implements none of them either.\n\nThe two failure paths are distinguishable, which supplies the inference channel for a blind SSRF: a falsy fetch result raises `InvalidRequestUriError` (`invalid_request_uri`, lines 162-163), while a successful fetch of non-JWT content raises `InvalidRequestObjectError` (`invalid_request_object`, line 186).\n\n### PoC\n\nThis demonstrates the library-level defect with no network egress required: it shows the unvalidated URI reaching the fetch hook pre-authentication.\n\n```bash\npython -m venv .venv \u0026\u0026 .venv/bin/pip install authlib\n```\n\n```python\nfrom authlib.oauth2.rfc6749.requests import BasicOAuth2Payload, OAuth2Request\nfrom authlib.oauth2.rfc9101 import JWTAuthenticationRequest\n\nreached = []\n\n\nclass Extension(JWTAuthenticationRequest):\n    def get_request_object(self, request_uri):\n        reached.append(request_uri)  # the docstring puts requests.get(request_uri) here\n        return None\n\n    def resolve_client_public_key(self, client):\n        return {\"keys\": []}\n\n    def get_server_metadata(self):\n        return {}\n\n    def get_client_require_signed_request_object(self, client):\n        return False\n\n\nclass AuthorizationServer:\n    def query_client(self, client_id):\n        return object()\n\n\nuri = \"http://169.254.169.254/latest/meta-data/\"\nrequest = OAuth2Request(\"GET\", \"https://as.example/authorize\")\nrequest.payload = BasicOAuth2Payload({\"client_id\": \"demo\", \"request_uri\": uri})\n\ntry:\n    Extension().parse_authorization_request(AuthorizationServer(), request)\nexcept Exception as exc:\n    print(\"error:\", type(exc).__name__)\n\nprint(\"fetch hook received:\", reached)\n```\n\nOutput on authlib 1.7.2:\n\n```text\nerror: InvalidRequestUriError\nfetch hook received: ['http://169.254.169.254/latest/meta-data/']\n```\n\nAgainst a deployment that used the docstring implementation, the equivalent unauthenticated request is:\n\n```text\nGET /authorize?response_type=code\u0026client_id=demo\u0026request_uri=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F\n```\n\nReturning a fetched-but-non-JWT body instead of `None` in the snippet above yields `InvalidRequestObjectError` rather than `InvalidRequestUriError`, showing the oracle that distinguishes a reachable target from an unreachable one.\n\n### Impact\n\nServer-side request forgery, reachable without authentication by anyone who knows a valid `client_id`. In a deployment that implemented `get_request_object` as documented, an attacker can make the authorization server issue GET requests to arbitrary URLs: internal-only services, cloud metadata endpoints such as `169.254.169.254`, and side-effectful internal GET routes. The `invalid_request_uri` versus `invalid_request_object` split, together with response timing, provides an oracle for internal host and port discovery. RFC 9101 §10.4.1 additionally notes the DoS and recursive-lookup risks that the missing timeout and recursion checks leave open.\n\nResponse bodies are consumed as a JWT and never reflected, so this is a blind primitive rather than direct data exfiltration. Because the fetch executes in integrator code, deployments that already allowlist inside their override are unaffected — but authlib provides no hook to make that the default, ships `support_request_uri=True`, and its documentation steers integrators to the unsafe implementation, so the insecure outcome is the expected one.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.6.0"
+            },
+            {
+              "fixed": "1.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.6.0",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.8.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-x4rv-c3wx-4cr8/GHSA-x4rv-c3wx-4cr8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-x4rv-c3wx-4cr8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114620"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/pull/949"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/6563f6f7a8c2f71d2f85ee7511d72a4fbae3acc0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/891e3f10ae5989176211f8be35dcc7cd40aa92c6"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.9.0"
+    }
+  ]
+}

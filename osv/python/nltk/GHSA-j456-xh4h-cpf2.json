@@ -1,0 +1,129 @@
+{
+  "id": "GHSA-j456-xh4h-cpf2",
+  "modified": "2026-10-27T15:00:05.453940749Z",
+  "published": "2026-10-27T14:50:30Z",
+  "aliases": [
+    "CVE-2026-109956"
+  ],
+  "summary": "NLTK: WekaClassifier passes an unvalidated caller-controlled model path to the weka JVM, bypassing nltk.pathsec containment",
+  "details": "## Summary\n`WekaClassifier` in NLTK passes a caller-controlled model file path to the weka Java VM without any `nltk.pathsec` validation. `WekaClassifier.train` puts the caller's `model_filename` verbatim into the weka argv `[\"-d\", model_filename, ...]` (weka *writes* the trained model there), and `WekaClassifier._classify_many` puts `self._model` into `[\"-l\", self._model, ...]` (weka *reads* it). Under `nltk.pathsec.ENFORCE=True` (the default on current HEAD), NLTK's stated invariant — established by advisory CVE-2026-81726 / GHSA-8mgp-746c-j5xp — is that caller-controlled model-artifact paths must be bounded to the allowed NLTK data roots before any native tool opens them. `WekaClassifier` is the one `java()`-based tool wrapper that skips this entirely, giving an untrusted workflow arbitrary-location file **write** (`-d`) and an arbitrary file **read/parse oracle** (`-l`), defeating pathsec containment.\n\nThis is a standalone, unfixed variant of the same class as CVE-2026-81726, on a code path the CVE-2026-81726 fix never touched. That advisory enumerates 6 functions (`TransitionParser.train`, `TransitionParser.parse`, `AveragedPerceptron.save`, `AveragedPerceptron.load`, `PerceptronTagger.save_to_json`, `save_maxent_params`) — `WekaClassifier` is not among them, and weka.py contains no `validate_tool_path`/`validate_model_resource` at all.\n\n## Root Cause\n`WekaClassifier.train(cls, model_filename, ...)` builds `cmd = [javaclass, \"-d\", model_filename, \"-t\", train_filename]` (nltk/classify/weka.py:256) and `WekaClassifier._classify_many` builds `[..., \"-l\", self._model, \"-T\", \u003cstaged\u003e, ...]` (weka.py:131-133); `self._model` is stored unvalidated in `__init__` (weka.py:108-110). Only the internally-generated `train.arff`/`test.arff` are staged via `make_staging_dir`; the model path is passed as-is. `nltk.internals.java()` (internals.py:388-431) validates the classpath (`_verify_jar_sandbox`), the JVM launcher options (`_validate_java_options`, the CVE-2026-12841 fix), the main-class token `cmd[0]`, and rejects `@argfile` tokens in any position — but it explicitly permits program arguments starting with `-` and never inspects the interior of a program-arg path value. So `-d \u003cpath\u003e` / `-l \u003cpath\u003e` flow unchecked to `subprocess.Popen(final_cmd, shell=False)` and the weka JVM performs an unbounded native open/write on the caller-chosen path.\n\nSibling wrappers prove the intended pattern: `CRFTagger.train`/`set_model_file` call `validate_tool_path` (crf.py:134,300); `MaltParser.generate_malt_command` validates `-i`/`-o` via `validate_tool_path` (malt.py:340,344), its model via `validate_model_resource` (malt.py:326) and `working_dir` via `validate_path` (malt.py:206). weka.py already uses pathsec elsewhere (`validate_path` for WEKAHOME, `pathsec_open` for ARFF writes) but never for the model path.\n\n## Impact\nUnder `pathsec.ENFORCE=True` (default on HEAD), an untrusted workflow that chooses the weka model save/load path obtains:\n- Arbitrary-location file **write** via `-d` — overwrite or create a file at an attacker-chosen absolute or `..`-traversal path outside the allowed NLTK data roots (content constrained to weka's serialized-model format; the target choice is the integrity impact). This corrupts/clobbers arbitrary chosen files.\n- Arbitrary file **read/parse oracle** via `-l` — weka loads an out-of-root path as a model, yielding an existence/parse differential (file content is not echoed back → confidentiality impact is limited).\n\nThis defeats the pathsec containment advisory CVE-2026-81726 promises, at the same privilege level / threat model that advisory was accepted under.\n\n## Proof of Concept\n```python\nimport nltk.pathsec as ps; ps.ENFORCE = True\nfrom nltk.classify.weka import WekaClassifier\n# write-side: model written OUTSIDE any allowed NLTK data root (refused for CRFTagger, allowed here)\nWekaClassifier.train(\"/tmp/outside_sandbox/evil.model\",\n                     [({\"a\": 1}, \"pos\"), ({\"a\": 0}, \"neg\")])\n# read-side: -l opens an arbitrary path\nclf = WekaClassifier(fmt, \"/home/victim/secret.model\")\nclf.classify_many([{\"a\": 1}])\n```\nThe argv construction — the vulnerable step — is confirmed without weka installed (see Bypass Evidence); a configured weka.jar is needed only to observe the JVM's actual file I/O.\n\n## Attack Chain\n1. **Entry.** Action: an app running with `pathsec.ENFORCE=True` lets an untrusted workflow choose the weka model path and calls `WekaClassifier.train(\"../../../home/victim/x\", featuresets)` (write) or `WekaClassifier(fmt, \"/home/victim/secret.model\").classify_many(...)` (read). Guard: none — plain classmethod/constructor parameter (weka.py:230,108-110). Bypass proof: grep shows weka.py uses no `validate_tool_path`/`validate_model_resource`/`validate_tool_dir` (NONE).\n2. **Command build.** Action: the path is placed into `cmd = [javaclass, \"-d\", model_filename, \"-t\", train_filename]` (weka.py:256) / `[\"-l\", self._model, ...]`. Guard: only the internally-generated `train.arff` is staged via `make_staging_dir`; the model path is passed as-is. Bypass proof: runtime capture yielded `['weka.classifiers.bayes.NaiveBayes', '-d', '/tmp/outside_sandbox_weka.model', '-t', '\u003cstaged\u003e/train.arff']` — the raw out-of-root path is `cmd[2]`.\n3. **java() sink.** Action: `java(cmd, classpath=_weka_classpath, ...)` → `subprocess.Popen(final_cmd)` (internals.py:431). Guard: `java()` validates classpath, JVM `options`, `cmd[0]`, and rejects `@argfile` tokens. Bypass proof: none of these inspect the `-d`/`-l` program-arg value; internals.py explicitly documents that program args after the main class may start with `-`, and the path is neither `cmd[0]` nor an `@`-token, so every `java()` gate passes. Negative control: the same path through `validate_tool_path(..., for_write=True, must_exist=False)` raises `PermissionError`.\n4. **Impact.** Action: the weka JVM opens the path outside the allowed roots → arbitrary-location write (`-d`) / parse-existence oracle (`-l`). Guard: pathsec is never consulted (no `validate_tool_path`, no `pathsec_open`). Bypass proof: the directly-analogous sibling `CRFTagger.train` calls `validate_tool_path(model_file, must_exist=False)` (crf.py:300); weka does not, and commit `ee6d6138` hardened weka's other sinks (scratch files, WEKAHOME jar) while leaving the model path unvalidated.\n\n## Bypass Evidence\n- Negative control (guard is real): `validate_tool_path(\"/tmp/outside_sandbox_weka.model\", for_write=True, must_exist=False)` → `PermissionError`; `validate_tool_path(\"../../../home/victim/.ssh/authorized_keys\", ...)` → `PermissionError`.\n- Sink reached unvalidated (guard absent): captured write-side argv `['weka.classifiers.bayes.NaiveBayes', '-d', '/tmp/outside_sandbox_weka.model', '-t', '\u003cstaged\u003e/train.arff']` and read-side `[..., '-l', '/home/victim/secret.model', '-T', '\u003cstaged\u003e/test.arff', '-p', '0']`.\n- Version: `git show v3.10.3:nltk/classify/weka.py` contains both the `-d` model-path build (line 235) and the `-l` read, and NO `validate_tool_path`.\n\n## Affected Versions\n`\u003c= 3.10.3` (present on the latest release tag v3.10.3 and on HEAD `c06cd264`). No published fix has ever targeted the weka `-d`/`-l` model path; commits after v3.10.3 (`ee6d6138`, `92aeada6`, `a9752559`) touched weka.py for other sinks but did not add model-path validation.\n\n## Suggested Fix\nBefore building the `-d`/`-l`/`-T` command, validate the model path with pathsec, mirroring `CRFTagger`/`MaltParser`:\n```python\nvalidate_tool_path(model_filename, context=\"WekaClassifier.train\", for_write=True, must_exist=False)\nvalidate_tool_path(self._model, context=\"WekaClassifier._classify_many\")\n```\n\n\n---\nReported by **zx (Jace)** — GitHub: @manus-use\n\n## Fix status (2026-09-28)\n\nStatus: MERGED on develop (unreleased; v3.10.3 of 2026-08-12 predates the fix).\n\nPR: #3863 \"Bound the WekaClassifier model path to the pathsec data roots\", merged 2026-09-06, merge commit bc2878725 on develop. Fix commit: 6a1760629.\n\nProbe: nltk/test/unit/security_probes/ghsa_j456_xh4h_cpf2.py, added by PR #3905 \"Add GHSA-j456 live probe; expand the GHSA-8mgp probe attack set\" (commit a96715264, merged 2026-09-20, merge commit 84d987bf8); verdict on develop 2fa3f48fe: FIXED (WekaClassifier -l and -d refuse out-of-root model paths).\n\nRelease: none yet; no release tag contains 6a1760629.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-j456-xh4h-cpf2/GHSA-j456-xh4h-cpf2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-j456-xh4h-cpf2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3863"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/6a17606293fe9d3ea1006f99dd3fed2e2b25d519"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

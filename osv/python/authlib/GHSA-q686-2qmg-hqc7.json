@@ -1,0 +1,127 @@
+{
+  "id": "GHSA-q686-2qmg-hqc7",
+  "modified": "2026-10-27T15:47:24.789132573Z",
+  "published": "2026-10-27T15:38:53Z",
+  "aliases": [
+    "CVE-2026-114619"
+  ],
+  "summary": "Authlib: OpenID implicit grant checks raw scope instead of allowed scope before issuing ID tokens",
+  "details": "## Report metadata\n\n| Field | Value |\n| --- | --- |\n| Package | `authlib` (PyPI, `pkg:pypi/authlib`) |\n| Repository | https://github.com/authlib/authlib |\n| Component | `authlib.oidc.core.grants.implicit.OpenIDImplicitGrant.validate_authorization_request` |\n| Vulnerability class | Authorization bypass: a client's scope restriction is bypassed for OpenID Connect ID token issuance |\n| Verified against | `c529a61af40e3efe05286140e00fbdced07d7987` (v1.8.0). Earlier releases were not checked. |\n| API surface | Public API (`OpenIDImplicitGrant`, registered with `server.register_grant(...)`) |\n| Affected in default configuration | Yes. No non-default option is needed once `OpenIDImplicitGrant` is registered. Client metadata decides exposure: Authlib's standard `ClientMixin` checks response type and scope independently, so a client can be permitted `id_token` responses without being allowed the `openid` scope. |\n\n## Summary\n\n`OpenIDImplicitGrant.validate_authorization_request()` first runs the parent `ImplicitGrant` validation, which filters the requested scope through `client.get_allowed_scope()` and stores the result in `request.scope`. It then decides whether this is an OpenID request by checking the raw, client-supplied `request.payload.scope` instead of that filtered value. A client that is allowed `profile` but not `openid` can therefore request `scope=openid profile`, pass the check, and receive a signed ID token (with `sub` and profile claims) once the user consents. This happens even when Authlib's built-in, scope-filtering `BearerTokenGenerator` is in use.\n\nThe tainted input is the authorization request's `scope` parameter. The OAuth client fully controls it, and the client is the very party the scope restriction is meant to constrain. Any registered client can add `openid` to its request if it is permitted an `id_token` or `id_token token` response type and its allowed scopes exclude `openid` but include a claim-bearing scope such as `profile`.\n\nSibling paths treat the same client correctly, which suggests the raw-scope check is a bug rather than intended behaviour:\n\n- `ImplicitGrant.validate_authorization_request()` -\u003e filters the requested scope through `client.get_allowed_scope()` into `request.scope` (safe, [`authlib/oauth2/rfc6749/grants/implicit.py` lines 141-147](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oauth2/rfc6749/grants/implicit.py#L141-L147))\n- `OpenIDImplicitGrant.validate_authorization_request()` -\u003e **checks the raw `request.payload.scope` (unsafe, [`authlib/oidc/core/grants/implicit.py` line 72](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L72))**\n- `UserInfoEndpoint` -\u003e rejects the same client's access token with 403 `insufficient_scope` (safe; observed during verification, line not recorded)\n- OIDC authorization code flow -\u003e issues no `id_token` for the same client (safe; observed during verification, line not recorded)\n\n## Impact\n\nA registered OAuth client that the operator has excluded from the `openid` scope can get an OpenID Connect ID token for any user who logs in and approves its authorization request. During verification the provider returned an RS256-signed ID token carrying `iss`, `aud` (the requesting client), `nonce`, `auth_time`, `at_hash`, `sub` and `name`, while the granted scope was only `profile`. A consent page built the way the Authlib docs show lists only `profile`, so the user is not shown that an identity token will be issued.\n\nWithout this bug, the same request fails with `InvalidScopeError` (\"Missing 'openid' scope\") because the client's resolved scope does not include `openid`. The new capability is the ID token itself: a signed assertion of the user's identity (`sub`) plus claims from the client's other allowed scopes. Gating that token is exactly what the `openid` scope is for. The access token stays restricted when the built-in token generator is used: Authlib's `UserInfoEndpoint` rejects it with 403 `insufficient_scope`.\n\n**Scoring note:** we did not compute a CVSS score. An initial triage rated this High. After dynamic verification we assess practical severity as closer to Medium, because:\n\n1. The attacker must be a registered client that is permitted `id_token` response types.\n2. The user must log in and consent.\n3. The ID token's `aud` is the attacking client.\n\nTwo kinds of deployment are not affected:\n\n- Deployments that use only the OIDC authorization code flow. During verification, that flow issued no ID token for the same client.\n- Deployments where every client permitted an `id_token` or `id_token token` response type is also allowed the `openid` scope.\n\n## Preconditions\n\n1. The authorization server registers `OpenIDImplicitGrant` (or a subclass), e.g. `server.register_grant(MyOpenIDImplicitGrant)`. The vulnerable method runs on every OIDC implicit authorization request.\n2. A client's metadata permits an OIDC implicit response type (`id_token` or `id_token token`). Nothing in Authlib ties this to the `openid` scope. The standard SQLAlchemy `ClientMixin` checks response type and scope independently, and it filters requested scopes against the client's allowed scopes at [`authlib/integrations/sqla_oauth2/client_mixin.py:124-129`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/integrations/sqla_oauth2/client_mixin.py#L124-L129).\n3. That client's allowed scopes exclude `openid` but include another claim-bearing scope, such as `profile`.\n4. The attacker controls that registered client and sends an authorization request that adds `openid` to otherwise allowed scopes (e.g. `scope=openid profile`), with a `nonce`.\n5. A user logs in and approves the request.\n6. Branch condition: the raw `request.payload.scope` contains `openid` while the filtered `request.scope` does not. So `is_openid_scope(self.request.payload.scope)` is true at `implicit.py:72` and no `InvalidScopeError` is raised.\n\nNo non-standard usage, monkey-patching or unusual configuration is needed: this is the public grant used as intended. Keeping a client's response types and allowed scopes in sync is not documented as the integrator's responsibility. The parent grant stores the filtered `request.scope` specifically so that authorization decisions use it. We did not capture a link to the relevant Authlib docs page, but the verification built its consent page the way those docs show.\n\n## Data flow\n\n1. **Source**: the OAuth client controls the authorization request's `scope` parameter, e.g. `GET /authorize?response_type=id_token%20token\u0026client_id=c\u0026redirect_uri=https%3A%2F%2Fc%2Fcb\u0026scope=openid%20profile\u0026nonce=n`. The raw value remains available as `request.payload.scope`.\n2. **Propagation**: `ImplicitGrant.validate_authorization_request()` filters the requested scope through `client.get_allowed_scope()` and stores the result in `request.scope` (here `'profile'`). `request.payload.scope` still holds the raw `openid profile` ([`authlib/oauth2/rfc6749/grants/implicit.py:141-147`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oauth2/rfc6749/grants/implicit.py#L141-L147)).\n3. **Sink**: `OpenIDImplicitGrant.validate_authorization_request()` uses the raw value to decide whether this is an OpenID request: `if not is_openid_scope(self.request.payload.scope):` ([`authlib/oidc/core/grants/implicit.py:72`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L72)). The injected `openid` satisfies the check, so the method returns the redirect URI instead of raising `InvalidScopeError` ([`authlib/oidc/core/grants/implicit.py:70-84`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L70-L84)).\n4. **Reachability**: `OpenIDImplicitGrant` is the public grant that serves OIDC implicit authorization requests. After the user consents, `create_granted_params()` and `process_implicit_token()` issue the ID token and user claims ([`authlib/oidc/core/grants/implicit.py:112-129`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L112-L129), [`authlib/oidc/core/grants/implicit.py:132-169`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L132-L169)).\n\n## Vulnerable code\n\n`authlib/oidc/core/grants/implicit.py`, lines 70-84 at `c529a61af40e3efe05286140e00fbdced07d7987` (an excerpt; `...` marks code left out of the captured snippet):\n\n```python\nredirect_uri = super().validate_authorization_request()  # safe: parent grant sets the filtered request.scope\nif not is_openid_scope(self.request.payload.scope):  # \u003c-- sink (line 72): raw, client-supplied scope\n    raise InvalidScopeError(\"Missing 'openid' scope\", ...)\n...\nreturn redirect_uri\n```\n\n## Reproduction\n\nVerified two ways on Authlib `c529a61af40e3efe05286140e00fbdced07d7987` (v1.8.0):\n\n- a pytest PoC using the Flask test client\n- a standalone Flask OpenID Provider on localhost, driven with `curl`\n\nThe Python and Flask versions were not recorded.\n\nSetup: a client registered with `scope='profile'` only (no `openid`) and response types `id_token` / `id_token token`. It uses Authlib's built-in SQLAlchemy `ClientMixin` and the built-in scope-filtering `BearerTokenGenerator`.\n\n1. The client sends an authorization request with `scope=openid profile` and a `nonce`.\n2. `ImplicitGrant` sets `request.scope='profile'`. A consent page built the way the docs show displays only `profile`.\n3. `OpenIDImplicitGrant.validate_authorization_request()` checks the raw `request.payload.scope` at line 72, so the request passes.\n4. After the user approves, the provider returns an RS256-signed ID token with `iss`, `aud` (the client), `nonce`, `auth_time`, `at_hash`, `sub` and `name`, while the granted scope is `profile`. The ID token's signature verified against the provider's JWKS.\n\nControls run during verification:\n\n- The same request without `openid` returns `invalid_scope` (\"Missing 'openid' scope\").\n- Authlib's `UserInfoEndpoint` rejects this client's access token with 403 `insufficient_scope`.\n- The OIDC authorization code flow for the same client issues no `id_token`.\n\nThe sketch below shows the request shape against Authlib's Flask OIDC test app. The verification's own test script is not included here.\n\n```python\n# Client metadata: scope='profile' (no openid), response_types=['id_token token'].\nrv = client.get('/authorize?response_type=id_token%20token\u0026client_id=client-id\u0026redirect_uri=https%3A%2F%2Fclient.test%2Fauthorized\u0026scope=openid%20profile\u0026nonce=n')\n# after the user grants consent:\nassert 'id_token=' in rv.headers['Location']  # should have been rejected: openid is not an allowed scope\n```\n\n- **Expected:** `InvalidScopeError` / `invalid_scope` (\"Missing 'openid' scope\"), because the client's resolved allowed scope (`request.scope == 'profile'`) does not include `openid`.\n- **Actual:** after consent, the redirect carries a signed ID token (including `sub` and `name`) while the granted scope is `profile`.\n\n## Suggested remediation\n\nDecide whether to issue OpenID tokens from the scope the grant actually authorized, never from the raw requested scope. The authorized scope is `self.request.scope`, which the parent grant has already filtered through `client.get_allowed_scope()`.\n\n```diff\n redirect_uri = super().validate_authorization_request()\n-if not is_openid_scope(self.request.payload.scope):\n+if not is_openid_scope(self.request.scope):\n     raise InvalidScopeError(\"Missing 'openid' scope\", ...)\n```\n\nDuring verification, this one-line change at line 72 blocked the exploit, and the existing OIDC implicit/hybrid tests still passed (23 passed).\n\nThe same rule should hold for the rest of OIDC issuance. `create_granted_params()` ([`authlib/oidc/core/grants/implicit.py:112-129`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L112-L129)) passes the raw `payload.scope` to `generate_token`. It should pass `self.request.scope` instead.\n\nNotes:\n\n- **Adjacent raw-scope use, worth fixing in the same change:** `create_granted_params()` hands the raw `payload.scope` to `generate_token`. So a deployment whose custom token generator does not filter scope also grants the client access-token scopes it is not allowed; verification noted `openid` and `email`. Authlib's built-in `BearerTokenGenerator` re-filters the access-token scope, so this only shows up with a non-filtering generator. That re-filtering does not stop the ID token.\n- **Other paths through the same raw value:** beyond `create_granted_params()`, we did not audit every scope read in `process_implicit_token()` ([`authlib/oidc/core/grants/implicit.py:132-169`](https://github.com/authlib/authlib/blob/c529a61af40e3efe05286140e00fbdced07d7987/authlib/oidc/core/grants/implicit.py#L132-L169)), or in other OIDC grants such as the hybrid grant. Whether they share the pattern is not verified.\n- **Already safe, no change needed:**\n  - the scope filtering in the parent `ImplicitGrant` and in `ClientMixin`\n  - `UserInfoEndpoint`, which rejects this client's access token with 403 `insufficient_scope`\n  - the OIDC authorization code flow, which issues no ID token for this client\n\nSuggested regression test, alongside the existing Flask OIDC implicit-grant tests:\n\n1. Register a client with `scope='profile'` and `response_types=['id_token token']`.\n2. Send an authorization request with `scope=openid profile` and a `nonce`, and approve it.\n3. Assert that the response is an `invalid_scope` error (\"Missing 'openid' scope\") and that the redirect contains no `id_token`.\n\nA second case should use a token generator that does not filter scope, and assert that the issued access token carries only the client's allowed scopes.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.9.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1",
+        "0.10",
+        "0.11",
+        "0.12",
+        "0.12.1",
+        "0.13",
+        "0.14",
+        "0.14.1",
+        "0.14.2",
+        "0.14.3",
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "0.1rc0",
+        "0.2",
+        "0.2.1",
+        "0.3",
+        "0.4",
+        "0.4.1",
+        "0.5",
+        "0.5.1",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.8.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-q686-2qmg-hqc7/GHSA-q686-2qmg-hqc7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-q686-2qmg-hqc7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114619"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/pull/945"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/e3bd41cb29dcfee434453b135ffb487884baeedf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.9.0"
+    }
+  ]
+}

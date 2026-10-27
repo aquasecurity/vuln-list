@@ -1,0 +1,100 @@
+{
+  "id": "GHSA-6hp3-vr39-rqw8",
+  "modified": "2026-10-27T13:45:03.535023414Z",
+  "published": "2026-10-27T13:30:10Z",
+  "aliases": [
+    "CVE-2026-48705"
+  ],
+  "summary": "MONAILabel Server Crash and Silent Inference Corruption via Crafted DICOM (pydicom DS/IS Validation Bypass)",
+  "details": "### Summary\n\nAn unauthenticated remote attacker can crash a running MONAILabel server or silently corrupt its medical AI inference results by uploading a single crafted DICOM file (~132 KB) via the REST API. The vulnerability stems from pydicom's lack of validation for Decimal String (DS) and Integer String (IS) DICOM Value Representations, which allows NaN and infinity values to pass through MONAI's PydicomReader and propagate through the entire spatial transform and ML inference pipeline.\n\nNo authentication is required for the default MONAILabel REST API. The attacker needs only network access to the server (default port 8000).\n\n**Severity:** CVSS 3.1: 8.7 HIGH  \n**CVSS Vector:** CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:N/I:H/A:L  \n**CWE:** CWE-20 (Improper Input Validation) → CWE-682 (Incorrect Calculation)\n\n### Details\n\n**Root Cause — Layer 1: pydicom accepts invalid VR values**\n\npydicom's `DSfloat.__new__()` calls Python's `float(val)`, which silently accepts \"NaN\", \"inf\", and \"-inf\". The DICOM standard (PS3.5 Table 6.2-1) defines DS as digits 0-9, +, -, ., e only. NaN and inf are not valid DS values. The `is_valid_ds()` check only runs in RAISE validation mode, which is NOT the default. The default mode is WARN, which still returns the invalid value.\n\n```python\n\u003e\u003e\u003e from pydicom.valuerep import DSfloat\n\u003e\u003e\u003e DSfloat(\"NaN\")\nnan    # Accepted silently — should be rejected\n\u003e\u003e\u003e DSfloat(\"inf\")\ninf    # Accepted silently — should be rejected\n```\n\nThis affects ALL pydicom versions from 0.9.7 through 3.0.2 (current).\n\nA related bypass exists in pydicom's IS type: `IS(\"1e4\")` returns 10000 via an `int(float(val))` fallback, accepting scientific notation that is not valid per the DICOM standard.\n\n**Root Cause — Layer 2: MONAI Core trusts pydicom output without validation**\n\nMONAI's `PydicomReader._get_affine()` builds a 4x4 affine transformation matrix from PixelSpacing, ImagePositionPatient, and ImageOrientationPatient with ZERO `isfinite()` or `isnan()` checks. NaN in PixelSpacing produces NaN in the affine diagonal, propagating through every spatial transform:\n`PydicomReader._get_affine() → LoadImaged → Spacingd → Model → Writer`\n\n**Root Cause — Layer 3: MONAILabel REST API accepts anything**\n\nMONAILabel's `PUT /datastore/` endpoint accepts DICOM uploads with no authentication (default deployment), no validation of spatial metadata, and no bounds checking on any DICOM tag values. The malicious DICOM is stored permanently and made available for inference.\n\n### PoC\n\n**Environment Setup:**\n```bash\n# Start MONAILabel (Docker)\ndocker pull projectmonai/monailabel:latest\ndocker run -d --name monailabel-poc -p 8000:8000 --memory=8g \\\n    projectmonai/monailabel:latest monailabel start_server \\\n    --app /opt/monai/sample-apps/radiology \\\n    --studies /opt/monai/datasets/Task09_Spleen/imagesTr \\\n    --conf models segmentation\n\n# Verify server is running\ncurl http://localhost:8000/info/\n```\n\n**Step 1 — Establish baseline (legitimate data works):**\n```bash\ncurl -X POST \"http://localhost:8000/infer/segmentation?image=spleen_40\" \\\n     -o baseline.nii.gz -w \"HTTP %{http_code} - %{size_download} bytes\"\n# Result: HTTP 200, ~223,628 bytes valid segmentation mask\n```\n\n**Step 2 — Run the attack (NaN DICOM upload + inference):**\n```bash\npip install pydicom numpy requests\npython poc_monailabel_ds_bypass.py --server http://localhost:8000\n```\n\nThe PoC script:\n1. Confirms pydicom accepts NaN/inf in DS fields\n2. 2. Creates three malicious DICOM files (~132 KB each) with NaN/inf in PixelSpacing and ImagePositionPatient\n3. 3. Uploads each via `PUT /datastore/` (no auth required) — HTTP 200 accepted\n4. 4. Triggers inference via `POST /infer/segmentation` — HTTP 500, server crash\n**Demonstrated Results:**\n\n| Payload | Upload | Inference | Result |\n|---|---|---|---|\n| Baseline (spleen_40) | N/A | HTTP 200 | Valid 223 KB segmentation |\n| NaN PixelSpacing | HTTP 200 | HTTP 500 | RuntimeError crash (18.0s wasted compute) |\n| NaN PixelSpacing + IPP | HTTP 200 | HTTP 500 | RuntimeError crash (16.7s wasted compute) |\n| Inf PixelSpacing | HTTP 200 | HTTP 500 | RuntimeError crash (16.4s wasted compute) |\n\n**Server crash traceback:**\n```\nmonailabel/tasks/infer/basic_infer.py → self.writer(data)\nmonailabel/transform/writer.py → write_itk(...)\nitk/ITKCommonBasePython.py → itkProcessObject_Update()\nRuntimeError: itkGDCMImageIO.cxx:1226:\n  ITK ERROR: GDCMImageIO: A Floating point buffer was passed\n  but the stored pixel type was not specified.\n```\n\nEach request burns ~16 seconds of server compute (full ML inference pipeline) before crashing. The NaN DICOM persists in the datastore — any future inference on that image ID crashes the server again.\n\n**Library-level confirmation:** 17/17 test vectors confirmed against MONAI 1.5.2 and pydicom 3.0.2, including actual MONAI `LoadImaged` and `Spacingd` transforms accepting NaN geometry without error.\n\n### Impact\n\n1. **Denial of Service:** A single ~132 KB DICOM upload crashes the MONAILabel inference pipeline. All active inference requests from legitimate users are aborted. Repeatable indefinitely with minimal bandwidth.\n2. **Silent Data Corruption:** NaN values in spatial metadata propagate through the entire ML inference pipeline and produce geometrically incorrect segmentation masks. If the output writer does not crash, the result is returned with HTTP 200 and zero warnings.\n3. **Persistent Datastore Poisoning:** The malicious DICOM is stored permanently via `PUT /datastore/`. Any future inference request on that image ID reproduces the crash or corruption, persisting across server restarts.\n**Affected MONAI Ecosystem (9 repositories):**\n- MONAI Core: PydicomReader, LoadImaged, Spacingd transforms\n- - MONAILabel: REST API + DICOMweb datastore\n- - MONAI Deploy App SDK: DICOMDataLoaderOperator\n- - model-zoo, VISTA, GenerativeModels, tutorials, research-contributions\n**Affected DICOM Tags (any DS VR):** PixelSpacing, ImagePositionPatient, SliceThickness, ImageOrientationPatient, RescaleSlope, WindowCenter/WindowWidth\n\n**Recommended Fix:**\n1. Add `math.isfinite()` validation in `PydicomReader._get_affine()` on all values from PixelSpacing, IPP, IOP. Raise ValueError for NaN/inf.\n2. 2. Validate spatial metadata of uploaded DICOM in MONAILabel `PUT /datastore/`. Return HTTP 400 for invalid geometry.\n3. 3. Validate spatial metadata is finite in `LoadImaged`/`Spacingd` before resampling.\n4. 4. Coordinate with pydicom upstream to reject NaN/inf in DS fields in all validation modes.\n**Upstream:** pydicom GHSA filed 2026-04-05.\n\n**Author:** Paulino Calderon (paulino@calderonpale.com)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "monai",
+        "purl": "pkg:pypi/monai"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.6.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.2.0",
+        "0.3.0",
+        "0.4.0",
+        "0.5.0",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.6.0",
+        "0.7.0",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "0.9.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.3.2rc1",
+        "1.3.3rc1",
+        "1.4.0",
+        "1.4.0rc1",
+        "1.4.0rc10",
+        "1.4.0rc11",
+        "1.4.0rc12",
+        "1.4.0rc2",
+        "1.4.0rc3",
+        "1.4.0rc4",
+        "1.4.0rc5",
+        "1.4.0rc6",
+        "1.4.0rc7",
+        "1.4.0rc8",
+        "1.4.0rc9",
+        "1.4.1rc1",
+        "1.5.0",
+        "1.5.0rc1",
+        "1.5.1",
+        "1.5.2",
+        "1.5.2rc1",
+        "1.6.0",
+        "1.6.1rc0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-6hp3-vr39-rqw8/GHSA-6hp3-vr39-rqw8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Project-MONAI/MONAI/security/advisories/GHSA-6hp3-vr39-rqw8"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Project-MONAI/MONAI/commit/434c094a3e6b84cca5b6e81da51e0d18a0100607"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Project-MONAI/MONAI"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Project-MONAI/MONAI/releases/tag/1.6.1"
+    }
+  ]
+}

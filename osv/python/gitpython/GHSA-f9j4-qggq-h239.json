@@ -1,0 +1,91 @@
+{
+  "id": "GHSA-f9j4-qggq-h239",
+  "modified": "2026-10-27T15:47:24.258288646Z",
+  "published": "2026-10-27T15:26:50Z",
+  "aliases": [
+    "CVE-2026-110858"
+  ],
+  "summary": "GitPython Remote.pull() refspec bypasses the --upload-pack unsafe-option guard, enabling arbitrary command execution",
+  "details": "## Summary\n\n`Remote.pull()` in GitPython forwards its positional `refspec` argument directly to the `git pull` child process while its unsafe-option guard inspects only keyword arguments. An application that passes attacker-influenced data as the `refspec` (for example a user-supplied branch or refspec parameter in a web or CI service) can supply an option-shaped value such as `--upload-pack=\u003ccommand\u003e`. The value bypasses the `unsafe_git_pull_options` check, is placed after the `--` separator on the `git pull` command line, and is executed as the upload-pack program for local-path or SSH transports. This yields arbitrary command execution with the privileges of the calling process using the documented default arguments (`allow_unsafe_options=False`).\n\n## Root Cause\n\n`Remote.pull()` is documented to reject dangerous options unless `allow_unsafe_options=True`, and `--upload-pack` is explicitly listed as such an option. The guard, however, only screens keyword arguments and never the positional `refspec`. The check builds its candidate list with `Git._option_candidates([], kwargs)`, passing an empty list in place of the positionals, so the `refspec` value is never compared against `unsafe_git_pull_options = [\"--upload-pack\"]`. The normalized `refspec` is then forwarded verbatim to the `git pull` invocation. The leading `--` separator that neutralizes an option-shaped refspec for `git fetch` and `git push` does not protect `git pull`, because `git pull` re-forwards its trailing positionals to an internal `git fetch` without re-inserting a `--` separator, so the positional becomes an option to that internal fetch.\n\n```text\nAffected function: git.remote.Remote.pull\nSource: git/remote.py (guard at the check_unsafe_options call using _option_candidates([], kwargs); sink at the self.repo.git.pull(\"--\", self, refspec, ...) invocation)\n```\n\n## Impact\n\nAn attacker who controls the `refspec` value passed to `Remote.pull()` achieves arbitrary operating-system command execution as the process invoking GitPython, with no additional privileges and no user interaction, on the default code path. Exploitation requires that the pulled remote uses a transport that runs upload-pack on the local side, namely a local filesystem path or SSH; over HTTPS the `--upload-pack` value is inert because the server ignores a client-supplied upload-pack program. This transport requirement narrows the population of vulnerable deployments but does not add work for the attacker once a vulnerable target is reached. Working checkouts commonly use local-path or SSH origins, so the exposed population is substantial.\n\n## Proof of Concept\n\n```text\nEnvironment: GitPython from the affected source tree; system git 2.43.0.\nThe pulled origin uses a local filesystem transport (protocol.file.allow=always for git \u003e= 2.38).\n```\n\nReproduction steps:\n\n1. Create an origin repository reachable over a local-path transport.\n2. In a consumer repository, register that origin and call `Remote.pull()` with an attacker-controlled refspec.\n3. Observe that the injected command executes.\n\n```python\nimport git\nrepo = git.Repo(\"consumer\")                 # has an origin using a local-path or ssh transport\norigin = repo.remote(\"origin\")\n# Attacker-controlled refspec value; default arguments (allow_unsafe_options=False):\norigin.pull(refspec=\"--upload-pack=touch /tmp/pwned; git-upload-pack\")\n```\n\n```text\ncmdline: git pull -v -- origin --upload-pack=touch /tmp/pwned; git-upload-pack\n[attack]  marker created (RCE)      : True\n[isolate] upload_pack passed as KWARG blocked : True   (only the positional refspec escapes)\n[sibling] same value via git fetch  : safe            (pull-specific behavior)\n[control] benign refspec            : safe\n```\n\n## Attack Chain\n\n1. **Exposure:** An application calls `Remote.pull(refspec=\u003cvalue\u003e)` on the default path, where `\u003cvalue\u003e` is derived from attacker-influenced input such as a branch or refspec request parameter.\n2. **Control:** The attacker supplies the string `--upload-pack=\u003ccommand\u003e; git-upload-pack`. The value passes through `Git._unpack_args`, which only flattens and stringifies it, preserving the option shape.\n3. **Path:** The protocol loop calls `Git.check_unsafe_protocols` on the value, which only matches remote-helper transport URLs (a `\u003ctransport\u003e::` form) and does not flag an `--upload-pack=` token.\n4. **Guard:** The unsafe-option guard calls `check_unsafe_options(options=Git._option_candidates([], kwargs), ...)`. Because positionals are passed as an empty list, the positional `refspec` is never inspected against `unsafe_git_pull_options`.\n5. **Primitive:** The value is forwarded to `git pull -v -- \u003cremote\u003e --upload-pack=\u003ccommand\u003e; git-upload-pack`; `git pull` re-forwards the positional to an internal `git fetch` without a `--` separator, so it is honored as the upload-pack program.\n6. **Result:** For a local-path or SSH transport, git executes `\u003ccommand\u003e` as the upload-pack program, giving arbitrary command execution as the calling process user.\n\n## Bypass Evidence\n\nThe relevant guard is `Remote.pull()`'s own `check_unsafe_options` call, present in the current released artifact. It is incomplete: it inspects `Git._option_candidates([], kwargs)`, which only considers keyword arguments, so the positional `refspec` is never checked. This was confirmed empirically: passing the identical value as the `upload_pack=` keyword argument raises `UnsafeOptionError`, while passing it as the positional `refspec` does not, proving that only the positional escapes the guard.\n\nThe `--` separator on the `git pull` command line was tested as a possible mitigation and refuted: with system git 2.43.0, `git pull -- \u003cremote\u003e '--upload-pack=\u003ccmd\u003e'` executed the injected command, while the identical value supplied to `git fetch -- ...` and `git push -- ...` did not execute, because those subcommands honor the `--` terminator whereas `git pull` re-forwards positionals to an internal fetch without one. The `check_unsafe_protocols` transport check was also examined and does not flag the `--upload-pack=` token because it has no `\u003ctransport\u003e::` form. No prior published advisory for this package addresses `Remote.pull`, the fetch or pull refspec positional, or `--upload-pack` injection via a refspec; the closest accepted issue covers the same class (a positional argument escaping a keyword-only guard) in a different function and sink.\n\n## Affected Versions\n\n- `Ecosystem: pip (PyPI)`\n- `Package: GitPython`\n- `Confirmed affected range: \u003e= 3.1.30`\n- `Latest release checked: 3.1.62 (PyPI); source verified against the 3.1.62 release tag`\n- `Fix status: not fixed in any released version or on the development branch`\n\nThe keyword-only pull guard together with the positional `refspec` sink is present in every released tag from 3.1.30 through the latest release 3.1.62, verified by inspecting the shipped `git/remote.py` in each tagged artifact. Version 3.1.30 introduced the `unsafe_git_pull_options` guard; the affected range is stated from that boundary under the incomplete-guard framing. Releases before 3.1.30 forward the `refspec` positionally with no unsafe-option guard and no `--` separator and are also exploitable, but the range is stated conservatively from the guard-introduction boundary. No fixed release exists.\n\n## Suggested Fix\n\nEnforce the unsafe-option invariant on the positional `refspec`, not only on keyword arguments. The guard should build its candidate list from the actual forwarded positionals (for example by passing the normalized refspec list into `Git._option_candidates` alongside `kwargs`) so that an option-shaped `refspec` such as `--upload-pack=...` is rejected with `UnsafeOptionError` unless `allow_unsafe_options=True`. The same correction should be verified for any other reference or refspec forwarding path that relies on the keyword-only guard. As an interim mitigation without a code change, callers should validate or reject refspec values that begin with `-`, avoid passing untrusted data as the `refspec`, and prefer HTTPS remotes where a client-supplied upload-pack program is inert.\n\nReported by zx (GitHub: @manus-pi).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.1.30"
+            },
+            {
+              "fixed": "3.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.60",
+        "3.1.61",
+        "3.1.62"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-f9j4-qggq-h239/GHSA-f9j4-qggq-h239.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-f9j4-qggq-h239"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2247"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/790bb3164948625ffb043d2a162425d55923fe9a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.2.0"
+    }
+  ]
+}

