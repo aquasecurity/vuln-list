@@ -1,0 +1,127 @@
+{
+  "id": "GHSA-j7qq-vr8c-xvw3",
+  "modified": "2026-10-27T21:45:04.265039747Z",
+  "published": "2026-10-27T21:26:39Z",
+  "aliases": [
+    "CVE-2026-116691"
+  ],
+  "summary": "MLflow CrewAI autologging records LLM provider API keys in logged trace spans",
+  "details": "### Summary\n\n`mlflow.crewai.autolog()` leaks CrewAI LLM provider API keys into MLflow trace telemetry.\n\nWhen a CrewAI `Agent` is instrumented with MLflow autologging, MLflow serializes the agent's `__dict__` and converts its fields to strings. The `llm` field contains the CrewAI LLM object, whose string representation includes its `api_key` in plaintext.\n\nAs a result, an application that calls `mlflow.crewai.autolog()` can unintentionally send its LLM provider API key to the MLflow trace backend or configured OTLP destination.\n\nThe application does not need to explicitly log the credential or place it in a span attribute. The credential is extracted automatically by MLflow's instrumentation.\n\nThis was verified on **MLflow 3.16.0** with **CrewAI 1.15.18** using MLflow's own OTLP exporter. The fake credential appeared in **5 attribute locations across 2 spans**.\n\n### Details\n\nThe primary issue is in:\n\n`mlflow/crewai/autolog.py::_get_agent_attributes()`\n\nThe function walks the CrewAI `Agent.__dict__` and converts agent fields to strings. `tools` and `embedder` receive special handling, but credential-bearing objects such as the following are not sanitized:\n\n* `llm`\n* `function_calling_llm`\n* `agent_executor`\n* `crew`\n\nFor example, `agent.llm` is a CrewAI `LLM` object. In CrewAI 1.15.18, the underlying LLM model contains `api_key` as a normal field. Its string representation therefore contains the credential:\n\n```text\nllm_type='openai' model='gpt-4.1-mini' ... api_key='sk-proj-...' ...\n```\n\nMLflow subsequently stores this string as a span attribute.\n\nThere is an important indication that this is an unintended disclosure: MLflow's dedicated LLM attribute extraction already explicitly excludes `api_key` in `_get_llm_attributes()`. The LLM span therefore does not expose the credential, while the broader Agent `__dict__` serialization bypasses that protection.\n\nThere is also a second, independent serialization path in:\n\n`mlflow/crewai/autolog.py::_construct_full_inputs()`\n\nThis code uses:\n\n```python\nv.__dict__ if hasattr(v, \"__dict__\") else v\n```\n\non call arguments. During CrewAI execution, the `Agent` object is passed as an argument, causing its `__dict__` to be expanded and the credential-bearing LLM object to be included in `mlflow.spanInputs`.\n\nTherefore, there are two independent leakage paths:\n\n1. **Agent span attributes** through `_get_agent_attributes()`\n2. **Span inputs** through `_construct_full_inputs()`\n\nFixing only the Agent attribute serialization would leave the `mlflow.spanInputs` path vulnerable.\n\nA safer approach would be to avoid recursively serializing arbitrary object `__dict__` values. Agent telemetry should use an explicit allowlist of non-sensitive scalar fields, and credential-bearing objects such as `llm`, `function_calling_llm`, `agent_executor`, and `crew` should either be reduced to safe metadata or omitted.\n\nSimilarly, `_construct_full_inputs()` should not automatically expand arbitrary objects through `__dict__`, or the resulting values should pass through the same sanitization mechanism before being attached to a span.\n\n### PoC\n\nEnvironment:\n\n```text\nMLflow: 3.16.0\nCrewAI: 1.15.18\nPython: 3.12.3\nopentelemetry-exporter-otlp-proto-http: 1.42.1\n```\n\n#### 1. Direct serialization proof\n\nThe following demonstrates the vulnerability without starting a Crew, making a network request, or requiring an MLflow server:\n\n```python\nimport importlib\nfrom crewai import LLM, Agent\n\nautolog = importlib.import_module(\"mlflow.crewai.autolog\")\n\nllm = LLM(\n    model=\"gpt-4.1-mini\",\n    api_key=\"sk-proj-EXAMPLE1234567890\",\n)\n\nagent = Agent(\n    role=\"r\",\n    goal=\"g\",\n    backstory=\"b\",\n    llm=llm,\n)\n\nattrs = autolog._get_agent_attributes(agent)\n\nassert \"sk-proj-EXAMPLE1234567890\" in attrs[\"llm\"]\n\nprint(attrs[\"llm\"])\n```\n\nThe output contains the API key in plaintext, for example:\n\n```text\nllm_type='openai' model='gpt-4.1-mini' ... api_key='sk-proj-EXAMPLE1234567890' ...\n```\n\nNo provider request is required.\n\n#### 2. End-to-end trace disclosure\n\nThe issue can also be reproduced through MLflow's actual OTLP exporter.\n\nConfigure a local OTLP HTTP receiver and set:\n\n```bash\nexport OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces\nexport OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf\nexport CREWAI_DISABLE_TELEMETRY=true\n```\n\nThen run:\n\n```python\nimport mlflow\n\nfrom crewai import Agent, Crew, LLM, Task\n\nmlflow.crewai.autolog()\n\nllm = LLM(\n    model=\"gpt-4.1-mini\",\n    api_key=\"sk-proj-EXAMPLE1234567890\",\n)\n\nagent = Agent(\n    role=\"Support Responder\",\n    goal=\"Answer support questions\",\n    backstory=\"A support agent\",\n    llm=llm,\n)\n\ntask = Task(\n    description=\"Answer the user's question\",\n    expected_output=\"A response\",\n    agent=agent,\n)\n\ncrew = Crew(\n    agents=[agent],\n    tasks=[task],\n)\n\ncrew.kickoff()\n```\n\nA local OTLP receiver can decode the `ExportTraceServiceRequest` sent by MLflow.\n\nThe provider request is expected to fail because the credential is intentionally fake. This does not affect the vulnerability: the sensitive value is added to the MLflow span when the instrumentation starts, before the provider call succeeds or fails.\n\nIn the tested environment, the fake API key appeared in the exported telemetry in **5 locations across 2 spans**, including:\n\n```text\nSupport Responder\n  attributes.llm\n  attributes.function_calling_llm\n  attributes.agent_executor\n  attributes.mlflow.spanInputs\n\nTask.execute_sync\n  attributes.mlflow.spanInputs\n```\n\nThe captured value is produced by MLflow's actual telemetry/export path rather than being manually inserted into a span.\n\nAll credentials used in the reproduction are locally generated fake values. No real API credential is required.\n\n### Impact\n\n**Type:** Sensitive Information Disclosure / Credential Disclosure\n**CWE:** CWE-532 — Insertion of Sensitive Information into Log File\n\nAny application using `mlflow.crewai.autolog()` with a CrewAI `LLM` configured with an API key can unintentionally disclose that credential through MLflow traces.\n\nThe credential is written to trace telemetry even though the application does not explicitly log it.\n\nAnyone with access to the MLflow trace storage or configured OTLP destination may therefore obtain the provider credential. Depending on the deployment, this can include MLflow users, observability operators, or third-party telemetry providers.\n\nThe leaked credential can then potentially be used against the corresponding LLM provider account, including for unauthorized API usage and associated costs.\n\nThe issue is particularly significant because the credential crosses a trust boundary: a provider API key intended for use by the application is automatically copied into observability telemetry where a broader set of users or systems may have access.\n\nThe vulnerability does not require the developer to intentionally log the secret. The only relevant prerequisite is enabling the CrewAI autologging integration.\n\n### Patches\n\nFixed in MLflow 3.17.0 by #25845. `mlflow.crewai.autolog()` now reduces CrewAI LLM objects to their model name and drops credential-like keys before they are written to span attributes or `mlflow.spanInputs`.\n\n### Remediation\n\n- Upgrade to `mlflow\u003e=3.17.0`.\n- Upgrading stops new leakage but does not remove credentials already written. Rotate any LLM provider key that a CrewAI `LLM` object held (for example one passed as `LLM(api_key=...)`) while `mlflow.crewai.autolog()` was enabled on MLflow 2.19.0 through 3.16.x.\n- Delete or redact the affected traces in the MLflow tracking backend and in any OTLP destination they were exported to. The key appears in Agent and Crew span attributes and in `mlflow.spanInputs`.\n\n### Workarounds\n\nIf you cannot upgrade yet, disable CrewAI autologging with `mlflow.crewai.autolog(disable=True)`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "mlflow",
+        "purl": "pkg:pypi/mlflow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.19.0"
+            },
+            {
+              "fixed": "3.17.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.19.0",
+        "2.20.0",
+        "2.20.0rc0",
+        "2.20.1",
+        "2.20.2",
+        "2.20.3",
+        "2.20.4",
+        "2.21.0",
+        "2.21.0rc0",
+        "2.21.1",
+        "2.21.2",
+        "2.21.3",
+        "2.22.0",
+        "2.22.0rc0",
+        "2.22.1",
+        "2.22.2",
+        "2.22.3",
+        "2.22.4",
+        "2.22.5",
+        "3.0.0",
+        "3.0.0rc0",
+        "3.0.0rc1",
+        "3.0.0rc2",
+        "3.0.0rc3",
+        "3.0.1",
+        "3.1.0",
+        "3.1.0rc0",
+        "3.1.1",
+        "3.1.2",
+        "3.1.3",
+        "3.1.4",
+        "3.10.0",
+        "3.10.0rc0",
+        "3.10.1",
+        "3.11.0",
+        "3.11.0rc0",
+        "3.11.0rc1",
+        "3.11.1",
+        "3.12.0",
+        "3.12.0rc0",
+        "3.13.0",
+        "3.13.0rc0",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.16.0",
+        "3.16.1",
+        "3.2.0",
+        "3.2.0rc0",
+        "3.3.0",
+        "3.3.0rc0",
+        "3.3.1",
+        "3.3.2",
+        "3.4.0",
+        "3.4.0rc0",
+        "3.5.0",
+        "3.5.0rc0",
+        "3.5.1",
+        "3.6.0",
+        "3.6.0rc0",
+        "3.7.0",
+        "3.7.0rc0",
+        "3.8.0",
+        "3.8.0rc0",
+        "3.8.1",
+        "3.9.0",
+        "3.9.0rc0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-j7qq-vr8c-xvw3/GHSA-j7qq-vr8c-xvw3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/security/advisories/GHSA-j7qq-vr8c-xvw3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/pull/25845"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/commit/20927930d27f0072fcfeb7f024f24ad8c5e77c47"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/mlflow/mlflow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/mlflow/mlflow/releases/tag/v3.17.0"
+    }
+  ]
+}
