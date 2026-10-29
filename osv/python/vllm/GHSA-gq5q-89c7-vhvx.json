@@ -1,0 +1,95 @@
+{
+  "id": "GHSA-gq5q-89c7-vhvx",
+  "modified": "2026-10-28T21:30:04.994007514Z",
+  "published": "2026-10-28T21:15:35Z",
+  "aliases": [
+    "CVE-2026-115914"
+  ],
+  "summary": "vLLM DeepSeek-OCR image processing vulnerable to denial of service",
+  "details": "## Summary\n\nAny vLLM deployment serving a model of the DeepSeek-OCR family — `deepseek-ai/DeepSeek-OCR`, `deepseek-ai/DeepSeek-OCR-2`, or `baidu/Unlimited-OCR` (whose `UnlimitedOCRForCausalLM` subclasses `DeepseekOCRForCausalLM`) — can be **killed by a single unauthenticated chat request carrying an ordinary, schema-valid PNG image**, under completely default server configuration.\n\nThe image model's input validation contains a guard inherited from the upstream DeepSeek-OCR reference implementation:\n\n```python\n# vllm/model_executor/models/deepseek_ocr.py:478-479  (_parse_and_validate_image_input)\nif torch.sum(pixel_values).item() == 0:\n    return None\n```\n\nIn the original research code this was an empty-batch shortcut; in vLLM's serving architecture `pixel_values` is the actual client image tensor, and the condition is **exactly satisfiable by a legitimate image**: the in-tree `DeepseekOCRProcessor` normalizes pixels with `ToTensor + Normalize(0.5, 0.5)` (`vllm/transformers_utils/processors/deepseek_ocr.py:120-140`), mapping pixel value 0 → exactly −1.0 and 255 → exactly +1.0 in float32. A 1024×1024 image that is half pure black and half pure white (a perfectly ordinary 1-bit-style scanned-document PNG for an OCR model) therefore yields `torch.sum(pixel_values) == 0.0` **exactly** (equal counts of ±1.0; pairwise reduction stays integer-exact, well inside float32's 2²⁴ exactness bound). `ImageOps.pad(image, (1024, 1024))` is the identity map for an already-1024×1024 image (`processors/deepseek_ocr.py:350-355`), so no padding pixels disturb the balance.\n\nReturning `None` makes `embed_multimodal` return `None` (`deepseek_ocr.py:606-611`), which immediately trips the engine-side sanity check in the worker:\n\n```python\n# vllm/v1/worker/utils.py:512  (sanity_check_mm_encoder_outputs)\nassert isinstance(mm_embeddings, (list, tuple, torch.Tensor)), (\n    \"Expected multimodal embeddings to be a list/tuple of 2D tensors, ...\")\n```\n\nThe `AssertionError` is raised inside the encoder runner of the EngineCore worker process with no per-request containment, escapes to the busy loop's top-level handler (`vllm/v1/engine/core.py:1368`, \"EngineCore encountered a fatal error.\"), triggers `EngineDeadError` at the API server (`vllm/v1/engine/async_llm.py:843`), and the whole process tree shuts down permanently. `/health` refuses connections until a manual restart.\n\nVerified end-to-end on the official `vllm/vllm-openai:v0.30.0` image (id d076d77d8dad) with real `deepseek-ai/DeepSeek-OCR` weights: after confirming `/health` 200, a text chat 200, and two control images (all-white and all-black 1024×1024) 200, the single half-black/half-white request returned HTTP 500 (`EngineCore encountered an issue`), the engine log shows `AssertionError: Expected multimodal embeddings to be a list/tuple of 2D tensors ... got \u003cclass 'NoneType'\u003e` at `v1/worker/utils.py:512`, the API server shut itself down, and the container exited (`Exited (0)`, `OOMKilled=false`). Every subsequent request, including `GET /health`, fails at the socket. The vulnerable check is unchanged on `main` (verified 2026-09-30 against the raw file on the default branch).\n\n**Environment notes (disclosed for completeness; unrelated to the sink):** (1) the v0.30.0 image's Triton version refuses to compile `deepencoder.py`'s fused rel-pos attention kernel (`LOG2E` non-constexpr global) during the startup profile run; per the compiler's own suggestion we set `TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1` — an environment workaround only, no source file was modified. (2) DeepSeek-OCR ships no `chat_template`, so verification passed a one-line `--chat-template` that concatenates message content text; this does not touch the image data path. (3) The zero-sum check aggregates over the whole per-step modality batch, so the trigger image must be alone in its encoder batch — trivially true on an idle instance (our verification: first attempt, single request), and simply retried otherwise.\n\n## Details\n\n**1. The processor maps an ordinary binary image to exactly ±1.0 pixels.** `DeepseekOCRProcessor.tokenize_with_images` (`vllm/transformers_utils/processors/deepseek_ocr.py:338-389`) builds the global view as `ImageOps.pad(image, (base_size, base_size), color=mean*255)` with `base_size = 1024` (`:21`). For a 1024×1024 input the pad is a no-op (same-size `ImageOps.contain` resampling is the identity: the bicubic kernel passes through sample points exactly). `ImageTransform` (`:120-140`) then applies `T.ToTensor()` (uint8 0 → 0.0, 255 → 1.0, exact in float32) and `T.Normalize((0.5,)*3, (0.5,)*3)` (0.0 → −1.0, 1.0 → +1.0, exact). A left-half-black/right-half-white 1024×1024 RGB image therefore produces 1,572,864 elements of −1.0 and 1,572,864 of +1.0; `torch.sum` (pairwise/tree reduction, partial sums bounded by 1.58M ≪ 2²⁴) evaluates to exactly `0.0`, and `.item() == 0` is `True`. All of this runs in the API process and passes every validation layer: the image is 1 MP, far under the default `VLLM_MAX_IMAGE_PIXELS` cap of 178,956,970 (`vllm/envs.py:86`).\n\n**2. The zero guard turns a valid image into a `None` encoder output.** `_parse_and_validate_image_input` (`deepseek_ocr.py:468-497`) returns `None` on the exact-zero sum; `embed_multimodal` (`:606-611`) propagates that `None` to its caller. The same pattern exists in `deepseek_ocr2.py:339` (`if pixel_values is None or torch.sum(pixel_values).item() == 0: return None`), and `UnlimitedOCRForCausalLM` (`unlimited_ocr.py:244`) inherits the method unmodified. (A sibling check in `_encode_local_features` at `deepseek_ocr.py:522-523` guards crop tensors, which pass through a lossy resize and are not needed for this report.)\n\n**3. The worker asserts on the `None` and the engine dies.** With the default configuration (`cudagraph_mm_encoder=False`, `config/compilation.py`), the V2 model runner executes the encoder eagerly: `execute_model` (`v1/worker/gpu/model_runner.py:1849`) → `model_states/default.py:108 prepare_inputs_embeds` → `encoder_runner.execute_mm_encoder` (`v1/worker/gpu/mm/encoder_runner.py:168`) → `model.embed_multimodal(**mm_kwargs_batch)` → `None` → `sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=1)` (`encoder_runner.py:170`) → `AssertionError` at `v1/worker/utils.py:512`. There is no per-request try/except anywhere on this path; the exception reaches the busy loop's top-level `except Exception` at `core.py:1368` (via `step_with_batch_queue` at `core.py:660` and `collective_rpc`), which logs \"EngineCore encountered a fatal error.\", sends engine-dead, and re-raises (fault tolerance off by default; `engine_core_sentinel` re-raises). The API server's `output_handler` receives `EngineDeadError` (`async_llm.py:843`) and shuts down. In the verified run the container exited (code 0, `OOMKilled=false`) and the port stayed closed — no self-recovery.\n\n**4. Why the guard exists and why it is wrong here.** The `torch.sum(...) == 0 → return None` shortcut comes from the upstream DeepSeek-OCR reference implementation, where it skipped empty batches during batch inference. In vLLM, `embed_multimodal` is only invoked when the scheduler has real multimodal items to encode, so the guard never protects anything — it is purely a landmine that converts one specific, perfectly legal pixel distribution into a contract violation (`embed_multimodal` must return embeddings, not `None`) that the engine treats as a fatal invariant breach.\n\n**Version history.** The check was introduced together with the model itself in #27247 (\"[Model] Upstream Deepseek-OCR model\", commit 675aa2ec, 2025-10-22; first stable release v0.11.1) and is unchanged since. DeepSeek-OCR-2 support (#33165, 2026-02-02) carries the same check at `deepseek_ocr2.py:339`. On `main` (checked 2026-09-30) the guard in `_parse_and_validate_image_input` is still present verbatim.\n\n## Impact\n\nAny unauthenticated client that can reach the OpenAI-compatible API of a deployment serving DeepSeek-OCR, DeepSeek-OCR-2, or Unlimited-OCR can **deterministically crash the entire serving instance with one request**: the EngineCore process dies, every in-flight and future request fails, and the API server exits; absent a supervisor the deployment stays down until restarted. The trigger is a schema-valid chat request with a small, completely legal PNG — for an OCR service, a half-black/half-white bitmap is indistinguishable from ordinary scanned-document traffic. The attack costs one request (~0.1 s observed end-to-end) and can be repeated after every restart.\n\nNo special server flags, no malformed input, no resource exhaustion, and no race are involved; the only requirement is that the trigger image is alone in its per-step encoder batch (true on an idle instance and retryable otherwise). Default-configured deployments of these models are affected with no mitigation short of patching.\n\n**Suggested remediation** (any one of these breaks the kill chain):\n\n1. Remove the `torch.sum(pixel_values) == 0 → return None` shortcut from `_parse_and_validate_image_input` (and the `_encode_local_features` sibling) in `deepseek_ocr.py` / `deepseek_ocr2.py`: in vLLM an empty encoder batch never reaches `embed_multimodal`, so the guard protects nothing and only converts valid inputs into a contract violation. If an all-zeros fast-path is ever needed, return a correctly-shaped zero embedding, not `None`.\n2. If the check is kept as input validation, enforce it where it belongs: reject the offending item with a per-request error (HTTP 400) in the API-process input pipeline, not by violating the `embed_multimodal` return contract inside the worker.\n3. Defense in depth: `sanity_check_mm_encoder_outputs` failures should fail the offending request rather than the EngineCore busy loop — a model returning `None` for one item should not be engine-fatal.\n\nThis advisory was fixed in [MR59417](https://github.com/vllm-project/vllm/pull/59417).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.11.1"
+            },
+            {
+              "fixed": "0.32.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.30.0",
+        "0.31.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-gq5q-89c7-vhvx/GHSA-gq5q-89c7-vhvx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-gq5q-89c7-vhvx"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115914"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/59417"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/c15672cfb49152ebf65cfd188e71b84593ec5686"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.32.0"
+    }
+  ]
+}

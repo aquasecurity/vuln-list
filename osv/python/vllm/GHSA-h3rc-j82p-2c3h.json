@@ -1,0 +1,162 @@
+{
+  "id": "GHSA-h3rc-j82p-2c3h",
+  "modified": "2026-10-28T21:30:04.893844519Z",
+  "published": "2026-10-28T21:15:29Z",
+  "aliases": [
+    "CVE-2026-115915"
+  ],
+  "summary": "vLLM: Untrusted EPS inputs can trigger denial of service or Ghostscript RCE",
+  "details": "### Summary\n\nIn vLLM 0.30.0, `ImageMediaIO` passes attacker-controlled image bytes to Pillow's format autodetection without restricting the accepted formats; the request's MIME label does not constrain decoder selection. An EPS payload labeled `image/png` reached the host's Ghostscript executable. On a host with Ghostscript affected by CVE-2024-29510, this exposes the known Ghostscript sandbox escape through vLLM's image-loading path and can execute commands with the vLLM process's privileges. A bounded marker-command payload executed through the PyPI wheel's actual `ImageMediaIO.load_base64()` implementation using Debian Ghostscript 10.03.0. The loader-level execution is reproduced; the HTTP request path is source-traced but was not exercised end to end. This report concerns vLLM's untrusted-format dispatch and does not claim a new Ghostscript vulnerability. Exploitation requires an image-capable request path, a caller able to reach it under the deployment's authentication policy, and a vulnerable host Ghostscript build.\n\n### Details\n\n`ImageMediaIO` is the boundary where attacker-controlled bytes enter Pillow's format autodetection: the declared MIME type does not constrain decoder selection, and the loader calls `Image.open(BytesIO(data))` without a Pillow format allowlist. Pillow recognizes EPS by its file signature, and vLLM's subsequent `image.load()` call enters Pillow's EPS processing path. The OpenAI chat multimodal parser reaches this path through [`parse_image()` and `fetch_image()`](https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/vllm/entrypoints/chat_utils.py#L1077-L1081) and the [media connector](https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/vllm/multimodal/media/connector.py#L367-L402); the data URL path extracts the MIME label and forwards the bytes to the loader ([source](https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/vllm/multimodal/media/connector.py#L319-L332)). This is the vLLM-specific issue: untrusted image bytes can select a Pillow-supported format parser. Each downstream impact depends on the relevant parser, component version, and host configuration.\n\nPillow recognizes EPS by its file signature and invokes Ghostscript with `-dSAFER`, `-sDEVICE=pnmraw`, and the untrusted EPS input ([Pillow EPS plugin](https://github.com/python-pillow/Pillow/blob/12.3.0/src/PIL/EpsImagePlugin.py#L132-L159), [load path](https://github.com/python-pillow/Pillow/blob/12.3.0/src/PIL/EpsImagePlugin.py#L405-L415)). The command execution in this report uses the already-known Ghostscript CVE-2024-29510, which allows crafted PostScript to bypass `-dSAFER`; Ghostscript lists 10.03.1 as the upstream fixed version ([Ghostscript CVE details](https://www.ghostscript.com/releases/cve/index.html)). This is an N-day dependency chain: CVE-2024-29510 provides the command-execution primitive, while the vLLM-specific issue is that untrusted, remotely supplied image bytes can reach the affected interpreter. No new Ghostscript flaw is claimed here.\n\nThe vLLM Python requirements declare Pillow but not Ghostscript, so this execution chain depends on a Ghostscript executable supplied by the host or deployment image. I reproduced command execution with the PyPI `vllm==0.30.0` wheel, Pillow 12.3.0, and Debian amd64 Ghostscript `10.03.0~dfsg-1`. The Codean Labs CVE-2024-29510 testkit identified that Ghostscript build as vulnerable. The adapted EPS payload ran only `touch` on a temporary marker. The marker existed after the loader call, although Pillow then raised `ValueError` because the exploit changes Ghostscript's output device. The API route was traced in source but a model-backed HTTP request was not run. Only PyPI `vllm==0.30.0` was checked; no wider affected release range or other Ghostscript vendor build is claimed.\n\nThe same input boundary also exposes a separate Pillow-only denial-of-service condition when the installed Pillow version is 12.0.0–12.2.0. CVE-2026-59203 is triggered by a negative `%%BeginBinary` byte count and causes Pillow's EPS parser to loop during `Image.open()`; it does not invoke Ghostscript or provide code execution ([Pillow advisory](https://github.com/python-pillow/Pillow/security/advisories/GHSA-pg7v-jwj7-p798)). The published [`vllm==0.30.0` requirements](https://github.com/vllm-project/vllm/blob/v0.30.0/requirements/common.txt#L21) leave Pillow unpinned, so an existing environment can retain an affected Pillow version; the source at commit `bc21cba9673cfc2256a2726b4bc32f062237cd35` requires [`pillow\u003e=12.3.0`](https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/requirements/common.txt#L22). In an isolated local check with Pillow 12.2.0, the official sample hung through `ImageMediaIO.load_bytes()` and `MediaConnector.fetch_image_async()`. Eight concurrent image loads occupied the connector's eight media-loading threads and left a benign image load queued. Pillow 12.3.0 rejected the sample promptly. This confirms a conditional media-processing DoS path, separate from the Ghostscript RCE chain; full HTTP-server availability was not measured.\n\n### Impact\n\nWhen a vLLM image-processing endpoint accepts attacker-supplied content and the host has Ghostscript affected by CVE-2024-29510, a caller who can reach the endpoint can trigger command execution as the vLLM process user. API-key authentication and network access controls determine who can reach the request path. Deployments without Ghostscript or with a build fixed for CVE-2024-29510 are not affected by this execution chain. Separately, existing environments that run vLLM 0.30.0 with Pillow 12.0.0–12.2.0 are exposed to CVE-2026-59203 through the same image-format dispatch boundary; the demonstrated impact is exhaustion of media-loading workers, and this Pillow CVE does not cause RCE. The report asks vLLM to assess and address the unsafe dispatch of untrusted image bytes and the affected dependency combinations.\n\nThis advisory was fixed in [MR60022](https://github.com/vllm-project/vllm/pull/60022).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.32.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.30.0",
+        "0.31.0",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-h3rc-j82p-2c3h/GHSA-h3rc-j82p-2c3h.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-h3rc-j82p-2c3h"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115915"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/60022"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/710ac56e691d4713feca50a43e6c440f07d373fd"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.32.0"
+    }
+  ]
+}

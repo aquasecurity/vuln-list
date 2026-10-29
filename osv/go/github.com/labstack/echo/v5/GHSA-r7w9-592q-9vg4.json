@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-r7w9-592q-9vg4",
+  "modified": "2026-10-28T20:00:03.851200504Z",
+  "published": "2026-10-28T19:53:36Z",
+  "aliases": [
+    "CVE-2026-118266"
+  ],
+  "summary": "Echo has CSRF Protection Bypass via MethodOverride Rewriting POST to Safe Method",
+  "details": "## Summary\n\nThe `MethodOverride` middleware accepts any non-empty string as the override target method — including safe methods (GET, HEAD, OPTIONS, TRACE) — when rewriting a POST request. When `MethodOverride` is registered before `CSRF` in the post-routing middleware chain (`e.Use()`), it rewrites the request method to a safe method before `CSRF` evaluates it. The CSRF middleware then skips token validation for the now-safe method, allowing state-changing POST handlers to execute without any CSRF check. Both the legacy token path and the modern `Sec-Fetch-Site` protection path are bypassed simultaneously.\n\n## Affected Component\n\n- `middleware/method_override.go` — `MethodOverrideConfig.ToMiddleware()` (lines 55–71): no whitelist on the override target method\n- `middleware/csrf.go` — `CSRFConfig.ToMiddleware()` (lines 188–189): safe-method bypass branch reads the already-rewritten method\n- `middleware/csrf.go` — `checkSecFetchSiteRequest()` (line 283): `Sec-Fetch-Site` safe check also reads the rewritten method\n\n## Description\n\n### MethodOverride accepts safe methods as override targets\n\n`MethodOverrideConfig.ToMiddleware()` (`method_override.go:55-71`) restricts the **source** method (only POST requests are overrideable) but applies no whitelist to the **target**:\n\n```go\n// method_override.go:61-67\nreq := c.Request()\nif req.Method == http.MethodPost {\n    m := config.Getter(c)\n    if m != \"\" {\n        req.Method = m   // ← any non-empty string accepted, including \"GET\"\n    }\n}\n```\n\nThe docstring's security claim — \"For security reasons, only POST method can be overridden\" — refers only to the source-method restriction. There is no guard preventing POST from being rewritten to `GET`, `HEAD`, `OPTIONS`, or `TRACE`. The test suite (`method_override_test.go`) only tests POST→DELETE and POST→PUT; POST→GET is never tested or blocked.\n\n### CSRF safe-method branch reads the already-rewritten method\n\n`CSRFConfig.ToMiddleware()` (`csrf.go:188-189`) makes its validation decision based on `c.Request().Method` at the time it runs:\n\n```go\n// csrf.go:188-189\nswitch c.Request().Method {\ncase http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:\n    // skip validation — no token check\ndefault:\n    // validate CSRF token\n```\n\nIf MethodOverride has already run and set `req.Method = \"GET\"`, this `switch` falls into the skip branch regardless of the original HTTP method or what handler was matched.\n\nThe `Sec-Fetch-Site`-based path in `checkSecFetchSiteRequest()` (`csrf.go:283`) is identically vulnerable:\n\n```go\n// csrf.go:283\nisSafe := slices.Contains(safeMethods, c.Request().Method)\n```\n\nWith `req.Method = \"GET\"` (already rewritten), `isSafe = true` and the function returns `true` — the request is allowed even when `Sec-Fetch-Site` is `cross-site`. **Both** CSRF protection paths are bypassed in a single step.\n\n### Execution chain\n\nIn `echo.go:700`, routing and middleware wrapping are performed in one step:\n\n```go\nh = applyMiddleware(e.router.Route(c), e.middleware...)\n```\n\n1. `e.router.Route(c)` evaluates with `req.Method = \"POST\"` → matches and binds the POST `/transfer` handler\n2. `applyMiddleware` wraps it: `MethodOverride → CSRF → postHandler`\n\nAt request execution time:\n3. **MethodOverride** runs: `req.Method == \"POST\"` → reads form field `_method` = `\"GET\"` → `req.Method = \"GET\"` → calls `next`\n4. **CSRF** runs: `c.Request().Method` = `\"GET\"` → `case http.MethodGet` → **skips token validation** → calls `next`\n5. **postHandler** runs (the handler matched in step 1 — the original POST `/transfer` state-change handler)\n\nThe state-changing handler executes with no CSRF token validation and with no `Sec-Fetch-Site` check.\n\n### The missing target-method whitelist is the root cause\n\nThe legitimate use case for MethodOverride is allowing HTML forms (which only support GET/POST) to send PUT, DELETE, or PATCH requests. There is no legitimate scenario in which an HTML form needs to rewrite POST to GET — that can always be expressed as an ordinary GET request. Allowing POST→GET (and HEAD/OPTIONS/TRACE) serves no valid purpose and is inherently dangerous when any safe-method-aware security middleware (CSRF, logging, audit) appears downstream.\n\n## Proof of Concept\n\n```go\npackage main\n\nimport (\n    \"net/http\"\n    echo \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    e := echo.New()\n    // MethodOverride before CSRF — both in e.Use() (post-routing)\n    e.Use(middleware.MethodOverrideWithConfig(middleware.MethodOverrideConfig{\n        Getter: middleware.MethodFromForm(\"_method\"),\n    }))\n    e.Use(middleware.CSRF())\n    e.POST(\"/transfer\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"transfer executed\")\n    })\n    e.Logger.Fatal(e.Start(\":18080\"))\n}\n```\n\n```bash\n# Baseline — CSRF correctly blocks a POST without a valid token\ncurl -i -X POST 'http://127.0.0.1:18080/transfer' \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data 'amount=100'\n# HTTP/1.1 400 Bad Request (missing CSRF token)\n\n# Bypass — _method=GET rewrites method before CSRF runs, skipping token validation\ncurl -i -X POST 'http://127.0.0.1:18080/transfer' \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data '_method=GET\u0026amount=100'\n# HTTP/1.1 200 OK\n# transfer executed\n\n# Browser-based CSRF PoC (attacker's page, auto-submits on load):\n# \u003cform method=\"POST\" action=\"https://victim.example/transfer\" id=\"f\"\u003e\n#   \u003cinput name=\"_method\" value=\"GET\"\u003e\n#   \u003cinput name=\"amount\" value=\"1000\"\u003e\n#   \u003cinput name=\"to\" value=\"attacker_account\"\u003e\n# \u003c/form\u003e\n# \u003cscript\u003edocument.getElementById('f').submit();\u003c/script\u003e\n```\n\nThe same bypass works with `MethodFromHeader` (`X-HTTP-Method-Override: GET`) and `MethodFromQuery` (`?_method=GET`).\n\n## Impact\n\n- Any state-changing endpoint protected by `CSRF()` is reachable without a valid CSRF token when the vulnerable middleware ordering is present\n- The `Sec-Fetch-Site` modern-browser CSRF protection is bypassed simultaneously — browsers that support `Sec-Fetch-Site` provide no additional defense\n- Applicable attacks include: fund transfers, password/email changes, account deletion, privilege escalation, data manipulation — any POST-protected operation\n- Audit logs may record `GET` as the HTTP method for what were actually state-changing operations\n\n## Recommended Remediation\n\n### Option 1: Whitelist only unsafe methods as override targets in `MethodOverride` (preferred)\n\nThe root cause is that MethodOverride accepts safe methods as targets. Restricting the override to legitimately overrideable methods (PUT, PATCH, DELETE) closes the bypass regardless of middleware ordering:\n\n```go\n// method_override.go — illustrative fix\nvar allowedOverrideMethods = map[string]bool{\n    http.MethodPut:    true,\n    http.MethodPatch:  true,\n    http.MethodDelete: true,\n}\n\n// in ToMiddleware:\nif req.Method == http.MethodPost {\n    m := config.Getter(c)\n    if m != \"\" \u0026\u0026 allowedOverrideMethods[m] {\n        req.Method = m\n    }\n}\n```\n\n### Option 2: Use `e.Pre()` for `MethodOverride` and document the ordering requirement\n\nPlacing MethodOverride in `e.Pre()` (pre-routing middleware) causes the router to match the overridden method, not the original POST. If only POST `/transfer` is registered, a POST-to-GET override results in a 405/404 — the handler never executes. Add an explicit documentation warning that MethodOverride must not be placed in `e.Use()` when CSRF middleware is also registered:\n\n```go\n// MethodOverride returns a MethodOverride middleware.\n//\n// IMPORTANT: Register this middleware with e.Pre(), not e.Use().\n// If registered with e.Use() before CSRF middleware, method rewriting\n// occurs after route matching but before CSRF validation, allowing\n// attackers to bypass CSRF token checks by specifying _method=GET.\nfunc MethodOverride() echo.MiddlewareFunc {\n```\n\nOption 1 is strongly preferred as it closes the vulnerability at the source and is safe regardless of middleware placement.\n\n## Credit\n\nThis vulnerability was discovered and reported by [bugbunny.ai](https://bugbunny.ai).\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. The MethodOverride middleware no longer overrides a POST to `GET`, `HEAD`, `OPTIONS`, `TRACE` or `CONNECT`.\n\n## Workarounds\n\nRegister MethodOverride with `Echo#Pre` (as documented), register CSRF before MethodOverride, or use the default header getter (`X-HTTP-Method-Override`), which a cross-site form cannot set.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "5.0.0"
+            },
+            {
+              "fixed": "5.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r7w9-592q-9vg4/GHSA-r7w9-592q-9vg4.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.16.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-r7w9-592q-9vg4/GHSA-r7w9-592q-9vg4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-r7w9-592q-9vg4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v4.16.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.4.0"
+    }
+  ]
+}

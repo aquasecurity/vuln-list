@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-99jh-6h7p-pp36",
+  "modified": "2026-10-28T20:00:03.842940841Z",
+  "published": "2026-10-28T19:53:24Z",
+  "aliases": [
+    "CVE-2026-118651"
+  ],
+  "summary": "Echo: Reverse Proxy Forwards Attacker-Supplied X-Real-IP to Upstream by Default",
+  "details": "## Summary\n\nThe Echo proxy middleware (`middleware/proxy.go`) preserves an incoming `X-Real-IP` header verbatim and forwards it to the upstream service when `Echo#IPExtractor` is not configured — which is the default. Because any HTTP client can supply an arbitrary `X-Real-IP` value, an attacker can cause Echo to relay a spoofed client IP address to every upstream service behind the proxy, undermining upstream IP-based access controls, rate limiting, audit logging, and geo-restriction.\n\n## Affected Component\n\n- `middleware/proxy.go` — `ProxyConfig.ToMiddleware()`, header-rewriting block (lines 351–355)\n\n## Description\n\n### The header-preservation condition passes spoofed values to upstream\n\n`ProxyConfig.ToMiddleware()` (`proxy.go:338-405`) prepares forwarding headers before dispatching each request. The `X-Real-IP` rewrite logic at lines 351-355 reads:\n\n```go\n// proxy.go:351-355\n// Basically it's not good practice to unconditionally pass incoming x-real-ip header to upstream.\n// However, for backward compatibility, legacy behavior is preserved unless you configure Echo#IPExtractor.\nif req.Header.Get(echo.HeaderXRealIP) == \"\" || c.Echo().IPExtractor != nil {\n    req.Header.Set(echo.HeaderXRealIP, c.RealIP())\n}\n```\n\nThe condition is `TRUE` (and therefore overwrites the header with a derived value) only when:\n- The header is absent — `req.Header.Get(echo.HeaderXRealIP) == \"\"`; **or**\n- `IPExtractor` is explicitly configured — `c.Echo().IPExtractor != nil`\n\nThe condition is `FALSE` — and the header is left **unchanged** — when the request arrives with an `X-Real-IP` header already set **and** `IPExtractor` is `nil`. Because `Echo.New()` leaves `IPExtractor` as `nil`, this is the out-of-the-box behaviour for every application that uses `Proxy()` or `ProxyWithConfig()` without extra configuration.\n\nAn attacker who sets `X-Real-IP` to any value causes Echo to forward exactly that value to the upstream, with no modification or validation.\n\n### The comment in the source code confirms intent and the security gap\n\nThe inline comment at line 351-352 explicitly states:\n\n\u003e \"Basically it's not good practice to unconditionally pass incoming x-real-ip header to upstream. However, for backward compatibility, legacy behavior is preserved unless you configure Echo#IPExtractor.\"\n\nThe framework is aware that the default is insecure and retains it for backward compatibility. No warning appears in the `Proxy()` or `ProxyWithConfig()` documentation, so operators who follow the standard setup example receive a silently insecure proxy configuration.\n\nThis is structurally identical to the documented insecurity in `ip.go:27`:\n\n\u003e \"Note: if you don't set `Echo#IPExtractor` explicitly, Echo fallback to legacy behavior, which is not a good choice.\"\n\n### Full execution chain\n\n1. Attacker sends `GET /api/admin` to the Echo proxy with header `X-Real-IP: 203.0.113.1` (a trusted corporate IP)\n2. `ToMiddleware()` evaluates the guard at line 353: header is present (`!= \"\"`), `IPExtractor` is `nil` → condition is `FALSE`\n3. `req.Header.Set` is **not** called; the upstream request carries the original, attacker-supplied `X-Real-IP: 203.0.113.1`\n4. Upstream service checks `X-Real-IP` against its IP allowlist → finds `203.0.113.1` → grants access\n5. Attacker reaches an endpoint that should be restricted to the corporate IP range\n\nSecondary impact path (audit poisoning):\n- All upstream log entries, rate-limit counters, and geo-restriction checks are evaluated against `203.0.113.1` rather than the real client IP, rendering audit trails and security analytics unreliable.\n\n## Proof of Concept\n\n```go\npackage main\n\nimport (\n    \"fmt\"\n    \"log\"\n    \"net/http\"\n    echo \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    // Upstream server: echoes back the X-Real-IP it received\n    upstream := http.NewServeMux()\n    upstream.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\n        fmt.Fprintf(w, \"upstream sees X-Real-IP: %s\\n\", r.Header.Get(\"X-Real-IP\"))\n    })\n    go http.ListenAndServe(\":9000\", upstream)\n\n    // Echo proxy — IPExtractor deliberately NOT set (the default)\n    e := echo.New()\n    targets := []*middleware.ProxyTarget{{URL: mustParse(\"http://127.0.0.1:9000\")}}\n    e.Use(middleware.Proxy(middleware.NewRoundRobinBalancer(targets)))\n    log.Fatal(e.Start(\":1323\"))\n}\n```\n\n```bash\n# Without spoofed header — upstream sees actual peer address\ncurl http://127.0.0.1:1323/\n# upstream sees X-Real-IP: 127.0.0.1\n\n# With spoofed header — upstream sees attacker-supplied value\ncurl -H 'X-Real-IP: 198.51.100.77' http://127.0.0.1:1323/\n# upstream sees X-Real-IP: 198.51.100.77\n```\n\nThe attacker-supplied IP `198.51.100.77` arrives at the upstream unchanged.\n\n## Impact\n\n- Upstream IP-based access controls (allowlists, blocklists, geo-restrictions) can be bypassed by supplying the expected IP in `X-Real-IP`\n- Upstream rate limiters that key on `X-Real-IP` are bypassable (same class as the Echo rate-limiter finding, now on every upstream service)\n- Audit logs, intrusion detection systems, and SIEM tools that rely on `X-Real-IP` record the attacker-chosen IP, not the real source — forensic trails are poisoned\n- Any upstream admin endpoint restricted by IP allowlist is reachable by any attacker who knows or guesses a trusted IP address\n\n## Recommended Remediation\n\n### Option 1: Always overwrite `X-Real-IP` from an authoritative source (preferred)\n\nRemove the conditional that preserves the incoming header. Echo, as the edge proxy, is the only authoritative source for the real client IP:\n\n```go\n// proxy.go — always set X-Real-IP from an authoritative source\nreq.Header.Set(echo.HeaderXRealIP, c.RealIP())\n```\n\nFor this to be safe, operators using `Proxy()` should also configure `IPExtractor`:\n\n```go\ne.IPExtractor = echo.ExtractIPDirect() // no upstream proxy\n// or\ne.IPExtractor = echo.ExtractIPFromXFFHeader() // behind a trusted upstream LB\n```\n\n### Option 2: Document and warn in `Proxy()` godoc\n\nIf backward compatibility must be preserved, add a prominent security warning to `Proxy()` and `ProxyWithConfig()`:\n\n```go\n// Proxy returns a Proxy middleware.\n//\n// SECURITY: By default, an incoming X-Real-IP header supplied by the client\n// is forwarded to the upstream unchanged. This allows any client to spoof its\n// IP identity to upstream services. Configure Echo#IPExtractor before using\n// this middleware to ensure X-Real-IP is derived from a trusted source:\n//\n//   e.IPExtractor = echo.ExtractIPDirect()\n//\n// See https://echo.labstack.com/guide/ip-address for details.\nfunc Proxy(balancer ProxyBalancer) echo.MiddlewareFunc {\n```\n\n## Credit\n\nThis vulnerability was discovered and reported by [bugbunny.ai](https://bugbunny.ai).\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0: the Proxy middleware always sets `X-Real-IP` from `Context.RealIP()`, which is the address of the direct peer unless `Echo#IPExtractor` is configured.\n\n`github.com/labstack/echo/v4` is not changed, because v4's `Context.RealIP()` without `Echo#IPExtractor` trusts `X-Forwarded-For` and `X-Real-IP` by design, and changing that default would merge all clients behind a proxy into one rate-limit bucket.\n\n## Workarounds\n\nConfigure `Echo#IPExtractor` for your deployment, for example `e.IPExtractor = echo.ExtractIPDirect()` when there is no proxy in front of the application, or `echo.ExtractIPFromXFFHeader()` / `echo.ExtractIPFromRealIPHeader()` (with `TrustIPRange` for proxies on public addresses). With an extractor set, the Proxy middleware overwrites `X-Real-IP` in v4 too.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-99jh-6h7p-pp36/GHSA-99jh-6h7p-pp36.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "4.0.0"
+            },
+            {
+              "last_affected": "4.16.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-99jh-6h7p-pp36/GHSA-99jh-6h7p-pp36.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-99jh-6h7p-pp36"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.4.0"
+    }
+  ]
+}

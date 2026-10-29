@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-375p-5qhx-8wq4",
+  "modified": "2026-10-28T20:15:05.439970416Z",
+  "published": "2026-10-28T19:54:20Z",
+  "aliases": [
+    "CVE-2026-118650"
+  ],
+  "summary": "Echo's middleware.Static: `%2F`-encoded path bypasses route/group middleware guarding a statically-served path",
+  "details": "## Summary\n\nWhen `middleware.Static` is mounted globally (`e.Use(middleware.Static(...))`) and an application relies on a **route- or group-level middleware guard** to restrict a path that also falls under the served static root, a `%2F`-encoded request bypasses that guard while the file is still served. This is the same encoding/decoding mismatch fixed for `StaticFS`/`StaticDirectoryHandler` in CVE-2026-55677 / GHSA-vfp3-v2gw-7wfq, but the fix did not cover the `middleware.Static` path. In addition, the `StaticConfig.EnablePathUnescaping` docstring states the default configuration prevents exactly this bypass, which is inaccurate for the global-mount case.\n\n**This is not path traversal:** no file outside the static root is accessed. The served file lives inside the static root; the issue is that access-control expectations set by a route guard are inconsistent between the literal and `%2F`-encoded forms of the same path.\n\n## Details\n\nRoot cause — the router and the static handler disagree on how to interpret `%2F`:\n\n- The router matches routes on the **raw, still-encoded** path, so `GET /admin%2Fsecret.txt` does **not** match a `/admin/...` route or group; any middleware attached to that route/group is therefore skipped.\n- `middleware.Static` selects its path source in `middleware/static.go` (~L219): with a global `e.Use` mount there is no wildcard route, so it uses `c.Request().URL.Path`, which `net/http` has already **decoded** (`%2F` → `/`). It then `path.Clean`s (~L235) and `Open`s (~L259) `admin/secret.txt`, serving the file.\n\nNet effect: for the literal path the guard runs; for the `%2F`-encoded path the guard is skipped but the same file is served.\n\nRelevant code:\n- `middleware/static.go` ~L219 (`p := c.Request().URL.Path`), ~L235 (`path.Clean`), ~L259 (`currentFS.Open`)\n- `StaticConfig.EnablePathUnescaping` docstring (`static.go` ~L60-67) — claims the default prevents the `/admin%2fprivate.txt` → `/admin/*` guard bypass; this is not true for the global mount.\n\nRelationship to prior advisories:\n- **CVE-2026-55677 / GHSA-vfp3-v2gw-7wfq** (patched 5.2.0): same `%2F` router-vs-handler mismatch, but fixed for `StaticFS`/`StaticDirectoryHandler`. The `middleware.Static` path was not covered — this report is that gap.\n- **CVE-2026-25766 / GHSA-pgvm-wxw2-hrv9** (patched 5.0.3): a *different* issue (Windows backslash traversal **outside** the root). Referenced only to disambiguate; not the same as this report.\n\n## PoC\n\nEnvironment: `golang:1.25`, module using the official release (`go get github.com/labstack/echo/v5@v5.3.1`, no local `replace`). Static root `public/` contains a marker file `public/admin/secret.txt` = `SECRET`.\n\nMinimal app (the pattern under test: static served globally + a group guard intended to protect `/admin`):\n\n```go\npackage main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/labstack/echo/v5\"\n\t\"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n\te := echo.New()\n\te.Use(middleware.Static(\"public\")) // serves ./public globally (default filesystem)\n\n\tadmin := e.Group(\"/admin\", func(next echo.HandlerFunc) echo.HandlerFunc {\n\t\treturn func(c *echo.Context) error { return c.String(http.StatusUnauthorized, \"auth required\") }\n\t})\n\tadmin.GET(\"/secret.txt\", func(c *echo.Context) error { return c.String(http.StatusOK, \"handler\") })\n\n\te.Start(\":1323\")\n}\n```\n\nRequests (unauthenticated):\n\n```\n# Literal: route matches -\u003e group guard runs\ncurl -i http://localhost:1323/admin/secret.txt\n# =\u003e 401\n\n# %2F-encoded: route does NOT match -\u003e guard skipped, but middleware.Static serves the file\ncurl -i --path-as-is http://localhost:1323/admin%2Fsecret.txt\n# =\u003e 200, body: SECRET\n```\n\nObserved on `v5.3.1`: literal → `401`; `%2F` → `200` with the file contents. For contrast, serving via the (patched) `e.StaticFS(\"/\")` returns `404` for the same `%2F` request, showing the `middleware.Static` path was not covered by the CVE-2026-55677 fix.\n\n## Impact\n\nAn unauthenticated remote user can retrieve a file served by `middleware.Static` even when the application attached a route/group middleware guard to that path, by substituting `/` with `%2F`. The consequence is limited to files already inside the served static root (CWE-863 authorization inconsistency; CWE-436 interpretation conflict) — **there is no access to files outside the static root**.\n\n**Honest caveat on validity / severity:** this only has security impact for applications that (a) serve a directory statically to the public *and* (b) place a sensitive file inside that same directory while relying on a *route-level* guard to protect it. That combination is arguably a misconfiguration — a statically-served directory is public by design — so maintainers may reasonably classify this as a documentation fix (correct the `EnablePathUnescaping` claim) or won't-fix rather than a code vulnerability. It is filed primarily because (1) the router-vs-handler `%2F` inconsistency is the exact class fixed in CVE-2026-55677 but left uncovered for `middleware.Static`, and (2) the docstring currently promises protection it does not provide.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. With the default settings, the Static middleware resolves files from the same form of the path that the router matched, so percent-encoded paths such as `/admin%2Fsecret.txt` or `/%61dmin/secret.txt` no longer reach a file under a guarded route. Paths with `.`, `..` or empty segments are no longer served.\n\nNote: middleware registered with `Echo#Use` runs before route and group middleware, so route guards never protect files served by a global Static middleware. Keep protected files outside its root directory, or serve them with `Echo#Static` behind the guard.\n\n## Workarounds\n\nKeep files that need protection outside the Static middleware's root directory.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-375p-5qhx-8wq4/GHSA-375p-5qhx-8wq4.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.16.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-375p-5qhx-8wq4/GHSA-375p-5qhx-8wq4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-375p-5qhx-8wq4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v4.16.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.4.0"
+    }
+  ]
+}

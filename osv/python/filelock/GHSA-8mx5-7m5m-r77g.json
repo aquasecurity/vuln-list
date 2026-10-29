@@ -1,0 +1,147 @@
+{
+  "id": "GHSA-8mx5-7m5m-r77g",
+  "modified": "2026-10-28T21:15:05.688436299Z",
+  "published": "2026-10-28T21:08:55Z",
+  "aliases": [
+    "CVE-2026-112910"
+  ],
+  "summary": "filelock: WindowsFileLock ignores mode: a 0o600 lock file and the ReadWriteLock database inherit the directory ACL",
+  "details": "filelock on Windows ignores the `mode` argument. `FileLock(path, mode=0o600)` creates the same file as `FileLock(path)`: one with no security descriptor of its own (the Windows record that says who may access a file). Its access list, or ACL, is whatever the lock directory hands down to new files. filelock creates the `ReadWriteLock` database, which it asks to be `0o600`, the same way. In a directory whose inheritable ACL grants other local accounts access to new files, those accounts can open the lock file or database. They can take the byte-range lock (a lock on a span of bytes in a file) once the owner releases it and keep the owner's later `acquire()` calls waiting or timing out. They can read holder metadata an `on_acquired` hook left in a `preserve_lock_file=True` file. Where the directory hands down modify access, they can write to both files.\n\n`lock.mode` still reports `0o600`. The documentation neither promises an ACL on Windows nor says that Windows drops the mode. On Unix the same mode keeps other accounts out. Mutual exclusion between processes that follow the protocol holds on either platform. Affected versions are filelock 3.10.0 through 4.2.0 on Windows.\n\nAnthropic's OSS Scanner reported this in private. Finding covered by this advisory:\n\n- `ANT-2026-0KEO0DDO` [medium, CWE-732]: WindowsFileLock ignores mode; 0o600 lock files inherit the directory ACL.\n\n## Severity\n\n**CVSS 3.1 `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L` scores 5.3 (Medium).**\n\n`AV:L` (local): the other account needs a logon on the same host. `PR:L` (low privileges): an ordinary account is enough. `UI:N` (no user interaction). `AC:L` (low attack complexity): no race. `C:L` (partial confidentiality impact): the lock file (holder metadata) and the lock database are readable where `0o600` was meant to keep them private. `I:L` (partial integrity impact): in the directory layout the maintainers tested, the other account can also write both files, which lets it corrupt the lock's own state but nothing the lock protects. `A:L` (partial availability impact): the other account can hold the byte-range lock and make the owner wait or time out. `S:U` (scope unchanged).\n\nClassification from the review: **Windows permission failure with security impact only where callers rely on `mode=0o600` across accounts**. The review had marked it an unconfirmed Windows claim, since the scanner traced stand-in Win32 calls on Linux. The maintainers have since confirmed it on Windows with two local accounts (see Evidence). The scanner rated this medium; the maintainers keep medium.\n\n## Scope and preconditions\n\n- The affected classes are `FileLock` and `AsyncFileLock` on Windows (`WindowsFileLock`), and the SQLite database of `ReadWriteLock` and `AsyncReadWriteLock`. Both go through `_open_non_reparse_fd`. The soft locks create their markers with `os.open`, which also keeps only a read-only bit of the mode on Windows; the scanner did not examine them further.\n- The directory is one that other local accounts cannot write, which the documentation already requires on Windows, but whose inheritable entries grant them read (or modify) access to new files. Examples are a service's data directory readable by `Users`, or any directory with `(OI)(CI)` entries (entries that new files and sub-directories inherit) for another account. A directory whose ACL already excludes other accounts, such as one inside a user profile, hides the problem.\n- The other account must open the file. According to the `LockFileEx` documentation, read access is enough to take the byte-range lock, so it can hold the lock whenever the owner does not. The lock file exists while the owner holds the lock, and stays after release with `preserve_lock_file=True`. The `ReadWriteLock` database is not unlinked at any point.\n- Unix is not affected, because `UnixFileLock` creates the file with the mode and repeats it with `fchmod`. Mutual exclusion between cooperating processes is not affected.\n\n## Affected code\n\nScanned commit `b831496b0273`: [`_open_non_reparse_fd` reduces the mode to one `read_only` bit](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_windows.py#L252-L253). That bit is false for every accepted mode, because [`_check_mode`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_api.py#L526) rejects any mode without owner read and write, and an unset mode becomes `0o666`. In [`_nt_open`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_windows.py#L283-L310) the `OBJECT_ATTRIBUTES.SecurityDescriptor` field stays unassigned, and `read_only` only chooses `FILE_ATTRIBUTE_READONLY`. [`_open_lock_database`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_read_write.py#L1079-L1086) passes `0o600` through the same function on Windows.\n\n## Introduced\n\n[d0061e4](https://github.com/tox-dev/filelock/commit/d0061e4643df) \"added multiuser support and associated tests\" ([#192](https://github.com/tox-dev/filelock/pull/192), 2023-03-15), first tag 3.10.0 (verified), added the `mode` parameter and on Windows handed it to `os.open`, which applies only the read-only attribute. The Windows backend has applied no more of the mode than that at any version, so this is a long-standing gap rather than a regression.\n\n## Mechanism\n\n`_open_non_reparse_fd(path, mode)` computes `read_only = not mode \u0026 _OWNER_WRITE` and calls `_nt_open(path, read_only=read_only)`. `_nt_open` fills an `OBJECT_ATTRIBUTES` with the NT path and `OBJ_CASE_INSENSITIVE` and leaves `SecurityDescriptor` NULL. It then calls `NtCreateFile` with `FILE_OPEN_IF` and `FILE_ATTRIBUTE_NORMAL` (or `FILE_ATTRIBUTE_READONLY` when `read_only`, which no accepted mode produces). Nothing consults the group and other bits. Per the `NtCreateFile` and `OBJECT_ATTRIBUTES` documentation, a NULL descriptor gives the new file default security, which on NTFS is the set of inheritable entries of the parent directory. A lock file created with `mode=0o600` in a directory that hands down read access to `Users` is therefore readable by `Users`.\n\nNothing tells the caller. The constructor validates the mode, `lock.mode` returns `0o600`, and `has_explicit_mode` is `True`. `docs/concepts.rst` says \"filelock creates the file with it\" and that \"`0o600` and `0o700` keep other UIDs out\", with no Windows caveat. Only the `_open_non_reparse_fd` docstring and a comment in `_soft.py` record the limitation.\n\n## Reproduction\n\nThe scanner's reproducer for `ANT-2026-0KEO0DDO`, quoted as received. It ran against commit `b831496b0273`.\n\n**`repro`**\n\n```python\n#!/usr/bin/env python3\nimport os\nimport shutil\nimport subprocess\nimport sys\nimport tempfile\n\nprivate_job = \"/tmp/repro.d/job_with_private_lock.py\"  # with FileLock(path, mode=0o600)\ndefault_job = \"/tmp/repro.d/job_with_default_lock.py\"  # with FileLock(path)\non_windows_backend = \"/tmp/repro.d/run_on_windows_backend.py\"  # prints every Win32 call filelock makes\n\nos.umask(0o022)\nlocks = tempfile.mkdtemp()\n\n# control: UnixFileLock, which leaves the lock file behind\nsubprocess.run([sys.executable, private_job, f\"{locks}/private.lock\"], check=True)\nsubprocess.run([sys.executable, default_job, f\"{locks}/default.lock\"], check=True)\nunix_private_mode = os.stat(f\"{locks}/private.lock\").st_mode \u0026 0o777\nunix_default_mode = os.stat(f\"{locks}/default.lock\").st_mode \u0026 0o777\n\n# trigger: the same two programs on WindowsFileLock, same lock name so the call lists can be compared whole\nwindows_private = [sys.executable, on_windows_backend, private_job, f\"{locks}/job.lock\"]\nwindows_default = [sys.executable, on_windows_backend, default_job, f\"{locks}/job.lock\"]\nwindows_private_calls = subprocess.run(windows_private, check=True, capture_output=True, text=True).stdout.splitlines()\nwindows_default_calls = subprocess.run(windows_default, check=True, capture_output=True, text=True).stdout.splitlines()\nshutil.rmtree(locks)\n\n# check: mode=0o600 must reach the OS; on Windows that means a security descriptor on NtCreateFile\nprint(f\"CONTROL  UnixFileLock FileLock(path, mode=0o600): lock file mode {unix_private_mode:#o}\")\nprint(f\"CONTROL  UnixFileLock FileLock(path):             lock file mode {unix_default_mode:#o}\")\nfor call in windows_private_calls:\n    print(f\"OBSERVED WindowsFileLock FileLock(path, mode=0o600): {call}\")\nfor call in windows_default_calls:\n    print(f\"OBSERVED WindowsFileLock FileLock(path):             {call}\")\nprint(f\"OBSERVED the two Win32 call lists are identical: {windows_private_calls == windows_default_calls}\")\n\nhonoured_on_unix = unix_private_mode == 0o600 and unix_default_mode == 0o644\nprivate_create = next(call for call in windows_private_calls if call.startswith(\"NtCreateFile(\"))\ndropped_on_windows = (\n    \"ObjectAttributes.SecurityDescriptor=None\" in private_create\n    and windows_private_calls == windows_default_calls\n)\nprint(\"BUG\" if honoured_on_unix and dropped_on_windows else \"OK\")\n```\n\n**`repro.d/job_with_default_lock.py`**\n\n```python\nimport sys\n\nfrom filelock import FileLock\n\nwith FileLock(sys.argv[1]):\n    pass\n```\n\n**`repro.d/job_with_private_lock.py`**\n\n```python\nimport sys\n\nfrom filelock import FileLock\n\nwith FileLock(sys.argv[1], mode=0o600):\n    pass\n```\n\n**`repro.d/run_on_windows_backend.py`**\n\n```python\nimport ctypes\nimport fcntl\nimport os\nimport runpy\nimport sys\nimport types\n\n# Stand-ins for the ntdll, kernel32 and msvcrt functions filelock's Windows backend calls. Each prints the call with\n# the arguments filelock passed, then does the nearest Linux thing so the program runs to its end.\n\n\ndef RtlDosPathNameToNtPathName_U_WithStatus(dos_path, nt_name, _file_part, _relative_name):\n    print(f\"RtlDosPathNameToNtPathName_U_WithStatus({os.path.basename(dos_path)!r})\")\n    nt_name._obj.Buffer = os.path.abspath(dos_path)\n    return 0  # STATUS_SUCCESS\n\n\ndef NtCreateFile(\n    handle, access, attributes, _io_status, allocation_size, file_attributes, share, disposition, options, ea, ea_length\n):\n    object_attributes = attributes._obj\n    print(\n        f\"NtCreateFile(DesiredAccess={access:#x},\"\n        f\" ObjectAttributes.Attributes={object_attributes.Attributes:#x},\"\n        f\" ObjectAttributes.SecurityDescriptor={object_attributes.SecurityDescriptor},\"\n        f\" AllocationSize={allocation_size}, FileAttributes={file_attributes:#x}, ShareAccess={share:#x},\"\n        f\" CreateDisposition={disposition}, CreateOptions={options:#x}, EaBuffer={ea}, EaLength={ea_length})\"\n    )\n    path = object_attributes.ObjectName.contents.Buffer\n    handle._obj.value = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW)\n    return 0  # STATUS_SUCCESS\n\n\ndef RtlFreeUnicodeString(_nt_name):\n    print(\"RtlFreeUnicodeString()\")\n\n\ndef GetFileInformationByHandle(_handle, info):\n    print(\"GetFileInformationByHandle()\")\n    info._obj.dwFileAttributes = 0x80  # FILE_ATTRIBUTE_NORMAL: not a reparse point\n    return True\n\n\ndef LockFileEx(handle, flags, _reserved, bytes_low, bytes_high, _overlapped):\n    print(f\"LockFileEx(dwFlags={flags:#x}, nNumberOfBytesToLockLow={bytes_low}, nNumberOfBytesToLockHigh={bytes_high})\")\n    fcntl.flock(handle, fcntl.LOCK_EX)\n    return True\n\n\ndef UnlockFileEx(handle, _reserved, bytes_low, bytes_high, _overlapped):\n    print(f\"UnlockFileEx(nNumberOfBytesToUnlockLow={bytes_low}, nNumberOfBytesToUnlockHigh={bytes_high})\")\n    fcntl.flock(handle, fcntl.LOCK_UN)\n    return True\n\n\n# only a filelock that builds a security descriptor for the lock file calls this\ndef ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, _revision, descriptor, _size):\n    print(f\"ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl!r})\")\n    descriptor._obj.value = 1  # any address but NULL\n    return True\n\n\n# filelock sets argtypes on these at import; a lock taken without contention never calls them\ndef not_called(*_arguments):\n    raise NotImplementedError\n\n\ndlls = {\n    \"ntdll\": types.SimpleNamespace(\n        RtlDosPathNameToNtPathName_U_WithStatus=RtlDosPathNameToNtPathName_U_WithStatus,\n        NtCreateFile=NtCreateFile,\n        RtlFreeUnicodeString=RtlFreeUnicodeString,\n        RtlNtStatusToDosError=not_called,\n    ),\n    \"kernel32\": types.SimpleNamespace(\n        GetFileInformationByHandle=GetFileInformationByHandle,\n        LockFileEx=LockFileEx,\n        UnlockFileEx=UnlockFileEx,\n        CloseHandle=not_called,\n        OpenProcess=not_called,\n        GetProcessTimes=not_called,\n    ),\n    \"advapi32\": types.SimpleNamespace(\n        ConvertStringSecurityDescriptorToSecurityDescriptorW=ConvertStringSecurityDescriptorToSecurityDescriptorW,\n    ),\n}\n\n# Import filelock once on the real platform, so the standard library modules it uses load their Linux versions, then\n# drop it and import it again with the Windows branches active. A HANDLE is the Linux descriptor number.\nimport filelock  # noqa: E402\n\nfor name in [name for name in sys.modules if name.split(\".\")[0] == \"filelock\"]:\n    del sys.modules[name]\n\nctypes.WinDLL = lambda name, use_last_error=False: dlls[name]\nsys.modules[\"msvcrt\"] = types.SimpleNamespace(open_osfhandle=lambda handle, _flags: handle, get_osfhandle=lambda fd: fd)\nos.O_NOINHERIT = 0\nsys.platform = \"win32\"\n\nimport filelock  # noqa: E402, F811\n\nassert filelock.FileLock is filelock.WindowsFileLock\n\nsys.argv = sys.argv[1:]\nrunpy.run_path(sys.argv[0], run_name=\"__main__\")\n```\n\n## Failure sequence\n\n```mermaid\nsequenceDiagram\n    participant O as owner process: FileLock(path, mode=0o600)\n    participant N as NtCreateFile\n    participant F as lock file (inherits the directory ACL)\n    participant U as other local account\n    O-\u003e\u003eN: _open_non_reparse_fd(path, 0o600): read_only=False, SecurityDescriptor=NULL\n    rect rgb(255, 214, 214)\n        N--\u003e\u003eF: created with the parent's inheritable entries only, group and other bits not consulted\n        Note over F: the file reports mode 0o600 to the owner, the ACL says otherwise\n    end\n    O-\u003e\u003eF: LockFileEx (holds the lock), release, unlock\n    U-\u003e\u003eF: open for read (and write, where the directory hands down modify)\n    U-\u003e\u003eF: LockFileEx through that handle\n    O-\u003e\u003eF: acquire() -\u003e waits or Timeout while U holds the byte-range lock\n    U-\u003e\u003eF: read holder metadata left by on_acquired with preserve_lock_file=True\n```\n\n## Evidence\n\nThe scanner's reproducer runs on a Linux image. It imports filelock's unmodified Windows backend with `sys.platform == \"win32\"` over stand-ins that print every Win32 call. The program with `mode=0o600` and the one without produce identical call lists (`RtlDosPathNameToNtPathName_U_WithStatus`, `NtCreateFile` with `FileAttributes=0x80` and `ObjectAttributes.SecurityDescriptor=None`, `RtlFreeUnicodeString`, `GetFileInformationByHandle`, `LockFileEx`, `UnlockFileEx`), while the Unix control produced `0o600` and `0o644` files. It prints `OBSERVED the two Win32 call lists are identical: True` and `BUG`. The scanner stated that it inferred the resulting ACL, and what another user can then do, from the documentation and did not run on Windows.\n\nMaintainer triage: the stand-in reproducer prints `BUG` on the scanned commit `b831496` and on the 4.2.0 release image.\n\nMaintainer verification on Windows 11 with two local accounts: a script creates `private.lock` with `FileLock(mode=0o600, preserve_lock_file=True)`, `default.lock` without a mode, and a `ReadWriteLock` database `lock.db` as the first account, in a directory granted `(OI)(CI)(M)` to a second account that is a member of `Users`. It then opens each file under the second account's logon token with `LogonUserW` and `ImpersonateLoggedOnUser`. On 4.2.0 the second account could open `private.lock` and `lock.db` for both read and write, the same as `default.lock`, and `icacls` listed only inherited `(I)` entries on all three. This confirms the claim the review had marked unconfirmed.\n\n## Impact\n\nA program that passes `mode=0o600` so that other accounts cannot open its lock file gets no such restriction on Windows. In a directory that hands down read access, another account can hold the lock and make the owner wait or time out, and read holder metadata in a preserved lock file. Where the directory hands down modify access, as in the maintainers' test, it can also write the lock file and the `ReadWriteLock` database. With the mode honoured, as on Unix, a user without write access to the directory can do none of this. The exposure ends there: the effect reaches only the lock file or lock database, and mutual exclusion between processes that follow the protocol still holds.\n\n## Workarounds\n\n- On Windows, keep lock files and `ReadWriteLock` databases in a directory whose ACL already excludes other accounts (inside the user profile, or a directory with inheritance disabled and only the owner, `SYSTEM` and `Administrators` granted), rather than relying on `mode`.\n- After creating a lock file with `preserve_lock_file=True` or a `ReadWriteLock` database, set its ACL yourself, for example `icacls \u003cfile\u003e /inheritance:r /grant:r \"\u003cowner\u003e:F\" \"SYSTEM:F\" \"Administrators:F\"`; a file that exists keeps its ACL on later opens.\n- Do not store anything confidential in the lock file through `on_acquired` on Windows.\n\n## Patched version\n\n4.2.1.\n\nFix: https://github.com/tox-dev/filelock/pull/835\n\n## Credits\n\nReported by Anthropic's OSS Scanner (automated analysis), 15 October 2026; reviewed by the maintainers.\n\n- 2026-10-15 23:08 UTC: report received (36 findings; this one rated medium by the scanner)\n- 2026-10-16 05:38 UTC: draft advisory created (first as part of GHSA-69hj-f68j-2879, then split out); two-account verification on Windows by the maintainers\n- 2026-10-16 01:16 UTC: fix PR #835 opened",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "filelock",
+        "purl": "pkg:pypi/filelock"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "4.2.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.10.4",
+        "3.10.5",
+        "3.10.6",
+        "3.10.7",
+        "3.11.0",
+        "3.12.0",
+        "3.12.1",
+        "3.12.2",
+        "3.12.3",
+        "3.12.4",
+        "3.13.0",
+        "3.13.1",
+        "3.13.2",
+        "3.13.3",
+        "3.13.4",
+        "3.14.0",
+        "3.15.0",
+        "3.15.1",
+        "3.15.2",
+        "3.15.3",
+        "3.15.4",
+        "3.16.0",
+        "3.16.1",
+        "3.17.0",
+        "3.18.0",
+        "3.19.1",
+        "3.20.0",
+        "3.20.1",
+        "3.20.2",
+        "3.20.3",
+        "3.20.4",
+        "3.21.0",
+        "3.21.1",
+        "3.21.2",
+        "3.22.0",
+        "3.23.0",
+        "3.24.0",
+        "3.24.1",
+        "3.24.2",
+        "3.24.3",
+        "3.25.0",
+        "3.25.1",
+        "3.25.2",
+        "3.28.0",
+        "3.29.0",
+        "3.29.1",
+        "3.29.2",
+        "3.29.3",
+        "3.29.4",
+        "3.29.5",
+        "3.29.6",
+        "3.29.7",
+        "3.30.0",
+        "3.30.1",
+        "3.30.2",
+        "3.30.3",
+        "3.31.0",
+        "3.31.1",
+        "3.31.2",
+        "3.32.0",
+        "3.32.2",
+        "3.32.3",
+        "3.32.4",
+        "3.32.5",
+        "3.32.6",
+        "3.32.7",
+        "4.0.0",
+        "4.0.1",
+        "4.0.10",
+        "4.0.11",
+        "4.0.12",
+        "4.0.2",
+        "4.0.3",
+        "4.0.4",
+        "4.0.5",
+        "4.0.6",
+        "4.0.7",
+        "4.0.8",
+        "4.0.9",
+        "4.1.0",
+        "4.1.1",
+        "4.1.2",
+        "4.2.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 4.2.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8mx5-7m5m-r77g/GHSA-8mx5-7m5m-r77g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/security/advisories/GHSA-8mx5-7m5m-r77g"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/pull/835"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/commit/e1e825b1992f69fb6b346dc395d5ae4893536c0a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/tox-dev/filelock"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/tox-dev/filelock/releases/tag/4.2.1"
+    }
+  ]
+}

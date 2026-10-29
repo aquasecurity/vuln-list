@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-3pmx-cf9f-34xr",
+  "modified": "2026-10-28T21:15:05.143057870Z",
+  "published": "2026-10-28T21:04:46Z",
+  "aliases": [
+    "CVE-2026-118654"
+  ],
+  "summary": "Echo static file middleware route protection bypass via encoded dot-dot traversal",
+  "details": "## Summary\n\nEcho v5.2.0 contains a bypass of the fix for GHSA-vfp3-v2gw-7wfq. The fix rejects encoded path separators such as `%2F` and `%5C` before static file path unescaping, but two traversal forms still bypass route-level middleware protections for static files.\n\nThe primary bypass uses encoded dot-dot segments. A request such as `/public/%2E%2E/admin/secret.txt` passes the encoded-separator guard, is unescaped to `public/../admin/secret.txt`, then `path.Clean` resolves it to `admin/secret.txt`. If `/admin/*` is protected by middleware but the static filesystem is mounted at `/`, the protected file is returned through the public static route.\n\nA second bypass exists when `UseEscapedPathForMatching=true`. In that mode, the router normalizes encoded separators before the static handler checks the wildcard. The handler receives a decoded wildcard with no `%` characters, so the encoded-separator guard does not run on the original encoded path.\n\n## Impact\n\nAn unauthenticated attacker can read files that an application intended to protect with route-level middleware, when those files are also reachable through a static filesystem mount after path normalization.\n\nThe high-severity variant works with the default router configuration and requires only encoded dot-dot path segments. The direct protected route returns 403, while the public static route returns the protected file content.\n\nThe `UseEscapedPathForMatching=true` variant is lower severity because it requires a non-default router configuration.\n\n## Affected versions\n\nTested vulnerable:\n\n- `github.com/labstack/echo/v5` v5.2.0\n- Current `master` at `5786024ea4d85c01784796e8aa7aac53e007b39b`\n\nNo patched version is currently known.\n\n\n## Policy and version checks\n\nGitHub Private Vulnerability Reporting is enabled for `labstack/echo`. The repository has a root `SECURITY.md` and accepts security reports through GitHub Security Advisories.\n\nThe vulnerable code was revalidated on both current `master` and the latest release tag:\n\n- Current `master`: `5786024ea4d85c01784796e8aa7aac53e007b39b`\n- Latest release: `v5.2.0`, published June 14 2026\n- Package: `github.com/labstack/echo/v5`\n\nThe same focused Go tests pass on the checked out `v5.2.0` / `master` commit, proving the bypass remains present in the latest released version and latest main branch at the time of reporting.\n\n## Reproduction\n\nThe following application shape reproduces the high-severity bypass:\n\n```go\ne := echo.New()\n\ng := e.Group(\"/admin\", func(next echo.HandlerFunc) echo.HandlerFunc {\n    return func(c echo.Context) error {\n        return echo.NewHTTPError(http.StatusForbidden)\n    }\n})\ng.GET(\"/*\", handler)\n\ne.StaticFS(\"/\", fsysWithAdminSecret)\n```\n\nControl request:\n\n```http\nGET /admin/secret.txt\n```\n\nObserved result:\n\n```text\n403 Forbidden\n```\n\nBypass request:\n\n```http\nGET /public/%2E%2E/admin/secret.txt\n```\n\nObserved result:\n\n```text\n200 OK\nTOP-SECRET\n```\n\nFor the non-default router variant:\n\n```go\ne := echo.New()\ne.router = echo.NewRouter(echo.RouterConfig{\n    UseEscapedPathForMatching: true,\n})\n\ng := e.Group(\"/admin\", authMiddlewareReturning403)\ng.GET(\"/*\", handler)\n\ne.StaticFS(\"/\", fsysWithAdminSecret)\n```\n\nBypass request:\n\n```http\nGET /public%2F..%2Fadmin%2Fsecret.txt\n```\n\nObserved result:\n\n```text\n200 OK\nTOP-SECRET\n```\n\n## Proof of concept evidence\n\nI added focused tests against the current Echo codebase. The tests exercise both `StaticDirectoryHandler` and the static middleware path.\n\nCommand:\n\n```bash\ngo test -run TestHostile -v ./...\n```\n\nObserved result:\n\n```text\n=== RUN   TestHostile_StaticDirectoryHandler_EncodedSeparatorsBlocked\n--- PASS: TestHostile_StaticDirectoryHandler_EncodedSeparatorsBlocked (0.00s)\n=== RUN   TestHostile_StaticDirectoryHandler_EncodedDotDotBypass\n--- PASS: TestHostile_StaticDirectoryHandler_EncodedDotDotBypass (0.00s)\n=== RUN   TestHostile_UseEscapedPathForMatching_Bypass\n--- PASS: TestHostile_UseEscapedPathForMatching_Bypass (0.00s)\nPASS\nok  github.com/labstack/echo/v5  0.013s\n=== RUN   TestHostile_StaticMiddleware_EncodedSeparatorsBlocked\n--- PASS: TestHostile_StaticMiddleware_EncodedSeparatorsBlocked (0.01s)\n=== RUN   TestHostile_StaticMiddleware_EncodedDotDotBypass\n--- PASS: TestHostile_StaticMiddleware_EncodedDotDotBypass (0.00s)\n=== RUN   TestHostile_StaticMiddleware_DisablePathUnescaping\n--- PASS: TestHostile_StaticMiddleware_DisablePathUnescaping (0.00s)\nPASS\nok  github.com/labstack/echo/v5/middleware  0.012s\n```\n\nThe control tests also confirm that the new fix blocks encoded separators such as `%2F`, `%5C`, double-encoded slash values, null bytes, and overlong slash encodings.\n\n## Root cause\n\nThe fix for GHSA-vfp3 uses a denylist-style guard that checks for encoded path separators before unescaping the static wildcard. This blocks `%2F` and `%5C`, but does not block encoded traversal segments such as `%2E%2E`.\n\nThe vulnerable flow is:\n\n1. The static route wildcard accepts `public/%2E%2E/admin/secret.txt`.\n2. The encoded-separator guard sees no `%2F` or `%5C` and allows the request.\n3. The handler unescapes the wildcard to `public/../admin/secret.txt`.\n4. `path.Clean` resolves it to `admin/secret.txt`.\n5. The file is served through the public static route instead of the protected `/admin/*` route.\n\nFor `UseEscapedPathForMatching=true`, the router decodes the path before the static handler sees the wildcard, so the handler cannot detect that encoded separators were used in the original request.\n\n## Remediation\n\nDo not rely only on detecting encoded separators. Reject encoded traversal sequences before unescaping, and reject normalized wildcard values that cross route or static mount boundaries.\n\nPossible fixes:\n\n1. Extend the pre-unescape guard to reject encoded dot segments such as `%2E` and `%2E%2E` in path components.\n2. After unescaping, reject any wildcard where cleaning changes the path in a way that removes `.` or `..` components.\n3. For `UseEscapedPathForMatching=true`, run the static-file guard against the original escaped request path before router normalization, or preserve metadata that the matched wildcard came from encoded separators.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. The Static middleware and `StaticDirectoryHandler` (used by `Echo.Static`, `Echo.StaticFS`, `Group.Static` and `Group.StaticFS`) no longer serve paths with a `.`, `..` or empty segment, including after path unescaping. The encoded variant of the first vector (`/public/%2E%2E/admin/secret.txt`) was already fixed in v5.2.1 and v4.15.4 (GHSA-vfp3-v2gw-7wfq).\n\n## Workarounds\n\nPut a reverse proxy in front of the application that normalizes request paths (removes dot segments and merges slashes), or keep protected files outside the served directory.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-3pmx-cf9f-34xr/GHSA-3pmx-cf9f-34xr.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.16.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-3pmx-cf9f-34xr/GHSA-3pmx-cf9f-34xr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-3pmx-cf9f-34xr"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v4.16.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.4.0"
+    }
+  ]
+}

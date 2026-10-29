@@ -1,0 +1,84 @@
+{
+  "id": "GHSA-v753-g4cw-jm48",
+  "modified": "2026-10-28T21:15:05.570237165Z",
+  "published": "2026-10-28T21:04:22Z",
+  "aliases": [
+    "CVE-2026-118656"
+  ],
+  "summary": "Echo has Open Redirect via Control-Character Prefix Defeating sanitizeURI",
+  "details": "## Summary\n\nEcho's dedicated open-redirect guard, `sanitizeURI`, decides whether a redirect target is a local path by inspecting exactly two byte positions: `uri[0]` and `uri[1]`. If the value begins with a control character such as a tab or a newline, followed by a separator pair, the guard does not fire and the value is written to the `Location` header unchanged.\n\nBrowsers remove tab and newline characters from URLs before parsing them, and treat a backslash as a forward slash for HTTP and HTTPS URLs. A `Location` value of ``/\\t/attacker.example`` is therefore resolved by the browser as an absolute URL on `attacker.example`. Confirmed end to end in a headless browser.\n\n## Technical background\n\n### The guard\n\n`middleware/slash.go:144` (duplicated verbatim at `echo.go:958`):\n\n```go\nfunc sanitizeURI(uri string) string {\n\t// double slash `\\\\`, `//` or even `\\/` is absolute uri for browsers and by redirecting request to that uri\n\t// we are vulnerable to open redirect attack. so replace all slashes from the beginning with single slash\n\tif len(uri) \u003e 1 \u0026\u0026 (uri[0] == '\\\\' || uri[0] == '/') \u0026\u0026 (uri[1] == '\\\\' || uri[1] == '/') {\n\t\turi = \"/\" + strings.TrimLeft(uri, `/\\`)\n\t}\n\treturn uri\n}\n```\n\nThe condition is anchored at absolute offsets 0 and 1. It cannot see a separator that has been shifted by one byte.\n\n### Data flow\n\n1. `RemoveTrailingSlash` (`middleware/slash.go:112-140`) reads `url.Path`, which `net/http` has already percent-decoded, strips the trailing slash, and appends the raw query string:\n\n```go\npath := url.Path\n...\nif l \u003e 0 \u0026\u0026 strings.HasSuffix(path, \"/\") {\n    path = path[:l]\n    uri := path\n    if qs != \"\" {\n        uri += \"?\" + qs\n    }\n    if config.RedirectCode != 0 {\n        return c.Redirect(config.RedirectCode, sanitizeURI(uri))   // line 132\n    }\n```\n\n2. `AddTrailingSlash` does the same in the opposite direction at `middleware/slash.go:67`.\n\n3. A request for `/%09/attacker.example/x/` has `url.Path` equal to `\"/\\t/attacker.example/x/\"` (a literal TAB byte). `sanitizeURI` evaluates `uri[0] == '\\t'`, the condition is false, and the value passes through untouched.\n\n4. `Context.Redirect` (`context.go:735`) writes it to the `Location` header. Go's header writer removes CR and LF but leaves TAB, which is all that is required.\n\n### Conditional analysis\n\n- Guard: `uri[0]` and `uri[1]` are separators. Trust boundary: server-side sanitization of attacker-influenced path data.\n- Bypass: place a single control byte before the separator pair. The separator moves to index 1 and the guard's second condition (`uri[1]` being a separator) is never reached because the first condition (`uri[0]` being a separator) already failed.\n- Browser-side trust boundary: the client's URL parser. It is adversary favourable: control characters are stripped and backslashes are normalized before scheme and authority parsing. The attacker does not need any server-side weakness beyond producing the malformed `Location`.\n\nNote that the newline variant does not survive: `net/http` replaces CR and LF in header values. TAB does survive, and TAB alone is sufficient because the browser strips it.\n\n## Proof of concept\n\n**Attached PoC:** `ECHO-2026-002_poc.zip` (in this directory). Extract it and follow\n`ECHO-2026-002/README.md` for the full walkthrough. The archive contains a\nself-contained Go module (`go.mod`, `go.sum`, `main.go`, `README.md`).\n\n[ECHO-2026-002_poc.zip](https://github.com/user-attachments/files/32133975/ECHO-2026-002_poc.zip)\n\nQuick start:\n\n```bash\nunzip ECHO-2026-002_poc.zip\ncd ECHO-2026-002\n# edit go.mod: point the replace directive at your Echo checkout\nsed -i 's|=\u003e .*|=\u003e /absolute/path/to/echo|' go.mod\nGOFLAGS=-mod=mod go run .          # in-process check\nGOFLAGS=-mod=mod go run . -serve   # real listener on 127.0.0.1:18002\n```\n\n### Environment used for verification\n\n- OS: Linux 6.18.33.2-microsoft-standard-WSL2, x86_64\n- Go: go1.27.0 linux/amd64\n- Target: Echo v5.3.1 (module `github.com/labstack/echo/v5`)\n- Browser: headless Chromium drove the end-to-end confirmation\n\n### The vulnerable configuration\n\n```go\npackage main\n\nimport (\n    \"net/http\"\n\n    \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    e := echo.New()\n    e.Pre(middleware.RemoveTrailingSlashWithConfig(middleware.RemoveTrailingSlashConfig{\n        RedirectCode: http.StatusMovedPermanently,\n    }))\n    e.GET(\"/\", func(c *echo.Context) error { return c.String(200, \"home\") })\n    _ = e.Start(\"127.0.0.1:18002\")\n}\n```\n\n***\n\n### Reproduction\n\nIn-process check. The program requests five path shapes and applies the browser\nURL-parsing steps that matter (strip TAB, LF, CR; treat a backslash as a slash; a\nleading `//` starts an authority):\n\n```bash\nGOFLAGS=-mod=mod go run .\n```\n\n```\nGET                          code   Location (control chars shown) browser navigates to\n/normal/path/                301    /normal/path           (victim origin)\n                             control: ordinary path, sanitized correctly\n/%09/attacker.example/x/     301    /^I/attacker.example/x attacker.example\n                             exploit: TAB then slash\n/%09%5Cattacker.example/x/   301    /^I\\attacker.example/x attacker.example\n                             exploit: TAB then backslash\n/..%09/attacker.example/     301    /..^I/attacker.example (victim origin)\n                             NOT exploitable: TAB is not at index 1\n/%09//attacker.example/      301    /^I//attacker.example  (victim origin)\n                             NOT exploitable: three slashes is an empty authority\n\nRESULT: reproducible. ...\n```\n\n`^I` is a literal TAB byte. The last two rows are deliberate negatives, included\nso the mechanism (the guard reads only `uri[0]` and `uri[1]`) is unambiguous.\n\nOver the wire, with the `-serve` variant running on `127.0.0.1:18002`:\n\n1. Show the malformed `Location` on the wire. No backslash is needed for this variant:\n\n```bash\ncurl -s -i --max-time 5 'http://127.0.0.1:18002/%09/attacker.example/x/' | cat -A | head -3\n# HTTP/1.1 301 Moved Permanently\n# Location: /^I/attacker.example/x\n```\n\n`cat -A` renders the tab as `^I`, confirming it is a literal byte in the header.\n\n2. Show that LF does NOT work, which proves the mechanism is the guard's fixed\n   byte offsets rather than generic header injection:\n\n```bash\ncurl -s -i --max-time 5 'http://127.0.0.1:18002/%0A/attacker.example/x/' | cat -A | head -3\n# Location: / /attacker.example/x     (net/http rewrote LF to a space)\n```\n\n3. Confirm a browser leaves the origin. Start any HTTP server on port 18099, then\n   open this URL in a browser:\n\n```\nhttp://127.0.0.1:18002/%09/127.0.0.1:18099/x/\n```\n\nObserved in headless Chromium:\n\n```\nfinalUrl: http://127.0.0.1:18099/x\n```\n\nThe browser left the victim origin entirely, so this is a working open redirect,\nnot merely a suspicious header.\n\nExit status `0` means the finding reproduced; `1` means an expectation was\nviolated.\n\n## Impact\n\nAn attacker can craft a link on the victim domain that redirects the victim to an arbitrary external site. Practical consequences:\n\n- Phishing: the trusted domain name appears in the link and in the initial navigation, which defeats the usual \"check the domain\" advice.\n- OAuth and SSO token theft: any flow that permits a redirect target on the trusted origin and relies on that origin's redirects being local can be chained to leak authorization codes or access tokens.\n- Referrer and cache poisoning of downstream logic that treats the victim origin's redirects as trustworthy.\n\nThe client must follow the redirect (user interaction is required), which is why this is scored Medium rather than High, but open redirects on authentication-adjacent origins routinely escalate in practice.\n\n## Recommended fixes\n\nNormalize before deciding, instead of probing two fixed offsets.\n\n```go\nfunc sanitizeURI(uri string) string {\n\t// Strip control characters that browsers remove before parsing, so they cannot\n\t// be used to shift a separator out of the checked positions.\n\turi = strings.Map(func(r rune) rune {\n\t\tif r \u003c 0x20 || r == 0x7f {\n\t\t\treturn -1\n\t\t}\n\t\treturn r\n\t}, uri)\n\t// Collapse any leading separator run (both slash kinds) to a single slash.\n\tif strings.ContainsAny(uri[:min(len(uri), 1)], `/\\`) {\n\t\ttrimmed := strings.TrimLeft(uri, `/\\`)\n\t\tif len(trimmed) != len(uri) {\n\t\t\treturn \"/\" + trimmed\n\t\t}\n\t}\n\treturn uri\n}\n```\n\nAdditional hardening:\n\n1. Reject the request with 400 when the decoded path contains control characters, rather than attempting to sanitize. A path containing a raw TAB or NUL is malformed under RFC 3986 and has no legitimate use.\n2. Apply the same normalization to the `Location` value in `Context.Redirect` so every caller benefits, instead of relying on each call site to call `sanitizeURI`.\n3. Add a regression test for each variant (`%09/`, `%09%5C`, `%0A/`) against both trailing-slash middlewares. There is currently no test that asserts `sanitizeURI` behavior at all.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. The trailing slash middlewares and the static directory redirect percent-encode control characters in the redirect path before collapsing leading slashes, so a browser can no longer be sent to another host.\n\n## Workarounds\n\nUse the trailing slash middlewares without `RedirectCode` (the default rewrites the path internally instead of redirecting), or reject request paths that contain control characters before these middlewares.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v5",
+        "purl": "pkg:golang/github.com/labstack/echo/v5"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "5.4.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v753-g4cw-jm48/GHSA-v753-g4cw-jm48.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/labstack/echo/v4",
+        "purl": "pkg:golang/github.com/labstack/echo/v4"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.16.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-v753-g4cw-jm48/GHSA-v753-g4cw-jm48.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/security/advisories/GHSA-v753-g4cw-jm48"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/labstack/echo"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v4.16.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/labstack/echo/releases/tag/v5.4.0"
+    }
+  ]
+}

