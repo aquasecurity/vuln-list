@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-vp5q-ff62-jwqv",
+  "modified": "2026-10-30T23:15:08.280947847Z",
+  "published": "2026-10-30T22:59:08Z",
+  "aliases": [
+    "CVE-2026-116794"
+  ],
+  "summary": "russh: Agent server never calls `Agent::confirm`, so keys added with the confirm constraint (`ssh-add -c`) sign without confirmation",
+  "details": "### Summary\n\nThe agent server in `russh::keys::agent::server` never calls `Agent::confirm` before signing with a key that was added with the confirm constraint. That constraint is `SSH_AGENT_CONSTRAIN_CONFIRM` (RFC 9987 §5.2.7.2), which is what `ssh-add -c` sends.\n\nThe call was replaced by a hard-coded `true` in 3e04597 (\"Native async traits encore\", #455), first released in 0.50.0-beta.12. Every release since, up to and including 0.64.1, signs requests for confirm-constrained keys without asking the `Agent` implementation. A user who added a key with `-c` is therefore never asked to confirm.\n\n### Details\n\n`Connection::try_sign` notes that the key needs confirmation, then awaits a ready future instead of the agent ([server.rs L348-L360 at v0.64.1](https://github.com/Eugeny/russh/blob/e5d80a07dc554480b6ea3b2e14adfc190407b627/russh/src/keys/agent/server.rs#L348-L360)):\n\n```rust\nlet agent = if needs_confirm {\n    let (agent, ok) = {\n        let _pk = key.clone();\n        Box::new(futures::future::ready((agent, true)))\n    }\n    .await;\n    if !ok {\n        return Ok((agent, false));\n    }\n    agent\n} else {\n    agent\n};\n```\n\nBefore [3e04597](https://github.com/Eugeny/russh/commit/3e04597dc54e36bfc85c21996f7d8d9d224e9826) the first statement was `let (agent, ok) = agent.confirm(key.clone()).await;`.\n\n`try_sign` was checked in the published crates on crates.io:\n- Every russh release from 0.50.0-beta.12 to 0.64.1 (52 versions) has the hard-coded `true`.\n- russh 0.50.0-beta.8 to beta.11 call `agent.confirm`.\n- Earlier russh releases have no agent server. It lived in russh-keys, and no russh-keys release is affected.\n\nNot affected:\n- `Agent` implementations that keep the default `confirm`, which returns `true` anyway.\n- Checks made in `Agent::confirm_request`, which is still called with `MessageType::Sign` for every sign request ([L158-L159](https://github.com/Eugeny/russh/blob/e5d80a07dc554480b6ea3b2e14adfc190407b627/russh/src/keys/agent/server.rs#L158-L159)).\n- The agent client, and the SSH client and server.\n\n### PoC\n\n1. Add this test to `mod test` in `russh/src/keys/mod.rs`. It uses the module's existing `Incoming` helper and `ED25519_KEY`.\n2. Run `cargo test -p russh --lib keys::test::test_agent_confirms_keys_added_with_the_confirm_constraint`.\n\n```rust\n#[tokio::test]\n#[cfg(unix)]\nasync fn test_agent_confirms_keys_added_with_the_confirm_constraint() {\n    use std::sync::atomic::{AtomicUsize, Ordering};\n\n    // An agent whose user refuses every confirmation prompt.\n    #[derive(Clone)]\n    struct Refuse(std::sync::Arc\u003cAtomicUsize\u003e);\n    impl agent::server::Agent for Refuse {\n        fn confirm(\n            self,\n            _: std::sync::Arc\u003cPrivateKey\u003e,\n        ) -\u003e Box\u003cdyn Future\u003cOutput = (Self, bool)\u003e + Send + Unpin\u003e {\n            self.0.fetch_add(1, Ordering::SeqCst);\n            Box::new(futures::future::ready((self, false)))\n        }\n    }\n\n    let prompts = std::sync::Arc::new(AtomicUsize::new(0));\n    let dir = tempfile::tempdir().unwrap();\n    let agent_path = dir.path().join(\"agent\");\n    let mut listener = tokio::net::UnixListener::bind(\u0026agent_path).unwrap();\n    let agent = Refuse(prompts.clone());\n    tokio::spawn(async move {\n        agent::server::serve(\n            Incoming {\n                listener: \u0026mut listener,\n            },\n            agent,\n        )\n        .await\n    });\n\n    let key = decode_secret_key(ED25519_KEY, Some(\"blabla\")).unwrap();\n    let public = key.public_key().clone();\n    let stream = tokio::net::UnixStream::connect(\u0026agent_path).await.unwrap();\n    let mut client = agent::client::AgentClient::connect(stream);\n    // What `ssh-add -c` sends.\n    client\n        .add_identity(\u0026key, \u0026[agent::Constraint::Confirm])\n        .await\n        .unwrap();\n\n    let signed = client\n        .sign_request(\u0026AgentIdentity::from(public), None, b\"data\".to_vec())\n        .await;\n    let confirm_calls = prompts.load(Ordering::SeqCst);\n    assert!(\n        signed.is_err(),\n        \"the agent signed with a confirm-constrained key without asking: \\\n         Agent::confirm was called {confirm_calls} time(s)\"\n    );\n    assert_eq!(\n        confirm_calls, 1,\n        \"Agent::confirm should be asked exactly once\"\n    );\n}\n```\n\nOn v0.64.1 (e5d80a0) the test fails:\n\n```\nthe agent signed with a confirm-constrained key without asking: Agent::confirm was called 0 time(s)\n```\n\nWith the fix below it passes, and so do all 46 `keys::` tests.\n\n### Impact\n\nA russh-based agent whose `Agent::confirm` asks the user, or applies any other check, signs every request for a confirm-constrained key without running that check. Anyone who can talk to the agent can then use the key without the user's approval:\n- other local processes of the user;\n- the remote host, when the agent is forwarded (`ssh -A`).\n\nPreventing exactly this is the purpose of the confirm constraint. RFC 9987 §10 names it as what stops an attacker with access to the agent from \"stealing use of those keys\".\n\nBecause the agent accepts the constraint, `ssh-add -c` reports success and the user believes the key is protected. RFC 9987 §5.2.7 says an agent that does not support a constraint MUST refuse the key instead.\n\nThe private key itself is not exposed. The impact is unauthorized use of it for as long as the attacker can reach the agent: logging in to other hosts as the user, or signing data such as git commits.\n\n**Known affected downstream user** (from its public code; not tested): Proton Pass desktop, which uses russh 0.62.7.\n- It adds every key with `Constraint::Confirm` ([mod.rs L332](https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass-desktop/native/napi/src/ssh_agent/mod.rs#L332)).\n- It uses `Agent::confirm` as its \"Pass is unlocked\" check before signing, and defers `MessageType::Sign` from `confirm_request` to it ([L75-L100](https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass-desktop/native/napi/src/ssh_agent/mod.rs#L75-L100)). That check never runs.\n- Proton also removes keys from the agent on lock and logout ([ssh-agent.middleware.ts L23-L27](https://github.com/ProtonMail/WebClients/blob/64862561fea883c1b4360b7338a0102eaad5c0fb/applications/pass/src/app/Store/ssh-agent.middleware.ts#L23-L27)).\n\nSo the exposure there is limited to states in which keys stay loaded while Pass is not unlocked. Their own code notes, for example, that the agent persists across renderer reloads and account switches.\n\n### Suggested fix\n\n```diff\n--- a/russh/src/keys/agent/server.rs\n+++ b/russh/src/keys/agent/server.rs\n@@ -346,11 +346,7 @@ impl\u003cS: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync\n             }\n         };\n         let agent = if needs_confirm {\n-            let (agent, ok) = {\n-                let _pk = key.clone();\n-                Box::new(futures::future::ready((agent, true)))\n-            }\n-            .await;\n+            let (agent, ok) = agent.confirm(key.clone()).await;\n             if !ok {\n                 return Ok((agent, false));\n             }\n```\n\nWhen `confirm` returns `false`, `try_sign` returns `false` and the agent answers `SSH_AGENT_FAILURE`, as it did before the regression.\n\n**Compatibility note for the release notes:** `confirm` is called again for confirm-constrained keys, so implementations that stub it out will now hit that stub.\n- For example, Litterbox implements `confirm` as `todo!()` ([agent.rs L81-L87](https://github.com/Gerharddc/Litterbox/blob/c2cc67b80926affecbaa5905a7480af17b1270f2/litterbox/src/agent.rs#L81-L87)).\n- Each connection runs in its own task, so such a panic ends only that connection.\n\n**Related but separate:** with the default `confirm`, the agent still accepts the confirm constraint without enforcing it. Given RFC 9987 §5.2.7, refusing such keys when the application does not implement `confirm` may be worth considering.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.65"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-vp5q-ff62-jwqv/GHSA-vp5q-ff62-jwqv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-vp5q-ff62-jwqv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116794"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/3e04597dc54e36bfc85c21996f7d8d9d224e9826"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/62db6e7defd6d244159da962ccccb029e785ce0f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.65.0"
+    }
+  ]
+}

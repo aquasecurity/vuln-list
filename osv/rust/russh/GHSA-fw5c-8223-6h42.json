@@ -1,0 +1,58 @@
+{
+  "id": "GHSA-fw5c-8223-6h42",
+  "modified": "2026-10-30T23:15:05.419143037Z",
+  "published": "2026-10-30T22:58:53Z",
+  "aliases": [
+    "CVE-2026-116774"
+  ],
+  "summary": "russh: peer-declared zero maximum packet size permanently stalls channel writes (silent AsyncWrite hang)",
+  "details": "## Summary\n\nA peer can advertise `maximum packet size = 0` in its channel-open message (`CHANNEL_OPEN` when attacking a server, `CHANNEL_OPEN_CONFIRMATION` when attacking a client). russh accepts the value without validation and copies it into the channel write state, where it caps the size of every outgoing data chunk. In the `AsyncWrite` code path (`ChannelTx::poll_writable`, used by `Channel::data()`, `Channel::make_writer()` and `Channel::into_stream()`), a cap of 0 makes every write future stay `Poll::Pending` forever: `writable = max_packet_size.min(window_size).min(buf_len)` is always 0, and no future event can ever raise it (a static maximum packet size of 0 can never be satisfied by any amount of peer-granted window). The write neither completes nor errors, so the application task hangs silently.\n\nEvery other write path in russh already treats `max_packet_size == 0` as an error (`Error::Inconsistent`): `Channel::reserve_writable_chunk` (`russh/src/channels/mod.rs:363-365`) and the session packetizers (`russh/src/session.rs:489-492` and `549-552`). The `AsyncWrite` path is the only one that lacks the guard - it contradicts the crate's own invariant.\n\n## Root cause\n\n(1) Peer value accepted without validation:\n\n- `russh/src/parsing.rs:44` (`OpenChannelMessage::parse`): `let maxpacket = map_err!(u32::decode(r))?;` stored as `recipient_maximum_packet_size` (`:25-30`); no range check. Same for `ChannelOpenConfirmation::decode` at `russh/src/parsing.rs:194-207`.\n- The only packet-size validation anywhere is an upper bound on the *local* config that merely logs (`russh/src/client/mod.rs:1189-1194`, `russh/src/server/mod.rs:912-917`). Nothing validates the peer's value - 0 passes silently.\n\n(2) The value flows into the channel write state verbatim:\n\n- Server: `russh/src/server/encrypted.rs:1877-1900` - `ChannelParams { recipient_maximum_packet_size: msg.recipient_maximum_packet_size, .. }`, then `Channel::new(..., channel_params.recipient_maximum_packet_size, ...)`.\n- Client: `russh/src/client/encrypted.rs:471-488` - `parameters.confirm(\u0026msg)` (`russh/src/lib_inner.rs:519-523`) and `ChannelMsg::Open { max_packet_size: msg.maximum_packet_size, .. }`, consumed by `wait_channel_confirmation` (`russh/src/client/mod.rs:698-722`), which builds `ChannelWriteHalf { max_packet_size, .. }`.\n- The write half hands the value to the writer: `make_writer_ext` (`russh/src/channels/mod.rs:433-441`) and `into_stream` (`russh/src/channels/mod.rs:661-670`) pass `self.max_packet_size` to `ChannelTx::new`.\n\n(3) The hang - `russh/src/channels/io/tx.rs:82-108` (current v0.64.1, byte-identical in v0.60.0):\n\n```rust\nfn poll_writable(\u0026mut self, cx: \u0026mut Context\u003c'_\u003e, buf_len: usize) -\u003e Poll\u003cNonZeroUsize\u003e {\n    ...\n    let writable = (self.max_packet_size).min(*window_size).min(buf_len as u32) as usize;\n    match NonZeroUsize::try_from(writable) {\n        Ok(w) =\u003e {\n            *window_size -= writable as u32;\n            if *window_size \u003e 0 {\n                self.notify.notify_one();\n            }\n            Poll::Ready(w)\n        }\n        Err(_) =\u003e {\n            drop(window_size);\n            ready!(self.window_size_notication.poll_unpin(cx));\n            self.window_size_notication = WatchNotification::new(Arc::clone(\u0026self.notify));\n            cx.waker().wake_by_ref();\n            Poll::Pending\n        }\n    }\n}\n```\n\nWith `max_packet_size == 0`, `writable` is always 0 regardless of `window_size` and `buf_len`; the task parks on the window notification, gets re-polled on every `CHANNEL_WINDOW_ADJUST`, recomputes 0, and parks again - forever.\n\n(4) The guard exists everywhere else:\n\n```rust\n// russh/src/channels/mod.rs:363-365 (used by send_bytes -\u003e data_bytes / extended_data_bytes)\nif self.max_packet_size == 0 {\n    return Err(Error::Inconsistent);\n}\n\n// russh/src/session.rs:490-492 and :550-552 (packetizer)\nif max_packet_size == 0 {\n    return Err(crate::Error::Inconsistent);\n}\n```\n\nNote that `Channel::data(reader)` (`russh/src/channels/mod.rs:321-323`) goes through `send_data` -\u003e `tokio::io::copy(\u0026mut data, \u0026mut tx)` (`:350-360`) into the same `ChannelTx`, so the primary documented data API hangs as well; only the `*_bytes` variants reach the guard.\n\n## Attack scenarios\n\n- **Server (authenticated remote DoS)**: with the default configuration, an authenticated client opens a session channel advertising `maximum packet size = 0`. Whenever the server application writes on that channel through `AsyncWrite` (echo, shell prompts, SFTP - russh's own examples echo via `into_stream()`), the write future never completes. The handler task is stranded and no error surfaces, so application cleanup paths do not trigger. Repeat per channel and per connection; keep-alive traffic resets the server `inactivity_timeout` (default 600 s), so stranded resources persist as long as the attacker wants.\n- **Client (malicious server)**: a malicious or buggy server confirms an opened channel with `maximum packet size = 0`; the client application's writes on that channel stall forever. The client `inactivity_timeout` defaults to `None`, so nothing ever tears the session down.\n- This is distinct from a `window_size == 0` stall: a zero window is dynamic flow control that a well-behaved peer releases as soon as its buffers drain, while `maximum packet size` is a static peer declaration where 0 can never be satisfied by any future packet. RFC 4254 section 5.1 recommends a minimum of 32768 - legitimate peers do not send 0.\n\n## Impact\n\nPermanent, silent denial of service for the affected writes, with stranded tasks/channels/connections that accumulate for the attacker - resource exhaustion of a server or of a client application. Because the failure mode is `Poll::Pending` instead of `Err`, ordinary application mitigations (error handling, timeouts on writes, connection teardown) do not engage on their own.\n\n## Reproducer\n\nTwo stock russh instances are enough (no raw SSH crafting required):\n\n1. Server: default config plus a host key; `channel_open_session` accepts and echoes using `tokio::io::copy` into `channel.into_stream()` (the pattern from russh's own examples).\n2. Client: default config except `config.maximum_packet_size = 0` (accepted silently; see above), then `authenticate_publickey`, `channel_open_session().await`, `channel.data(\u0026b\"hello\"[..]).await`.\n\nThe client's `CHANNEL_OPEN` goes out with `maximum packet size = 0` (`russh/src/client/session.rs:21-44` encodes `self.common.config.maximum_packet_size` verbatim). All three scenarios below were verified end-to-end against a stock russh v0.64.1 build (ring backend), default settings otherwise:\n\n- control (both sides default, 32768): the server echoes and the client receives `hello`;\n- client `maximum_packet_size = 0`: the server prints the received bytes and then the echo write never completes - no data, no error, the client times out;\n- server `maximum_packet_size = 0`: the client's `channel.data(...)` future never completes - no error, it times out.\n\nObserved output (abridged):\n\n```\n=== SCENARIO A (control): both sides default (maxpacket 32768) ===\n[server] read 5 bytes; echoing via AsyncWrite ...\n[server] echo write completed\nRESULT A: echo received: \"hello\"\n\n=== SCENARIO B: client advertises maximum_packet_size = 0 ===\n[server] read 5 bytes; echoing via AsyncWrite ...\nRESULT B: TIMEOUT after 6s - server-side echo write is permanently stalled (no error, no data)\n\n=== SCENARIO C: server advertises maximum_packet_size = 0 ===\nRESULT C: TIMEOUT after 6s - client-side channel.data() is permanently stalled\n```\n\nThe server task stays parked inside `ChannelTx::poll_writable`; nothing is logged and nothing is returned to the handler. The harness source (server: `into_stream()` echo; client: one config toggle) can be attached on request.\n\nUnit-level sketch of the core defect:\n\n```rust\nlet mut tx = ChannelTx::\u003cMsg\u003e::new(\n    sender, ChannelId(0),\n    Arc::new(Mutex::new(4096)),   // window_size\n    Arc::new(Notify::new()),      // notify\n    0,                            // max_packet_size\n    None,\n);\n// poll_write(\u0026mut tx, cx, b\"x\") stays Poll::Pending forever,\n// even after CHANNEL_WINDOW_ADJUST raises `window_size`.\n```\n\n## Suggested fix\n\n- **Validate at parse time (preferred)**: reject `maximum_packet_size == 0` with `Error::Inconsistent` in `OpenChannelMessage::parse` and `ChannelOpenConfirmation::decode` (`russh/src/parsing.rs`), consistent with the existing guards; optionally clamp any value below the RFC 4254 recommended minimum (32768) instead.\n- **Defense in depth**: in `ChannelTx::poll_writable` (`russh/src/channels/io/tx.rs:82`), when `self.max_packet_size == 0`, surface an `io::Error` from `poll_write` instead of returning `Poll::Pending`.\n\nBoth match the treatment PR #695 already applied to the other write paths in v0.61.0 (the `reserve_writable_chunk` and session packetizer guards).\n\n## Affected versions\n\nVerified by inspecting the release artifacts: **0.60.0 through 0.64.1 (current) are affected** - `poll_writable` is byte-identical in v0.60.0 and the peer-value plumbing is present in all of them. The `ChannelTx` write logic and the peer-value flow predate 0.60 (they go back to the `channels::io` refactor), so we recommend treating all releases that ship `channels::io::ChannelTx` as affected. The zero-guards in the other write paths were only added in 0.61.0, so on 0.60.x those paths do not even fail with an error.\n\n## Reporter\n\nTshellauth",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.60.0"
+            },
+            {
+              "fixed": "0.65"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.64.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-fw5c-8223-6h42/GHSA-fw5c-8223-6h42.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-fw5c-8223-6h42"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116774"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/39cb9dbaa37caf555d34c6c22efa3bbbff9e186c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.65.0"
+    }
+  ]
+}

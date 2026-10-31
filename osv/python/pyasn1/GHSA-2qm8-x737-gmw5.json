@@ -1,0 +1,106 @@
+{
+  "id": "GHSA-2qm8-x737-gmw5",
+  "modified": "2026-10-30T23:15:04.525223875Z",
+  "published": "2026-10-30T23:07:04Z",
+  "aliases": [
+    "CVE-2026-119196"
+  ],
+  "summary": "pyasn1 has quadratic CPU consumption in constructed BIT STRING decoding",
+  "details": "## Summary\n\nIn pyasn1 through 0.6.4, decoding a constructed BIT STRING with many fragments repeatedly shifts and copies the entire value accumulated so far. For fixed-size fragments, CPU time grows quadratically with the encoded input size. An application that passes sufficiently large, attacker-controlled ASN.1 data to an affected decoder can suffer CPU exhaustion during `decode()`; no conversion or formatting of the decoded value is required.\n\nThe BER and CER decoders reach this path for constructed BIT STRING values, with or without an `asn1Spec`. The DER decoder rejects constructed BIT STRING in schema-less decoding, but its schema-driven path accepts a **definite-length** constructed BIT STRING when given a matching `asn1Spec` and reaches the same vulnerable code. Constructed BIT STRING is not valid DER; this DER exposure is due to decoder permissiveness. DER rejects the indefinite-length form.\n\nThis is a separate decoder path from the OBJECT IDENTIFIER accumulation fixed in [CVE-2026-59885](https://github.com/advisories/GHSA-8ppf-4f7h-5ppj).\n\n## Technical details\n\nIn the 0.6.4 [`BitStringPayloadDecoder`](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L173-L301), both the [definite-length](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L237-L255) and [indefinite-length](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L275-L301) fragment loops call `BitString.fromOctetString(..., prepend=bitString)` for every fragment. [`fromOctetString`](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/type/univ.py#L614-L627) shifts the growing `SizedInteger` left by the fragment's bit length and ORs in the fragment. Shifting an ever-larger Python integer for each fixed-size fragment makes total work O(n²) for n fragments. The fragments are siblings, so the decoder's nesting-depth limit does not constrain their count; its limit on the number of length octets does not prevent the demonstrated inputs.\n\nIn 0.6.4, DER's [tag-driven map](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/der/decoder.py#L15-L40) disables constructed BIT STRING, while its schema-driven type map retains the inherited decoder that permits it. This explains why a schema-less DER rejection is not a negative result for all DER decoding.\n\nUnder [X.690](https://www.itu.int/rec/T-REC-X.690-202102-I/en), a conforming CER constructed BIT STRING uses an indefinite-length outer encoding and primitive fragments with 1000 contents octets except possibly the last. That form reaches the affected indefinite-length loop. DER requires primitive string encoding, although the schema-driven pyasn1 decoder accepts the definite-length constructed example below.\n\n## Impact\n\nAn application is exposed when untrusted input can reach one of the affected decoder paths and its input limits admit enough fragments. The work occupies the decoding thread or worker and may cause denial of service. Whether the input is network-accessible or unauthenticated depends on the calling application. This advisory makes no claim that every application using pyasn1, or any particular protocol implementation, accepts such input.\n\n## Severity assessment (CVSS v3.1)\n\nThe 7.5 Base score assumes a reasonable application that automatically decodes attacker-supplied ASN.1 from unauthenticated network input. Valid BER and conforming CER values trigger the issue without special conditions, privileges, or user interaction. Repeated crafted values could occupy a finite decoder-worker pool and deny service while the attack continues. No confidentiality or integrity impact is demonstrated. This library-level score does not claim that every application is network-exposed or fully unavailable; deployment-specific input limits and architecture may change the score. See [FIRST's library-scoring guidance](https://www.first.org/cvss/v3-1/user-guide).\n\n## Reproducer\n\nThe definite-length example below is valid BER. It is deliberately not a conforming CER or DER encoding. The second constructor uses conforming CER fragment sizing and framing. CPU times are machine-dependent; run the larger cases only in a local test environment.\n\n```python\nimport time\n\nfrom pyasn1.codec.ber import decoder as ber_decoder\nfrom pyasn1.codec.cer import decoder as cer_decoder\nfrom pyasn1.codec.der import decoder as der_decoder\nfrom pyasn1.error import PyAsn1Error\nfrom pyasn1.type import univ\n\n\ndef encode_length(size):\n    octets = size.to_bytes((size.bit_length() + 7) // 8, \"big\")\n    return bytes((0x80 | len(octets),)) + octets\n\n\ndef definite_fragments(count):\n    body = b\"\\x03\\x02\\x00\\xa5\" * count  # one data octet per BIT STRING fragment\n    return b\"\\x23\" + encode_length(len(body)) + body\n\n\ndef cer_fragments(count):\n    # Each primitive fragment has 1000 contents octets: one unused-bits\n    # octet (zero) followed by 999 data octets.\n    fragment = b\"\\x03\" + encode_length(1000) + b\"\\x00\" + b\"\\xa5\" * 999\n    return b\"\\x23\\x80\" + fragment * count + b\"\\x00\\x00\"\n\n\ndef measure(label, decode, payload, **options):\n    start = time.process_time()\n    value, remainder = decode(payload, **options)\n    print(label, len(payload), f\"{time.process_time() - start:.3f}s CPU\")\n    assert not remainder and len(value) \u003e 0\n\n\nfor count in (50_000, 100_000, 200_000):\n    measure(f\"BER {count} fragments\", ber_decoder.decode,\n            definite_fragments(count))\n\nfor count in (1_000, 2_000, 4_000):\n    measure(f\"CER {count} fragments\", cer_decoder.decode,\n            cer_fragments(count))\n\nsample = definite_fragments(1_000)\nmeasure(\"DER with BIT STRING schema\", der_decoder.decode, sample,\n        asn1Spec=univ.BitString())\ntry:\n    der_decoder.decode(sample)\nexcept PyAsn1Error:\n    print(\"DER without schema rejects the constructed value\")\nelse:\n    raise AssertionError(\"DER unexpectedly accepted schema-less input\")\n```\n\n## Verification\n\nLocal measurements of the official v0.6.4 tag on CPython 3.14.8 used `time.process_time()`. A local 0.6.5 candidate containing the fix was timed on the same machine. Times are illustrative, not a guaranteed cost on other systems.\n\n| Input | Size | v0.6.4 CPU | 0.6.5 candidate CPU |\n| --- | ---: | ---: | ---: |\n| BER definite, 50,000 fragments | 0.20 MB | 0.530 s | 0.084 s |\n| BER definite, 100,000 fragments | 0.40 MB | 1.915 s | 0.170 s |\n| BER definite, 200,000 fragments | 0.80 MB | 7.392 s | 0.344 s |\n| Conforming CER, 1,000 fragments | 1.004 MB | 0.163 s | 0.0035 s |\n| Conforming CER, 2,000 fragments | 2.008 MB | 0.657 s | 0.0070 s |\n| Conforming CER, 4,000 fragments | 4.016 MB | 2.582 s | 0.0144 s |\n\nThe definite BER input with 100,000 fragments also decoded through DER with `asn1Spec=univ.BitString()` in 1.949 s on v0.6.4, versus 0.172 s with the 0.6.5 candidate. Schema-less DER rejected the same input. Independent reports reproduced the old behavior on v0.6.4: one measured 21.1 s for a 1.28 MB definite-length value; another measured 7.25 s for a 0.8 MB value versus 2.8 ms for a primitive BIT STRING carrying the same data volume. These measurements were taken on different systems and should not be compared as a single benchmark series.\n\n## Resolution\n\nUpgrade to pyasn1 0.6.5. The decoder assembles fragment bits in a `bytearray`, preserves decoded bit values including intermediate-fragment padding, and converts the complete payload to a BIT STRING once. This removes the repeated shift of the growing integer in both constructed decoding loops.\n\nFor applications that cannot upgrade immediately, enforce an application-appropriate limit on untrusted ASN.1 input size **before** passing it to pyasn1. Such a limit bounds exposure but does not change the quadratic behavior of 0.6.4. Where a protocol forbids constructed BIT STRING, rejecting that encoding before decoding also prevents this path.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyasn1",
+        "purl": "pkg:pypi/pyasn1"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.6.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.10a",
+        "0.0.11a",
+        "0.0.12a",
+        "0.0.13",
+        "0.0.13a",
+        "0.0.13b",
+        "0.0.6a",
+        "0.0.9a",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.4.5",
+        "0.4.6",
+        "0.4.7",
+        "0.4.8",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.6.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-2qm8-x737-gmw5/GHSA-2qm8-x737-gmw5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/security/advisories/GHSA-2qm8-x737-gmw5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-119196"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/pull/132"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/commit/73ba7b043cc7e92cb37f16f2c955bff93b0e6f6c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyasn1/pyasn1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/releases/tag/v0.6.5"
+    }
+  ]
+}

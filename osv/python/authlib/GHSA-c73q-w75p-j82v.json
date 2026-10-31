@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-c73q-w75p-j82v",
+  "modified": "2026-10-30T23:15:08.194586957Z",
+  "published": "2026-10-30T23:09:04Z",
+  "aliases": [
+    "CVE-2026-116672"
+  ],
+  "summary": "Authlib RFC 7592 examples omit registration-access-token client binding",
+  "details": "## Description\n\n### Summary\n\nRFC 7592 (OAuth 2.0 Dynamic Client Registration Management Protocol) lets a previously registered client read, update, or delete its own registration, authenticated by a `registration_access_token` issued specifically to that client at registration time. The entire security model of this protocol depends on the server verifying that the token presented in the request actually belongs to the client identified in the request, not merely that the token is valid for some client.\n\nAuthlib's `ClientConfigurationEndpoint` implements the control flow correctly in structure, calling `authenticate_token`, then `authenticate_client`, then `check_permission`, and treats all three as abstract methods that \"Developers MUST implement in subclass.\" The problem is that the documented example implementations for these methods, taken together exactly as written, never perform the one check that matters: binding the authenticated token to the specific client being accessed. A developer who implements these methods by following the provided examples ends up with a complete authorization bypass on this endpoint.\n\n### Details\n\n`authenticate_client`'s documented example (`authlib/oauth2/rfc7592/endpoint.py`):\n\n```python\ndef authenticate_client(self, request):\n    \"\"\"Read a client from the request payload.\n    Developers MUST implement this method in subclass::\n\n        def authenticate_client(self, request):\n            client_id = request.payload.data.get(\"client_id\")\n            return Client.get(client_id=client_id)\n\n    :return: client instance\n    \"\"\"\n    raise NotImplementedError()\n```\n\nThis looks the target client up purely by the `client_id` supplied in the request payload, with no reference to the token at all.\n\n`check_permission`'s documented example, in the same file:\n\n```python\ndef check_permission(self, client, request):\n    \"\"\"Checks whether the current client is allowed to be accessed, edited\n    or deleted. Developers MUST implement it in subclass, e.g.::\n\n        def check_permission(self, client, request):\n            return client.editable\n\n    :return: boolean\n    \"\"\"\n    raise NotImplementedError()\n```\n\nThis checks a property of the target client alone (whether it is generally \"editable\"), again with no reference to `request.credential`, the authenticated token object returned earlier by `authenticate_token` and stored on the request specifically so that later steps can check it:\n\n```python\ndef create_configuration_response(self, request):\n    token = self.authenticate_token(request)\n    if not token:\n        raise AccessDeniedError()\n\n    request.credential = token\n\n    client = self.authenticate_client(request)\n    ...\n    if not self.check_permission(client, request):\n        raise UnauthorizedClientError(...)\n```\n\n`request.credential` is set specifically so that a binding check can be performed downstream, but neither documented example ever reads it. Following both examples as written produces an implementation where the only requirements to access, modify, or delete a client's registration are: possessing any valid registration_access_token for any client, and knowing or guessing the target `client_id`.\n\nThis is meaningfully different from how the equivalent example is written for the token introspection endpoint (RFC 7662) elsewhere in the same codebase, which does correctly demonstrate checking the authenticated caller's own identity (`authlib/oauth2/rfc7662/introspection.py`):\n\n```python\ndef check_permission(self, token, client, request):\n    \"\"\"Check if the request has permission to introspect the token. Developers\n    MUST implement this method::\n\n        def check_permission(self, token, client, request):\n            # only allow a special client to introspect the token\n            return client.client_id == \"introspection_client\"\n    \"\"\"\n```\n\nIn that endpoint, `client` represents the already-authenticated caller (verified through normal client credential authentication earlier in the flow), so checking a property of `client` is meaningful authorization logic. In the RFC 7592 endpoint, `client` instead represents the target being acted upon, not the caller, so the same style of example is actively misleading: it looks like a reasonable authorization check but performs none of the binding the protocol requires.\n\nNo file anywhere in the repository, including the Flask, Django, and SQLAlchemy integration modules, provides a complete, corrected reference implementation of `ClientConfigurationEndpoint`. The misleading docstring examples are the only guidance shipped for this endpoint.\n\n### Realistic exploitability\n\nRFC 7591 dynamic client registration is commonly deployed without requiring an initial access token, since the specification explicitly anticipates open, self-service registration as a normal deployment model. Under that common configuration, an attacker can freely self-register their own throwaway client with no authentication at all, receive a valid `registration_access_token` scoped to that throwaway client, and then present that same token against `/register/{target_client_id}` for any other client, since neither documented example checks that the token corresponds to the target. If the target client's `editable` property (or whatever equivalent the developer implements based on the documented example) is true, an attacker can read the victim client's full registration including its metadata, update it (for example, changing `redirect_uris` to an attacker-controlled endpoint, enabling authorization code or token interception against that client's users), or delete it outright.\n\n### Reproduction\n\n1. Deploy an authorization server using `ClientConfigurationEndpoint` with `authenticate_client` and `check_permission` implemented exactly as documented in the class's own docstrings.\n2. As an attacker, register a new client via the RFC 7591 registration endpoint (commonly open/anonymous), obtaining `client_id_A` and `registration_access_token_A`.\n3. Identify or guess `client_id_B`, belonging to a different, unrelated client.\n4. Send `GET /register/client_id_B` (or `PUT`/`DELETE`) with `Authorization: Bearer registration_access_token_A`, and `client_id` set to `client_id_B` in the request body for the `PUT` case.\n5. `authenticate_token` succeeds because `registration_access_token_A` is a valid token. `authenticate_client` succeeds because it looks up `client_id_B` directly from the payload, ignoring which token was presented. `check_permission` succeeds because it only checks `client_B.editable`, not whether `registration_access_token_A` has any relationship to `client_B`. The request proceeds and returns, modifies, or deletes client B's registration.\n\n### Impact\n\nFull read, modify, and delete access to any other client's registration record, for any party able to obtain a valid registration_access_token for any client of their own. In an open dynamic registration deployment this reduces to no meaningful barrier at all, since attackers can self-issue their own qualifying token for free. Impact includes disclosure of client metadata, redirect URI hijacking enabling authorization code or token interception, and denial of service via deletion of arbitrary client registrations.\n\n## Suggested fix\n\nUpdate the documented example for `check_permission` (or `authenticate_client`) to explicitly demonstrate binding the authenticated token to the target client, for example:\n\n```python\ndef check_permission(self, client, request):\n    return request.credential.client_id == client.get_client_id()\n```\n\nand add an explicit warning in both docstrings that omitting this comparison results in a complete authorization bypass on this endpoint. Consider also shipping a complete, correct reference implementation of `ClientConfigurationEndpoint` in the Flask/Django/SQLAlchemy integration modules, since none currently exists.\n\n---\n\n## Affected products\n\n**Ecosystem:** pip  \n**Package name:** Authlib  \n**Affected versions:** 1.7.2  \n**Patched versions:** 1.9.1\n\n## Severity\n\nPrivileges Required is Low, reflecting that the attacker needs some registration_access_token of their own, which under the common open dynamic registration deployment model is trivially self-issued. This is a documentation/reference-implementation issue rather than a bug the library enforces unconditionally on every deployment, since `authenticate_client` and `check_permission` are abstract methods a developer must implement; the finding is that the only guidance provided for implementing them correctly is, itself, exploitable if followed as written.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "authlib",
+        "purl": "pkg:pypi/authlib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.15"
+            },
+            {
+              "fixed": "1.9.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.15",
+        "0.15.1",
+        "0.15.2",
+        "0.15.3",
+        "0.15.4",
+        "0.15.5",
+        "0.15.6",
+        "1.0.0",
+        "1.0.0a1",
+        "1.0.0a2",
+        "1.0.0b1",
+        "1.0.0b2",
+        "1.0.0rc1",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.3.1",
+        "1.3.2",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.5.2",
+        "1.6.0",
+        "1.6.1",
+        "1.6.10",
+        "1.6.11",
+        "1.6.12",
+        "1.6.2",
+        "1.6.3",
+        "1.6.4",
+        "1.6.5",
+        "1.6.6",
+        "1.6.7",
+        "1.6.8",
+        "1.6.9",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.8.0",
+        "1.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.9.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-c73q-w75p-j82v/GHSA-c73q-w75p-j82v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/security/advisories/GHSA-c73q-w75p-j82v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116672"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/commit/1bd2a313492ce0a4d0571c150730907aa3fc91ff"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/authlib/authlib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/authlib/authlib/releases/tag/v1.9.1"
+    }
+  ]
+}

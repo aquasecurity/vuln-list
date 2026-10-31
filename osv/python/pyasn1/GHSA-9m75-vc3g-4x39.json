@@ -1,0 +1,106 @@
+{
+  "id": "GHSA-9m75-vc3g-4x39",
+  "modified": "2026-10-30T23:15:07.377922369Z",
+  "published": "2026-10-30T23:03:51Z",
+  "aliases": [
+    "CVE-2026-119195"
+  ],
+  "summary": "pyasn1 has quadratic-time denial of service in constructed string and indefinite-length ANY decoding",
+  "details": "## Summary\n\nIn pyasn1 0.6.4 and earlier, decoding a constructed OCTET STRING or character string made of many fragments can spend disproportionate CPU time repeatedly copying the accumulated value. A separate indefinite-length `ANY` path has the same problem while collecting the encoded components. The work grows roughly quadratically with the number of fixed-size fragments, although the input and decoded value grow linearly. An application that lets an attacker supply such ASN.1 input to an affected decoder can suffer CPU exhaustion.\n\nThe affected string paths are available in BER and CER. The DER decoder also accepts certain *non-DER* constructed strings: a definite-length constructed OCTET STRING when an `asn1Spec` selects `univ.OctetString`, and constructed character strings such as UTF8String even without a schema. Indefinite-length `ANY` is affected in BER and CER when an `asn1Spec` selects `univ.Any`; DER rejects indefinite lengths.\n\nThis is a distinct decoder path from the OBJECT IDENTIFIER/RELATIVE-OID accumulation addressed by [CVE-2026-59885](https://github.com/advisories/GHSA-8ppf-4f7h-5ppj). It has the same complexity class, but the OID fix in 0.6.4 did not change these string or `ANY` loops.\n\n## Technical details\n\nIn the [v0.6.4 BER decoder](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py), `OctetStringPayloadDecoder` appends each decoded fragment to a growing `bytes` value with `header += component` in both its [definite-length](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L338-L351) and [indefinite-length](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L368-L387) constructed forms. [`AnyPayloadDecoder.indefLenValueDecoder`](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py#L1403-L1430) similarly uses `chunk += component`. In the exercised paths, each concatenation copies an increasingly large prefix. For `N` fixed-size fragments, the total copied data grows with `1 + 2 + ... + N`, or O(N²).\n\nThe OCTET STRING decoder is also the base class of the decoders for UTF8String, NumericString, PrintableString, TeletexString, VideotexString, IA5String, GraphicString, VisibleString, GeneralString, UniversalString, BMPString, ObjectDescriptor, GeneralizedTime, and UTCTime. These types inherit the same constructed-string reassembly path.\n\nThe [DER decoder's OCTET STRING restriction](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/der/decoder.py#L15-L49) replaces the tag-driven decoder, but its schema-driven `TYPE_MAP` retains the BER-derived decoder. Thus `der.decode(data)` rejects a constructed OCTET STRING, while `der.decode(data, asn1Spec=univ.OctetString())` accepts its definite-length form and reaches the accumulation loop. DER does not replace the inherited character-string decoders, so a constructed UTF8String is also accepted without `asn1Spec`. These inputs violate [X.690's DER string-encoding rule](https://www.itu.int/rec/T-REC-X.690-202102-I/en) and should not be described as valid DER encodings.\n\nThe original short-fragment, definite-length OCTET STRING reproducer is valid BER. The CER decoder accepts it, but it is not a conforming CER string encoding: X.690 requires an indefinite-length outer constructed string and 1,000 contents octets per fragment except possibly the last. A conforming CER-shaped constructed OCTET STRING with those fragment sizes also reaches the loop and shows quadratic growth. The indefinite-length `ANY` reproducer below can represent a CER `SEQUENCE OF OCTET STRING` and reaches the separate `ANY` loop when decoded with an `ANY` schema.\n\nThe decoder's eight-octet length-field limit and nesting-depth limit do not bound the number of sibling fragments in these examples. The BER reproducer below uses only a three-octet outer length field; all fragments have shallow nesting. There is no per-message fragment-count cap in v0.6.4.\n\n## Impact\n\nIf an application passes attacker-controlled ASN.1 to the affected `decode()` or `StreamingDecoder` path without an adequate input or resource limit, a megabyte-scale value can occupy a decoding worker for seconds. Repeated inputs can exhaust available CPU. Whether this is reachable before authentication, or through a particular protocol, depends on the application; the library finding alone does not establish those conditions. No confidentiality or integrity impact is claimed.\n\n## Severity assessment (CVSS v3.1)\n\nThe 7.5 Base score assumes a reasonable application that automatically decodes attacker-supplied ASN.1 from unauthenticated network input. Valid BER and conforming CER inputs trigger the string-reassembly issue without special conditions, privileges, or user interaction. Repeated crafted inputs could occupy all available decoder workers and deny service while the attack continues. No confidentiality or integrity impact is demonstrated. This library-level score does not assert that every adopter has such an endpoint or loses all service; deployment-specific input limits and architecture may change the score. See [FIRST's library-scoring guidance](https://www.first.org/cvss/v3-1/user-guide).\n\nOn the official v0.6.4 tag, local CPU-time measurements with CPython 3.14.8 on macOS arm64 gave the following results. Times vary by machine and Python runtime; the input-size scaling is the relevant observation. “Fixed” means the local 0.6.5 decoder fix applied to the same inputs.\n\n| Decoder path and input | Fragments | v0.6.4 CPU | Fixed CPU |\n| --- | ---: | ---: | ---: |\n| BER constructed OCTET STRING, 0.40 MB | 100,000 × 2 payload bytes | 0.340 s | 0.160 s |\n| BER constructed OCTET STRING, 0.80 MB | 200,000 × 2 payload bytes | 0.886 s | 0.312 s |\n| BER constructed OCTET STRING, 1.60 MB | 400,000 × 2 payload bytes | 2.738 s | 0.623 s |\n| BER indefinite `ANY`, 0.30 MB | 100,000 × 1 payload byte | 0.459 s | 0.206 s |\n| BER indefinite `ANY`, 0.60 MB | 200,000 × 1 payload byte | 1.245 s | 0.412 s |\n| BER indefinite `ANY`, 1.20 MB | 400,000 × 1 payload byte | 3.980 s | 0.826 s |\n| CER constructed OCTET STRING, 1.00 MB, conforming fragment layout | 1,000 × 1,000 payload bytes | 0.0089 s | 0.0022 s |\n| CER constructed OCTET STRING, 2.01 MB, conforming fragment layout | 2,000 × 1,000 payload bytes | 0.0311 s | 0.0044 s |\n| CER constructed OCTET STRING, 4.02 MB, conforming fragment layout | 4,000 × 1,000 payload bytes | 0.1379 s | 0.0090 s |\n\nFor the same short-fragment layout, the original report measured up to 16.05 seconds for a 3.2 MB BER constructed OCTET STRING. An independent report on CPython 3.11.16/Linux measured 5.76 seconds for a 2.4 MB constructed OCTET STRING, versus about 0.005 seconds for a primitive OCTET STRING of comparable size. These are reporter measurements on different systems, not fixed performance guarantees.\n\n## Reproduction\n\nThis example uses public decoder APIs. Run it with pyasn1 0.6.4 and increase `n` to observe the scaling. The final two calls show the DER paths accepted by v0.6.4; their constructed encodings are not valid DER.\n\n```python\nimport time\n\nfrom pyasn1.codec.ber import decoder as ber\nfrom pyasn1.codec.cer import decoder as cer\nfrom pyasn1.codec.der import decoder as der\nfrom pyasn1.type import univ\n\n\ndef tlv(identifier, contents):\n    length = len(contents)\n    if length \u003c 128:\n        return bytes((identifier, length)) + contents\n    encoded = length.to_bytes((length.bit_length() + 7) // 8, \"big\")\n    return bytes((identifier, 0x80 | len(encoded))) + encoded + contents\n\n\ndef measure(label, decode, substrate, asn1Spec=None):\n    start = time.process_time()\n    _, rest = decode(substrate, asn1Spec=asn1Spec)\n    assert not rest\n    print(f\"{label}: {len(substrate)} input bytes, \"\n          f\"{time.process_time() - start:.3f} CPU seconds\")\n\n\nn = 100_000\noctet_fragments = b\"\\x04\\x02AA\" * n\nutf8_fragments = b\"\\x0c\\x02AA\" * n\n\nmeasure(\"BER constructed OCTET STRING\", ber.decode,\n        tlv(0x24, octet_fragments))\nmeasure(\"BER indefinite ANY\", ber.decode,\n        b\"\\x30\\x80\" + b\"\\x04\\x01A\" * n + b\"\\x00\\x00\",\n        univ.Any())\n\n# CER uses indefinite length and 1,000-content-octet primitive fragments.\ncer_fragment = tlv(0x04, b\"A\" * 1000)\nmeasure(\"CER constructed OCTET STRING\", cer.decode,\n        b\"\\x24\\x80\" + cer_fragment * 1000 + b\"\\x00\\x00\")\n\n# These constructed encodings are accepted by pyasn1 but are invalid DER.\nmeasure(\"DER OCTET STRING with schema\", der.decode,\n        tlv(0x24, octet_fragments), univ.OctetString())\nmeasure(\"DER UTF8String without schema\", der.decode,\n        tlv(0x2c, utf8_fragments))\n```\n\n## Patch\n\npyasn1 0.6.5 replaces the growing `bytes` accumulator with a list of fragments and joins them once after decoding in all three affected loops. The OCTET STRING base-class change also covers the inheriting character-string decoders. This removes the repeated copying while preserving the assembled decoded value.\n\n## Workaround\n\nUntil upgrading, enforce application-appropriate limits on the size of untrusted ASN.1 input *before* passing it to pyasn1, and limit the CPU resources available to decoding workers. Applications that require DER can also reject constructed string encodings before invoking the decoder. The appropriate byte limit depends on the protocol and expected valid values.\n\n## Credits and references\n\nReported by [alimony](https://github.com/alimony). Independently reported by [manus-pi](https://github.com/manus-pi), whose report identified the schema-driven DER route, inherited character-string decoders, and additional performance evidence.\n\n- [pyasn1 v0.6.4 affected decoder source](https://github.com/pyasn1/pyasn1/blob/v0.6.4/pyasn1/codec/ber/decoder.py)\n- [ITU-T X.690, CER and DER string-encoding rules](https://www.itu.int/rec/T-REC-X.690-202102-I/en)\n- [CVE-2026-59885, separate OID decoder issue](https://github.com/advisories/GHSA-8ppf-4f7h-5ppj)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pyasn1",
+        "purl": "pkg:pypi/pyasn1"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.6.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.10a",
+        "0.0.11a",
+        "0.0.12a",
+        "0.0.13",
+        "0.0.13a",
+        "0.0.13b",
+        "0.0.6a",
+        "0.0.9a",
+        "0.1.1",
+        "0.1.2",
+        "0.1.3",
+        "0.1.4",
+        "0.1.5",
+        "0.1.6",
+        "0.1.7",
+        "0.1.8",
+        "0.1.9",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.4.1",
+        "0.4.2",
+        "0.4.3",
+        "0.4.4",
+        "0.4.5",
+        "0.4.6",
+        "0.4.7",
+        "0.4.8",
+        "0.5.0",
+        "0.5.1",
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.6.4"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.6.4",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/10/GHSA-9m75-vc3g-4x39/GHSA-9m75-vc3g-4x39.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/security/advisories/GHSA-9m75-vc3g-4x39"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-119195"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/pull/132"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/commit/4ce00797c594b59c1fd6b86d9ebc3ba87b7ec9f9"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/pyasn1/pyasn1"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/pyasn1/pyasn1/releases/tag/v0.6.5"
+    }
+  ]
+}
