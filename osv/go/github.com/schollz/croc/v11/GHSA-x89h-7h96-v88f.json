@@ -1,0 +1,176 @@
+{
+  "id": "GHSA-x89h-7h96-v88f",
+  "modified": "2026-11-09T22:45:03.971039760Z",
+  "published": "2026-11-09T22:40:12Z",
+  "aliases": [
+    "CVE-2026-119298"
+  ],
+  "summary": "croc: Overwrite-confirmation bypass via a crafted \"croc-stdin-\" filename on receive",
+  "details": "## Summary\n\ncroc is an end-to-end encrypted peer-to-peer file transfer tool. On the receiving side, the confirmation that normally protects an existing file from being overwritten or resumed is skipped whenever the received file's name starts with `croc-stdin-`, regardless of whether the incoming transfer is actually a text transfer. A sender can therefore name a file `croc-stdin-\u003cexisting-name\u003e` and silently overwrite, truncate, or replace an existing file of that name in the receiver's working directory - including removing the existing file and substituting a symlink - without the `Overwrite?` prompt that the standard path requires. The exemption was introduced to keep croc's internal text-transfer artifacts from triggering prompts, but it is keyed on the filename prefix rather than on the transfer type, so any ordinary file transfer can claim the exemption.\n\n## Vulnerability Details\n\nAffected code at commit `b6f27da9401f2c3647c1adb6b77a46bb8c0923d2` (HEAD, v11.5.1+1):\n\nThe receive-side file-readiness loop in `src/croc/croc.go` decides whether to prompt before overwriting or resuming an existing destination file. The decision is made around line 3413:\n\n```go\nisStdinName := strings.HasPrefix(path.Base(fileInfo.Name), \"croc-stdin-\")\n...\nif destinationExists \u0026\u0026 !c.Options.Overwrite \u0026\u0026 !c.Options.Rename \u0026\u0026 !isStdinName {\n    resumable := fileInfo.Size \u003e 0 \u0026\u0026 fileInfo.Symlink == \"\" \u0026\u0026 recipientFileInfo.Mode().IsRegular()\n    overwrite, promptErr := askReceiveOverwrite(c.clientContext(), fileInfo, resumable)\n    if promptErr != nil {\n        return promptErr\n    }\n    if !overwrite {\n        continue\n    }\n}\n```\n\n`isStdinName` is derived purely from the received file's basename. The prompt is suppressed for any such name, even when `c.Options.SendingText` is false and the transfer is an ordinary file transfer whose name the sender chose.\n\nWhen the prompt is skipped and the transfer declares `fileInfo.Size == 0` or a symlink (`fileInfo.Symlink != \"\"`), the loop calls `createEmptyFileAndFinish()` (src/croc/croc.go:3245), which - before creating the new entry - removes any existing file at the destination:\n\n```go\nif fileInfo.Symlink != \"\" {\n    if err = validateReceiveSymlinkTarget(fileInfo.FolderRemote, fileInfo.Symlink); err != nil {\n        return\n    }\n    log.Debug(\"creating symlink\")\n    // remove symlink if it exists\n    if _, errExists := root.Lstat(pathToFile); errExists == nil {\n        if err = root.Remove(pathToFile); err != nil {\n            return err\n        }\n    }\n    err = root.Symlink(fileInfo.Symlink, pathToFile)\n    ...\n}\n```\n\nFor a normal (non-`croc-stdin-`) name, the overwrite prompt runs first, so the remove/replace step only happens with the user's explicit `y`. For a `croc-stdin-` name the entire prompt is bypassed: an existing `croc-stdin-*` file is deleted and replaced with the attacker's symlink (or, for `Size == 0`, truncated to an empty file) with no confirmation.\n\nFor a non-empty regular-file transfer with a `croc-stdin-` name, the same missing prompt lets the receive path proceed through `recipientInitializeFile()` (src/croc/croc.go:3109; the `os.O_RDWR` open is at 3136-3138): the existing file is opened `O_RDWR` (no `O_EXCL`), truncated to the sender-declared size when the sizes differ, and the sender's chunks are written at the declared offsets - a silent overwrite of the existing file's content.\n\nWhy the check is missing: the exemption was added deliberately so that croc's own `croc-stdin-*` text artifacts (created by `os.CreateTemp(\".\", \"croc-stdin-\")` for `croc send --text` / piped stdin) do not trigger an overwrite question every time. History: commit b687778d \"bug fix: doesn't ask overwrite text Fixes #384\" (2021-04-29) introduced the prefix-based skip, keyed on the filename and not on the transfer's `SendingText` flag. The branch that handles `Size == 0 || Symlink != \"\"` via `createEmptyFileAndFinish()` predates that (6386e4a8, 2019) and at the time ran unconditionally for every received name; the refactor 615af377 \"fix: gate overwrites and receive hash algorithms\" (2026-08-29, first released in v11.3.6) moved it below the overwrite-prompt gate, so after v11.3.6 the empty-file/symlink replacement reaches the remove-and-replace step without user confirmation only through the `croc-stdin-` exemption. The refactor extracted the prefix test into `isStdinName` and kept it filename-only, dropping the explicit `!c.Options.SendingText` conjunct that the pre-refactor prompt conditions still carried (615af377~1); the original intent was to suppress the prompt only for transfers actually marked as text. Because the exemption is keyed on a filename prefix the sender fully controls, any peer a user receives from can claim it.\n\nThe same prefix exemption also suppresses the `--rename` side of the decision (`if destinationExists \u0026\u0026 !isStdinName \u0026\u0026 c.Options.Rename`), so `--rename` receivers silently keep the attacker-chosen name and overwrite too.\n\nThis is distinct from the previously reported `croc-marked-files.txt` arbitrary file deletion (oss-sec 2026/Q3 #497, fixed in 11.0.3 by commit c0d51f0, which removed the on-disk cleanup list). That defect reached deletion through `RemoveMarkedFiles()`; this one reaches silent overwrite/replacement through the filename-keyed prompt exemption in the receive loop, which the 11.0.3 fix did not touch and which remains live at HEAD.\n\n## Impact\n\nAn attacker who can send a file to a victim (croc's sender-is-untrusted model; the receiver accepts a transfer from them) can silently overwrite, truncate, or delete-and-replace an existing `croc-stdin-*` file in the receiver's working directory without the confirmation every other received name triggers. The attack needs the colliding file to already exist with an exact name the sender can predict; receiver-side text artifacts get unpredictable `os.CreateTemp`-style suffixes, so the practical target is a name the attacker knows (e.g. a file the user deliberately kept, or a name pattern from an earlier transfer the same peer sent). With the noisy prompt gone, the substitution is invisible to the user. Severity is bounded because the vulnerable names must start with the `croc-stdin-` prefix (dotfiles such as `.bashrc` cannot be named this way), so the attack cannot reach outside that namespace.\n\nCVSS 3.1: `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:L` - base score 5.4 (Medium).\n- **Attack Vector (AV): Network** - the sender is a remote peer; no local access needed.\n- **Attack Complexity (AC): Low** - a crafted basename and a normal file transfer; no special conditions.\n- **Privileges Required (PR): None** - the sender has no account on the receiver.\n- **User Interaction (UI): Required** - the victim must run croc receive and accept the transfer.\n- **Scope (S): Unchanged** - the vulnerable component is the croc receiver itself.\n- **Confidentiality (C): None** - no read primitive; planted symlink targets are confined to the receive directory.\n- **Integrity (I): Low** - the modification is limited to files whose names carry the `croc-stdin-` prefix, and it requires an exact-name collision with a pre-existing file; per CVSS 3.1, \"can modify only certain files\" is I:L - dotfiles such as `.bashrc` are unreachable.\n- **Availability (A): Low** - the truncate-to-empty and remove-and-replace branches leave the previous file unavailable or destroyed. CWE-693 (Protection Mechanism Failure) is the root-cause classification: the overwrite protection mechanism is bypassed by a sender-controlled filename; CWE-73 (External Control of File Name or Path) is the companion classification and is the GHSA-selectable one (CWE-693 is not in GitHub's selectable set), while CWE-22 (path traversal) is not accurate here because writes stay confined to the receive root. Alternative reading: if the bounded namespace is scored as full integrity within reach - total content replacement of every colliding `croc-stdin-*` file - Integrity: High yields `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:L` = 7.1 (High).\n\n## Reproduction Steps\n\nPrerequisite: a Go toolchain satisfying `go.mod` (`go 1.27`) and a checkout of croc at commit `b6f27da9401f2c3647c1adb6b77a46bb8c0923d2`. The repro is a self-contained Go test that reuses the project's own in-process loopback test relay - the same harness as `TestCrocLocal` in `src/croc/croc_test.go` - so it requires no network, no third party, and no separately installed binary; it drives the exact production receive path (`NewCtx` + `Receive` -\u003e receive-ready loop -\u003e the gate at `src/croc/croc.go:3413`).\n\n1. Save the following as `src/croc/repro_overwrite_bypass_test.go` in the checkout:\n\n```go\npackage croc\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"net\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"testing\"\n\t\"time\"\n\n\tlog \"github.com/schollz/croc/v11/src/logger\"\n)\n\n// Repro: overwrite-confirmation bypass via a crafted \"croc-stdin-\" filename on receive.\nfunc TestOverwriteConfirmationBypass(t *testing.T) {\n\tlog.SetLevel(\"warn\")\n\tlocalPorts := freeConsecutiveTestPorts(t, 2)\n\tlocalAddress := net.JoinHostPort(\"127.0.0.1\", localPorts[0])\n\n\tvictim := t.TempDir()\n\tattacker := t.TempDir()\n\tmustWrite := func(path, content string) {\n\t\tt.Helper()\n\t\tif err := os.WriteFile(path, []byte(content), 0o644); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t}\n\tattackerStdin := filepath.Join(attacker, \"croc-stdin-notes.txt\")\n\tattackerCtrl := filepath.Join(attacker, \"notes.txt\")\n\tmustWrite(attackerStdin, \"ATTACKER-REPLACEMENT\\n\")\n\tmustWrite(attackerCtrl, \"ATTACKER-CONTROL\\n\")\n\tvictimStdin := filepath.Join(victim, \"croc-stdin-notes.txt\")\n\tvictimCtrl := filepath.Join(victim, \"notes.txt\")\n\tmustWrite(victimStdin, \"ORIGINAL-CONTENT\\n\")\n\tmustWrite(victimCtrl, \"ORIGINAL-CONTROL\\n\")\n\n\t// Receiver writes into its working directory (like `croc \u003ccode\u003e` run in a folder).\n\toldWD, err := os.Getwd()\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tif err := os.Chdir(victim); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tdefer func() { _ = os.Chdir(oldWD) }()\n\n\tsender, err := NewCtx(context.Background(), Options{\n\t\tIsSender:      true,\n\t\tSharedSecret:  \"8123-testingthecroc\",\n\t\tRelayAddress:  localAddress,\n\t\tRelayPorts:    append([]string(nil), localPorts...),\n\t\tRelayPassword: \"pass123\",\n\t\tNoPrompt:      true,\n\t\tDisableLocal:  false,\n\t\tOnlyLocal:     true,\n\t\tCurve:         \"ed25519\",\n\t})\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\t// Default receive options: Overwrite=false, Rename=false. NoPrompt only\n\t// auto-accepts the transfer itself; it does NOT suppress the per-file\n\t// overwrite prompt (the code under test).\n\treceiver, err := NewCtx(context.Background(), Options{\n\t\tIsSender:      false,\n\t\tSharedSecret:  \"8123-testingthecroc\",\n\t\tRelayAddress:  localAddress,\n\t\tIP:            localAddress,\n\t\tRelayPassword: \"pass123\",\n\t\tNoPrompt:      true,\n\t\tDisableLocal:  false,\n\t\tCurve:         \"ed25519\",\n\t})\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\tresults := make(chan error, 2)\n\tgo func() {\n\t\tfilesInfo, emptyFolders, total, errGet := GetFilesInfo([]string{attackerStdin, attackerCtrl}, false, false, []string{})\n\t\tif errGet != nil {\n\t\t\tresults \u003c- errGet\n\t\t\treturn\n\t\t}\n\t\tresults \u003c- sender.Send(filesInfo, emptyFolders, total)\n\t}()\n\twaitForRelayPorts(t, localPorts)\n\tgo func() { results \u003c- receiver.Receive() }()\n\tfor i := 0; i \u003c 2; i++ {\n\t\tselect {\n\t\tcase err := \u003c-results:\n\t\t\tif err != nil {\n\t\t\t\tt.Fatalf(\"transfer %d failed: %v\", i, err)\n\t\t\t}\n\t\tcase \u003c-time.After(60 * time.Second):\n\t\t\tt.Fatal(\"transfer timed out\")\n\t\t}\n\t}\n\ttime.Sleep(500 * time.Millisecond)\n\n\tgotStdin, _ := os.ReadFile(victimStdin)\n\tgotCtrl, _ := os.ReadFile(victimCtrl)\n\tfmt.Printf(\"OBSERVED croc-stdin-notes.txt: %q (no prompt)\\n\", string(gotStdin))\n\tfmt.Printf(\"OBSERVED notes.txt: %q (prompt fired; retained)\\n\", string(gotCtrl))\n\n\tif string(gotStdin) != \"ATTACKER-REPLACEMENT\\n\" {\n\t\tt.Errorf(\"croc-stdin-notes.txt = %q, want %q (silent overwrite did not occur)\", string(gotStdin), \"ATTACKER-REPLACEMENT\\n\")\n\t}\n\tif string(gotCtrl) != \"ORIGINAL-CONTROL\\n\" {\n\t\tt.Errorf(\"notes.txt = %q, want %q (prompt did not protect the control file)\", string(gotCtrl), \"ORIGINAL-CONTROL\\n\")\n\t}\n}\n```\n\n2. Run it:\n\n```bash\ngo test -count=1 -run TestOverwriteConfirmationBypass -v -timeout 150s ./src/croc/ \u003c/dev/null\n```\n\n3. Test output at pin `b6f27da9401f2c3647c1adb6b77a46bb8c0923d2` (2026-09-08):\n\n```text\nResume 'notes.txt' (0.0%)? (y/N)   (use --overwrite to omit) Skipping 'notes.txt'\nOBSERVED croc-stdin-notes.txt: \"ATTACKER-REPLACEMENT\\n\" (no prompt)\nOBSERVED notes.txt: \"ORIGINAL-CONTROL\\n\" (prompt fired; retained)\n--- PASS: TestOverwriteConfirmationBypass (1.04s)\nPASS\n```\n\nWhat the differential shows: the transfer carries two ordinary files (not a text transfer - `SendingText` is false). One is named `croc-stdin-notes.txt` and collides with a pre-existing file in the receiver's directory; the other is named `notes.txt` and collides with another pre-existing file. For `notes.txt` the code printed the resume/overwrite confirmation (`Resume 'notes.txt' (0.0%)? (y/N) (use --overwrite to omit)`); with stdin closed (`\u003c/dev/null`, answer EOF) it skipped the file, which keeps its original content (`ORIGINAL-CONTROL`). For `croc-stdin-notes.txt` no prompt is printed at all, the loop falls through to `recipientInitializeFile` (src/croc/croc.go:3109), which opens the existing file `O_RDWR` (croc.go:3136-3138) and truncates/writes the sender's chunks - the file ends up holding exactly the attacker's content (`ATTACKER-REPLACEMENT`). The receiver here uses `NoPrompt=true` (the CLI `--yes` equivalent), which does not suppress this prompt: `askReceiveOverwrite` (src/croc/croc.go:3301) runs regardless of `NoPrompt`; only `--overwrite`, `--rename`, or the crafted `croc-stdin-` prefix suppress it.\n\nSymlink / empty-file variant (v11.3.6 and later): with sender-declared metadata `fileInfo.Size == 0` or `fileInfo.Symlink != \"\"` for a file named `croc-stdin-\u003cname\u003e`, the skipped gate hands control to `createEmptyFileAndFinish` (src/croc/croc.go:3245), which removes any existing file at the destination (`root.Remove`, no prompt) and then creates an empty file or a symlink to the sender-supplied target. To exercise it, replace the attacker's regular file with an empty file or an in-directory symlink on the sender's side (e.g. `ln -s notes.txt src/croc-stdin-notes.txt`; note the target is validated by `validateReceiveSymlinkTarget`, croc.go:892, and must stay inside the receive directory) and re-run the same test; the regular-file case above already demonstrates the identical prompt-skip.\n\n## Recommendations\n\nGate the exemption on the transfer actually being a text transfer, not on the received filename. In `src/croc/croc.go` the cleanest fix is to require both conditions before suppressing the prompt, e.g.:\n\n```go\nisStdinName := strings.HasPrefix(path.Base(fileInfo.Name), \"croc-stdin-\") \u0026\u0026 c.Options.SendingText\n```\n\nand make the empty-file/symlink branch (`createEmptyFileAndFinish`) and the `--rename` branch honor the same combined condition, so a regular file transfer can never claim the text-transfer exemption. As defense-in-depth, apply the same `SendingText` gate wherever a received `croc-stdin-*` name short-circuits a user confirmation, and document that the prefix is reserved for transfers the sender marked as text.\n\n## Resources\n\n- Source at pinned commit: https://github.com/schollz/croc/blob/b6f27da9401f2c3647c1adb6b77a46bb8c0923d2/src/croc/croc.go (prompt-gate ~L3405-3430; `createEmptyFileAndFinish` L3245-3280; `recipientInitializeFile` L3109-3160 (`os.O_RDWR` open at L3136-3138))\n- Exemption origin: https://github.com/schollz/croc/commit/b687778d (\"bug fix: doesn't ask overwrite text Fixes #384\", 2021-04-29)\n- `createEmptyFileAndFinish` origin (pre-gate, name-unrestricted until 615af377): https://github.com/schollz/croc/commit/6386e4a8\n- Refactor that kept the exemption filename-only: https://github.com/schollz/croc/commit/615af377 (\"fix: gate overwrites and receive hash algorithms\", 2026-08-29, first released v11.3.6)\n- Prior related disclosure (arbitrary file deletion via `croc-marked-files.txt`, fixed 11.0.3 by c0d51f0, different sink and mechanism): oss-sec 2026/Q3 #497 - https://seclists.org/oss-sec/2026/q3/497\n- Related prior advisory in the same class (sender-controlled names reaching the filesystem, fixed 9.6.16, does not cover this prompt bypass): GHSA-ppjh-xp5v-46wc (CVE-2023-43619)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc/v11",
+        "purl": "pkg:golang/github.com/schollz/croc/v11"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "11.5.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc/v10",
+        "purl": "pkg:golang/github.com/schollz/croc/v10"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "10.7.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc/v9",
+        "purl": "pkg:golang/github.com/schollz/croc/v9"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "9.6.17"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc/v8",
+        "purl": "pkg:golang/github.com/schollz/croc/v8"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "8.6.12"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc/v6",
+        "purl": "pkg:golang/github.com/schollz/croc/v6"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "6.4.11"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/schollz/croc",
+        "purl": "pkg:golang/github.com/schollz/croc"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "3.0.6"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x89h-7h96-v88f/GHSA-x89h-7h96-v88f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/schollz/croc/security/advisories/GHSA-x89h-7h96-v88f"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-119298"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/schollz/croc/pull/1327"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/schollz/croc/commit/25fe49b6f14db99f517e902cfef76299ad0a95a3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/schollz/croc"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/schollz/croc/releases/tag/v11.5.2"
+    }
+  ]
+}

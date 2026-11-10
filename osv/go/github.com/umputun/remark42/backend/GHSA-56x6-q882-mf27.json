@@ -1,0 +1,96 @@
+{
+  "id": "GHSA-56x6-q882-mf27",
+  "modified": "2026-11-09T21:30:07.591487659Z",
+  "published": "2026-11-09T21:18:29Z",
+  "aliases": [
+    "CVE-2026-77463"
+  ],
+  "summary": "Remark42: Rate limit bypass via unconditional trust of X-Forwarded-For/X-Real-IP headers in direct-internet deployment",
+  "details": "### Summary\nRemark42 applied chi's `middleware.RealIP` globally, trusting `True-Client-IP` / `X-Real-IP` / `X-Forwarded-For` headers without verifying the request came from a trusted proxy. The per-IP rate limiters key on the overwritten `r.RemoteAddr`, so any client can bypass every per-IP rate limiter by rotating spoofed IP headers. The same spoofed IP also drives other per-IP controls (stored comment IP, anonymous identity derivation, and `--votes-ip` vote de-duplication). This affects deployments reachable directly from the internet (Remark42's built-in HTTP, static TLS, and ACME modes are all documented and supported), as well as any proxied deployment where the proxy forwards an attacker-controlled recognised header.\n\n### Details\nThe router applies `middleware.RealIP` globally, ahead of the per-route limiters, without any check that the server is behind a trusted proxy (in v1.16.1, `backend/app/rest/api/rest.go:207`).\n\nThe `rateLimiter` function (v1.16.1, `backend/app/rest/api/rest.go:769-779`) builds a tollbooth limiter with `IPLookup{Name: \"RemoteAddr\"}`, which reads `r.RemoteAddr`. Since chi's `middleware.RealIP` (v1.16.1, `backend/vendor/github.com/go-chi/chi/v5/middleware/realip.go:42-55`) unconditionally overwrites `r.RemoteAddr` from `True-Client-IP \u003e X-Real-IP \u003e first X-Forwarded-For` (accepting any syntactically valid IP), any client can set its apparent IP to an arbitrary value.\n\nThis bypasses every per-IP rate limiter that runs after `RealIP`: `/auth` (2/s), avatars (100/s), the image proxy (10/s), open / protected / admin route groups (10/s), root routes (50/s), and `/web/*` (20/s). Comment and vote creation go through the update limiter, whose server default is `UPDATE_LIMIT=0.5`/s (burst 1), not 10/s. The global 1,000 concurrent-request throttle still applies, so this is a per-IP-limit bypass rather than truly unlimited throughput. chi's own documentation warns that `middleware.RealIP` should be used only behind a trusted proxy.\n\n### PoC\n```bash\n# Deploy Remark42 reachable directly from the internet (built-in HTTP / TLS / ACME, no proxy that overwrites the headers).\n# Comment creation is limited to UPDATE_LIMIT (default 0.5/s, burst 1) per IP.\n\n# Rotate X-Real-IP across many requests; each distinct value gets its own token bucket.\nfor i in $(seq 1 100); do\n  curl -s -o /dev/null -w '%{http_code}\\n' \\\n    -H \"X-Real-IP: 192.0.2.$i\" \\\n    -X POST 'https://remark42.example.com/api/v1/comment?site=site1' \\\n    -H 'Authorization: Bearer YOUR_JWT' \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"text\":\"spam\",\"locator\":{\"site\":\"site1\",\"url\":\"https://example.com/post\"}}'\ndone | sort | uniq -c\n# With rotating headers the responses stay 201; without them, requests beyond the burst return 429.\n```\n\n### Impact\nBy rotating the spoofed client IP an attacker bypasses the per-IP token buckets on all rate-limited endpoints and defeats other per-IP controls, enabling: (a) spam comment creation beyond the configured per-IP limit, (b) confirmation-email / notification flooding to supplied addresses, (c) high-volume outbound image fetching and resource consumption via the image proxy (its transport still blocks private/reserved destinations and DNS rebinding, so this is amplification, not new SSRF reach), (d) authentication-endpoint abuse, (e) where `--votes-ip` is enabled, defeating per-IP vote de-duplication (ballot stuffing), and (f) minting fresh anonymous identities and poisoning the stored comment IP and request logs, since the anonymous user ID is derived from `name + RemoteAddr`. The global concurrency ceiling and per-request timeouts remain, so availability impact is limited.\n\n### Resolution\nMitigation support was added in v1.16.2 (umputun/remark42#2116, follow-up in #2118). **Upgrading alone does not remediate the issue: `--trusted-proxy` must be configured.**\n\nThe fix adds `--trusted-proxy` / `TRUSTED_PROXY`. When set, the forwarding headers (`X-Real-IP`, then `CF-Connecting-IP`, then the leftmost public `X-Forwarded-For`) are honoured only when the direct TCP peer falls inside a trusted-proxy network; for a request from any other peer those headers are dropped and the real socket IP is used. When it is **unset**, the previous trust-all behaviour is preserved for backward compatibility and a startup warning is logged, so an un-configured v1.16.2 remains exploitable. `True-Client-IP` is no longer recognised. `TRUSTED_PROXY` takes a comma-separated list; on the command line, repeat `--trusted-proxy` per entry.\n\n**Required configuration:**\n- **Reachable directly from the internet:** set a value that no real client matches so the forwarding headers are always ignored, e.g. `--trusted-proxy=127.0.0.1/32` (only when Remark42 is not actually reached over loopback).\n- **Behind a reverse proxy:** point `--trusted-proxy` at the proxy's network only, block direct access to Remark42, and make the proxy **overwrite** `X-Real-IP` with the real client and discard client-supplied forwarding headers. A proxy that merely appends to `X-Forwarded-For`, or that forwards a client-supplied `X-Real-IP`, still lets the client choose the reported IP. Note that the shipped nginx manual sets `X-Real-IP` but does not strip a client `True-Client-IP`.\n- **Before v1.16.2:** strip `True-Client-IP`, `X-Real-IP`, and `X-Forwarded-For` at the edge and set a known-safe client-IP header.\n\nSee the [Trusted proxies and client IP docs](https://remark42.com/docs/configuration/parameters/#trusted-proxies-and-client-ip).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/umputun/remark42/backend",
+        "purl": "pkg:golang/github.com/umputun/remark42/backend"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.16.2"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-56x6-q882-mf27/GHSA-56x6-q882-mf27.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/umputun/remark42",
+        "purl": "pkg:golang/github.com/umputun/remark42"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "last_affected": "1.2.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-56x6-q882-mf27/GHSA-56x6-q882-mf27.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/security/advisories/GHSA-56x6-q882-mf27"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-77463"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/pull/2116"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/pull/2118"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/commit/b1502801facd7782a1c70fd51f8ad5c2eb650d39"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/commit/e62b3c830d81659cf5d2687b0c8261da7d42fdab"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/umputun/remark42"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/umputun/remark42/releases/tag/backend/v1.16.2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://remark42.com/docs/configuration/parameters/#trusted-proxies-and-client-ip"
+    }
+  ]
+}

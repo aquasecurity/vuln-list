@@ -1,0 +1,61 @@
+{
+  "id": "GHSA-2xwh-426q-42c5",
+  "modified": "2026-11-09T23:00:03.862864236Z",
+  "published": "2026-11-09T22:43:33Z",
+  "aliases": [
+    "CVE-2026-88982"
+  ],
+  "summary": "Kubeflow Pipelines: Cross-tenant execution-cache poisoning / output substitution via a namespace-blind cache key in the cache webhook (multi-user)",
+  "details": "## Summary\n\nThe legacy Kubeflow Pipelines V1/raw-Argo execution cache does not separate cached results by Kubernetes namespace. In multi-user deployments where tenants share the cache service, a tenant can receive another tenant's cached outputs or seed outputs that are subsequently substituted into another tenant's step.\n\nThis affects the Argo-template cache mutating webhook and its cache-server storage path. Standard KFP V2 component pods bypass this webhook cache; the separate V2 cache implementation is outside this advisory's scope.\n\n## Affected deployments and impact\n\nThe issue requires multiple tenant namespaces sharing the legacy cache service, cache-enabled V1/raw-Argo steps, and cache entries that satisfy the configured staleness policy. The standard multi-user configuration watches pods across namespaces.\n\nA tenant able to submit a step with the same cache-relevant template fields as another tenant's step can:\n\n- Read cached step outputs originally produced in another namespace.\n- Populate the shared cache before another tenant's matching step runs, causing that step to report the cached outputs instead of executing its intended containers.\n\nMatching refers to the selected template fields used by the cache key, not merely an identical container image. This is an application-level cache-key collision caused by missing tenant scope, not a cryptographic SHA-256 collision. The finding establishes cross-namespace confidentiality and integrity impact; it does not establish arbitrary code execution.\n\n## CVSS rationale\n\n**Medium — CVSS 3.1: 5.4**\n\n`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N`\n\n- **AV:N / PR:L / UI:N:** a tenant with ordinary workload-submission privileges can exercise the shared cache through network-accessible APIs. Reading an existing cached result or poisoning a subsequent automated execution requires no additional victim interaction.\n- **AC:L:** known or shared templates can produce the same cache key deterministically. Cache-enabled execution and matching template fields describe the affected configuration; they do not establish an unavoidable narrow race or secret prerequisite.\n- **S:U:** the established impact is disclosure or substitution of output data managed by the same cache service. Crossing tenant namespaces alone does not establish a change in security authority; execution under a separate victim authority has not been established here.\n- **C:L / I:L / A:N:** the confirmed impact is selective cached-output disclosure and substitution. Arbitrary code execution, complete workload compromise, and a service-availability impact are not established.\n\n## Root cause\n\nThe vulnerable implementation hashes selected Argo template fields without a namespace. Cache lookups and duplicate checks use the key alone, and stored rows have no namespace ownership field. On a hit, the admission handler restores cached outputs and substitutes a dummy container for the step's containers.\n\nThe completion watcher also trusts the mutable `pipelines.kubeflow.org/execution_cache_key` annotation when publishing outputs. Adding a namespace to the hash alone is therefore insufficient: a tenant able to patch its own pod could supply another namespace's deterministic key. Namespace ownership must be enforced independently on cache writes and reads.\n\nRelevant implementation files are `backend/src/cache/server/mutation.go`, `backend/src/cache/server/watcher.go`, `backend/src/cache/storage/execution_cache_store.go`, and `backend/src/cache/model/execution_cache.go`.\n\n## Fix status\n\nThe source fix merged on September 10, 2026 in [PR #14359](https://github.com/kubeflow/pipelines/pull/14359), commit [620d0cc89ae0d042a484a003f8ffe6e9a55d347e](https://github.com/kubeflow/pipelines/commit/620d0cc89ae0d042a484a003f8ffe6e9a55d347e).\n\nThe merged fix:\n\n- Derives namespaced keys from the API server's admission request namespace and selected template fields.\n- Recomputes completed pods' keys from their observed namespace and `ARGO_TEMPLATE`, rejecting mismatched or malformed identities rather than trusting the annotation.\n- Stores the observed namespace separately and scopes normal reads and duplicate detection by namespace and key.\n- Adds a namespace column and composite index, leaving historical rows unowned and excluded from normal lookups.\n- Rejects structurally malformed template objects without panicking.\n\nThe first fixed release is **[2.18.0](https://github.com/kubeflow/pipelines/releases/tag/2.18.0)**. Releases through **2.17.3** remain affected; the affected-version upper bound is `\u003c= 2.17.3` and the patched version is `2.18.0`.\n\n## Upgrade requirements and legacy fallback\n\nThe standard cache-server Deployment supports a normal rolling upgrade from 2.17.2. Apply the upgraded manifests without manually stopping old replicas or pausing submissions. Namespace isolation is fully enforced only after all old cache-server processes, including terminating pods, have exited and every new replica uses `enforce`. Custom installations sharing the cache database must upgrade every writer. Mixed-version operation does not yet provide the full isolation guarantee.\n\nExpect reduced cache reuse and increased step execution/resource use as tasks next run; there is no startup cache rebuild. Do not infer or backfill namespace ownership for historical rows. Pre-upgrade pods carrying old-format keys do not seed the new namespaced cache. Completing the upgrade does not undo previously disclosed data or reused poisoned outputs. Do not roll back to the vulnerable implementation to recover cache hits.\n\n[PR #14427](https://github.com/kubeflow/pipelines/pull/14427) merged into `release-2.18` on October 5, 2026 and standardizes the compatibility setting as **`KFP_SECURITY_LEGACY_CACHE_MODE=enforce|audit` on the cache-server Deployment**. This supersedes the original fix's `ALLOW_LEGACY_CACHE_FALLBACK` interface. Unset, empty, or `enforce` keeps full namespace isolation; invalid values prevent startup.\n\nExplicit `audit` permits a genuine namespaced cache miss to reuse a historical template-only entry whose stored namespace is empty. That entry may contain another tenant's outputs, including poisoned outputs: audit accepts residual cross-tenant confidentiality and integrity risk, and is not full remediation. Scoped entries take precedence, known foreign namespaces remain excluded, and a database error does not enable legacy fallback. Legacy hits are not promoted or backfilled into namespaced rows.\n\nThe server emits a startup warning and scoped `security_audit` events for legacy reuse without logging cached outputs or credentials. Keep replicas configured consistently, persist the mode in deployment configuration, and return to `enforce` after migration. Native V2 caching is outside this control and this advisory.\n\nSee the [released cache-server guide](https://github.com/kubeflow/pipelines/blob/2.18.0/backend/src/cache/README.md#namespace-isolation-and-upgrades) for rollout completion checks and audit-to-enforce migration. This fix does not establish an integrity boundary between users who can modify workloads within the same namespace.\n\n## Mitigation until the fixed release is deployed\n\nDisable legacy cache reuse for affected workloads, or ensure mutually untrusted namespaces do not share the legacy cache service and storage. Restricting the webhook's namespace selector or watcher scope alone is insufficient if mutually untrusted tenants still share cached entries.\n\n## Validation\n\nSource review identified the shared key, unscoped storage, and mutable-annotation write path. The public fix includes regressions exercising admission and completion handling, forged foreign-namespace keys, normal same-namespace reuse, malformed templates, legacy-row exclusion, and optional fallback behavior.\n\nDuring development, the cache test suite and lint passed; populated and repeatable schema migration and scoped storage behavior were verified on SQLite, MySQL 8.4, and PostgreSQL 16. Negative controls removing the watcher identity check or storage namespace filter failed their corresponding regressions. These tests use fake Kubernetes clients; they are not a claim of a live multi-tenant Kubernetes exploit reproduction.\n\n### Private patch disposition\n\nThe earlier [private PR #1](https://github.com/kubeflow/pipelines-ghsa-2xwh-426q-42c5/pull/1) is closed as superseded by [public PR #14359](https://github.com/kubeflow/pipelines/pull/14359) and the released follow-ups described above. The private branch and review history are retained; this closure does not dismiss the report or change reporter credit. The advisory remains a draft pending the publication review.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/kubeflow/pipelines",
+        "purl": "pkg:golang/github.com/kubeflow/pipelines"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.0-20260910172610-620d0cc89ae0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-2xwh-426q-42c5/GHSA-2xwh-426q-42c5.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubeflow/pipelines/security/advisories/GHSA-2xwh-426q-42c5"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-88982"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubeflow/pipelines/pull/14359"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubeflow/pipelines/commit/620d0cc89ae0d042a484a003f8ffe6e9a55d347e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/kubeflow/pipelines"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/kubeflow/pipelines/releases/tag/2.18.0"
+    }
+  ]
+}

