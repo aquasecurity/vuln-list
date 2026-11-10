@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-2h4w-29cv-2cmv",
+  "modified": "2026-11-10T16:15:05.756455827Z",
+  "published": "2026-11-10T15:57:17Z",
+  "aliases": [
+    "CVE-2026-113663"
+  ],
+  "summary": "AG2: Newline injection in SandboxShellTool bypasses allowed=[...] and readonly=True, enabling arbitrary command execution",
+  "details": "### Summary\nSandboxShellTool's restricted modes — allowed=[...] (explicit command allowlist) and readonly=True (implicit READONLY_COMMANDS allowlist) — can both be bypassed by embedding a newline character inside the command string. The filter only inspects a single-line set of shell metacharacters, but execution runs the raw string through `sh -c`, where a shell treats an embedded newline exactly like a `;` statement separator. An agent (or content that steers the agent, e.g. via prompt injection) can therefore run arbitrary shell commands even when the tool was configured to allow only a specific command prefix or only read-only commands. With the default LocalEnvironment() backend this is a real host subprocess (its own docstring: \"Commands run via subprocess on the host, so there is no real isolation\"), not an isolated container, so this is full host command execution, not merely an escape from an already-sandboxed environment.\n\n### Details\nBoth restricted modes are enforced by `ShellAdapter._filter()` in `ag2/tools/sandbox/adapter/shell.py`:\n\n```python\ndef _filter(self, command: str) -\u003e str | None:\n    if self._allowed is not None:\n        if not any(matches(p, command) for p in self._allowed):\n            return f\"Command not allowed: {command!r}\"\n        if contains_shell_operator(command):\n            return f\"Command not allowed (shell operators are not permitted in restricted mode): {command!r}\"\n    ...\n```\n\n`readonly=True` reuses this exact same branch: `SandboxShellTool.__init__` / `ShellAdapter.__init__` sets `self._allowed = list(READONLY_COMMANDS)` when `readonly` is set and no explicit `allowed` is given, so both modes share one filter and one bypass.\n\n`contains_shell_operator()` in `ag2/tools/sandbox/filter.py` checks the command against:\n\n```python\n_SHELL_OPERATORS: tuple[str, ...] = (\"\u003e\", \"\u003e\u003e\", \"|\", \";\", \"\u0026\u0026\", \"||\", \"`\", \"$(\")\n```\n\nThis tuple has no entry for `\\n` (or `\\r`). `matches()` only checks that the command starts with an allowed prefix followed by a space or end-of-string; it never inspects the remainder of the string. Execution is:\n\n```python\nargv = [\"sh\", \"-c\", command]\n...\nreturn await sandbox.exec(argv, env=self._env, timeout=self._timeout)\n```\n\nA POSIX shell splits `sh -c \"\u003cline1\u003e\\n\u003cline2\u003e\"` into two sequential statements, the same as if they were separated by `;`. So a command such as `\"cat allowed_file.txt\\nrm -rf /anything\"`:\n\n1. Passes `matches(\"cat\", command)` — the string starts with `\"cat \"`.\n2. 2. Passes `contains_shell_operator(command)` — `\\n` is not a recognized operator.\n3. 3. Reaches `sh -c \"cat allowed_file.txt\\nrm -rf /anything\"`, which runs both statements.\n### Proof of Concept\nVerified directly against the current `main` branch (github.com/ag2ai/ag2, commit a05ff1cb6ff4955ef252a4e0d4a27d3a32ad57f0, cloned 2026-09-21), by importing the real `ag2/tools/sandbox/filter.py` module (stdlib-only, no other AG2 dependencies needed) and reproducing `ShellAdapter._filter()`'s allowlist branch verbatim:\n\n```\n=== allowed=['cat'] ===\n'cat /etc/passwd; rm -rf /tmp/x'   -\u003e Command not allowed (shell operators are not permitted in restricted mode): ...\n'cat /etc/passwd \u0026\u0026 rm -rf /tmp/x' -\u003e Command not allowed (shell operators are not permitted in restricted mode): ...\n'cat /etc/passwd | rm -rf /tmp/x'  -\u003e Command not allowed (shell operators are not permitted in restricted mode): ...\n'cat /etc/passwd\\nrm -rf /tmp/x'   -\u003e None   \u003c-- BYPASS: newline variant is NOT rejected\n\n=== readonly=True (uses READONLY_COMMANDS as the allowed list) ===\n'echo hi\\nid'                      -\u003e None   \u003c-- BYPASS in readonly mode too\n\n=== sh -c really treats the embedded newline as a second statement (mirrors ShellAdapter._exec_async) ===\n$ sh -c 'echo first-command-output\\necho SECOND-STATEMENT-RAN-$((21*2))'\nfirst-command-output\nSECOND-STATEMENT-RAN-42\n```\n\nThe three standard chaining attempts (`;`, `\u0026\u0026`, `|`) are correctly rejected by the real filter, confirming it does real work; the newline-separated variant, expressing the same intent, is accepted by the identical filter in both restricted modes, and a real `sh -c` call confirms the shell executes both statements.\n\n### Impact\nAny agent configured with `SandboxShellTool(allowed=[...])` or `SandboxShellTool(readonly=True)` — the two configurations the tool's own docstring presents as actual security boundaries, as opposed to `blocked`, which the same docstring explicitly says \"is not a security boundary\" — can be made to execute arbitrary shell commands via a single embedded newline in the command argument. Because tool arguments are LLM-generated and can be steered by content the agent processes (a fetched document, tool output, or any other text reaching the model — i.e. indirect prompt injection), this is reachable without the operator of the agent writing the malicious command themselves. With the default LocalEnvironment() backend, this is command execution on the host process running the agent, not confined to a container.\n\n### Suggested Remediation\n- Add \"\\n\" and \"\\r\" to `_SHELL_OPERATORS` in `ag2/tools/sandbox/filter.py` so `contains_shell_operator()` rejects embedded newlines the same way it rejects `;`.\n- - More robustly, execute allowlisted/readonly commands without invoking a shell in restricted mode (`shlex.split` + exec with no `sh -c` wrapper), so redirection, chaining, substitution, and every kind of statement separator are inert by construction instead of relying on an enumerated denylist.\n### Environment Tested\n- Repository: github.com/ag2ai/ag2, commit a05ff1cb6ff4955ef252a4e0d4a27d3a32ad57f0 (main), cloned 2026-09-21.\n- - PyPI package `ag2`, version 1.0.5 per pyproject.toml on this commit.\n- - Python 3, stdlib only (`subprocess`, `importlib`) against the real, unmodified `ag2/tools/sandbox/filter.py` — no AG2 runtime dependencies required to reproduce.\n-",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "ag2",
+        "purl": "pkg:pypi/ag2"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.13.2"
+            },
+            {
+              "fixed": "1.1.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.13.2",
+        "0.13.3",
+        "0.13.4",
+        "0.14.0",
+        "1.0.0",
+        "1.0.0b0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.0.5",
+        "1.0.6",
+        "1.1.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-2h4w-29cv-2cmv/GHSA-2h4w-29cv-2cmv.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "autogen",
+        "purl": "pkg:pypi/autogen"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.13.2"
+            },
+            {
+              "last_affected": "0.14.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.13.2",
+        "0.13.3",
+        "0.13.4",
+        "0.14.0",
+        "0.14.1",
+        "0.14.1rc1"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-2h4w-29cv-2cmv/GHSA-2h4w-29cv-2cmv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ag2ai/ag2/security/advisories/GHSA-2h4w-29cv-2cmv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-113663"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ag2ai/ag2/commit/3cd86726bb731eb11d6270f0ef9e50e42b5abb39"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ag2ai/ag2"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ag2ai/ag2/releases/tag/v1.1.1"
+    }
+  ]
+}
