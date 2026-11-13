@@ -1,0 +1,122 @@
+{
+  "id": "GHSA-7g44-g9rc-x53w",
+  "modified": "2026-11-13T16:45:03.468864320Z",
+  "published": "2026-11-13T16:34:59Z",
+  "aliases": [
+    "CVE-2026-126193"
+  ],
+  "summary": "Soup Sieve: Uncontrolled recursion in CSS parser lets nested pseudo-class selectors exhaust the Python call stack",
+  "details": "## Summary\n\nThe Soup Sieve CSS selector parser recurses once per level of nested pseudo-class selector (`:is()`, `:not()`, `:where()`, `:has()`) without any limit on nesting depth. An unauthenticated attacker who can supply a CSS selector string to `soupsieve.compile()`, `soupsieve.select()`, or Beautiful Soup's `soup.select()` / `soup.select_one()` can force the parser to exceed Python's recursion limit with a small crafted input (about 1.6 KB, roughly 330 nesting levels), raising an uncontrolled `RecursionError`. Because this exception is not part of the parser's documented error contract, applications that catch only `ValueError` or `SelectorSyntaxError` see an unexpected failure of the request or task that parsed the selector.\n\n## Root Cause\n\nThe parser dispatches each opening pseudo-class token to `parse_pseudo_open`, which calls back into `parse_selectors` to parse the pseudo-class body. Every nesting level therefore adds Python stack frames, and no counter, depth guard, or `RecursionError` handler bounds this descent. The token-count guard `SELECTOR_LIMIT = 8192` (added for the earlier comma-separated-list memory issue) counts parsed tokens, not recursion depth; at the failing nesting depth the token count is only about 330, roughly four percent of that limit, so the guard never fires. The security invariant that untrusted selector input must not be able to exhaust interpreter resources is not enforced for nesting depth.\n\n```text\nsoupsieve/css_parser.py\n  CSSParser.parse_pseudo_open (line 985): sel.selectors.append(self.parse_selectors(iselector, index, flags))\n  CSSParser.parse_selectors  (line 1137): recursive target; dispatches pseudo-class tokens back into parse_pseudo_class -\u003e parse_pseudo_open\n  CSSParser.increment_count  (lines 707-712): SELECTOR_LIMIT token guard; increments once per nesting level, cannot bound depth\n```\n\n## Impact\n\nAny application that compiles or evaluates untrusted CSS selectors through Soup Sieve (directly or via Beautiful Soup) is affected. No authentication, privilege, or user interaction is required; the failure occurs during selector parsing, before any document is matched. A single crafted selector of about 1.6 KB reliably raises `RecursionError`. The demonstrated capability is a transient denial of the individual request, task, or invocation that parsed the malicious selector: the exception propagates uncaught unless the caller handles `RecursionError` (or a broad `except Exception`). The `RecursionError` in CPython 3.x is a recoverable stack unwind, not an interpreter crash or persistent resource exhaustion, and it carries no confidentiality or integrity impact. Applications following the parser's documented error pattern (catching `ValueError` / `SelectorSyntaxError`) will not catch it, so a repeated stream of such selectors can plausibly cause repeated per-request failures; this per-request availability effect is the demonstrated consequence, not a service-wide or amplified outage.\n\n## Proof of Concept\n\nRequires only an installed Soup Sieve (any release from 0.4 through 2.10) and a default CPython recursion limit of 1000. No Beautiful Soup document or network setup is needed.\n\n```python\nimport soupsieve as sv\n\n# ~330 levels of nested :is() around a single tag: about 1.6 KB of input.\ndepth = 330\nselector = \":is(\" * depth + \"a\" + \")\" * depth\nprint(\"selector length:\", len(selector))\nsv.compile(selector)\n```\n\n```text\nselector length: 1651\nTraceback (most recent call last):\n  ...\n  File \".../soupsieve/css_parser.py\", line 985, in parse_pseudo_open\n    sel.selectors.append(self.parse_selectors(iselector, index, flags))\nRecursionError: maximum recursion depth exceeded\n```\n\nThe same failure was reproduced with `:not()`, `:where()`, and `:has()`, and through `BeautifulSoup(...).select(selector)`. A negative control at depth 100 compiles successfully with a token count of 101, confirming the token guard is far from firing.\n\n## Attack Chain\n\n1. **Exposure:** The application exposes `soupsieve.compile()` / `select()` or Beautiful Soup's `.select()` / `.select_one()` to attacker-influenced CSS selector input. These are the library's primary public API and ship enabled by default; Soup Sieve is an automatic dependency of Beautiful Soup 4.\n2. **Control:** The attacker fully controls the selector string. The nested pseudo-class pattern (`:is(:is(...a...))`) survives tokenization and normalization unchanged.\n3. **Path:** `compile()` reaches `CSSParser.process_selectors()` and then `parse_selectors()`, which dispatches each pseudo-class token through `parse_pseudo_class()` into `parse_pseudo_open()`, which calls `parse_selectors()` again, once per nesting level.\n4. **Guard:** The only resource guard is the `SELECTOR_LIMIT` token counter, which reaches about 330 at the failing depth versus its limit of 8192, so it never fires. No recursion-depth counter and no `RecursionError` handler exist anywhere in the package.\n5. **Primitive:** Python's recursion limit is exceeded during parsing, raising an uncontrolled `RecursionError`.\n6. **Result:** The unhandled `RecursionError` propagates to the caller, failing the request, task, or process invocation that parsed the selector, outside the parser's documented `ValueError` / `SelectorSyntaxError` error contract.\n\n## Bypass Evidence\n\nThe relevant existing guard is the `SELECTOR_LIMIT = 8192` token counter in `increment_count()`. It does not block this path: it increments once per nesting level, so at the failing depth of about 330 the count is roughly 330 (about four percent of 8192), verified by instrumenting `increment_count` and observing a maximum count of 329 at the point `RecursionError` was raised. A search of the package for `RecursionError` and `RuntimeError` handlers returns no matches, so nothing catches the error internally, and `functools.lru_cache` on the compile path does not cache exceptions. Attempts to invalidate the finding were made and failed: raising the interpreter recursion limit only shifts the required nesting depth (a proportionally larger but still small selector), and a broad `except Exception` in the caller does catch the error but the parser's documented contract raises only `ValueError` / `SelectorSyntaxError`, so callers coded to that contract remain exposed. This is a distinct weakness from the prior comma-separated-list memory-exhaustion advisory: that issue exhausts heap memory through linear object expansion and was addressed by the token count limit, whereas this issue exhausts the call stack through unbounded recursion depth and is not addressed by any released version, including 2.8.4 which was independently confirmed to still raise `RecursionError` on this input.\n\n## Affected Versions\n\n- `Ecosystem: pip (PyPI)`\n- `Package: soupsieve`\n- `Confirmed affected range: \u003e= 0.4, \u003c= 2.10`\n- `Latest release checked: soupsieve 2.10 (PyPI, latest published release as of 2026-09-25)`\n- `Fix status: not fixed in any released version`\n\nThe recursive `parse_pseudo_open` to `parse_selectors` structure is present in the earliest PyPI release (0.4) and in every subsequent release through the current 2.10, verified against the published PyPI source artifacts. Version 2.5, release 2.8.4 (which added that token-count limit), and 2.10 were each executed and confirmed to raise `RecursionError` on the crafted input. No released version adds a recursion-depth limit; the token-count `SELECTOR_LIMIT` introduced in 2.8.4 is architecturally unable to bound nesting depth. There is no registry or tag disagreement and no package or module path change.\n\n## Possible Solution\n\nPython's `RecursionError` is sometimes a contested issue related to security. The Soup Sieve project does not consider it \"uncontrolled\" and allows it to be raised to indicate Python's maximum recursion depth was reached, and allows it to fail to prevent overflows, a much worse and real security vulnerability. With that said, the algorithm can be reworked to be non-recursive, allowing the selector limit check to now capture and raise an exception. In addition, the limit could be exposed to the user to give them better control.\n\n## Mitigation\n\nFor those on older versions where the algorithm is still recursive, a try/except block that captures `RecursionError` can be added around calls if accepting untrusted user input is allowed.\n\n## Note\n\nThis issue was fixed in version 3.0.0, which has been yanked from the PyPI registry. Use versions 3.0.2 and above to upgrade.\n\n---\n\nReported by zx (GitHub: @manus-pi).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "soupsieve",
+        "purl": "pkg:pypi/soupsieve"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.4"
+            },
+            {
+              "fixed": "3.0.2"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.4",
+        "0.5",
+        "0.5.1",
+        "0.5.2",
+        "0.5.3",
+        "0.6",
+        "1.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0b1",
+        "1.0b2",
+        "1.1",
+        "1.2",
+        "1.2.1",
+        "1.3",
+        "1.3.1",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.6.1",
+        "1.6.2",
+        "1.7",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.8",
+        "1.9",
+        "1.9.1",
+        "1.9.2",
+        "1.9.3",
+        "1.9.4",
+        "1.9.5",
+        "1.9.6",
+        "2.0",
+        "2.0.1",
+        "2.1",
+        "2.10",
+        "2.2",
+        "2.2.1",
+        "2.3",
+        "2.3.1",
+        "2.3.2",
+        "2.3.2.post1",
+        "2.4",
+        "2.4.1",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.8.1",
+        "2.8.2",
+        "2.8.3",
+        "2.8.4",
+        "2.9",
+        "2.9.1",
+        "2.9.2",
+        "3.0",
+        "3.0.1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.10",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-7g44-g9rc-x53w/GHSA-7g44-g9rc-x53w.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/security/advisories/GHSA-7g44-g9rc-x53w"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126193"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/pull/306"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/commit/52de12f157a373614ad0f486d434551c5a4378ee"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/facelessuser/soupsieve"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/facelessuser/soupsieve/releases/tag/3.0"
+    }
+  ]
+}
