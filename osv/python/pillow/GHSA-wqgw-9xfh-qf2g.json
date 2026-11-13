@@ -1,0 +1,167 @@
+{
+  "id": "GHSA-wqgw-9xfh-qf2g",
+  "modified": "2026-11-12T23:45:03.298534910Z",
+  "published": "2026-11-12T23:35:39Z",
+  "aliases": [
+    "CVE-2026-128066"
+  ],
+  "summary": "Pillow: Memory DoS in TIFF and EXIF IFD parsing via overlapping tag data",
+  "details": "```\n============================================================================\nANT-2026-D7STJUWL  [medium]  CWE-770  dos\nMemory DoS in TIFF and EXIF IFD parsing via overlapping tag data\nLocation: src/PIL/TiffImagePlugin.py:927  in ImageFileDirectory_v2.load()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nA small, crafted image file can make Pillow use thousands of times its own size in memory while the file is only being opened, which lets anyone who can submit an image crash or stall the process handling it. A 144 KB TIFF makes `Image.open()` return normally while holding 1.6 GiB of memory. The largest such standard TIFF, about 786 KB, asks for roughly 48 GiB, which in practice gets the worker killed by the operating system. The file declares a 1×1 image, so the decompression-bomb check never triggers and no warning is raised. There is no memory corruption; the impact is denial of service.\n\nThe bug is in `ImageFileDirectory_v2.load()` in `src/PIL/TiffImagePlugin.py` (around line 927). For every directory entry whose value is stored elsewhere in the file, it reads that value into a new `bytes` object with `ImageFile._safe_read(fp, count * unit_size)` and keeps it in `_tagdata`. `_safe_read()` only checks that the bytes exist. Nothing limits the total read across entries, and nothing stops every entry from pointing at the same bytes. An attacker can therefore give each of N distinct private tags an offset and count that covers the whole file, at a cost of 12 bytes per entry. Memory grows as N × file size, which is quadratic in the file size, and BigTIFF removes the 65,535-entry ceiling.\n\nThe same loop parses EXIF data, so the problem reaches beyond TIFF:\n\n* A 66 KB JPEG APP1 segment costs about 340 MiB inside `Image.open()` itself, via `_read_dpi_from_exif()`.\n* A 96 KB PNG `eXIf` chunk costs 754 MiB on `getexif()` or `ImageOps.exif_transpose()`.\n* WebP EXIF and MPO reach the same code.\n\nThe attached reproducer builds a 72 KB TIFF and a 72 KB PNG. Using only `Image.open()` and `getexif()`, each causes 412 MiB of tag data to be retained, about 6,000 times the file size. The loop dates to the original PIL 1.1.7 import, so every Pillow release since 1.0 is affected.\n\n## Details\n\n`TiffImagePlugin.ImageFileDirectory_v2.load()` reads the out-of-line value of every IFD entry into its own `bytes` object and keeps it in `self._tagdata`. Nothing bounds the sum of those reads, and nothing prevents every entry from pointing at the same region of the file. An IFD with N entries whose `(offset, count)` each cover the whole file therefore costs N × filesize bytes of memory, while the IFD itself costs only 12 bytes per entry. This one loop is the IFD parser for TIFF frames and for `Image.Exif` alike, so it is reachable from `Image.open()` on a TIFF or JPEG and from `getexif()` / `ImageOps.exif_transpose()` on PNG, JPEG, WebP and MPO.\n\nObserved on the stock build at this commit: a valid 144,110-byte 1×1 greyscale TIFF with 12,000 such entries makes `Image.open()` return normally (no exception, no warning, 1 declared pixel so `MAX_IMAGE_PIXELS` is irrelevant) after 1.5 s, with the process RSS grown from 15 MiB to 1,671 MiB and `im.tag_v2` holding 1,649 MiB of tag data for as long as the image object lives. The same IFD placed in the `eXIf` chunk of a 96 KB PNG makes `im.getexif()` retain 754 MiB. A 65,870-byte JPEG whose APP1 `Exif` segment is such an IFD (5,400 entries × 65,519 bytes) allocates ~340 MiB inside `Image.open()` itself, with no further call.\n\n```python\n# src/PIL/TiffImagePlugin.py:902-946  (ImageFileDirectory_v2.load)\nfor i in range(tag_count):\n    tag, typ, count, data = ( … self._unpack(\"HHL4s\", self._ensure_read(fp, 12)))\n    …\n    size = count * unit_size                         # 918: attacker-chosen\n    if size \u003e (8 if self._bigtiff else 4):\n        here = fp.tell()\n        (offset,) = self._unpack(\"Q\" if self._bigtiff else \"L\", data)\n        …\n        fp.seek(offset)                              # 926: attacker-chosen\n        data = ImageFile._safe_read(fp, size)        # 927: new bytes object of `size`\n        fp.seek(here)\n    …\n    self._tagdata[tag] = data                        # 945: kept\n    self.tagtype[tag] = typ\n```\n\n`ImageFile._safe_read()` only guarantees that `size` bytes are actually present in the stream (it reads in `SAFEBLOCK` chunks and raises on truncation); it is a guard against allocating for data that does not exist, not against reading the same existing data many times. For a well-formed file each entry points at its own disjoint value, so the total read is at most the file size. For the crafted file every one of the N entries has a distinct tag number (so none overwrites another in `_tagdata`), type BYTE, `count = filesize - 1` and `offset = 1`; each iteration allocates and fills a fresh `filesize - 1`-byte object and stores it. `load()` does not care whether the tag number is known or whether the type makes sense for it; any 16-bit tag number and any type in `_load_dispatch` is accepted. Memory is `N × filesize`, and since `filesize ≈ 12 N`, it is quadratic in the file size: 12,000 entries / 144 KB → 1.6 GiB (measured); the classic-TIFF maximum of 65,535 entries / 786 KB → ~48 GiB; BigTIFF (`tag_count` is a `Q`) has no 16-bit entry limit at all.\n\nReachability:\n\n- TIFF: `TiffImageFile._open()` (`TiffImagePlugin.py:1187`) → `self._seek(0)` (`:1210`) → `self.tag_v2.load(self.fp)` (`:1258`, and again at `:1271`). This runs inside `Image.open()`, before `load()` and before any size check (`_decompression_bomb_check` only looks at `width × height` and is satisfied by the 1×1 image), and the resulting directory stays referenced as `im.tag_v2`. `_seek()` parses the IFD twice, but `reset()` drops the first copy, so the peak does not double; it is paid again for every frame on `seek()`/`n_frames`.\n- EXIF in other formats: `Image.Exif.load()` / `load_from_fp()` / `_get_ifd_dict()` (`Image.py:4146-4196`, `:4119-4133`) wrap the same `ImageFileDirectory_v2.load()` around the EXIF blob. `PngImagePlugin.chunk_eXIf` (`PngImagePlugin.py:697`) stores the whole chunk as `info[\"exif\"]`, `JpegImagePlugin` concatenates APP1 `Exif` segments into `info[\"exif\"]` (`JpegImagePlugin.py:114-117`), and WebP exposes its EXIF chunk the same way; `im.getexif()`, `ImageOps.exif_transpose()` and `_getexif()` then parse it and keep the values in `im._exif`. For JPEG no explicit call is needed: `JpegImageFile._open()` ends with `self._read_dpi_from_exif()` (`JpegImagePlugin.py:413`), which calls `getexif()` whenever no JFIF DPI is present, so the APP1 IFD is parsed during `Image.open()`. Note that an EXIF blob is parsed into several IFDs (main, EXIF, GPS, Interop via `_get_ifd_dict`), each through its own `load()` call.\n\nThe only failure path in `load()` is `except OSError` → warning; running out of memory is not an `OSError`, so on Linux the realistic outcome for a larger N is the kernel OOM killer terminating the process rather than a Python exception.\n\nThe loop predates Pillow: it came in with the PIL 1.1.7 import in `9a640e315715` (\"Forking PIL\", 2010-07-30) and was carried over unchanged into `ImageFileDirectory_v2`, so every release since 1.0 is affected. The per-tag `_safe_read` bounding added in the CVE-2019-16865 era does not address the sum.\n\n## Impact\n\nAny service that calls `Image.open()` on an uploaded TIFF or JPEG — or `getexif()` / `ImageOps.exif_transpose()` on an uploaded PNG, JPEG or WebP, which thumbnailers routinely do to honour orientation — can be made to allocate and retain memory roughly `entries × filesize`, i.e. thousands of times the upload size, from a file of a few hundred KB that declares a 1×1 image and passes the decompression-bomb check. A ~800 KB TIFF requests ~48 GiB; in practice the worker (or its container) is OOM-killed within seconds, taking down all requests it was serving, and repeated uploads keep it down. No pixel decoding, `load()`, or further API call is required for the TIFF and JPEG cases, `MAX_IMAGE_PIXELS` does not apply, and no `DecompressionBomb*` warning gives the application a chance to refuse the file. There is no memory corruption; the effect is denial of service of the process handling the input.\n\nThis is the same class as CVE-2021-27921/27922/27923 (BLP/ICNS/ICO \"arbitrarily large memory allocations\" from unchecked reported sizes, fixed in 8.1.2) and CVE-2021-28675 (PSD layer count not checked against the data size, DoS on `Image.open()` prior to `load()`), here in the TIFF/EXIF directory parser shared by several formats.\n\n## Reproducing\n\n`repro` is a single Python script that runs against the stock Pillow in `/src`; nothing is compiled. It needs about 1 GB of free RAM (it caps its own address space at 4 GiB so that a larger run ends in `MemoryError` rather than the OOM killer).\n\n**Input.** `aliased_ifd()` builds, in memory, a little-endian classic TIFF: an 8-byte header, one IFD, nothing else. Every crafted entry is a private tag (1000 upwards) of type BYTE with `offset = 1` and `count = file size - 1`, i.e. each claims the whole file body as its value. Each costs 12 bytes in the file but a full file-sized read in `ImageFileDirectory_v2.load()`.\n\n**TIFF path.** The first file adds 8 ordinary tags (ImageWidth = ImageLength = 1, BitsPerSample = 8, no compression, BlackIsZero, one 1-byte strip pointing at a header byte) so that Pillow accepts it as a 1×1 `L` image, plus 6,000 aliased tags (72,110 bytes). Because the image is 1×1, `MAX_IMAGE_PIXELS` never comes into play. The script calls `Image.open()` on it and nothing else: no `load()`, no pixel access.\n\n**EXIF path.** The same 6,000-entry IFD (without the image tags) is passed as `exif=` when saving a 1×1 PNG, so it lands in an `eXIf` chunk; the script opens that PNG and calls `im.getexif()`, which is what `ImageOps.exif_transpose()` calls.\n\n**Check.** For each path the script reads `VmRSS` from `/proc/self/status` before and after, and adds up `len()` over the resulting directory's `_tagdata`. In a well-formed IFD each entry points at its own bytes, so the tag data can never be larger than the file. The script prints `BUG` if both the TIFF's `im.tag_v2` and the PNG's EXIF directory hold more than 2000× the size of their file, otherwise `OK`. On this commit each holds 412 MiB (~6000× the file) and RSS grows by about as much for each.\n\nThe memory cost is entries × file size, and the file size itself grows at 12 bytes per entry, so the cost is quadratic: doubling to 12,000 entries (144 KB) gives the 1.6 GiB quoted above, and the classic-TIFF maximum of 65,535 entries (~786 KB file) comes to ~48 GiB. A JPEG APP1 segment or a WebP EXIF chunk carrying the same IFD behaves like the PNG case (for JPEG, already during `Image.open()`).\n\n## Suggested fix\n\nThe attached patch bounds the out-of-line tag data a single `ImageFileDirectory_v2.load()` call may pull in by the length of the stream it reads from. The values of a well-formed IFD do not overlap, so their total can never exceed the file; only aliased entries can push past it. `load()` now measures the stream once on entry (`fp.seek(0, io.SEEK_END)`, then back to `self._offset`; `load()` already requires a seekable `fp`, since both the TIFF plugin and `Exif` do), keeps a running `total_size` of out-of-line values, and, before the `fp.seek(offset)` / `_safe_read()` at `TiffImagePlugin.py:926-927`, warns `\"Tag data larger than file. Skipping tag …\"` and `continue`s for any entry that would take the total past the file size, in the same warn-and-skip idiom as the existing \"Tag offset too large\" check. No fixed constant is introduced and no valid file changes behaviour, including TIFFs with very large Photoshop/ImageSourceData (tag 37724) payloads, which routinely exceed 64 MB. Because `Image.Exif`, the PNG/JPEG/WebP EXIF paths and MPO all go through this one method, they are covered too. The patch adds `test_tag_data_larger_than_file` to `Tests/test_file_tiff_metadata.py`, next to `test_tag_offset`. With it applied, both paths in the reproducer drop to 1× the file size. One visible side effect: a single oversize entry now skips that tag with this warning instead of aborting the rest of the IFD via the `OSError` path.\n\nA fixed module-level cap in the style of `PngImagePlugin.MAX_TEXT_MEMORY` (e.g. a 64 MiB `TiffImagePlugin.MAX_IFD_DATA`) would be the weaker alternative on its own: a 140 KB file could still retain ~63 MiB per IFD — and a JPEG's EXIF is parsed into several IFDs (main, EXIF, GPS, Interop), so a 66 KB APP1 segment could still request roughly 1000× its size — and legitimate TIFFs with more than 64 MiB of tag data would lose those tags with a warning. It could still be added on top of the stream-length check as a user-adjustable knob.\n\nAn alternative that removes the amplification entirely is to store `(offset, size)` in `_tagdata` and read lazily in `__getitem__`, which is what the class docstring already describes (\"we don't decode tags unless they're asked for\"); that is a larger change because `_tagdata` is shared with `ImageFileDirectory_v1` (`from_v2`/`to_v2`) and exposed as the legacy `tagdata` property, and lazy reads would need the file object to still be open when a tag is first accessed.\n\n## The patch\n\nSkip IFD entries once the total out-of-line tag data read by ImageFileDirectory_v2.load() would exceed the size of the stream\n\nApplies to `src/PIL/TiffImagePlugin.py` at the commit above.\n\n```diff\ndiff --git a/Tests/test_file_tiff_metadata.py b/Tests/test_file_tiff_metadata.py\nindex 7b35a0196..ccf923128 100644\n--- a/Tests/test_file_tiff_metadata.py\n+++ b/Tests/test_file_tiff_metadata.py\n@@ -500,6 +500,21 @@ def test_tag_offset() -\u003e None:\n         ifd.load(f)\n \n \n+def test_tag_data_larger_than_file() -\u003e None:\n+    ifd = TiffImagePlugin.ImageFileDirectory_v2()\n+\n+    # Two BYTE tags that both claim the whole 30 byte IFD as their value\n+    tag_count = struct.pack(\"\u003cH\", 2)\n+    tags = struct.pack(\"\u003cHHLL\", 0, 1, 30, 0) + struct.pack(\"\u003cHHLL\", 1, 1, 30, 0)\n+    next_offset = struct.pack(\"\u003cL\", 0)\n+\n+    f = io.BytesIO(tag_count + tags + next_offset)\n+    with pytest.warns(UserWarning, match=\"Tag data larger than file\"):\n+        ifd.load(f)\n+    assert len(ifd[0]) == 30\n+    assert 1 not in ifd\n+\n+\n def test_tag_group_data() -\u003e None:\n     base_ifd = TiffImagePlugin.ImageFileDirectory_v2()\n     interop_ifd = TiffImagePlugin.ImageFileDirectory_v2(group=40965)\ndiff --git a/src/PIL/TiffImagePlugin.py b/src/PIL/TiffImagePlugin.py\nindex 42c1cc96c..c9d506933 100644\n--- a/src/PIL/TiffImagePlugin.py\n+++ b/src/PIL/TiffImagePlugin.py\n@@ -892,6 +892,9 @@ class ImageFileDirectory_v2(_IFDv2Base):\n     def load(self, fp: IO[bytes]) -\u003e None:\n         self.reset()\n         self._offset = fp.tell()\n+        fp.seek(0, io.SEEK_END)\n+        file_size = fp.tell()\n+        fp.seek(self._offset)\n \n         try:\n             tag_count = (\n@@ -899,6 +902,7 @@ class ImageFileDirectory_v2(_IFDv2Base):\n                 if self._bigtiff\n                 else self._unpack(\"H\", self._ensure_read(fp, 2))\n             )[0]\n+            total_size = 0\n             for i in range(tag_count):\n                 tag, typ, count, data = (\n                     self._unpack(\"HHQ8s\", self._ensure_read(fp, 20))\n@@ -923,6 +927,16 @@ class ImageFileDirectory_v2(_IFDv2Base):\n                     if offset \u003e= 2**63:\n                         warnings.warn(\"Tag offset too large\")\n                         continue\n+                    # The values of a well-formed IFD do not overlap, so in\n+                    # total they cannot be larger than the file they are read\n+                    # from. Do not let entries that alias the same bytes load\n+                    # many copies of it.\n+                    total_size += size\n+                    if total_size \u003e file_size:\n+                        warnings.warn(\n+                            f\"Tag data larger than file. Skipping tag {tag}\"\n+                        )\n+                        continue\n                     fp.seek(offset)\n                     data = ImageFile._safe_read(fp, size)\n                     fp.seek(here)\n```\n\n## The reproducer\n\n\u003cdetails\u003e\n\u003csummary\u003eReproducer — \u003ccode\u003erepro\u003c/code\u003e, 2,254 bytes (click to open)\u003c/summary\u003e\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# ImageFileDirectory_v2.load(): N IFD entries that all alias the file body make\n# Image.open() (TIFF) and getexif() (PNG eXIf etc.) retain ~N copies of the file.\n# Pure Python, stock Pillow in /src. Needs ~1 GB RAM, runs in ~1 s.\nimport io, struct, resource\nfrom PIL import Image\nresource.setrlimit(resource.RLIMIT_AS, (4 \u003c\u003c 30, 4 \u003c\u003c 30))  # MemoryError, not OOM-killer\n\ndef aliased_ifd(n_alias, real=()):\n    \"\"\"Classic LE TIFF: header + one IFD. n_alias BYTE tags each cover the whole file.\"\"\"\n    n = len(real) + n_alias\n    size = 8 + 2 + 12 * n + 4\n    ents = {t: struct.pack(\"\u003cHHLL\", t, typ, 1, v) for t, (typ, v) in dict(real).items()}\n    for t in range(1000, 1000 + n_alias):\n        ents[t] = struct.pack(\"\u003cHHLL\", t, 1, size - 1, 1)      # BYTE[size-1] @ offset 1\n    blob = b\"II*\\0\" + struct.pack(\"\u003cLH\", 8, n) + b\"\".join(ents[t] for t in sorted(ents)) + b\"\\0\" * 4\n    assert len(blob) == size\n    return blob\n\ndef rss():\n    return next(int(l.split()[1]) \u003c\u003c 10 for l in open(\"/proc/self/status\") if l.startswith(\"VmRSS\"))\n\n# 1) TIFF: 1x1 L image (pixel = a header byte) + 6000 aliased private tags -\u003e Image.open() only\nreal = {256: (3, 1), 257: (3, 1), 258: (3, 8), 259: (3, 1), 262: (3, 1),\n        273: (4, 8), 278: (3, 1), 279: (4, 1)}\ntif = aliased_ifd(6000, real)\nr0 = rss(); im = Image.open(io.BytesIO(tif)); r1 = rss()\nheld_t = sum(len(v) for v in im.tag_v2._tagdata.values())\nprint(f\"TIFF {len(tif)} B, {im.size} {im.mode}: Image.open() keeps {held_t \u003e\u003e 20} MiB of tag data \"\n      f\"({held_t // len(tif)}x file); RSS {r0 \u003e\u003e 20} -\u003e {r1 \u003e\u003e 20} MiB\")\n\n# 2) Same IFD as EXIF in a 1x1 PNG -\u003e im.getexif() (what ImageOps.exif_transpose calls)\nexif = aliased_ifd(6000)\nbuf = io.BytesIO(); Image.new(\"L\", (1, 1)).save(buf, \"PNG\", exif=exif); png = buf.getvalue()\nr0 = rss(); im2 = Image.open(io.BytesIO(png)); e = im2.getexif(); r1 = rss()\nheld_e = sum(len(v) for v in e._info._tagdata.values()) if e._info is not None else 0\nprint(f\"PNG  {len(png)} B: getexif() keeps {held_e \u003e\u003e 20} MiB ({held_e // len(png)}x file); \"\n      f\"RSS {r0 \u003e\u003e 20} -\u003e {r1 \u003e\u003e 20} MiB\")\n\n# A well-formed IFD's values cannot exceed the stream they come from (1x).\nprint(\"BUG\" if held_t \u003e 2000 * len(tif) and held_e \u003e 2000 * len(png) else \"OK\")\n```\n\u003c/details\u003e\n\n---",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "pillow",
+        "purl": "pkg:pypi/pillow"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "13.0.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7.0",
+        "1.7.1",
+        "1.7.2",
+        "1.7.3",
+        "1.7.4",
+        "1.7.5",
+        "1.7.6",
+        "1.7.7",
+        "1.7.8",
+        "10.0.0",
+        "10.0.1",
+        "10.1.0",
+        "10.2.0",
+        "10.3.0",
+        "10.4.0",
+        "11.0.0",
+        "11.1.0",
+        "11.2.1",
+        "11.3.0",
+        "12.0.0",
+        "12.1.0",
+        "12.1.1",
+        "12.2.0",
+        "12.3.0",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "2.3.0",
+        "2.3.1",
+        "2.3.2",
+        "2.4.0",
+        "2.5.0",
+        "2.5.1",
+        "2.5.2",
+        "2.5.3",
+        "2.6.0",
+        "2.6.1",
+        "2.6.2",
+        "2.7.0",
+        "2.8.0",
+        "2.8.1",
+        "2.8.2",
+        "2.9.0",
+        "3.0.0",
+        "3.1.0",
+        "3.1.0.rc1",
+        "3.1.0rc1",
+        "3.1.1",
+        "3.1.2",
+        "3.2.0",
+        "3.3.0",
+        "3.3.1",
+        "3.3.2",
+        "3.3.3",
+        "3.4.0",
+        "3.4.1",
+        "3.4.2",
+        "4.0.0",
+        "4.1.0",
+        "4.1.1",
+        "4.2.0",
+        "4.2.1",
+        "4.3.0",
+        "5.0.0",
+        "5.1.0",
+        "5.2.0",
+        "5.3.0",
+        "5.4.0",
+        "5.4.0.dev0",
+        "5.4.1",
+        "6.0.0",
+        "6.1.0",
+        "6.2.0",
+        "6.2.1",
+        "6.2.2",
+        "7.0.0",
+        "7.1.0",
+        "7.1.1",
+        "7.1.2",
+        "7.2.0",
+        "8.0.0",
+        "8.0.1",
+        "8.1.0",
+        "8.1.1",
+        "8.1.2",
+        "8.2.0",
+        "8.3.0",
+        "8.3.1",
+        "8.3.2",
+        "8.4.0",
+        "9.0.0",
+        "9.0.1",
+        "9.1.0",
+        "9.1.1",
+        "9.2.0",
+        "9.3.0",
+        "9.4.0",
+        "9.5.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 12.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-wqgw-9xfh-qf2g/GHSA-wqgw-9xfh-qf2g.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/security/advisories/GHSA-wqgw-9xfh-qf2g"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/4908edaf7f416616784c7c03d8c1a60153710ffb"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/commit/4b63dffd8a6d980fa0e21b40832fa6cbf033eacf"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/python-pillow/Pillow/releases/tag/13.0.0"
+    }
+  ]
+}
