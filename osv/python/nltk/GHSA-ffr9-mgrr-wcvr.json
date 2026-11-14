@@ -1,0 +1,99 @@
+{
+  "id": "GHSA-ffr9-mgrr-wcvr",
+  "modified": "2026-11-13T21:15:14.554118302Z",
+  "published": "2026-11-13T21:08:55Z",
+  "aliases": [
+    "CVE-2026-126300"
+  ],
+  "summary": "NLTK: Quadratic CPU exhaustion in TreebankWordTokenizer.span_tokenize via list.pop(0) in quote-restore loop",
+  "details": "## Summary\n\n`TreebankWordTokenizer.span_tokenize` in the NLTK tokenizer package contains an unguarded O(n^2) processing loop in its quote-restoration step. When the method is invoked on text containing a long run of double-quote characters (for example `'\"' * n`), it performs a `list.pop(0)` operation once per quote token, and because `list.pop(0)` is O(length), the total cost grows with the square of the input length. An attacker who can supply untrusted text to this public span-tokenization API can force a single request to saturate one CPU core for a prolonged period, degrading availability. No authentication, special configuration, or user interaction is required.\n\n## Root Cause\n\nInside `span_tokenize`, when the input contains double or repeated quotes, the code builds `matched`, a list with one entry per quote occurrence, and then reconstructs tokens in a comprehension that calls `matched.pop(0)` for each token that is a quote. Removing the first element of a Python list is an O(len(list)) operation because all remaining elements are shifted. For an all-quote input the tokenizer produces n quote tokens and `matched` has n entries, so `pop(0)` is called n times, each time on a list of shrinking but still linear length, giving cumulative O(n^2) CPU work. The violated invariant is bounded per-input work: there is no length cap on `span_tokenize` or the underlying `tokenize`, so untrusted input length translates into quadratic processing time. The neighboring `align_tokens` call is linear and is not the quadratic term.\n\n```text\nAffected function: TreebankWordTokenizer.span_tokenize\nSource: nltk/tokenize/treebank.py\n  - branch selector at line 203\n  - matched list built at line 205\n  - quadratic sink matched.pop(0) at line 209\n  - linear align_tokens call at line 215\n```\n\n## Impact\n\nAn attacker who controls text passed to `TreebankWordTokenizer.span_tokenize` can trigger quadratic CPU work. In the reviewed release, an all-quote input of 128,000 characters takes about 1.76 seconds and 256,000 characters about 6.57 seconds on a single core, with cost growing as the square of the length. Memory use is linear. The demonstrated capability is single-core CPU exhaustion producing denial of service or latency degradation in any network-reachable component that uses span tokenization on untrusted input, such as offset, annotation, or highlighting pipelines. There is no confidentiality or integrity impact. The plausible operational consequence, where multiple concurrent requests are used, is worker-pool exhaustion; this is inferred from the measured per-request cost and was not executed against a live deployment.\n\n## Proof of Concept\n\n`Requires only the released nltk package; no corpus download is needed.`\n\n1. Instantiate `TreebankWordTokenizer`.\n2. Call `span_tokenize` on an all-double-quote string of increasing length and time each call.\n3. Compare against an equal-token-count control input that avoids the quote branch.\n\n```python\nimport time\nfrom nltk.tokenize import TreebankWordTokenizer\n\ntok = TreebankWordTokenizer()\nfor n in (32000, 64000, 128000, 256000):\n    payload = '\"' * n\n    start = time.perf_counter()\n    list(tok.span_tokenize(payload))\n    print(\"quote-run\", n, round(time.perf_counter() - start, 3))\n\ncontrol = \"a \" * 128000  # comparable token count, avoids the pop(0) branch\nstart = time.perf_counter()\nlist(tok.span_tokenize(control))\nprint(\"control\", round(time.perf_counter() - start, 3))\n```\n\n```text\nquote-run 32000 0.23\nquote-run 64000 0.52\nquote-run 128000 1.76\nquote-run 256000 6.57   (about 4x per doubling =\u003e O(n^2))\ncontrol 0.16            (roughly 11x faster, isolates pop(0))\n```\n\n## Attack Chain\n\n1. **Exposure:** `TreebankWordTokenizer` is exported from `nltk.tokenize` and `span_tokenize` is a public, documented method reachable by any service that span-tokenizes untrusted text.\n2. **Control:** The attacker fully controls the `text` argument; a run of double-quote characters such as `'\"' * n` survives to the quote branch unchanged.\n3. **Path:** The branch selector at line 203 (`'\"' in text` or `\"''\" in text`) is satisfied by the payload, entering the vulnerable branch; `matched` is built at line 205 with n entries and the reconstruction comprehension runs at line 209.\n4. **Guard:** There is no length cap on `span_tokenize` or `tokenize`. The regex timeout backstop in `nltk/redos.py` only wraps regular-expression operations and does not cover the pure-Python `list.pop(0)` sink; a 256,000-character input ran to completion in 6.57 seconds with no timeout raised.\n5. **Primitive:** `matched.pop(0)` executed once per quote token, each call O(len(matched)), yields cumulative O(n^2) CPU work.\n6. **Result:** A single request with a large quote-run input exhausts one CPU core for a sustained period, degrading service availability.\n\n## Bypass Evidence\n\nNo guard blocks this path. Direct inspection found no `MAX_TOKEN_LEN` or length check in `nltk/tokenize/treebank.py`, in contrast to the sibling `sonority_sequencing.py` which does cap token length. The strongest refutations were attempted and failed: (1) the hypothesis that `tokenize` collapses repeated quotes so few `pop(0)` calls occur was disproven by observing that `tokenize('\"' * n)` yields exactly n quote tokens and timing showing about 4x growth per doubling, while an equal-token-count non-quote control ran roughly 11x faster; (2) the hypothesis that the project regex-timeout backstop already caps this cost was disproven by running a 256,000-character input to normal completion in 6.57 seconds with no `TimeoutError`, confirming the backstop wraps only regex operations and not `list.pop(0)`; (3) the hypothesis that this line was already audited was disproven, since the project quadratic-DoS test suite explicitly clears the neighboring `align_tokens` line reached through `span_tokenize` but contains no test for the `pop(0)` loop, an audited-neighbor pattern where the adjacent line was checked and this one was missed. The seed remediation touched a different module and no advisory covers this sink.\n\n## Affected Versions\n\n- `Ecosystem: pip`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.2.5, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI)`\n- `Fix status: not fixed`\n\nThe vulnerable `pop(0)` loop is present and unguarded in the current released artifact 3.10.3, verified by direct source inspection and by reproducing the quadratic curve through fresh execution. The lower bound of 3.2.5 reflects when the affected quote-restoration code shipped; the disclosure-relevant fact is that the latest published release is affected and no fix has been released.\n\n## Suggested Fix\n\nReplace the O(n) `list.pop(0)` pattern with an O(1) consumption strategy, for example iterating over `matched` with an index or an iterator, or using `collections.deque` with `popleft()`, so that the quote-restoration step runs in linear time overall. Additionally, consider enforcing a configurable maximum input length in `span_tokenize` consistent with the caps applied to sibling tokenizers, and ensure the fix covers all callers that pass untrusted text. As an interim mitigation, deployments that expose span tokenization of untrusted input can cap request and input sizes at the application boundary to bound the worst-case length.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nTwo pull requests carry a fix.\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured). Fix commit: cf12a5e6a (the quote-restore loop in tokenize/treebank.py and tokenize/destructive.py iterates forward instead of list.pop(0)).\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144. Fix commit: e20c40e26 \"Bound tokenizer/parser algorithmic DoS (ffr9/gpwc/8fx7)\".\n\nNo probe. The advisory PoC re-run (span_tokenize over 32k and 128k double quotes): #3753 head 3.5x over a 4x input, #3895 head 3.2x, both linear. On develop 2fa3f48fe the 128k run did not finish within 120 s, so develop is still VULNERABLE.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.2.5"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-ffr9-mgrr-wcvr/GHSA-ffr9-mgrr-wcvr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-ffr9-mgrr-wcvr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126300"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/e20c40e26ec9306de885703f6e53250695f1f49b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-from-3.2.5-before-3.10.4-cpu-exhaustion-via-treebankwordtokenizer-span-tokenize"
+    }
+  ]
+}

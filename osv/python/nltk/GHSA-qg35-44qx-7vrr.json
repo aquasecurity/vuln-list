@@ -1,0 +1,76 @@
+{
+  "id": "GHSA-qg35-44qx-7vrr",
+  "modified": "2026-11-13T21:15:14.544338378Z",
+  "published": "2026-11-13T20:55:16Z",
+  "aliases": [
+    "CVE-2026-126304"
+  ],
+  "summary": "NLTK: Symlink escape in YCOECorpusReader lets a psd/pos directory symlink read files outside the corpus root within the data sandbox",
+  "details": "## Summary\n\n`YCOECorpusReader` builds two nested corpus sub-readers whose roots are derived from `self.root.join(\"psd\")` and `self.root.join(\"pos\")` (nltk/corpus/reader/ycoe.py). Because `FileSystemPathPointer.join()` (nltk/data.py) performs a purely lexical containment check and never resolves symlinks, and because `CorpusReader.__init__` (nltk/corpus/reader/api.py) validates a sub-reader root only against the global NLTK data sandbox and not against the enclosing corpus root, a directory symlink named `psd` or `pos` planted inside a YCOE corpus lets the reader anchor its nested sub-readers outside the YCOE corpus root. An attacker who controls the contents of a YCOE corpus loaded under `pathsec.ENFORCE=True` can make `parsed_sents()`, `tagged_words()`, and related methods return file content from other locations inside the allowed data sandbox, defeating the per-corpus-root containment boundary the pathsec controls are meant to enforce.\n\n## Root Cause\n\nNLTK's pathsec controls are designed to keep each corpus reader confined to its own corpus root. The scoped containment is enforced through `validate_path(..., required_root=self._root)` at read time. However, the containment invariant is violated at reader-construction time for nested readers:\n\n- `FileSystemPathPointer.join()` accepts a component that is a directory symlink because it only checks the joined string lexically (`os.path.normpath` plus a `startswith` prefix test) and never calls `resolve()`.\n- `CorpusReader.__init__` validates the resulting sub-reader root string, but calls `validate_path` without `required_root`, so only the global-sandbox layer runs; the scoped per-corpus-root layer is skipped. The symlink is resolved by that global check, its target is found to be inside the allowed sandbox, and the sub-reader is accepted with its root pointing at the escaped target.\n\nFrom that point every read the sub-reader performs is scoped to the already-escaped root, so no later guard re-anchors it to the YCOE corpus root.\n\n```text\nAffected functions:\n- nltk.corpus.reader.ycoe.YCOECorpusReader.__init__   (nltk/corpus/reader/ycoe.py) builds nested sub-readers from self.root.join(\"psd\")/(\"pos\") without containing them to the parent root\n- nltk.corpus.reader.api.CorpusReader.__init__        (nltk/corpus/reader/api.py) validates a sub-reader root only against the global sandbox (validate_path without required_root)\n- nltk.data.FileSystemPathPointer.join               (nltk/data.py) applies a lexical prefix check only and never resolves symlinks\n```\n\n## Impact\n\nAn attacker who controls the directory contents of a YCOE corpus that is loaded by a victim application under `pathsec.ENFORCE=True` (the default in the affected releases) can read file content that lives outside the YCOE corpus root but inside an allowed NLTK data root. The disclosure is bounded to the global NLTK data sandbox: a symlink whose target resolves outside every allowed root is rejected at construction, so this is not an arbitrary-filesystem read. The demonstrated capability is read-only cross-corpus-root disclosure. In a multi-tenant or automated-ingestion deployment the accessible scope includes other corpora placed under the shared data path and the shared system temporary directory, which is a default allowed root and can hold other processes' sensitive temporary files. There is no integrity or availability impact.\n\n## Proof of Concept\n\n`Dependencies: a released nltk (3.10.0 through 3.10.3) on a POSIX host. No third-party packages. The only allowed data root is a fresh temp sandbox; ENFORCE is left at its default of True.`\n\nSteps:\n1. Create a sandbox directory and register it as the sole `nltk.data.path` entry.\n2. Inside the sandbox create a \"victim\" directory holding `doc1.psd` / `doc1.pos` outside the YCOE corpus root.\n3. Create a YCOE corpus root whose `psd` and `pos` entries are directory symlinks pointing at the victim directory.\n4. Construct `YCOECorpusReader` on that root and read it.\n\n```python\nimport os, tempfile, nltk\nfrom nltk import pathsec\nsandbox = os.path.realpath(tempfile.mkdtemp())\npathsec.ENFORCE = True\nnltk.data.path = [sandbox]\npathsec._ALLOWED_ROOTS_CACHE = None\nfrom nltk.corpus.reader.ycoe import YCOECorpusReader\n\nvictim = os.path.join(sandbox, \"victim\", \"psd_secret\")\nvictim_pos = os.path.join(sandbox, \"victim\", \"pos_secret\")\nos.makedirs(victim); os.makedirs(victim_pos)\nopen(os.path.join(victim, \"doc1.psd\"), \"w\").write(\"(S (SECRET leaked-out-of-ycoe-root))\\n\")\nopen(os.path.join(victim_pos, \"doc1.pos\"), \"w\").write(\"SECRET_NN leaked-out-of-ycoe-root_NN\\n\")\n\nycoe = os.path.join(sandbox, \"corpora\", \"ycoe_evil\"); os.makedirs(ycoe)\nos.symlink(victim, os.path.join(ycoe, \"psd\"))\nos.symlink(victim_pos, os.path.join(ycoe, \"pos\"))\n\nreader = YCOECorpusReader(ycoe)\nprint(reader.parsed_sents())\nprint(reader.tagged_words())\n```\n\n```text\npsd sub-reader real root : /tmp/ycoe_poc_zc35zihw/victim/psd_secret\nycoe corpus root         : /tmp/ycoe_poc_zc35zihw/corpora/ycoe_evil\nparsed_sents()           : [Tree('S', [Tree('SECRET', ['leaked-out-of-ycoe-root'])])]\ntagged_words()           : [('SECRET', 'NN'), ('leaked-out-of-ycoe-root', 'NN')]\nESCAPE CONFIRMED: YCOE read out-of-root content via psd/pos symlink\n```\n\nA negative control with real (non-symlink) `psd`/`pos` directories stays contained, and a symlink whose target is `/etc` is rejected at construction with a `PermissionError`, confirming the escape is bounded to the sandbox.\n\n## Attack Chain\n\n1. **Exposure:** A victim application loads a YCOE corpus whose directory contents are attacker-controlled (a downloaded, shared, or planted corpus placed under an allowlisted NLTK data root), running with `pathsec.ENFORCE=True`.\n2. **Control:** The attacker sets the corpus root's `psd` and `pos` entries to directory symlinks pointing at another directory inside the allowed sandbox.\n3. **Path:** `YCOECorpusReader.__init__` calls `self.root.join(\"psd\")`; `FileSystemPathPointer.join()` returns a pointer to `\u003croot\u003e/psd` after a lexical-only check that never resolves the symlink.\n4. **Guard:** `CorpusReader.__init__` calls `validate_path(root)` without `required_root`, so the scoped per-corpus-root layer is skipped; only the global-sandbox layer runs and it resolves the symlink to an in-sandbox target and accepts it.\n5. **Primitive:** The nested sub-reader's root is now the escaped target; `find_corpus_fileids` and the read-time `validate_path(required_root=self._root)` both anchor to that escaped root, so all reads are treated as in-root.\n6. **Result:** `parsed_sents()`, `tagged_words()`, `tagged_sents()`, and `words()` return file content from outside the YCOE corpus root but inside the allowed sandbox: read-only cross-corpus-root disclosure.\n\n## Bypass Evidence\n\nThe relevant guards are the pathsec containment checks that were added to confine corpus readers to their roots. They do not block this path:\n\n- `FileSystemPathPointer.join()` (nltk/data.py) checks `joined == root or joined.startswith(root + os.sep)` on the lexical, non-resolved path. A `psd` component that is a directory symlink yields `\u003croot\u003e/psd`, which satisfies the prefix test, and the symlink is never resolved. `FileSystemPathPointer.__init__` uses `os.path.abspath`, which also does not resolve symlinks.\n- `CorpusReader.__init__` (nltk/corpus/reader/api.py) invokes `validate_path(root, context=\"CorpusReader.__init__\")` with no `required_root`. In `validate_path`, the scoped layer is guarded by `if required_root:` and is therefore skipped; only the global-sandbox layer runs, which resolves the symlink target and accepts it because it lies inside `nltk.data.path`.\n- The read-time guard `validate_path(path, required_root=self._root)` uses the sub-reader's own `self._root`, which is already the escaped target, so it cannot detect the escape. `find_corpus_fileids` computes `resolved_root = os.path.realpath(root.path)` on the escaped root, so its `commonpath` descent guard also confines to the escaped target rather than the YCOE root.\n\nRefutation attempts that failed: a boundary test with a `/etc` symlink target is rejected at construction (`PermissionError`), so this is not arbitrary-filesystem read; a negative control with real `psd`/`pos` directories stays contained; and the escape reproduces against the exact published PyPI sdists for 3.10.0 and 3.10.3, so it is not an artifact of an unreleased development tree. No published advisory or fix addresses this reader: the currently released readers hardened for symlink escapes do not include YCOE's nested-reader root construction, and no fix commit touches nltk/corpus/reader/ycoe.py.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.10.0, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI sdist sha256 bb9327a461c3811c2fa4900e03840401f2126adfb30c0072827c433bd2444ea4, uploaded 2026-08-12)`\n- `Fix status: 3.10.4`\n\nThe pathsec corpus-root containment control is active by default (`ENFORCE=True`) in the 3.10.x line, and the vulnerable YCOE nested-reader construction is present unchanged in every 3.10.x release. The escape was reproduced against the published 3.10.0 and 3.10.3 sdists. Version 3.9.4 ships with `ENFORCE=False` by default, so the per-corpus-root control is not active there by default; that un-hardened default is tracked separately and is not the boundary this report concerns. No later fixed release exists at the time of review.\n\n## Suggested Fix\n\nEnforce the per-corpus-root containment invariant when a reader constructs a nested sub-reader. Two complementary options:\n\n- In `YCOECorpusReader.__init__`, validate each nested root against the parent corpus root, for example `validate_path(self.root.join(\"psd\"), required_root=self.root)` (and likewise for `pos`), so a sub-reader root that resolves outside the enclosing YCOE root is rejected.\n- Harden `FileSystemPathPointer.join()` to reject a component whose resolved target escapes the pointer's own resolved root, rather than relying on a lexical prefix test, so no reader can be pointed outside its root by a symlinked component.\n\nApply the same review to any other reader that constructs nested sub-readers from a root-derived path. As an interim mitigation, only load YCOE corpora from trusted, attacker-inaccessible directories, and avoid placing untrusted corpora under a shared NLTK data root in multi-tenant or automated-ingestion pipelines.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3888 \"Validate chat80.sql_query dbname for path containment (CWE-59/73)\", open; head e0e890f51 at the time of this note.\n\nFix commits: 68434c042 \"Enforce corpus-root containment in YCOE reader and StreamBackedCorpusView\" and 2c563b13f (scopes the YCOE guard).\n\nNo probe. Regression test on the PR: nltk/test/unit/test_ycoe_streamview_pathsec.py (13 passed on the PR head e0e890f51). The advisory PoC re-run (psd and pos directory symlinks pointing outside the corpus root but inside the data sandbox): on the PR head YCOECorpusReader refuses with ValueError (Security Violation [YCOECorpusReader]: path escapes root); on develop 2fa3f48fe parsed_sents() and tagged_words() return the planted out-of-root content, so develop is still VULNERABLE.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-qg35-44qx-7vrr/GHSA-qg35-44qx-7vrr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-qg35-44qx-7vrr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126304"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3888"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/2c563b13f9dce7c15eefd4b03463e1b69b64f1f3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/68434c0427f8d296f3adfddb518525038d1f7bfa"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-3.10.0-before-3.10.4-symlink-escape-in-ycoecorpusreader"
+    }
+  ]
+}

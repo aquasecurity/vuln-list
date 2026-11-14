@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-8fx7-8jr8-84rv",
+  "modified": "2026-11-13T21:15:14.552241935Z",
+  "published": "2026-11-13T21:02:19Z",
+  "aliases": [
+    "CVE-2026-126303"
+  ],
+  "summary": "NLTK: Unbounded CPU consumption in SteppingRecursiveDescentParser.parse() with ambiguous or self-embedding grammars",
+  "details": "## Summary\n\n`nltk.parse.recursivedescent.SteppingRecursiveDescentParser.parse()` performs an unbounded top-down search over ambiguous or self-embedding context-free grammars with no wall-clock or step limit. An actor who can influence the grammar and supply a short input to a caller that uses this parser can force a single `parse()` call to pin a CPU core indefinitely, producing a denial of service. The related base class `RecursiveDescentParser` gained a `max_time` wall-clock deadline, but the stepping subclass drives its own step loop and never arms or consults that deadline, and its constructor does not accept a `max_time` parameter, so the guard cannot be enabled on this path.\n\n## Root Cause\n\n`RecursiveDescentParser` bounds its recursive search inside `_parse`: it arms a wall-clock deadline on the first step and raises `TimeoutError` once `max_time` (default 5.0 seconds) is exceeded. `SteppingRecursiveDescentParser` was designed for interactive single-stepping and overrides both `parse()` and `_parse`. Its `parse()` runs `initialize()` followed by a `while self.step() is not None` loop that never enters the guarded base `_parse`. Its `_parse` override is a state-capturing stub that records history and returns a sentinel, and it never references the inherited `self._parse_deadline` or `self._max_time`. Its `__init__` signature omits `max_time` entirely, so a caller cannot enable or tighten a bound. The security invariant that a single parse must terminate within a bounded time is therefore never enforced on this parser.\n\n```text\nAffected component: nltk.parse.recursivedescent.SteppingRecursiveDescentParser\n- parse()      nltk/parse/recursivedescent.py:428-433  (drives its own step loop, no bound armed or checked)\n- _parse()     nltk/parse/recursivedescent.py:643-668  (stub override; never consults self._parse_deadline / self._max_time)\n- __init__()   nltk/parse/recursivedescent.py:410-418  (signature (self, grammar, trace=0); no max_time parameter)\nBase guard for comparison: RecursiveDescentParser._parse nltk/parse/recursivedescent.py:141-150\n```\n\n## Impact\n\nAn actor who controls or influences the grammar passed to `SteppingRecursiveDescentParser` and can supply a short token sequence to a caller that invokes `parse()` can cause that call to never return. The top-down search enumerates a derivation space that grows on the order of the Catalan numbers with no memoization of the search and no deadline, so one crafted grammar plus a short input deterministically consumes a CPU core. In a deployment that parses attacker-influenced input on a bounded worker pool, repeated requests exhaust the pool and deny service to legitimate users. No authentication, privilege, or user interaction is required in that worst-credible deployment. Exploitation requires that the target actually use this parser on untrusted input; because the stepping parser is primarily a debugging or interactive-stepping component that backs a GUI, real-world exposure is narrower than for the base parser, though `parse()` is a supported public method that behaves as a full parser.\n\n## Proof of Concept\n\n`Requires only the nltk package (3.10.3) and standard library; no data downloads or network access.`\n\nReproduction steps:\n1. Build an ambiguous, self-embedding grammar such as `S -\u003e 'a' S S | 'a'`.\n2. Confirm the base parser self-terminates: `RecursiveDescentParser(g, max_time=2.0).parse(['a']*17)` raises `TimeoutError` at about 2 seconds.\n3. Run the stepping parser on the same grammar and input and observe it never returns.\n\n```python\nimport time, inspect\nfrom nltk import CFG\nfrom nltk.parse.recursivedescent import RecursiveDescentParser, SteppingRecursiveDescentParser\n\ng = CFG.fromstring(\"S -\u003e 'a' S S | 'a'\")\n\n# Base parser is bounded and self-terminates.\ntry:\n    list(RecursiveDescentParser(g, max_time=2.0).parse(['a'] * 17))\nexcept TimeoutError:\n    print(\"base: TimeoutError (guarded)\")\n\n# Stepping subclass cannot be bounded: no max_time parameter.\nprint(\"stepping __init__ sig:\", inspect.signature(SteppingRecursiveDescentParser.__init__))\n\n# Stepping parser runs unbounded on the same input.\nt0 = time.perf_counter()\nlist(SteppingRecursiveDescentParser(g).parse(['a'] * 17))  # does not return\nprint(\"stepping: returned after\", time.perf_counter() - t0)\n```\n\n```text\nbase: TimeoutError (guarded)\nstepping __init__ sig: (self, grammar, trace=0)\n# stepping len3: 1 parse in 0.001s ; len7: 5 in 0.017s ; len9: 14 in 0.075s ; len11: 42 in 0.36s\n# stepping len17: still running past a 10s watchdog, process alive, no RecursionError\n```\n\n## Attack Chain\n\n1. **Exposure:** A caller uses `nltk.parse.SteppingRecursiveDescentParser`, a public exported symbol (`nltk/parse/__init__.py:97`), invoking `parse(tokens)` on grammar and input influenced by an actor.\n2. **Control:** The actor influences the grammar (an ambiguous, self-embedding CFG such as `S -\u003e 'a' S S | 'a'`) and supplies a short token list (for example 17 copies of `'a'`). Both survive to the parser unchanged.\n3. **Path:** `parse()` (`recursivedescent.py:428`) calls `initialize()` then loops `while self.step() is not None`; `step()` (`:479`) calls `match()`/`expand()` (`:552`/`:512`) which call the inherited `_match`/`_expand` (`:172`/`:214`), which resolve `self._parse` by MRO to the subclass stub (`:643`).\n4. **Guard:** The `max_time` wall-clock deadline exists only in the base `_parse` (`:141-150`) and is never entered on this path; the stub `_parse` records state and returns without consulting the deadline, and `__init__` exposes no `max_time` to enable a bound.\n5. **Primitive:** The unbounded top-down search enumerates a Catalan-number-sized derivation space with no memoization and no deadline.\n6. **Result:** The `parse()` call never returns and pins a CPU core; repeated calls exhaust a bounded worker pool, denying service.\n\n## Bypass Evidence\n\nThe prior fix for this class of issue added a `max_time` wall-clock deadline to the base `RecursiveDescentParser._parse` (`recursivedescent.py:141-150`, default 5.0 seconds). This report demonstrates that the fix does not cover the sibling `SteppingRecursiveDescentParser` entry point, and the maintainers separately hardened other parsers (chart, earley chart, viterbi, shift-reduce, non-projective dependency) with `max_time` while leaving this subclass unbounded.\n\nChallenges attempted and their outcomes:\n- Hypothesis that the inherited `self._max_time` value (observed at 5.0) makes the path guarded: refuted; the value is inherited but never read on the stepping path, and the parser runs unbounded despite it being set.\n- Hypothesis that a caller can bound the parser via the constructor: refuted; `inspect.signature(SteppingRecursiveDescentParser.__init__)` is `(self, grammar, trace=0)`, with no `max_time` parameter.\n- Hypothesis that the failure is merely an early `RecursionError` rather than CPU exhaustion: refuted; the step loop is iterative over an explicit history stack, so no exception is raised within a 10 second watchdog, CPU time grows exponentially with input length, and a small negative control input returns in about 0.001 seconds.\n- Hypothesis that the `_tried_e`/`_tried_m` records collapse the search: refuted; those records are keyed by the frozen full partial tree, so they deduplicate only identical productions at identical states and do not prevent the exponential enumeration.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI sdist nltk-3.10.3.tar.gz)`\n- `Fix status: 3.10.4`\n\nThe stepping subclass has never carried a time or step bound in any released version; the prior fix added the guard only to the base class. The vulnerable methods were verified present in the exact published PyPI 3.10.3 source distribution (`parse()` at lines 428-433, stub `_parse` at 643-668 with no deadline reference, and `__init__` without `max_time`). Because the class predates the prior fix and no specific historical introduction tag was pinned, the lower bound is left open rather than invented; the upper bound is verified against the current published artifact (3.10.3). No released fix exists.\n\n## Suggested Fix\n\nEnforce a bounded parse on the stepping parser: give `SteppingRecursiveDescentParser` its own wall-clock or step-count budget that is checked inside its step loop (for example in `parse()` and/or the `_parse`/`step` path), and add a `max_time` (or equivalent step-limit) parameter to `__init__` that is propagated and honored, mirroring the base `RecursiveDescentParser` and the other hardened sibling parsers. As an interim mitigation without a code change, callers should avoid invoking `SteppingRecursiveDescentParser.parse()` on grammars or input derived from untrusted sources, run any such parsing under an external timeout or a separate resource-limited process, and prefer a chart parser for untrusted input.\n\n---\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status (2026-09-28)\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144.\n\nFix commit: e20c40e26 \"Bound tokenizer/parser algorithmic DoS (ffr9/gpwc/8fx7)\" (SteppingRecursiveDescentParser gains the max_time parameter, default 5.0 s, and honours the parse deadline).\n\nNo probe. The advisory PoC re-run (grammar S -\u003e 'a' S S | 'a', 17 tokens): on the PR head the parse raises TimeoutError after 5.0 s and the constructor signature is (self, grammar, trace=0, max_time=5.0); on develop 2fa3f48fe the same parse ran past a 45 s watchdog, so develop is still VULNERABLE.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-8fx7-8jr8-84rv/GHSA-8fx7-8jr8-84rv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-8fx7-8jr8-84rv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126303"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/e20c40e26ec9306de885703f6e53250695f1f49b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-before-3.10.4-denial-of-service-via-steppingrecursivedescentparser-parse"
+    }
+  ]
+}

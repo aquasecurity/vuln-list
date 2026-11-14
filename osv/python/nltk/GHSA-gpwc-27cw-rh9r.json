@@ -1,0 +1,90 @@
+{
+  "id": "GHSA-gpwc-27cw-rh9r",
+  "modified": "2026-11-13T21:30:03.781891485Z",
+  "published": "2026-11-13T21:16:34Z",
+  "summary": "NLTK: Quadratic CPU exhaustion in LegalitySyllableTokenizer.tokenize via unguarded onset reversal loop",
+  "details": "## Summary\n\n`LegalitySyllableTokenizer.tokenize` in the NLTK tokenizer package contains an unguarded O(n^2) processing loop. When the method is called on a single token that consists of a long run of vowels (for example `\"a\" * n`), it consumes CPU time proportional to the square of the token length. An attacker who can supply an untrusted token to this public tokenizer API can force a single request to saturate one CPU core for a prolonged period, degrading availability of any service that syllabifies attacker-controlled text. No authentication, special configuration, or user interaction is required.\n\n## Root Cause\n\nThe method walks the token in reverse and, on every iteration after the first vowel is seen, evaluates the membership test `char_lower + current_onset[::-1] in self.legal_onsets`. The set `legal_onsets` is built by `onset()`, which returns only the characters up to the first vowel, so every member is vowel-free. For an all-vowel token the first branch can therefore never match, `onset` never becomes `True`, and the reset branch that would clear `current_onset` is never reached. As a result `current_onset` grows by one character on every iteration. Building `current_onset[::-1]` and hashing the resulting string costs O(k) on iteration k, and this is repeated for k from 1 to n, giving total cost O(n^2). The security invariant that is violated is bounded per-token work: there is no length cap on this code path, so untrusted token length translates directly into quadratic CPU consumption.\n\n```text\nAffected function: LegalitySyllableTokenizer.tokenize\nSource: nltk/tokenize/legality_principle.py (membership-test sink at line 133; loop over token[::-1] beginning at line 126)\nHelper establishing the vowel-free onset set: LegalitySyllableTokenizer.onset (nltk/tokenize/legality_principle.py, returns prefix up to first vowel)\n```\n\n## Impact\n\nAn attacker who controls a token passed to `LegalitySyllableTokenizer.tokenize` can trigger quadratic CPU work. In the reviewed release a token of roughly 64,000 vowel characters takes about 1.8 seconds on a single core, and the cost grows with the square of the length, so a token in the hundreds of kilobytes to megabyte range consumes a core for many seconds to minutes. Memory use is linear. The demonstrated capability is single-core CPU exhaustion leading to denial of service or latency degradation in any network-reachable component that syllabifies untrusted input. There is no confidentiality or integrity impact; the effect is availability degradation of the affected process. The plausible operational consequence, where multiple concurrent requests are used, is exhaustion of the available worker pool; this is inferred from the per-request cost and was not itself executed against a live deployment.\n\n## Proof of Concept\n\n`Requires only the released nltk package; no corpus download is needed because the quadratic behavior is driven entirely by the attacker token, not by the size of the legal-onset set.`\n\n1. Construct a tokenizer with any small onset source.\n2. Call `tokenize` with an all-vowel token of increasing length and time each call.\n3. Compare against a consonant-alternating control token of equal length.\n\n```python\nimport time\nfrom nltk.tokenize import LegalitySyllableTokenizer\n\ntok = LegalitySyllableTokenizer(\"tr c d\".split())  # tiny 3-word onset source\nfor n in (8000, 16000, 32000):\n    payload = \"a\" * n\n    start = time.perf_counter()\n    tok.tokenize(payload)\n    print(\"vowel-run\", n, round(time.perf_counter() - start, 3))\n\ncontrol = \"ba\" * 32000  # equal-length linear control\nstart = time.perf_counter()\ntok.tokenize(control)\nprint(\"control\", 64000, round(time.perf_counter() - start, 3))\n```\n\n```text\nvowel-run 8000 0.031\nvowel-run 16000 0.120\nvowel-run 32000 0.468   (about 4x per doubling =\u003e O(n^2))\ncontrol 64000 0.004     (linear, roughly 130x faster at larger size)\n```\n\n## Attack Chain\n\n1. **Exposure:** `LegalitySyllableTokenizer` is exported from `nltk.tokenize` and `tokenize` is a public, documented method reachable by any service that syllabifies untrusted text.\n2. **Control:** The attacker fully controls the `token` argument, including its length and character content; a run of vowels such as `\"a\" * n` survives with no normalization or length reduction.\n3. **Path:** The token flows into the reverse walk at `nltk/tokenize/legality_principle.py:126` and reaches the membership-test at line 133 on every iteration past the first vowel.\n4. **Guard:** There is no length cap on this path. The sibling `SyllableTokenizer` received a `MAX_TOKEN_LEN` cap during the project hardening work, but `legality_principle.py` received no such guard.\n5. **Primitive:** Repeated O(k) construction and hashing of `current_onset[::-1]` inside the loop yields cumulative O(n^2) CPU work.\n6. **Result:** A single request with a large vowel-run token exhausts one CPU core for a sustained period, degrading service availability.\n\n## Bypass Evidence\n\nNo guard blocks this path. Membership-set analysis shows the first branch at line 133 cannot fire for a vowel character because `legal_onsets` is provably vowel-free (it is derived from `onset()`, which stops at the first vowel), so `onset` never becomes `True` and `current_onset` is never reset. The strongest refutations were attempted and failed: (1) the hypothesis that the quadratic depends on a large or specific onset corpus was disproven by reproducing the same O(n^2) growth with a three-word onset source, showing the cost is driven solely by the attacker token; (2) the hypothesis that an upstream length cap neutralizes long tokens was disproven by direct source inspection, which found no `MAX_TOKEN_LEN` or equivalent clamp on this class and confirmed the default word-tokenization path does not call this class; (3) the hypothesis that this is covered by existing hardening was disproven, since the project quadratic-DoS test suite exercises the sibling `SyllableTokenizer` but contains no test for `LegalitySyllableTokenizer`, and no commit added a cap to this file. This is a fix-missed sibling of the accepted algorithmic-complexity class, not a previously remediated issue.\n\n## Affected Versions\n\n- `Ecosystem: pip`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.6, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI)`\n- `Fix status: not fixed`\n\nThe vulnerable loop is present and unguarded in the current released artifact 3.10.3, verified by direct source inspection and by reproducing the quadratic curve. The lower bound of 3.6 reflects when the affected module first shipped; the disclosure-relevant fact is that the latest published release is affected and no fix has been released.\n\n## Suggested Fix\n\nEnforce a bound on per-token work in `LegalitySyllableTokenizer.tokenize`, consistent with the `MAX_TOKEN_LEN` guard already applied to the sibling `SyllableTokenizer`. Options include rejecting or truncating tokens above a configurable maximum length before the reverse walk, or restructuring the onset accumulation so the loop does not repeatedly build and hash a growing reversed string (for example by maintaining the onset in its final orientation and comparing without an O(k) reversal each iteration). The remediation should cover any caller that passes untrusted tokens, not just the default word-tokenization path. As an interim mitigation, deployments that expose syllabification of untrusted input can cap request and token sizes at the application boundary to bound the worst-case token length.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144.\n\nFix commit: e20c40e26 \"Bound tokenizer/parser algorithmic DoS (ffr9/gpwc/8fx7)\" (LegalitySyllableTokenizer.tokenize refuses a token longer than MAX_TOKEN_LEN=4096 with ValueError naming CWE-407).\n\nNo probe. The advisory PoC re-run: on the PR head the 32k vowel token is refused and under the cap the tokenizer scales 0.8x over a 4x input (1k vs 4k); on develop 2fa3f48fe it scales 14.2x over a 4x input (8k 0.087 s, 32k 1.245 s), so develop is still VULNERABLE. The related merged PR #3911 (25beee962) bounds the SyllableTokenizer vowel accumulation, a different tokenizer, and does not cover this sink.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.6"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-gpwc-27cw-rh9r/GHSA-gpwc-27cw-rh9r.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-gpwc-27cw-rh9r"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126301"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/78781ba4575d536fb1540897f27baca0fb40617c"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/e20c40e26ec9306de885703f6e53250695f1f49b"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-from-3.6-before-3.10.4-quadratic-cpu-exhaustion-via-legalitysyllabletokenizer-tokenize"
+    }
+  ]
+}

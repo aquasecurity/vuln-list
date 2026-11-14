@@ -1,0 +1,141 @@
+{
+  "id": "GHSA-v8f3-6phw-6mh9",
+  "modified": "2026-11-14T00:15:03.202799158Z",
+  "published": "2026-11-14T00:05:57Z",
+  "aliases": [
+    "CVE-2026-126297"
+  ],
+  "summary": "NLTK: Quadratic-time CPU denial of service in ConllCorpusReader SRL instance builder via nested span rescan",
+  "details": "## Summary\n\n`ConllCorpusReader.srl_instances()` builds semantic-role-labeling instances from a CoNLL corpus block. For a sentence block with P predicates and P span columns, the instance builder rescans every span column (and every span within it) once per predicate while searching for each predicate's head, giving O(P^2 * R) work. A single well-formed block that places the head span in the last column forces the full scan on every predicate, so an application that reads an attacker-supplied CoNLL SRL corpus can be driven into tens of seconds of single-threaded CPU. No authentication or user interaction is required.\n\n## Root Cause\n\n`_get_srl_instances` iterates over the P predicates of a block; for each predicate it scans every span list and every span within it, using an inner `break` that stops only when a span tagged `V` or `C-V` containing the predicate word is found. When the sole head span is placed in the last span column, no earlier column matches, so the `for ... else: continue` construct traverses every span of every earlier column before matching. Over P predicates each scanning up to P columns of R spans, the cost is O(P^2 * R). The block is read whole with no size cap, and the grid-consistency check enforces only uniform column count, not a bound on P, R, or total work.\n\n```text\nAffected function:\n- nltk.corpus.reader.conll.ConllCorpusReader._get_srl_instances (nltk/corpus/reader/conll.py:394-424; nested rescan at lines 405-419)\nPublic entry point: nltk.corpus.reader.conll.ConllCorpusReader.srl_instances (nltk/corpus/reader/conll.py:158-169).\n```\n\n## Impact\n\nAn attacker who can supply a CoNLL corpus that an application loads and iterates with `srl_instances()` causes sustained single-threaded CPU consumption (availability loss). The path is network-reachable through any corpus-ingestion surface (AV:N) and needs no privileges or user interaction (PR:N, UI:N). Because the cost is super-linear in attacker-chosen predicate and column counts, a roughly 1 MB crafted corpus pins a core for tens of seconds and a few megabytes reaches minutes. Confidentiality and integrity are not affected. The NLTK regular-expression wall-clock timeout wraps regex matching only and does not cover this pure-Python nested loop over the parsed grid. Exploitation requires the application to use the SRL-specific API on untrusted CoNLL data with `words`, `pos`, `tree`, and `srl` columns; a deployment that never calls `srl_instances()` is unaffected.\n\n## Proof of Concept\n\n```text\nEnvironment: nltk 3.10.3, CPython. Stage a crafted CoNLL corpus under an authorized data root and iterate srl_instances().\nCorpus construction: one blank-line-delimited block with P predicate rows and P SRL span columns, the sole \"V\" head span in the last column.\n```\n\n```python\nimport time, os, tempfile\nfrom nltk.corpus.reader.conll import ConllCorpusReader\n\ndef build_block(n):\n    # n predicates, n SRL columns; the single V head placed in the last column\n    # (columns: words pos tree srl...): emit n predicate rows and n SRL span\n    # columns, with the single \"V\" head span placed in the final column.\n    ...\n\nfor n in (40, 80, 160, 320):\n    root = tempfile.mkdtemp()\n    open(os.path.join(root, \"c.conll\"), \"w\").write(build_block(n))\n    r = ConllCorpusReader(root, [\"c.conll\"], (\"words\", \"pos\", \"tree\", \"srl\"))\n    t = time.perf_counter()\n    list(r.srl_instances())\n    print(n, round(time.perf_counter() - t, 3), \"s\")\n```\n\n```text\nNegative control (single predicate): n=40 -\u003e 1.88 ms ; n=320 -\u003e 4.45 ms      (flat)\nAttack (P=R=n):  n=40 -\u003e 0.022s (10 KB) | n=80 -\u003e 0.148s (39 KB) | n=160 -\u003e 1.164s (156 KB) | n=320 -\u003e 10.002s (619 KB)\n```\n\nThe attack timing rises about 8x per doubling of n while the file grows only about 4x, confirming super-linear cost driven by attacker-chosen predicate and column count; the single-predicate control stays in the millisecond range.\n\n## Attack Chain\n\n1. **Exposure:** An application loads an attacker-supplied CoNLL corpus (columns include `srl`) and iterates it with the public `ConllCorpusReader(...).srl_instances()`.\n2. **Control:** The attacker controls the predicate count P, the span-column count, and the placement of the single head span; the block is read whole with no size cap.\n3. **Path:** `srl_instances()` calls `_get_srl_instances`, which pairs each predicate against the span columns via a doubly-nested scan.\n4. **Guard:** The inner `break` on the first matching `V` or `C-V` head is defeated by placing the sole head span in the last column, so every earlier column is scanned in full. The path-containment sandbox bounds where files load, not how much work a block costs.\n5. **Primitive:** The nested rescan performs O(P^2 * R) span comparisons with no work cap or timeout.\n6. **Result:** Sustained single-core CPU exhaustion; a roughly 1 MB corpus costs tens of seconds and scales super-linearly, blocking the processing thread.\n\n## Bypass Evidence\n\nThe only short-circuit on this path is the inner `break` that fires when a predicate's `V` or `C-V` head span is found. It is defeated by construction: placing the sole head span in the last span column means no earlier column matches, so the `for ... else: continue` traverses every span of every earlier column for every predicate. This was confirmed in source (nltk/corpus/reader/conll.py:405-419) and reproduced end-to-end through the real public `srl_instances()` API, where the attack timing scales super-linearly while a single-predicate control stays flat. The path-containment sandbox is a file-location control and imposes no bound on parse cost, and the regular-expression timeout does not wrap this loop. The strongest disproof attempts (that Python `range` membership is O(1) so the loop is linear, and that the `break` fires early) both fail: the O(1) membership test is evaluated once per span, and the number of spans traversed is exactly what the last-column head placement maximizes.\n\n## Affected Versions\n\n- `Ecosystem: PyPI (pip)`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, https://pypi.org/pypi/nltk/json)`\n- `Fix status: 3.10.4`\n\nThe nested rescan ships in every release carrying this reader and is present in the current latest published release, 3.10.3. The lower boundary was not bisected, so the introducing version is left open; the behavior predates the recent regular-expression hardening.\n\n## Suggested Fix\n\nReplace the per-predicate linear search over all span columns with a single pass that indexes head spans by word position (for example, build a map from word index to the owning span column once, then look up each predicate in constant time), reducing the total cost to about O(P * R). As defense in depth, bound the predicate and span counts accepted from a single block and process untrusted corpora under a CPU or time budget. No configuration-only mitigation removes the exposure for a service that must read untrusted CoNLL SRL data; until a fix ships, callers should cap accepted corpus size and isolate the parsing worker.\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status (2026-09-28)\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured).\n\nFix commit: cf12a5e6a \"Patch seven algorithmic-DoS and path/exec GHSA classes across all affected modules\" (ConllCorpusReader._get_srl_instances builds a one-pass wordnum to spanlist index instead of rescanning per predicate).\n\nProbe: nltk/test/unit/security_probes/ghsa_v8f3_6phw_6mh9.py (on the PR). Verdict on the PR head: FIXED (srl_instances scaled 3.9x over 4x predicates). The same probe run against develop 2fa3f48fe: VULNERABLE (45.8x over 4x predicates).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-v8f3-6phw-6mh9/GHSA-v8f3-6phw-6mh9.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-v8f3-6phw-6mh9"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126297"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3933"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/7bae75fc0f7b1f057ff7d89d24c81bb5a4a0f05a"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/9cacbb95d97eaac7debb30d6e7decbe74d2c635f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-before-3.10.4-cpu-denial-of-service-via-conllcorpusreader-srl-instances"
+    }
+  ]
+}

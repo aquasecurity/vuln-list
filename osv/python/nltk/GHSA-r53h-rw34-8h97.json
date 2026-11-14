@@ -1,0 +1,141 @@
+{
+  "id": "GHSA-r53h-rw34-8h97",
+  "modified": "2026-11-14T00:15:03.209174769Z",
+  "published": "2026-11-14T00:07:59Z",
+  "aliases": [
+    "CVE-2026-126298"
+  ],
+  "summary": "NLTK: Quadratic-time CPU denial of service in Tree.chomsky_normal_form right-factor binarization via list.pop(0)",
+  "details": "## Summary\n\n`Tree.chomsky_normal_form()` binarizes a parse tree and defaults to right factoring. For a node with N children the right-factor branch repeatedly removes the first element of a working list with `list.pop(0)`, which shifts all remaining elements each time, so binarizing one wide node costs O(N^2). An application that converts an attacker-supplied treebank tree to Chomsky Normal Form can be forced into tens of seconds of single-threaded CPU by one wide flat tree. No authentication or user interaction is required.\n\n## Root Cause\n\nIn the default right-factor branch the transform executes `curNode[0:] = [nodeCopy.pop(0), newNode]` inside a loop over the N children of a node. `list.pop(0)` is O(len) because it shifts every remaining element down by one; performed N-2 times over a shrinking length-N list this sums to O(N^2). The left-factor branch instead uses `nodeCopy.pop()` (removing the last element), which is O(1) and linear overall, so the two branches differ only by this front-versus-back removal. No cap is placed on the child count of a node, and the public `Tree.fromstring` parser accepts an arbitrarily wide bracketed tree.\n\n```text\nAffected function:\n- nltk.tree.transforms.chomsky_normal_form (nltk/tree/transforms.py; right-factor sink at line 168, O(1) left control at line 179)\nPublic entry points: nltk.tree.Tree.chomsky_normal_form (nltk/tree/tree.py:455, default factor=\"right\"); nltk.tree.Tree.fromstring (nltk/tree/tree.py:592).\n```\n\n## Impact\n\nAn attacker who can influence the tree that an application normalizes to Chomsky Normal Form causes sustained single-threaded CPU consumption (availability loss). The path is network-reachable (AV:N) and needs no privileges or user interaction (PR:N, UI:N). Because the cost grows quadratically with the attacker-chosen child count, roughly 1.5 MB of treebank input costs about 14 seconds on one core and scales as N^2 above that. Confidentiality and integrity are not affected. The NLTK regular-expression wall-clock timeout wraps regex matching only and does not wrap this pure-Python list loop.\n\n## Proof of Concept\n\n```text\nEnvironment: nltk 3.10.3, CPython. Drive the public transform on a wide flat tree.\n```\n\n```python\nimport time\nfrom nltk.tree import Tree\n\nfor N in (80000, 160000, 320000):\n    s = \"(S \" + \"(A a)\" * N + \")\"\n    t = Tree.fromstring(s)\n    start = time.perf_counter()\n    t.chomsky_normal_form()          # default factor=\"right\"\n    print(\"right\", N, round(time.perf_counter() - start, 3), \"s\")\n```\n\n```text\nright (default):  N=80000 1.972s | N=160000 5.004s (2.54x) | N=320000 14.518s (2.90x)   -\u003e super-linear\nleft  (control):  N=80000 1.399s | N=160000 2.731s (1.95x) | N=320000  5.379s (1.97x)   -\u003e linear\n```\n\n## Attack Chain\n\n1. **Exposure:** An application parses an attacker-influenced treebank string with the public `Tree.fromstring` and normalizes it with `Tree.chomsky_normal_form()`.\n2. **Control:** The attacker controls the number of children of a node (a wide flat tree such as `(S (A a)(A a)...(A a))`); no child-count cap exists in `fromstring` or the transform.\n3. **Path:** `Tree.chomsky_normal_form` delegates to `nltk.tree.transforms.chomsky_normal_form` with the default `factor=\"right\"`.\n4. **Guard:** None. There is no width bound on the loop, and the regex match timeout does not wrap this pure-Python list operation.\n5. **Primitive:** `curNode[0:] = [nodeCopy.pop(0), newNode]` performs an O(N) front shift on each of N iterations.\n6. **Result:** O(N^2) single-core CPU exhaustion; roughly 1.5 MB of input costs about 14 seconds and scales quadratically, blocking the processing thread.\n\n## Bypass Evidence\n\nThere is no guard to bypass on this path: neither `Tree.fromstring` nor `chomsky_normal_form` caps the child count, and the regular-expression wall-clock timeout wraps only regex matching, not this list loop. The finding was confirmed by fresh timing that isolates the cause: the right-factor default and the left-factor branch build the identical bounded head strings and copy the node once, so the only differing term is `pop(0)` versus `pop()`. The measured right-versus-left divergence grows with N (right rises toward a 4x per-doubling ratio while left holds near 2x), which proves a quadratic component beyond the shared linear costs. A relevant corroboration is that the inverse transform `un_chomsky_normal_form` was already rewritten to a single linear pass to remove exactly this quadratic class (see the comment at nltk/tree/transforms.py:195-201), while the forward default path retained the `pop(0)` idiom. The strongest disproof attempt (that the head-string join dominates and is linear) fails because that join is bounded and present in both branches and therefore cannot explain the branch-dependent quadratic growth.\n\n## Affected Versions\n\n- `Ecosystem: PyPI (pip)`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, https://pypi.org/pypi/nltk/json)`\n- `Fix status: 3.10.4`\n\nThe right-factor `pop(0)` idiom ships in every release carrying this transform and is present in the current latest published release, 3.10.3. The lower boundary was not bisected, so the introducing version is left open.\n\n## Suggested Fix\n\nRewrite the right-factor binarization to avoid removing from the front of a list: iterate the children with an index cursor or a `collections.deque` so each step is constant time, mirroring the linear rebuild already applied to `un_chomsky_normal_form`. As defense in depth, bound the child count accepted for normalization and raise a clear error past a configurable maximum. No configuration-only mitigation removes the exposure for a service that normalizes untrusted trees; until a fix ships, callers should cap accepted tree width and run the transform under a CPU or time budget in an isolated worker.\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status (2026-09-28)\n\nPR: #3909 \"Fix quadratic DoS in Tree.chomsky_normal_form right-factor binarization (GHSA-r53h-rw34-8h97)\", merged 2026-09-23, merge commit 2f53e20ce on develop.\n\nFix commits: 457ebe349 (linear front consume in chomsky_normal_form) and 677857dca (refuse a binarisation that would nest a tree beyond MAX_TREE_DEPTH). Follow-up #3917 (merge 9ba132e43, commit f0686dea6) walks Tree equality and conversion with an explicit stack so the deep-tree tests pass on Python 3.10 and 3.11.\n\nProbe: nltk/test/unit/security_probes/ghsa_r53h_rw34_8h97.py; verdict on develop 2fa3f48fe: FIXED (chomsky_normal_form scales 5.1x over a 4x input).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-r53h-rw34-8h97/GHSA-r53h-rw34-8h97.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-r53h-rw34-8h97"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126298"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3909"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/457ebe349f8dd8080224f76a64aff806dd437057"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/677857dcafd84e4591865d976b562a27dfde566e"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-before-3.10.4-quadratic-cpu-denial-of-service-via-tree-chomsky-normal-form"
+    }
+  ]
+}

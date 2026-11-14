@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-fg9w-wfp5-j933",
+  "modified": "2026-11-13T23:30:03.782609768Z",
+  "published": "2026-11-13T23:20:56Z",
+  "aliases": [
+    "CVE-2026-126295"
+  ],
+  "summary": "NLTK: BllipParser passes caller-supplied model paths to the bllipparser C extension with no pathsec check, enabling arbitrary read",
+  "details": "## Summary\n\n`BllipParser` in `nltk/parse/bllip.py` hands caller-supplied filesystem paths to the native `bllipparser` C extension without routing them through NLTK's `pathsec` validation. The constructor parameters `parser_model`, `reranker_features`, and `reranker_weights`, and the alternative `from_unified_model_dir()` entry point, flow directly to the C extension's `load_parser_model()` and `load_reranker_model()` calls, which open and read the given path at the OS level. Any application that passes an attacker-influenced path to this API reads a file of the attacker's choosing from anywhere on the filesystem, outside the NLTK data roots that every other NLTK tool wrapper confines access to.\n\n## Root Cause\n\nAs of NLTK 3.10.0, `SECURITY.md` documents a centralized I/O security module (`nltk.pathsec`) with strict enforcement enabled by default, under which file-backed resources must resolve inside allowed NLTK data directories. For paths handed to external tools and native extensions that open files themselves, the module provides `validate_tool_path()`, which runs name-safety checks, rejects option-shaped, URL-shaped, and traversal inputs, opens the path with `O_NOFOLLOW` requiring a regular single-linked file, and returns the validated string the caller must use. Every sibling tool wrapper applies it. `BllipParser` applies none of it: the module imports only `ParserI`, `safe_print`, and `Tree`, with zero `pathsec` references, so the three model-path parameters reach the C extension unchecked. The violated invariant is that NLTK tool wrappers must bound caller-supplied native-tool paths to the data roots before the native code opens them.\n\n```text\nnltk/parse/bllip.py:125-131   BllipParser.__init__ accepts parser_model,\n                              reranker_features, reranker_weights (no validation)\nnltk/parse/bllip.py:164       self.rrp.load_parser_model(parser_model, ...)   -\u003e C extension open\nnltk/parse/bllip.py:166-170   self.rrp.load_reranker_model(features_filename=...,\n                              weights_filename=...)                          -\u003e C extension open\nnltk/parse/bllip.py:218-255   from_unified_model_dir(model_dir) -\u003e __init__ (no validation)\nnltk/parse/bllip.py:9-11      imports: ParserI, safe_print, Tree (no pathsec import)\n```\n\n## Impact\n\nAn application that uses `BllipParser` (requiring the optional `bllipparser` package to be installed) and that passes a model path derived from untrusted input to the constructor or to `from_unified_model_dir()` allows that input to designate an arbitrary filesystem path. The native extension opens and reads the designated file into process memory to parse it as model data. This defeats the pathsec data-root confinement that NLTK applies to all other native-tool model loads. The attacker-controlled path can target files outside the NLTK data directories, for example local configuration or credential files readable by the process. Content disclosure to the attacker depends on how the application surfaces parser errors or results; file existence, size, and open behavior provide an oracle regardless. Because the same unvalidated path also skips the checks that refuse a non-regular file or an over-large model, the attacker can instead designate a FIFO, socket, device, or directory, or an oversized regular file, so the native load blocks or reads unbounded data into memory and the component performing the parse suffers reduced performance or a stalled worker. The primitive demonstrated by source analysis is attacker control of which file the process opens and reads.\n\n## Proof of Concept\n\n```text\nRequires the optional bllipparser C extension to be installed\n(pip install bllipparser) so that RerankingParser.load_parser_model\nis available. No NLTK data download is needed to exercise the path.\n```\n\n```python\n# An application forwards an untrusted \"model\" path into BllipParser.\nfrom nltk.parse.bllip import BllipParser\n\n# Attacker-controlled value reaches the constructor unchanged.\nuntrusted_path = \"/etc/passwd\"\nBllipParser(parser_model=untrusted_path)\n# The bllipparser C extension opens and reads untrusted_path at the OS\n# level with no NLTK pathsec confinement to the data roots.\n```\n\n```text\nStructural confirmation without the optional extension installed:\n\n$ grep -n \"pathsec\\|validate_path\\|validate_tool\" nltk/parse/bllip.py\n(no output)\n\n$ grep -n \"validate_tool_path\" nltk/tag/crf.py nltk/tag/hunpos.py \\\n      nltk/tag/stanford.py nltk/parse/malt.py\nnltk/tag/crf.py:140\nnltk/tag/crf.py:311\nnltk/tag/hunpos.py:111\nnltk/tag/stanford.py:85\nnltk/tag/stanford.py:137\nnltk/parse/malt.py:340\nnltk/parse/malt.py:344\n\nBllipParser is the only native-tool wrapper with no validate_tool_path call.\n```\n\n## Attack Chain\n\n1. **Exposure:** An application imports `BllipParser` (exported at `nltk/parse/bllip.py:83` and re-exported at `nltk/parse/__init__.py:47`) and constructs it with a model path influenced by untrusted input.\n2. **Control:** The attacker controls the `parser_model`, `reranker_features`, or `reranker_weights` string (or the `model_dir` passed to `from_unified_model_dir()` at `nltk/parse/bllip.py:218`); it is accepted as an arbitrary string with no type or content constraint.\n3. **Path:** The value flows unchanged from `BllipParser.__init__` (`nltk/parse/bllip.py:125`) to `self.rrp.load_parser_model(parser_model, ...)` at `nltk/parse/bllip.py:164`, and the reranker values to `self.rrp.load_reranker_model(...)` at `nltk/parse/bllip.py:166-170`.\n4. **Guard:** No pathsec guard is present on this path. `nltk/parse/bllip.py` imports no pathsec symbol, so `validate_tool_path()` (the guard applied by every sibling wrapper) is never invoked before the native open.\n5. **Primitive:** The `bllipparser` C extension performs an OS-level open and read of the supplied path to parse model data, reaching the filesystem directly.\n6. **Result:** A file at an attacker-chosen path, including locations outside the NLTK data roots, is opened and read by the process, bypassing the pathsec data-root confinement enforced elsewhere.\n\n## Bypass Evidence\n\nThe relevant protection is `nltk.pathsec.validate_tool_path()` (`nltk/pathsec.py:950`), documented as bounding \"a filesystem path handed to an external tool to read or write\" and designed exactly for native loaders that open the file themselves. The strongest counter-argument is that `SECURITY.md` disclaims being \"a general operating-system sandbox\" and does \"not prevent all unsafe behavior an application might perform outside NLTK.\" That disclaimer concerns application code outside NLTK, not NLTK's own tool wrappers: the project added `validate_tool_path()` and applied it to `CRFTagger.set_model_file()` (`nltk/tag/crf.py:140`), `HunposTagger` (`nltk/tag/hunpos.py:111`), `StanfordTagger` (`nltk/tag/stanford.py:85,137`), and `MaltParser` (`nltk/parse/malt.py:340,344`), with the CRFTagger and HunposTagger wrappers citing a prior tool-path advisory and explaining that `pathsec.open` cannot be used because the C extension does its own open. `BllipParser` is the single native-tool wrapper that omits the guard. The alternative `from_unified_model_dir()` path offers no mitigation: `get_unified_model_parameters()` belongs to the third-party `bllipparser` package and performs no NLTK data-root validation, so the derived sub-paths reach the constructor and the C extension unchecked.\n\n## Affected Versions\n\n- **Ecosystem:** `pip`\n- **Package:** `nltk`\n- **Confirmed affected range:** `\u003e= 3.10.0, \u003c= 3.10.3`\n- **Latest release checked:** `3.10.3` ([PyPI](https://pypi.org/project/nltk/3.10.3/))\n- **Fix status:** 3.10.4\n\nThe lower bound is 3.10.0 because the pathsec enforcement model and the `validate_tool_path()` guard were introduced in that release; before 3.10.0 no such boundary existed for NLTK to violate. The missing validation persists unchanged through 3.10.3, the current PyPI release, and on the repository default branch (no `pathsec`, `validate_path`, or `validate_tool` reference exists in `nltk/parse/bllip.py`). No fixed release is established.\n\n## Suggested Fix\n\nValidate every caller-supplied native-tool path in `BllipParser` before it reaches the `bllipparser` C extension, matching the pattern already used by the other wrappers. In `BllipParser.__init__`, pass `parser_model`, `reranker_features`, and `reranker_weights` through `nltk.pathsec.validate_tool_path()` (with `max_bytes=MAX_TOOL_MODEL_BYTES` and `require_private=True`, as `CRFTagger.set_model_file()` does) and build the C-extension arguments from the returned strings so a path swapped after the check is not reopened. Because `parser_model` denotes a model directory for this loader, the fix must cover the directory argument and the reranker file arguments, and should apply equally to the paths derived inside `from_unified_model_dir()`. As an interim measure, applications should refuse to pass untrusted input as any `BllipParser` model path and should load models only through `nltk.data.find()`, which already enforces pathsec confinement.\n\n---\n\nReported by zx.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-fg9w-wfp5-j933/GHSA-fg9w-wfp5-j933.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-fg9w-wfp5-j933"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126295"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/fdde6d9ebf5fd612e817b49ec7fecd752802c268"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-3.10.0-before-3.10.4-arbitrary-file-read-via-bllipparser-model-paths"
+    }
+  ]
+}

