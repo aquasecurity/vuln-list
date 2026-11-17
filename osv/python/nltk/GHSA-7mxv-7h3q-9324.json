@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-7mxv-7h3q-9324",
+  "modified": "2026-11-16T19:15:07.281117215Z",
+  "published": "2026-11-16T18:45:51Z",
+  "aliases": [
+    "CVE-2026-128134"
+  ],
+  "summary": "NLTK dot2img runs Graphviz 'dot' without the trusted-exec chokepoint, enabling local code execution via a writable PATH element",
+  "details": "## Summary\n\n`nltk.parse.dependencygraph.dot2img` invokes the Graphviz `dot` executable without the trusted-execution guarantees that NLTK applies to its other native-tool wrappers. The function resolves `dot` by bare name and then runs the resolved absolute path with a raw `subprocess.run`, omitting the ownership/writability check and the loader-environment scrub that `nltk.pathsec.spawn_trusted` provides. On a POSIX host, a local, unprivileged actor who can write to any group/world-writable directory that appears on the victim's `PATH` can plant a trojan `dot`; when the victim later renders a `DependencyGraph` (for example in a Jupyter notebook, which auto-invokes `_repr_svg_`) or calls `dot2img` directly, the planted binary executes as the victim. The advisory GHSA-6hwm-xvph-95vm (CVE-2026-78680) addressed the same untrusted-search-path class for the Graphviz `dot` invoker in `nltk/translate/api.py`, but `dot2img` received only part of that remediation and remains exploitable.\n\n## Root Cause\n\nNLTK's native-tool security model layers four defenses (documented in `nltk/EXTERNAL_TOOL_SECURITY.md`): (1) `find_binary` refuses a current-working-directory-relative match; (2) `resolve_trusted_executable` verifies the resolved file is a regular file that no other unprivileged user can replace (private parent directories, owner is the user or root, no group/world write bit); (3) shell execution is refused; (4) `safe_env` scrubs loader and interpreter environment variables before exec. Layers 2, 3, and 4 are reached only through `nltk.pathsec.spawn_trusted`. `dot2img` calls `find_binary(\"dot\")` (layer 1 only), then executes the result with `subprocess.run([dot_binary, ...])` and no `env=` argument. Layer 1 rejects only non-absolute matches, so an absolute path returned by the `which` search stage survives even when the file lives in a writable directory. Because `dot2img` never calls `spawn_trusted`, the ownership check and environment scrub never run.\n\n```text\nnltk/parse/dependencygraph.py:626   dot_binary = find_binary(\"dot\")          # layer 1 only\nnltk/parse/dependencygraph.py:631   subprocess.run([dot_binary, \"-T%s\" % t], ...)   # no trust check, no env=\nnltk/parse/dependencygraph.py:638   subprocess.run([dot_binary, \"-T%s\" % t], ...)   # binary-format branch, same gap\nnltk/internals.py:1034              if searching_bare_name and not os.path.isabs(path): continue  # skips only relative matches\nnltk/translate/api.py:145           process = spawn_trusted(dot_binary, [f\"-T{output_format}\"], ...)  # hardened sibling\n```\n\n## Impact\n\nPrerequisites: a POSIX host on which the attacker is a local, unprivileged user (or code) able to write to a group/world-writable directory that appears on the victim's `PATH`. This includes the commonly cited case of a Homebrew `/usr/local/bin` with `drwxrwxr-x` permissions, or a writable directory placed early on `PATH`. The attacker plants a trojan `dot` there. When the victim renders a `DependencyGraph` (notebook `_repr_svg_` auto-invocation) or calls `dot2img` directly, the trojan executes as the victim, yielding arbitrary local code execution in the victim's account: a local privilege-escalation and lateral-movement primitive. Because the child environment is not scrubbed, loader-injection variables (for example `LD_PRELOAD`, `DYLD_*`, `GCONV_PATH`) also reach the child, providing an additional execution surface. No control over NLTK inputs is required.\n\n## Proof of Concept\n\n`Requires: POSIX host, an importable NLTK build from the affected tree, and Python 3. No third-party dependencies.`\n\n1. Create a world-writable directory and write an executable `dot` script into it that drops a marker and emits fake SVG.\n2. Prepend that directory to `PATH` and run from a neutral working directory (so this is not the current-working-directory vector).\n3. Show that `resolve_trusted_executable` refuses the planted binary (so the hardened path would raise) while `dot2img` executes it.\n\n```python\nimport os, stat, tempfile, subprocess, sys\nd = tempfile.mkdtemp()\ndot = os.path.join(d, \"dot\")\nwith open(dot, \"w\") as f:\n    f.write(\"#!/bin/sh\\ntouch \" + os.path.join(d, \"MARKER\") + \"\\necho '\u003csvg\u003e\u003c!-- planted dot ran --\u003e\u003c/svg\u003e'\\n\")\nos.chmod(dot, 0o777)\nos.chmod(d, 0o777)\nos.environ[\"PATH\"] = d + os.pathsep + os.environ[\"PATH\"]\nos.chdir(\"/\")\nfrom nltk.pathsec import resolve_trusted_executable\nfrom nltk.parse.dependencygraph import dot2img\nprint(\"resolve_trusted_executable(planted dot):\", resolve_trusted_executable(os.path.join(d, \"dot\")))\nout = dot2img(\"digraph G { a -\u003e b }\")\nprint(\"dot2img stdout:\", repr(out))\nprint(\"planted dot executed (marker created):\", os.path.exists(os.path.join(d, \"MARKER\")))\n```\n\n```text\nresolve_trusted_executable(planted dot): None\ndot2img stdout: '\u003csvg\u003e\u003c!-- planted dot ran --\u003e\u003c/svg\u003e\\n'\nplanted dot executed (marker created): True\n```\n\n## Attack Chain\n\n1. **Exposure:** On a shared POSIX host, a group/world-writable directory is present on the victim's `PATH` (for example a writable directory early on `PATH`, or a Homebrew `/usr/local/bin` with group-write). The attacker writes a trojan `dot` into it.\n2. **Control:** The attacker fully controls the contents of the planted `dot` file; no control over NLTK inputs is needed.\n3. **Path:** The victim renders a `DependencyGraph` (notebook display triggers `_repr_svg_` at `nltk/parse/dependencygraph.py:209`, which calls `dot2img`) or calls `dot2img` directly.\n4. **Guard:** `find_binary(\"dot\")` applies layer 1 only (`nltk/internals.py:1034`), which discards a relative current-working-directory match but returns the attacker's absolute path from the `which` stage; `dot2img` never invokes `resolve_trusted_executable` (layer 2) or `safe_env` (layer 4), unlike the hardened sibling `nltk/translate/api.py:145`.\n5. **Primitive:** `subprocess.run([dot_binary, \"-T%s\" % t], ...)` (`nltk/parse/dependencygraph.py:631` and `:638`) executes the untrusted absolute path with the full inherited environment.\n6. **Result:** Arbitrary local code execution as the victim, plus a loader-injection surface via the unscrubbed environment.\n\n## Bypass Evidence\n\nCanonical prior advisory: GHSA-6hwm-xvph-95vm (CVE-2026-78680), \"Uncontrolled search path when invoking the Graphviz 'dot' binary\" (CWE-426/CWE-427), patched at `\u003e= 3.10.3`. That remediation was two-part: a uniform layer-1 current-working-directory refusal in `find_binary`, and a routing of native-tool `dot` invocations through `nltk.pathsec.spawn_trusted` (layers 2 and 4). Inspection of the current released tree (nltk 3.10.3) shows `dot2img` received the layer-1 change (the function was rewritten from a bare `subprocess.run([\"dot\", ...])` to `find_binary(\"dot\")` plus a run of the absolute path, with a CWE-426/427 comment at `nltk/parse/dependencygraph.py:622-625`) but did NOT receive the `spawn_trusted` routing. The sibling `nltk/translate/api.py:145` does route through `spawn_trusted`, and `nltk/EXTERNAL_TOOL_SECURITY.md` lists Graphviz `dot` only under `translate/api.py`; `dot2img` is absent from the hardened-wrapper inventory. Attempts to invalidate the finding all failed: (a) the claim that the fix covers all `dot` resolution is refuted because layer 1 filters only non-absolute matches and `dot2img` never reaches layers 2/4; (b) the duplicate hypothesis is refuted by a negative control, planting `./dot` in the working directory with none on `PATH` makes `find_binary(\"dot\")` raise `LookupError`, so the prior fix's working-directory guard still fires and this is the distinct residual ownership/environment gap; (c) the \"system dot shadows the trojan\" objection is refuted because realistic exploitation prepends the writable directory on `PATH` or replaces a `dot` already living in a writable `PATH` directory; (d) both the text and binary format branches share the identical unguarded exec, so it is not format-specific. A fresh PoC on the examined tree confirms `resolve_trusted_executable` refuses the planted binary while `dot2img` executes it.\n\n## Affected Versions\n\n- `Ecosystem: pip (PyPI)`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, latest published release as of the review date; source tree VERSION == 3.10.3)`\n- `Fix status: 3.10.4`\n\nThe `dot2img` function has invoked `dot` via a raw subprocess since well before the prior advisory. The prior advisory's `spawn_trusted` standardization routed only the sibling `translate/api.py` invoker through the trusted-execution chokepoint, so this residual gap in `dot2img` exists from at least that remediation release onward and remains present in the latest published release (3.10.3). Precise introduction and remediation boundaries below 3.10.3 could not be independently established in this environment (no git tags or release history in the checkout); the confirmed statement is that the latest published release is affected and no fix for `dot2img` exists.\n\n## Suggested Fix\n\nRoute `dot2img`'s execution through `nltk.pathsec.spawn_trusted(dot_binary, [\"-T%s\" % t], input=...)`, mirroring the sibling `nltk/translate/api.py`, so that the ownership/writability check (layer 2) and the loader-environment scrub (layer 4) apply, and handle `TrustError`/`OSError` with the same refusal pattern used at `nltk/translate/api.py:152-157`. Apply the change to both the text-format and binary-format branches. Add Graphviz `dot` under `nltk/parse/dependencygraph.py` to the per-wrapper inventory in `nltk/EXTERNAL_TOOL_SECURITY.md` so the second invoker is tracked. Interim mitigation without a code change: ensure no group/world-writable directory appears on the `PATH` of any account that renders NLTK dependency graphs, and install Graphviz in a directory writable only by the user or root.\n\n---\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nTwo open pull requests carry a fix.\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured). Fix commit: cf12a5e6a (internals.java() refuses a binary that resolve_trusted_executable rejects, _java_child_env drops the loader environment and pins PATH, dependencygraph.dot2img runs through pathsec.spawn_trusted). Probe: nltk/test/unit/security_probes/ghsa_7mxv_7h3q_9324.py (on that PR); verdict on its head: FIXED (planted absolute java refused with TrustError; loader and JVM environment scrubbed).\n\nPR: #3887 \"Resolve every executed tool binary absolute-only: prover9/mace4, megam, tadm, java, hunpos (untrusted search path, CWE-426/427)\", open; head 3ac1c5641 at the time of this note (a develop merge on top of 16b1de8ee, the head on which the verdicts below were measured). Fix commits: 992884a02 (the JVM is resolved before spawning and spawned through spawn_trusted) and b002a7288 (dot is spawned through the trusted path in dependencygraph). The #3753 probe run against this head reports STATIC (the planted java is refused with LookupError before the trust guard is reached).\n\nThe probe run against develop 2fa3f48fe: VULNERABLE (java() executed a planted untrusted binary from a writable directory).\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-7mxv-7h3q-9324/GHSA-7mxv-7h3q-9324.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-7mxv-7h3q-9324"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-128134"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3887"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/b002a7288c22db86fd6ca2d9526e3f91d6fda797"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}
