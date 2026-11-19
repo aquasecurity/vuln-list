@@ -1,0 +1,65 @@
+{
+  "id": "GHSA-ff87-73jp-f3v4",
+  "modified": "2026-11-18T21:00:39.416021960Z",
+  "published": "2026-11-18T20:42:50Z",
+  "aliases": [
+    "CVE-2026-69158"
+  ],
+  "summary": "Atomic Server: Unauthenticated full-response SSRF in Atomic-Server /bookmark endpoint",
+  "details": "## Summary\n\nAtomic-Server exposes a `GET /bookmark` endpoint that fetches an attacker-supplied URL server-side, parses the response, and reflects the fetched content back to the caller. The endpoint requires no authentication and performs no authorization of its own, and the underlying fetch helper applies no allow-list or private-IP deny-list. An unauthenticated attacker with network reach to the server can force it to issue arbitrary outbound HTTP GET requests to internal-only hosts (loopback services, internal admin panels, link-local cloud-metadata) and read the response body back. This is a full-response SSRF, not a blind one.\n\n## Root cause (source trace)\n\n1. The bookmark endpoint is registered unconditionally for every server: `server/src/appstate.rs:69` (`store.add_endpoint(plugins::bookmark::bookmark_endpoint())`).\n2. An unauthenticated caller on the standard GET route becomes `ForAgent::Public`: `server/src/helpers.rs:168-183` (`get_client_agent`).\n3. In `get_resource_extended`, when the subject matches an endpoint path the function returns via `call_endpoint` BEFORE the `hierarchy::check_read` authorization call: `lib/src/db.rs:1010-1017` (`if is_endpoint { return self.call_endpoint(...) }`, and `check_read` sits just after at :1017, never reached).\n4. `call_endpoint` performs no authorization itself; it only matches the path and invokes the handler: `lib/src/db.rs:662-706`.\n5. The bookmark handler discards the caller (`for_agent: _`) and fetches the `url` query parameter directly: `server/src/plugins/bookmark.rs:45-76` (`let content = fetch_data(\u0026path)?;`).\n6. `fetch_body` validates only `url.starts_with(\"http\")`: `lib/src/client/helpers.rs:78-91`. A repo-wide grep finds no `is_loopback` / `is_private` / `127.0.0.1` / `169.254` / `localhost` deny-list anywhere in `lib/src` or `server/src`, and no host allow-list.\n7. The fetched body is HTML-parsed and written into the resource `name`, `description`, `image` and `preview` (markdown) fields, which are returned to the caller: `server/src/plugins/bookmark.rs:79-110`. This is what makes it a full-response (not blind) SSRF; even plaintext internal responses are wrapped into the preview markdown.\n\n## Proof of concept (unauthenticated)\n\n```\nGET /bookmark?url=http://127.0.0.1:\u003cinternal-port\u003e/\u0026name=x        # internal loopback service\nGET /bookmark?url=http://169.254.169.254/latest/meta-data/\u0026name=x # IMDSv1 cloud metadata\n```\n\nNo authentication headers. The returned resource reflects the fetched content in its `name` / `description` / `preview` fields, so the attacker reads the internal target's response body.\n\n## Proof of omission\n\nThe endpoint-dispatch path returns at `lib/src/db.rs:1011` (`return self.call_endpoint(...)`) before the `check_read` call at `:1017`, and there is no authorization inside `call_endpoint` (`:662-706`). The handler discards the caller (`for_agent: _`, `bookmark.rs:49`), so the endpoint can never enforce per-agent access. `fetch_body` validates only `url.starts_with(\"http\")` (`helpers.rs:83`); no loopback/private/link-local deny-list exists anywhere in the source. No corresponding SSRF/security entry exists in CHANGELOG.md.\n\n## Impact\n\nAn unauthenticated attacker with network reach to the server can:\n- read internal-only HTTP services not exposed to the internet (admin panels, dashboards, unauthenticated microservices on loopback or the private network);\n- read cloud metadata reachable via plain GET (IMDSv1 and similar), enabling potential credential disclosure in affected deployments;\n- enumerate internal services / ports from the server's vantage point via differing timeout/error behaviour.\n\nBecause the response body is reflected, this is a high-value full-response SSRF. The only precondition is network reach to the server.\n\nSeverity: High, CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N = 8.6.\n\nHonest caveats (do not refute the finding): the `ureq` client uses a 2-second timeout, which limits slow targets; AWS IMDSv2 requires a PUT token, so plain GET metadata retrieval may fail there. IMDSv1 and any internal HTTP service or admin panel that answers a plain GET remain fully reachable and reflected.\n\n## Remediation\n\nAdd a central SSRF guard inside `fetch_body` (`lib/src/client/helpers.rs`): resolve the target host and reject loopback, link-local, RFC1918 private, CGNAT and unique-local ranges, and reject non-http(s) schemes. Re-validate after DNS resolution (to prevent DNS-rebinding) and after each redirect hop. Enforce authorization on endpoint dispatch: run `check_read` (or a per-endpoint policy) for outbound-fetching endpoints instead of short-circuiting before it at `lib/src/db.rs:1010-1012`, and at minimum require an authenticated, authorized agent for `/bookmark`. Optionally add an operator-configurable allow-list of fetchable hosts.\n\n## Dedup\n\n- atomicdata-dev/atomic-server GitHub Security Advisories: no published advisories (re-verified 2026-07-03). No CVE/GHSA for atomic-server SSRF / the /bookmark endpoint.\n- Source re-verified on current `develop` 2026-07-03: the handler still discards the caller (`for_agent: _`) and calls `fetch_data(url)`, and `fetch_body` still validates only `url.starts_with(\"http\")` with no private-IP deny-list (still vulnerable).\n\n## Credit / disclosure\n\nReported by Ray Sabee, Whitehat Security (https://whitehatsecurity.nl/), GitHub @raysabee. Please credit \"Ray Sabee / Whitehat Security / whitehatsecurity.nl\" on the advisory and in any release notes. Coordinated disclosure: nothing will be published before a fix is available.\n\nNote: two related findings exist in the same repo and can be handled in this advisory or alongside it: F-ATOMIC-SSRF-002 (a blind pre-auth SSRF in `POST /import` via the SAME `fetch_body` root cause, so one central fix covers both) and F-ATOMIC-LFI-001 (authenticated path-traversal file read in `GET /download`, a separate sink in `download.rs`).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "atomic-server",
+        "purl": "pkg:cargo/atomic-server"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "last_affected": "0.40.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-ff87-73jp-f3v4/GHSA-ff87-73jp-f3v4.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/ontola/atomic-server/security/advisories/GHSA-ff87-73jp-f3v4"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-69158"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ontola/atomic-server/commit/006ff290f7ec976c8cbafdceb7b6899389abd5be"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ontola/atomic-server/commit/2d4535fcd84761288027616505cc61abdf05bc50"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ontola/atomic-server/commit/e7f551d385045708240ca56889d1334a39349735"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/ontola/atomic-server"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/ontola/atomic-server/releases/tag/v0.40.3"
+    }
+  ]
+}
