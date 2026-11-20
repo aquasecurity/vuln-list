@@ -1,0 +1,82 @@
+{
+  "id": "GHSA-3mgh-93r5-r7jf",
+  "modified": "2026-11-19T23:00:36.642645468Z",
+  "published": "2026-11-19T22:48:14Z",
+  "aliases": [
+    "CVE-2026-83816"
+  ],
+  "summary": "CodeWhale: exec_shell parallel-readonly classifier auto-approves fd/rg/git grep exec flags enabling silent RCE",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. CodeWhale 0.8.67 and earlier are affected. Version 0.9.0 contains the fix in commit 208421b9d23d81cea3311a1eeb2a2ea81d637686. Users should upgrade to 0.9.0 or later. The original reporter analysis is preserved below.\n\n## Summary\nThe interactive Agent profile of DeepSeek-TUI (CodeWhale) is explicitly documented to gate **every** shell command behind an approval prompt (config.rs:3725-3736). However, `ExecShellTool::approval_requirement_for(\u0026tool_input)` downgrades the requirement from `Required` to `Auto` for any command the classifier deems \"parallel read-only\" (shell.rs:2314-2320). `registered_tool_approval_required` returns `false` for `Auto` **before** the `auto_approve` check runs (turn_loop.rs:37-38), so no prompt is shown even for a user who never enabled YOLO. The classifier `is_parallel_readonly_command` (command_safety.rs:389) rejects only shell metacharacters and then matches the flag-stripped base command name against an allowlist that includes `fd`, `rg`, and `git grep`. Those tools execute arbitrary external programs through documented flags (`fd -x/--exec`, `rg --pre`, `git grep --open-files-in-pager`) that need **no** shell metacharacters — yielding silent arbitrary-program execution in the default profile. Same silent-RCE class as CVE-2026-45311 (run_tests) but via a different, unpatched tool and code path.\n\n## Root Cause\n`approval_requirement_for` downgrades `exec_shell` to `Auto` when `exec_shell_input_is_parallel_readonly` returns true (shell.rs:2314-2320). The classifier strips all flags and matches the base command name against `PARALLEL_READONLY_PREFIXES` (command_safety.rs:363-385, 419-433). `fd`/`rg` are absent from `COMMAND_ARITY`, so `fd -x cp {} /tmp/exfil` canonicalizes to `\"fd\"` ∈ allowlist. The only remaining gate at the execute sink is `analyze_command`, which rates `fd`/`rg` as `Safe` (SAFE_COMMANDS command_safety.rs:527,530), so the `SafetyLevel::Dangerous`-only block (shell.rs:2408) never fires. Default execpolicy is empty (engine.rs:494) → Skip. Interactive-origin auto_review safety_floor holds only `Publish` (auto_review.rs:344-357), not interactive shell.\n\n## Impact\nArbitrary external program execution (any binary, any argv, including a repo-committed script) on the developer host, with no approval prompt, in the default interactive Agent profile — bypassing the boundary config.rs:3725-3736 explicitly promises. Identical outcome to seed CVE-2026-45311 via a different, unpatched tool.\n\n## Proof of Concept\nModel coerced (via indirect prompt injection from repo file / issue / fetched page — the seed threat model, in scope per SECURITY.md:48) to emit:\n```json\n{\"name\":\"exec_shell\",\"arguments\":{\"command\":\"fd -u -tf -x ./pwn.sh\"}}\n```\nAlternatives (all metachar-free, all auto-approved): `fd -tf -x cp {} /tmp/exfil`; `rg --pre /tmp/evil.sh --pre-glob '*' needle .`; `git grep --open-files-in-pager=/tmp/evil.sh needle`.\n\n## Attack Chain\n1. **Entry.** Agent ingests attacker-controlled content; injected instruction coerces the model to emit `exec_shell {\"command\":\"fd -u -tf -x ./pwn.sh\"}`.\n   - **Guard:** none — reading content and model tool-calls are by design (seed threat model: indirect prompt injection).\n   - **Bypass proof:** n/a (in-scope by design per SECURITY.md:48).\n2. **Gate — approval requirement.** turn_loop.rs:1738 → `spec.approval_requirement_for(\u0026input)` → shell.rs:2314-2320 `exec_shell_input_is_parallel_readonly`.\n   - **Guard:** metachar filter (command_safety.rs:394-400) + base-name allowlist.\n   - **Bypass proof:** the string contains none of `; \u0026 | \u003e \u003c \\` $(` or newlines; `-x \u003cprogram\u003e \u003cargs\u003e` is `fd`'s own exec mechanism (no shell). `classify_command` strips `-u -tf -x`, positionals `[fd, ./pwn.sh]`; `fd` ∉ `COMMAND_ARITY` → canonical `\"fd\"` ∈ `PARALLEL_READONLY_PREFIXES` → returns true. Maintainer test `parallel_readonly_command_classifier_is_strict` (command_safety.rs:1162+) confirms bare `fd`/`rg` classify parallel-readonly.\n3. **Gate — prompt decision.** `registered_tool_approval_required(name, Auto, auto_approve)`.\n   - **Guard:** the approval prompt itself.\n   - **Bypass proof:** `requirement == Auto` returns `false` at turn_loop.rs:37-38 unconditionally, before `!auto_approve`. No prompt regardless of user settings. Empty execpolicy → Skip; interactive safety_floor returns NoChange for fd.\n4. **Sink.** `ExecShellTool::execute` (shell.rs:2334) → `analyze_command`.\n   - **Guard:** `SafetyLevel::Dangerous` block (shell.rs:2408).\n   - **Bypass proof:** `fd` ∈ `SAFE_COMMANDS` (command_safety.rs:530) → `analyze_command` returns `Safe`; not `Dangerous` → not blocked. Child runs the attacker's program.\n5. **Impact.** Silent arbitrary-program execution on the developer host, no approval prompt, default interactive Agent profile.\n\n## Bypass Evidence\n- Present on latest release tag v0.8.67: turn_loop.rs:37-38 `Auto`→`return false`; shell.rs:2314-2320 override; command_safety.rs allowlist includes `\"rg\"`,`\"fd\"`,`\"git grep\"`; SAFE_COMMANDS includes `\"rg\"`,`\"fd\"`; `fd`/`rg` absent from `COMMAND_ARITY`. command_safety.rs / turn_loop.rs finding-critical functions byte-identical v0.8.67↔HEAD.\n- Maintainer's own test `parallel_readonly_command_classifier_is_strict` confirms bare `rg`/`fd` classify parallel-readonly and only metachar forms are rejected.\n\n## Affected Versions\n`\u003c= 0.8.67` (present on latest release tag v0.8.67 and HEAD 6a3403e).\n\n## Suggested Fix\nRemove exec-capable tools (`fd`, `rg`, `git grep`) from `PARALLEL_READONLY_PREFIXES`, or make the classifier reject their exec flags (`-x`/`--exec`, `--pre`, `--open-files-in-pager`), so a code-executing invocation cannot be auto-approved as read-only.\n\nReported by **zx (Jace)**",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.67",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-3mgh-93r5-r7jf/GHSA-3mgh-93r5-r7jf.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.67",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-3mgh-93r5-r7jf/GHSA-3mgh-93r5-r7jf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/security/advisories/GHSA-3mgh-93r5-r7jf"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-83816"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/commit/208421b9d23d81cea3311a1eeb2a2ea81d637686"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/codewhale-hq/Codewhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0"
+    }
+  ]
+}

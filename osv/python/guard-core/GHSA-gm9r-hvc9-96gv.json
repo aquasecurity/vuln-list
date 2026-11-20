@@ -1,0 +1,91 @@
+{
+  "id": "GHSA-gm9r-hvc9-96gv",
+  "modified": "2026-11-19T23:00:36.659118318Z",
+  "published": "2026-11-19T22:50:33Z",
+  "aliases": [
+    "CVE-2026-129304"
+  ],
+  "summary": "Guard Core: Unvalidated X-Forwarded-For-derived string used as a Redis key component and interpolated into a KEYS glob pattern",
+  "details": "### Summary\n\n`_extract_from_forwarded_header()` (`guard_core/utils.py:172-181` in 3.12.0; `:179` on master `08780f1`) returns the selected `X-Forwarded-For` entry **without any `ipaddress` validation**. When that entry is attacker-controlled, an arbitrary string becomes `client_ip` and flows into `BehaviorTracker` (`guard_core/handlers/behavior_handler.py:83-102`), which interpolates it verbatim into both a Redis key name and a `KEYS` glob pattern:\n\n```python\nkey = f\"behavior:usage:{endpoint_id}:{client_ip}\"\nawait self.redis_handler.set_key(\"behavior_usage\", f\"{key}:{current_time}\", \"1\", ttl=rule.window)\npattern = f\"behavior_usage:{key}:*\"\nkeys = await self.redis_handler.keys(pattern)      # blocking KEYS, O(N) over keyspace\n```\n\nSame shape in `track_return_pattern()` (`behavior_handler.py:135-142`). `redis_handler.keys()` maps to the blocking Redis `KEYS` command (`guard_core/handlers/redis_handler.py:265-275`).\n\n### Details\n\nThree consequences, in increasing severity:\n\n1. **Cross-client counter contamination.** `X-Forwarded-For: *` makes the glob match *every* client's behavior-usage keys for the endpoint. Verified with a fake-Redis harness: a client `9.9.9.9` hit an endpoint 3 times (threshold=3 rule), then a single attacker request carrying `XFF: *` issued the pattern `behavior_usage:behavior:usage:app.login:*:*`, counted the victim's events, and tripped the rule on its **first** request. An embedded `:` also shifts which key segment is parsed as the timestamp (`behavior_handler.py:94-100`).\n2. **Unbounded key-space growth + blocking scans.** Each request creates a **new unique key** (`f\"{key}:{current_time}\"`) and then issues a blocking `KEYS` scan whose cost grows with total keys — on the shared Redis instance, degrading every guard-core instance using it. Rotating arbitrary XFF strings multiplies distinct keys without bound.\n3. **Error path.** A tripped `ban` action passes the non-IP string to `ip_ban_manager.ban_ip()`, whose `ipaddress` validation raises `ValueError` uncaught in the behavioral processor — the request 500s.\n\n### PoC\n\n```python\nimport asyncio\nfrom types import SimpleNamespace\nfrom guard_core.models import SecurityConfig\nfrom guard_core.utils import extract_client_ip\n\nclass CIHeaders(dict):\n    def get(self, key, default=None):\n        for k, v in self.items():\n            if k.lower() == key.lower():\n                return v\n        return default\n\nclass FakeRequest:\n    def __init__(self, xff):\n        self.state = SimpleNamespace()\n        self.client_host = \"10.0.0.1\"          # the TRUSTED proxy\n        self.headers = CIHeaders({\"X-Forwarded-For\": xff})\n\nasync def main():\n    config = SecurityConfig(trusted_proxies=(\"10.0.0.1\",), enable_redis=False)\n    ip = await extract_client_ip(FakeRequest(\"*\"), config)\n    print(repr(ip))        # -\u003e '*'  (arbitrary string, no validation)\n\nasyncio.run(main())\n```\n\nThen `BehaviorTracker.track_endpoint_usage(\"app.login\", \"*\", rule)` issues `KEYS behavior_usage:behavior:usage:app.login:*:*` — matching other clients' keys (full fake-Redis script: `poc_xff_redis.py`, available on request).\n\n### Impact\n\nIntegrity and availability of the behavioral-analytics subsystem and the shared Redis instance, in deployments where the extracted XFF position is attacker-controllable. No data exposure; not reachable with default settings (`trusted_proxies` defaults empty).\n\n**Fix:** validate the extracted XFF entry with `ipaddress.ip_address()` before returning it from `extract_client_ip()` (fall back to the connecting IP on failure); escape glob metacharacters (`*?[]`) in anything interpolated into a `KEYS` pattern — or replace the KEYS+per-request-key design with an atomic counter / Lua sliding window (the rate-limit Lua script already shows the right shape).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "guard-core",
+        "purl": "pkg:pypi/guard-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "3.13.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.0.0",
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "2.0.0",
+        "2.1.0",
+        "2.2.0",
+        "2.2.1",
+        "2.2.2",
+        "3.0.0",
+        "3.1.0",
+        "3.1.1",
+        "3.10.0",
+        "3.11.0",
+        "3.12.0",
+        "3.2.0",
+        "3.3.0",
+        "3.4.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.7.1",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-gm9r-hvc9-96gv/GHSA-gm9r-hvc9-96gv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/security/advisories/GHSA-gm9r-hvc9-96gv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129304"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/pull/68"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/commit/c07239fa1c5aa93e3f179440e79dad652977d3e4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/releases/tag/3.13.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rennf93/guard-core"
+    }
+  ]
+}

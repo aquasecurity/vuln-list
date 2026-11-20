@@ -1,0 +1,72 @@
+{
+  "id": "GHSA-w674-vqhw-g3pg",
+  "modified": "2026-11-20T00:00:05.083219827Z",
+  "published": "2026-11-19T23:47:58Z",
+  "aliases": [
+    "CVE-2026-129233"
+  ],
+  "summary": "NLTK: StreamBackedCorpusView constructor os.stat leaks out-of-root file existence, size, and mtime bypassing pathsec ENFORCE",
+  "details": "## Summary\n\n`StreamBackedCorpusView`, a public API in `nltk/corpus/reader/util.py`, applies the pathsec sandbox to the file content it reads but not to the file metadata it probes in its constructor. When the view is created with a plain string fileid, `__init__` calls `os.stat(self._fileid).st_size` with no pathsec validation, so an application that passes an attacker influenced path to the constructor discloses whether an arbitrary out of root file exists and, if it does, its exact byte size and modification time, even when `nltk.pathsec.ENFORCE` is `True`. This is the residual metadata channel left open by the fix for CVE-2026-63312 (GHSA-x5ph-mj9p-rfr8), which closed arbitrary content read on the same code path but did not bring the sibling `os.stat` under the sandbox.\n\n## Root Cause\n\nThe pathsec sandbox is intended to confine all NLTK filesystem access to allowed data roots. The fix for CVE-2026-63312 enforced this for content reads by routing `StreamBackedCorpusView._open` through `nltk.pathsec.open` (`_secure_open`). The constructor, however, computes the end of file position eagerly, and on the non `PathPointer` branch it stats the caller supplied path directly. The `PathPointer` branch is validated (it calls `PathPointer.file_size()`), but the plain string branch reaches `os.stat` with no `validate_path`, `_secure_open`, or `required_root` check. The security invariant \"no filesystem access outside allowed roots under ENFORCE\" is therefore violated for the metadata channel: `os.stat` is filesystem access, and it is performed on the same untrusted string entry point that the content read fix protected.\n\n```text\nAffected component: nltk.corpus.reader.util.StreamBackedCorpusView.__init__\nSink:   nltk/corpus/reader/util.py, os.stat(self._fileid).st_size on the plain-string branch\nGuarded sibling: _open() (routes through nltk.pathsec.open); the constructor os.stat is not guarded\n```\n\n## Impact\n\nAn attacker who can influence the fileid string passed to `StreamBackedCorpusView(...)` (the same attacker model under which CVE-2026-63312 was published for content read) obtains a filesystem oracle that operates across the process visible filesystem regardless of the pathsec data roots and with `ENFORCE=True`:\n\n- Existence: a present path returns a size; a missing path raises `ValueError` whose message embeds the underlying OS error, so ENOENT, EACCES, and ENOTDIR are distinguishable, adding a permission and type probe.\n- Exact size: `st_size` of the target file is exposed (demonstrated below: `1850` for `/etc/passwd`, matching the real size).\n- Modification time: `st_mtime` is available from the same stat result.\n\nFile content is not disclosed: iterating the view still routes through the sandboxed open and is refused. The demonstrated capability is therefore metadata only (existence, exact size, mtime, and error class discrimination). Reachability is application conditional: in tree corpus readers construct views from validated `PathPointer` objects and take the guarded branch, so exploitation requires application code that hands an attacker influenced string directly to the public constructor, which is the same condition accepted for the original content read advisory.\n\n## Proof of Concept\n\n`Requires nltk 3.10.0 through 3.10.3 installed (the pathsec-hardened line). No non-default configuration; pathsec ENFORCE defaults to True. Reproduced against the published PyPI sdist nltk==3.10.3.`\n\n1. Construct the public corpus view with an out of root path string.\n2. Read the eagerly computed `_eofpos` (the leaked size) without iterating the view.\n3. Observe that iterating the view (which would read content) is blocked by the sandbox.\n\n```python\nimport os\nimport nltk.pathsec as ps\nfrom nltk.corpus.reader.util import StreamBackedCorpusView as V\n\nprint(\"ENFORCE\", ps.ENFORCE)                       # True (default)\n\nv = V(\"/etc/passwd\", lambda s: [s.read()])\nprint(\"size leaked\", v._eofpos, \"real\", os.stat(\"/etc/passwd\").st_size)\n\ntry:\n    \"\".join(list(v))                                # attempt content read\nexcept Exception as e:\n    print(\"content blocked\", type(e).__name__)\n```\n\n```text\nENFORCE True\nsize leaked 1850 real 1850\ncontent blocked PermissionError    # Security Violation [pathsec.open]: Unauthorized path /etc/passwd\n```\n\nA nonexistent path instead raises `ValueError: Unable to open or access '/etc/nonexistent_xyz' -- [Errno 2] No such file or directory`, providing the existence and error class oracle.\n\n## Attack Chain\n\n1. **Exposure:** An application constructs `StreamBackedCorpusView(fileid, block_reader)` where `fileid` is an attacker influenced string. The constructor is documented public API and its docstring accepts a bare string. The sandbox ships enabled (`ENFORCE=True`) by default.\n2. **Control:** The attacker controls the full path string stored as `self._fileid`; no parsing or normalization removes it.\n3. **Path:** In `__init__`, `isinstance(self._fileid, PathPointer)` is False for a plain string, so control falls to the else branch and reaches `os.stat(self._fileid)` with no intervening validation.\n4. **Guard:** None on the string branch before the stat. The pathsec routing that protects content lives only in `_open`; `ENFORCE` never gates the constructor stat.\n5. **Primitive:** `os.stat` on an arbitrary path yields existence, exact `st_size`, `st_mtime`, and, on failure, an error class that discriminates missing, permission denied, and not a directory.\n6. **Result:** A file existence, size, and mtime oracle across the process visible filesystem that crosses the pathsec containment boundary. Content read remains blocked, so impact is confined to metadata disclosure.\n\n## Bypass Evidence\n\nThe relevant guard is the CVE-2026-63312 (GHSA-x5ph-mj9p-rfr8) fix, which routed `StreamBackedCorpusView._open` through `nltk.pathsec.open` to block arbitrary content read. Comparison of published PyPI sdists shows the `_open` routing first appears in 3.10.0 (`nltk.pathsec.open` is imported and used) and is absent in 3.9.4, while the constructor `os.stat(self._fileid).st_size` is present unchanged across 3.9.4 through 3.10.3. The fix therefore addressed the content sink but left the sibling metadata sink in the same function unguarded.\n\nAttempts to invalidate the finding and their outcomes:\n- Duplicate of the content read advisory: refuted. Iterating the view is refused with a pathsec `PermissionError` on 3.10.0 through 3.10.3, so the disclosed content primitive is closed; only the metadata channel survives, a distinct impact class (information exposure rather than content read).\n- Guarded by pathsec anyway: refuted. Source inspection of the constructor shows no `validate_path`, `_secure_open`, or `required_root` before `os.stat` on the string branch, and the leak reproduces live with `ENFORCE=True`.\n- Not reachable: partially valid and reflected above. In tree readers pass validated `PathPointer` objects and never hit the string branch; reaching the sink requires application code that passes an attacker influenced string to the public constructor. That is the same reachability condition under which the content read advisory was accepted, so it narrows but does not defeat the finding.\n- Defense in depth only, not a boundary crossing: refuted. The pathsec design confines file access to allowed roots; `os.stat` on `/etc/passwd` is out of root file access performed on the same untrusted entry point the fix protected.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.10.0, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, resolved and downloaded as the source sdist)`\n- `Fix status: not fixed`\n\nThe pathsec sandbox and the constructor `os.stat` both exist from 3.9.4, but the CVE-2026-63312 content read fix that this finding is a residual gap of first ships in 3.10.0; the metadata oracle that survives that fix is therefore scoped to 3.10.0 through the latest release 3.10.3, all verified by inspecting the exact published PyPI sdists. No fixed release exists as of the latest published version. Version 3.9.4 carries the unguarded `os.stat` too but predates the content read fix, so it is outside the scope of this incomplete fix report and is already covered by the broader content read exposure of that line.\n\n## Suggested Fix\n\nEnforce the pathsec containment invariant on the metadata read as well as the content read. In `StreamBackedCorpusView.__init__`, validate the string fileid before calling `os.stat` (for example run it through `nltk.pathsec.validate_path` with the same context and root policy used by `nltk.pathsec.open`), or defer the end of file size computation so it is derived only from a successfully pathsec validated open. The remediation must cover the plain string branch specifically, since the `PathPointer` branch is already validated, and should preserve the existing `ValueError` on genuine access errors without leaking a distinguishing OS error class for out of root paths. No configuration only mitigation fully closes the gap because `ENFORCE=True` is already the default and does not gate the constructor stat; until a fix is available, applications should avoid passing untrusted path strings to `StreamBackedCorpusView` and should wrap fileids in a validated `PathPointer`.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3888 \"Validate chat80.sql_query dbname for path containment (CWE-59/73)\", open; head e0e890f51 at the time of this note.\n\nFix commits: 68434c042 \"Enforce corpus-root containment in YCOE reader and StreamBackedCorpusView\" and 2c563b13f \"Defer the corpus-view refusal to _open\" (the constructor no longer calls os.stat on the path; the containment check runs when the view is opened).\n\nNo probe. Regression test on the PR: nltk/test/unit/test_ycoe_streamview_pathsec.py (13 passed on the PR head e0e890f51). The advisory PoC re-run on that head: StreamBackedCorpusView(\"/etc/passwd\", ...) constructs with _eofpos None (no size leaked), and len() or iteration is refused with PermissionError (Security Violation [pathsec.open]); a nonexistent out-of-root path behaves identically at construction and on read, so the existence oracle is closed too. On develop 2fa3f48fe the object is constructed and _eofpos equals the real file size, so develop is still VULNERABLE.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-w674-vqhw-g3pg/GHSA-w674-vqhw-g3pg.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-w674-vqhw-g3pg"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129233"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3888"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/2c563b13f9dce7c15eefd4b03463e1b69b64f1f3"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/68434c0427f8d296f3adfddb518525038d1f7bfa"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

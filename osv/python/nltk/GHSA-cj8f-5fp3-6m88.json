@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-cj8f-5fp3-6m88",
+  "modified": "2026-11-20T00:00:05.087378419Z",
+  "published": "2026-11-19T23:48:18Z",
+  "aliases": [
+    "CVE-2026-129232"
+  ],
+  "summary": "NLTK: Quadratic CPU exhaustion in NLTK XMLCorpusView.read_block via deeply nested XML corpus tags",
+  "details": "## Summary\n\nNLTK's `XMLCorpusView.read_block` rebuilds the full root-to-node context path with `\"/\".join(context)` on every start tag while it is still searching for a matching element. Because the context stack grows with XML nesting depth and the join is repeated once per start tag, a single corpus file containing deeply nested tags forces O(n^2) pure-Python work, where n is the number of nested elements. Any application that parses attacker-influenced XML corpus data through an `XMLCorpusView` subclass (for example the `nps_chat`, `framenet`, `bnc`, `mte`, `nkjp`, or `semcor` readers) can be driven to exhaust a CPU core for an extended period, producing a denial of service without any authentication or special privilege.\n\n## Root Cause\n\n`read_block` maintains a `context` list that is appended on each start tag and popped on each end tag, so it grows monotonically to the maximum nesting depth while an element is being sought. For every start tag, while no target element has been located yet (`elt_start is None`), the code recomputes the entire path string from scratch and matches it against the reader's tagspec. The tagspec is anchored (`tagspec + \"\\\\Z\"`), so a nested path such as `a/a/a/...` never completes a full match against a concrete tagspec like `Session/Posts/Post`; `elt_start` therefore stays `None` for the entire file and the per-start-tag join runs for all n tags over depths 1..n. Summing those join costs yields O(n^2). There is no nesting-depth limit, context-length bound, or cumulative-work budget in `read_block`, and the per-call regex timeout used elsewhere in the file does not observe this cumulative pure-Python string cost.\n\n```text\nnltk/corpus/reader/xmldocs.py : XMLCorpusView.read_block\n  context.append(name)                              # start-tag: stack grows with depth\n  if elt_start is None:\n      if tagspec.match(\"/\".join(context)):          # full path rebuilt per start tag -\u003e O(depth)\n          ...\n  # empty-element variant rebuilds \"/\".join(context) + \"/\" + name the same way\n```\n\n## Impact\n\nAn unauthenticated attacker who can supply or influence an XML corpus file processed by an `XMLCorpusView` subclass can cause quadratic CPU consumption. A crafted file of roughly 200 KB consumes several seconds of a single core; a few-megabyte file pins a core for minutes, and an arbitrarily large or unclosed nested file can hang the affected process indefinitely on that core. The result is a denial-of-service condition (CWE-407 / CWE-400). No confidentiality or integrity impact is demonstrated; the impact is availability of the processing thread or process. The prerequisite is that the application feed untrusted or attacker-influenced corpus XML into one of the affected readers, which is the same trust boundary already accepted for the seed issue in the same file.\n\n## Proof of Concept\n\n`Requires only the nltk package and its standard XML corpus reading path; no network or special configuration.`\n\nReproduction drives a real `SeekableUnicodeStreamReader` and the real `read_block` with an `nps_chat`-style tagspec, comparing nested input (growing context depth) against a flat negative control with an identical tag count.\n\n```python\nimport time, io\nfrom nltk.corpus.reader.xmldocs import XMLCorpusView\n\ndef measure(build, label):\n    print(label)\n    prev = None\n    for n in (4000, 8000, 16000, 32000):\n        body = build(n).encode(\"utf-8\")\n        # write to a temp file and open through an XMLCorpusView subclass tagspec\n        import tempfile, os\n        fd, path = tempfile.mkstemp(suffix=\".xml\")\n        os.write(fd, b\"\u003cSession\u003e\" + body + b\"\u003c/Session\u003e\"); os.close(fd)\n        view = XMLCorpusView(path, \"Session/Posts/Post\")\n        t = time.time()\n        try:\n            list(view)\n        except Exception:\n            pass\n        dt = time.time() - t\n        ratio = \"\" if prev is None else f\"({dt/prev:.1f}x)\"\n        print(f\"  n={n:\u003e6} time={dt:7.3f}s {ratio}\")\n        prev = dt\n        os.remove(path)\n\nmeasure(lambda n: \"\u003ca\u003e\"*n + \"\u003c/a\u003e\"*n, \"NESTED  (context depth = n):\")\nmeasure(lambda n: \"\u003ca\u003e\u003c/a\u003e\"*n,        \"FLAT    (context depth = 1, negative control):\")\n```\n\n```text\nNESTED  (context depth = n):\n  n=  4000 time=  0.162s\n  n=  8000 time=  0.484s (2.99x)\n  n= 16000 time=  1.595s (3.29x)\n  n= 32000 time=  5.667s (3.6x)     -\u003e ratios trend toward 4x per 2x input = O(n^2)\nFLAT    (context depth = 1, negative control):\n  n=  8000 time=  0.145s\n  n= 16000 time=  0.293s (2.03x)\n  n= 32000 time=  0.580s (2.0x)     -\u003e 2x per 2x input = linear\n```\n\n## Attack Chain\n\n1. **Exposure:** An application uses an `XMLCorpusView` subclass (`nps_chat`, `framenet`, `bnc`, `mte`, `nkjp`, `semcor`, and similar) to read an XML corpus file whose contents an attacker can supply or influence.\n2. **Control:** The attacker controls the XML body and nests a tag the view's tagspec never fully matches, for example `\"\u003ca\u003e\"` repeated n times followed by `\"\u003c/a\u003e\"` repeated n times.\n3. **Path:** `read_block` consumes the whole file in one call, appending to `context` on every start tag; the target element is never found, so the loop runs to end of file and `context` grows to depth n.\n4. **Guard:** No nesting-depth cap, context-length bound, or cumulative-work budget exists in `read_block`; the anchored tagspec match fails in O(1) at offset 0, so it is not the hot term, and the per-call regex timeout does not see cumulative string-build cost.\n5. **Primitive:** For each of the n start tags, `\"/\".join(context)` rebuilds an O(depth) string, giving a cumulative O(n^2) pure-Python CPU cost.\n6. **Result:** Sustained single-core CPU exhaustion; a modest file blocks a core for seconds to minutes, and an unbounded or unclosed file hangs the processing thread indefinitely.\n\n## Bypass Evidence\n\nThe seed fix for the previously published quadratic-CPU issue in this same file (CVE-2026-81723, GHSA-vp2x-qp44-57v7) is confined to `_read_xml_fragment`, where it added incremental in-tag / last-open-bracket tracking. The commit that shipped that fix touched the `read_block` match line only to change the match call form (from a module-level regex match to a precompiled tagspec match) and preserved the `\"/\".join(context)` argument byte-for-byte; it did not add any depth or length bound. This sink is therefore not covered by the seed remediation. It is also distinct from the sibling published issue CVE-2026-81725 (GHSA-8mpw-7fpc-4gqj), whose sink is a `block.count(...)` line tracker in `Pl196xCorpusReader.read_block`, a different class, mechanism, input, and fix. The strongest disproof attempts, that the anchored tagspec match is the quadratic term, that the file is not fully consumed in one call, that an end-tag sanity check aborts early, that a depth cap or the per-call regex timeout catches it, that the seed fix already covers it, and that deep nesting is entity expansion blocked by defused XML handling, were each checked and refuted: the flat negative control with identical tag count stays linear, isolating the quadratic term to the depth-dependent join; well-formed balanced input runs to end of file before any pop; no depth cap exists; the timeout is per call and does not observe cumulative pure-Python cost; and benign literal nesting is not custom-entity expansion.\n\n## Affected Versions\n\n- `Ecosystem: PyPI (pip)`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, nltk-3.10.3-py3-none-any.whl)`\n- `Fix status: not fixed (no fix present in any released version or in the current development branch)`\n\nThe vulnerable join sink is present in the latest published artifact (3.10.3) and was corroborated in 3.9.1. No released version and no development-branch commit contains a fix, so the upper bound `\u003c= 3.10.3` is proven. The introduction boundary was not pinned to an exact first-affected release: the algorithm is long-standing legacy code present in all inspected supported releases, and pinning an exact introduced version would require bisecting historical wheels. The lower boundary is therefore left unestablished rather than asserted.\n\n## Suggested Fix\n\nBound the work performed while searching for a target element in `read_block`. Options that address the root cause: track the running context path incrementally (append and truncate a single cached path string alongside the `context` stack, rather than rejoining the whole list on every tag), or enforce an explicit maximum nesting depth / maximum accumulated tag count for a single block and raise a clear error when it is exceeded. The remediation must cover both the start-tag match at the primary join site and the empty-element variant that rebuilds `\"/\".join(context) + \"/\" + name`, and it should apply regardless of whether the input is well-formed and balanced or an unclosed nested run. As an interim mitigation, deployments can impose an upstream size limit on corpus XML fed to these readers and avoid parsing untrusted corpus files, though this does not remove the quadratic behavior for inputs under the limit.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144.\n\nFix commit: 002bcf714 \"Bound three quadratic algorithmic-DoS vectors on untrusted input\" (XMLCorpusView.read_block no longer rebuilds the context path per piece).\n\nNo probe. The advisory PoC re-run (nested tags, n=8000 vs n=32000 through read_block): on the PR head 0.7x over a 4x input (linear); on develop 2fa3f48fe 11.3x (3.08 s vs 34.9 s), so develop is still VULNERABLE. The open PR #3753 measured on its head 238f81500 also gives 10.9x: its xmldocs change targets the unclosed CDATA/comment rescan of GHSA-j8g8, not this vector.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-cj8f-5fp3-6m88/GHSA-cj8f-5fp3-6m88.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-cj8f-5fp3-6m88"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129232"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/002bcf714ef8cb8baf94436f4be73e5516914412"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

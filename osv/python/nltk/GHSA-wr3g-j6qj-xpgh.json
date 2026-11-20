@@ -1,0 +1,73 @@
+{
+  "id": "GHSA-wr3g-j6qj-xpgh",
+  "modified": "2026-11-20T00:15:05.398589877Z",
+  "published": "2026-11-19T23:59:15Z",
+  "aliases": [
+    "CVE-2026-128135"
+  ],
+  "summary": "NLTK: ZIP package extraction follows in-root hardlinks and overwrites files outside the NLTK data root",
+  "details": "## Summary\n\nNLTK ships a security wrapper, `nltk.pathsec.ZipFile`, that is meant to confine archive extraction to trusted data roots and to block link-based escapes. When `nltk.download()` installs a package, the extraction write opens each member's target path without checking whether that path is a hardlink to a file located outside the data root. A local actor who can write inside a shared or predictable NLTK data root (for example `~/nltk_data`, a group-writable `/usr/share/nltk_data`, or a shared container volume) can pre-plant an in-root hardlink at a member path that a soon-to-be-installed package will write. When the victim later runs the download, extraction truncates and overwrites the outside-root target through that hardlink. This is the same weakness class as the previously fixed downloader hardlink issue, but the fix did not reach the package-extraction write sink, so the latest published release remains exploitable through this path.\n\n## Root Cause\n\nThe prior fix added an `st_nlink \u003e 1` refusal to the file-open helpers (`nltk.pathsec.open` / `_hardened_open`) and routed the downloader temporary-file write through that hardened opener, so a multiply-linked inode is refused on those paths. The extraction write sink was never given the same check. On published releases, `nltk.pathsec.ZipFile.extract` validates member names with `validate_zip_archive` and then delegates to the standard library extractor, whose plain `open(targetpath, \"wb\")` opens and truncates a pre-existing hardlink. The containment guard `validate_zip_archive` relies on `Path.resolve()` and name checks; `resolve()` follows symlinks (so a symlinked member is correctly refused) but a hardlink has a legitimate in-root name and in-root resolved path, so it passes. No code on the extraction path performs the `st_nlink` fstat that the sibling open helper performs.\n\n```text\nAffected component: nltk.pathsec (archive extraction), driven by nltk.downloader\nReleased sink (\u003c= 3.10.3): nltk/pathsec.py ZipFile.extract -\u003e stdlib zipfile._extract_member -\u003e open(targetpath, \"wb\")\nContainment guard that fails open for hardlinks: nltk/pathsec.py validate_zip_archive (name checks + Path.resolve())\nDevelopment-branch sink: nltk/pathsec.py ZipFile._extract_member leaf reopen with O_WRONLY|O_TRUNC|O_NOFOLLOW (no st_nlink fstat)\n```\n\n## Impact\n\nAn unprivileged local user who can create a file inside a data root that the victim's NLTK installation will extract into can cause the victim's process to truncate and overwrite a file outside that root. The attacker chooses which outside file is destroyed by selecting the hardlink target, so the integrity impact is complete for the chosen path (arbitrary outside-root file destruction). Where the victim resolves packages through an attacker-influenced mirror or index, the overwritten bytes are also attacker-chosen, which plausibly enables targeted file replacement and later code execution if the victim subsequently consumes the replaced file; that escalation is plausible rather than demonstrated here. Practical exploitation requires either that kernel hardlink protection (`fs.protected_hardlinks`) is disabled, or that the outside target is one the planting actor is permitted to hardlink (owned, writable, or group-shared), which is the same precondition carried by the previously accepted advisory for this weakness class.\n\n## Proof of Concept\n\n`Dependencies: a released nltk (3.10.3) installed from PyPI. The demonstration creates a data root, a victim file outside it, and a package archive whose member path is pre-planted as a hardlink to the victim file, then extracts through the security wrapper. It runs as a single user and succeeds even with fs.protected_hardlinks=1.`\n\nSteps:\n1. Register a data root with `nltk.data.path` and create an extraction subtree inside it.\n2. Create a victim file outside the data root.\n3. Pre-plant an in-root hardlink at the member path the archive will write.\n4. Extract the archive through `nltk.pathsec.ZipFile.extract`.\n\n```python\nimport os, sys, tempfile, zipfile\nimport nltk\nimport nltk.pathsec as ps\n\nwork = tempfile.mkdtemp()\ndata_root = os.path.join(work, \"nltk_data\")\nextract_root = os.path.join(data_root, \"corpora\")\nos.makedirs(os.path.join(extract_root, \"pkgid\"))\nnltk.data.path.insert(0, data_root)\n\noutside = os.path.join(work, \"victim.txt\")\nopen(outside, \"w\").write(\"ORIGINAL-VICTIM-CONTENT\")\n\nzippath = os.path.join(data_root, \"pkg.zip\")\nwith zipfile.ZipFile(zippath, \"w\") as z:\n    z.writestr(\"pkgid/target\", \"PWNED-BY-EXTRACTION\")\n\nmember_abs = os.path.join(extract_root, \"pkgid/target\")\nos.link(outside, member_abs)  # pre-planted in-root hardlink\n\nwith ps.ZipFile(zippath, \"r\") as z:\n    z.extract(\"pkgid/target\", path=extract_root)\n\nprint(\"victim now:\", open(outside).read())\n```\n\n```text\nvictim now: PWNED-BY-EXTRACTION\n```\n\nThe equivalent test using a symlink instead of a hardlink is refused by `validate_zip_archive` with a Security Violation, isolating the missing guard to hardlinks on the extraction write.\n\n## Attack Chain\n\n1. **Exposure:** `nltk.download()` (and `python -m nltk.downloader`) is the shipped, default entry point; extraction of `.zip` packages into a data root is default behavior and is reachable by a local actor who can write inside a shared or predictable data root.\n2. **Control:** the attacker controls the target inode by pre-planting an in-root hardlink at `\u003cdownload_dir\u003e/\u003csubdir\u003e/\u003cpkg_id\u003e/\u003cmember\u003e`, and (under an attacker-influenced mirror) the written bytes; the member name stays `\u003cpkg_id\u003e/...` so it satisfies every name guard.\n3. **Path:** the install path does not wipe the destination before extraction (the tree is only removed on a STALE status, and that cleanup unlinks names rather than truncating the victim inode), so the planted hardlink survives to the write. The value flows through the downloader `expected_root` check and `_validate_member` (which uses `realpath`, so a hardlink stays in-root), then through `validate_zip_archive` (which uses `resolve()`), to the extraction write.\n4. **Guard:** every guard on the path inspects names or resolved paths; none performs the `st_nlink \u003e 1` fstat. `resolve()`, `realpath()`, and `O_NOFOLLOW` all fail to detect a hardlink because a hardlink is an ordinary regular file with a legitimate in-root name.\n5. **Primitive:** the member write opens the pre-existing hardlink and truncates plus overwrites the outside-root inode.\n6. **Result:** the victim-owned file chosen by the planting actor is destroyed and replaced with the extracted member's bytes, crossing from the managed data root out to the general filesystem.\n\n## Bypass Evidence\n\nThe prior remediation for this weakness is the canonical reference here: it added `st_nlink \u003e 1` refusals to `nltk.pathsec.open` / `_hardened_open` and routed the downloader temporary-file write through that opener. The new evidence is that the extraction write sink was never covered by that fix. On the released 3.10.3 wheel obtained from PyPI, the only `st_nlink` occurrences are inside the open helper; `ZipFile.extract` validates names and then calls the standard library extractor with no `st_nlink` check. Attempts to disprove the finding were made and failed:\n\n- Hypothesis that the released 3.10.3 routes extraction through a hardened or `st_nlink` path: refuted by inspecting the released wheel (`ZipFile.extract` delegates to the standard library, no override, no `st_nlink` on the extraction path) and by dynamic reproduction (hardlink overwrote the outside file; symlink refused).\n- Hypothesis that `validate_zip_archive` or `_validate_member` catch the hardlink: refuted because both use `resolve()` / `realpath()`, which cannot reveal a hardlink; the symlink-refused versus hardlink-overwritten asymmetry was reproduced.\n- Hypothesis that the download flow wipes the destination before extraction: refuted because the wipe runs only on a STALE status and uses name unlink, which does not truncate the victim inode.\n- Hypothesis that `O_NOFOLLOW` / `O_EXCL` on the development branch block it: refuted because `O_NOFOLLOW` guards only against a symlink final component and `O_EXCL` merely diverts to the truncate reopen branch; neither performs the `st_nlink` fstat.\n- Hypothesis that kernel hardlink protection makes it a non-issue: retained as a severity bound, not a disqualifier, because the same precondition applies to the previously accepted advisory for this weakness class.\n\n## Affected Versions\n\n- `Ecosystem: pip`\n- `Package: nltk`\n- `Confirmed affected range: \u003e= 3.9.4, \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI, nltk-3.10.3-py3-none-any.whl)`\n- `Fix status: not fixed (latest published release is affected; no fixed version exists)`\n\nThe latest published release (3.10.3) carries the open-helper fix for the related downloader issue yet remains exploitable through the extraction sink, so the upper bound is the current release and no fixed version exists. Releases 3.9.4 through 3.10.2 have no `st_nlink` guard at all and follow the hardlink through the same extraction path (confirmed by wheel inspection); the range floor 3.9.4 is the earliest release carrying this `nltk.pathsec` extraction path. The development branch adds a hardened extraction override that still omits the `st_nlink` check, so the same vector persists there through a different sink symbol; a fixed release should not be inferred from that development-branch change.\n\n## Suggested Fix\n\nEnforce the invariant that an extraction write must never land on a multiply-linked inode. Extend the existing `st_nlink \u003e 1` refusal (as implemented in the hardened open helper) to the extraction write descriptor: after opening or creating the leaf target, `fstat` the descriptor and refuse an inode with `st_nlink \u003e 1` before truncating or writing. Apply this on both the released delegation path and the development-branch `_extract_member` override, or alternatively have `validate_zip_archive` / the downloader member validator `fstat` each existing target and refuse a multiply-linked inode. As an interim mitigation, operators should ensure `fs.protected_hardlinks=1` is enabled and avoid shared, group-writable, or predictable data roots for accounts that run untrusted downloads.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured).\n\nFix commit: cf12a5e6a (pathsec.ZipFile._extract_member resolves member names to ZipInfo so the hardened extraction path actually runs, refuses a target with st_nlink greater than 1, and replaces through unlink plus O_EXCL; the downloader adds an lstat pre-check).\n\nProbe: nltk/test/unit/security_probes/ghsa_wr3g_j6qj_xpgh.py (on the PR). Verdict on the PR head: FIXED (hardlinked member target refused with PermissionError). The same probe run against develop 2fa3f48fe: VULNERABLE (extraction wrote through the hardlink to the outside secret).\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.9.4"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.9.4"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-wr3g-j6qj-xpgh/GHSA-wr3g-j6qj-xpgh.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-wr3g-j6qj-xpgh"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-128135"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3753"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/0e9898b7615b4ab3b023e868212316a489ece4f0"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/cf12a5e6a439fe1d722acd53d4309911faaaaf78"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

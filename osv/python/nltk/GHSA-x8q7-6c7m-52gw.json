@@ -1,0 +1,64 @@
+{
+  "id": "GHSA-x8q7-6c7m-52gw",
+  "modified": "2026-11-20T00:15:05.411020976Z",
+  "published": "2026-11-19T23:55:54Z",
+  "aliases": [
+    "CVE-2026-128138"
+  ],
+  "summary": "NLTK incomplete fix: additional JVM/JAR sandbox bypass through unvalidated launcher tokens in java() command arguments",
+  "details": "## Summary\n\nNLTK 3.10.3 contains security hardening intended to close JVM argument-injection and untrusted JAR/classpath execution paths in `nltk.internals.java()`, including the issue published as GHSA-m4rf-3fr8-xwx3.\n\nThe patched `options` channel correctly rejects Java argument-file references such as `@/path/to/args` and launcher modes such as `-jar`. However, an additional argument channel remains: the caller-provided `cmd` sequence is appended to the Java command after the validated option and classpath channels, without enforcing that its first item is a Java main-class name.\n\nI am reporting this as an additional post-fix bypass / incomplete-fix path affecting the 3.10.3 remediation, rather than as an unrelated vulnerability family.\n\nAs a result, the same launcher token that is rejected through `options` can be supplied as the first `cmd` item. I confirmed two reachable forms against the official `nltk-3.10.3-py3-none-any.whl`:\n\n1. direct use of the public `nltk.internals.java()` helper with `cmd=[\"-jar\", ...]`; and\n2. the higher-level `StanfordSegmenter`, whose public `java_class` constructor argument becomes the first `cmd` item and accepts an `@argfile` launcher token.\n\nBoth paths execute an external researcher-controlled JAR without setting `NLTK_ALLOW_UNSAFE_JARS`, `NLTK_ALLOW_UNSAFE_CLASSPATH`, or using `trusted_raw_options`. The original explicit outside-classpath route is blocked in 3.10.3, while the alternate command channel executes the JAR 3/3 times.\n\n## Affected artifact\n\n```text\nPackage: nltk\nConfirmed affected version: 3.10.3\nWheel: nltk-3.10.3-py3-none-any.whl\nSHA-256: ff9598a8e20518ee0d557745890cc4435b9578489e2dcbc69c4f81fa060caf7c\n```\n\nBaseline artifact:\n\n```text\nVersion: 3.10.2\nWheel: nltk-3.10.2-py3-none-any.whl\nSHA-256: 2c7ccacb765c5e26b0cb60fb1b57080af522c6924d12a714a243305ba3637412\n```\n\n## Relationship to the 3.10.3 security fixes\n\nThe existing 3.10.3 hardening validates the dedicated per-call `options` list before it reaches `subprocess.Popen`. In particular, the exact `@argfile` token used in this report is rejected through `options` with a `ValueError` that references CVE-2026-12841 and CWE-88.\n\nThe command is subsequently assembled in this order:\n\n```python\nfinal_cmd.extend(validated_options)\nif classpath_arg is not None:\n    final_cmd.extend([\"-cp\", classpath_arg])\nfinal_cmd.extend(cmd_list)\n```\n\n`cmd_list` is copied from the public `cmd` argument but its first token is not checked to ensure that it is an ordinary Java main class. Java therefore interprets leading `-jar`, `@argfile`, module-mode, or classpath-mode tokens as launcher control arguments rather than application arguments.\n\nThis is an alternate argument channel around the same JVM argument/JAR execution boundary protected by the 3.10.3 changes.\n\n## Confirmed API paths\n\n### Direct public helper\n\n```python\nnltk.internals.java(\n    [\"-jar\", \"/outside/trusted/roots/controlled.jar\"],\n    classpath=None,\n    stdout=\"pipe\",\n    stderr=\"pipe\",\n)\n```\n\nThe external JAR executed in all three subject runs.\n\n### Higher-level `StanfordSegmenter` path\n\n`StanfordSegmenter` exposes a public `java_class` constructor argument, stores it, and later places it at the beginning of the `cmd` sequence passed to `nltk.internals.java()`.\n\nA controlled argument file containing a `-jar` launcher invocation was supplied as:\n\n```python\nStanfordSegmenter(\n    path_to_jar=trusted_segmenter_jar,\n    java_class=\"@/path/to/controlled-launcher.args\",\n    path_to_model=\"dummy-model\",\n    java_options=[],\n)\n```\n\nThe trusted segmenter JAR passed the wrapper's checksum and classpath checks. The `@argfile` then switched the Java launcher to the external JAR, which executed in all three runs.\n\nThe deprecated wrapper subsequently raised an unrelated post-launch `AttributeError` while processing its output. The external marker had already been written by the child JVM before that exception.\n\n## Proof matrix\n\n```text\nR1  NLTK 3.10.2 + explicit external classpath\n    -\u003e controlled Java bytecode executed\n\nR2  NLTK 3.10.3 + same explicit external classpath\n    -\u003e UntrustedJarError; no marker\n\nR3A NLTK 3.10.3 + direct cmd=[\"-jar\", external_jar]\n    -\u003e controlled external JAR executed, 3/3\n\nR3B NLTK 3.10.3 + StanfordSegmenter(java_class=\"@argfile\")\n    -\u003e controlled external JAR executed, 3/3\n\nR4  NLTK 3.10.3 + ordinary main class in trusted classpath\n    -\u003e legitimate execution preserved\n```\n\nA direct channel comparison also confirmed:\n\n```text\noptions=[\"@argfile\"]       -\u003e BLOCKED\ncmd/java_class=\"@argfile\"  -\u003e EXTERNAL JAR EXECUTED\n```\n\nMachine-readable proof results and a portable reproducer are attached.\n\n## Preconditions\n\nPractical exploitability depends on an embedding application exposing attacker influence over one of these public argument paths:\n\n- the leading item of `nltk.internals.java(cmd=...)`; or\n- `StanfordSegmenter(java_class=...)` or an equivalent wrapper-controlled command token.\n\nThe attacker must also be able to reference an argument file or JAR readable by the NLTK process. The Java child process executes with the privileges of that process.\n\nThis is not a claim that importing NLTK alone is remotely exploitable. The confirmed issue is that the default protected execution boundary can be bypassed when these argument channels are exposed to untrusted input.\n\n## Impact\n\nSuccessful exploitation allows execution of attacker-selected Java bytecode with the privileges of the process using NLTK.\n\nSuggested classifications:\n\n- CWE-88: Improper Neutralization of Argument Delimiters in a Command\n- CWE-94: Improper Control of Generation of Code\n\nSuggested severity: Moderate, subject to maintainer assessment of realistic argument reachability in embedding applications.\n\n## Reproduction\n\nThe complete reproducer, machine-readable proof results, and proposed remediation are included in the attached evidence package.\n\n[nltk-3103-candidate-a-maintainer-evidence.zip](https://github.com/user-attachments/files/31124796/nltk-3103-candidate-a-maintainer-evidence.zip)\n\n\nThe included `reproducer/reproduce_cmd_channel_bypass.py` creates only temporary researcher-controlled Java source, JAR, argument-file, and marker artifacts. It performs no network access.\n\nRequirements:\n\n- Python 3.10 or newer\n- `nltk==3.10.3`\n- a JDK providing `java`, `javac`, and `jar`\n\nRun:\n\n```bash\npython reproducer/reproduce_cmd_channel_bypass.py\n```\n\nA confirmed run exits with status 0 and reports that:\n\n- the `options` channel blocks `@argfile`;\n- the direct `cmd` channel executes the external JAR 3/3;\n- the higher-level `StanfordSegmenter.java_class` channel executes it 3/3; and\n- legitimate trusted main-class execution remains functional.\n\n## Recommended remediation\n\nEnforce that the first ordinary `cmd` item is a Java main-class token. Reject Java launcher switches and `@argfile` references in this channel by default, before constructing or executing the subprocess command.\n\nFor example:\n\n```python\ncmd_list = list(cmd)\nif not cmd_list:\n    raise ValueError(\"cmd must contain a Java main class\")\nfirst = cmd_list[0]\nif not isinstance(first, str) or not first or first.startswith((\"-\", \"@\")):\n    raise ValueError(\"cmd must begin with a Java main class\")\n```\n\nIf raw Java launcher modes are intentionally supported, they should require a clearly named explicit trusted escape hatch rather than sharing the normal main-class channel.\n\nThe attachment includes a proposed source patch and focused regression tests. Local verification against code derived from the official 3.10.3 wheel showed:\n\n```text\ndirect -jar command channel       BLOCKED\nStanfordSegmenter @argfile path   BLOCKED\nexternal marker creation          BLOCKED\nlegitimate trusted main class     PRESERVED\n```\n\n## Relationship to existing advisory / duplicate note\n\nThe public advisory GHSA-m4rf-3fr8-xwx3 describes the per-call `options` validation gap fixed in 3.10.3. This report is intentionally scoped as an additional bypass of that remediation through the distinct `cmd`/`java_class` argument channel.\n\nI did not locate a public advisory, issue, or pull request describing this leading-`cmd` launcher-token path. I cannot determine whether an equivalent private report already exists, so please deduplicate this report against any private reports or unpublished follow-up work.\n\nPlease keep this report and attachment private while assessing and preparing any fix. I am available to test a candidate patch and adapt the regression tests to the project's preferred style.\n\n\n## Fix status (2026-09-28)\n\nStatus: MERGED on develop (unreleased; v3.10.3 of 2026-08-12 predates the fix).\n\nPR: #3771 \"Reject Java launcher switches and @argfiles in the java() cmd argument (CWE-88)\", merged 2026-08-20, merge commit 45a08fded on develop. Fix commit: b36212795 (java() raises ValueError when the first cmd token is a launcher switch or an @argfile, and when any cmd token is an @argfile; StanfordSegmenter passes its java_class as that first token, nltk/tokenize/stanford_segmenter.py line 432, so both reported paths hit the same check).\n\nProbe: none. Reproduction on develop 2fa3f48fe with the process spawn intercepted: cmd=[\"-jar\", jar], cmd=[\"@argfile\"] and cmd=[\"Main\", \"@argfile\"] each raise ValueError (CWE-88) before any spawn.\n\nRelease: none yet; no release tag contains b36212795.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.3"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-x8q7-6c7m-52gw/GHSA-x8q7-6c7m-52gw.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-x8q7-6c7m-52gw"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-128138"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3771"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/b36212795a522d2b7b176cf0e0d9d8da489ba6e6"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

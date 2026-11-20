@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-53pg-5qp8-mhvr",
+  "modified": "2026-11-20T00:00:04.071291431Z",
+  "published": "2026-11-19T23:49:16Z",
+  "aliases": [
+    "CVE-2026-129230"
+  ],
+  "summary": "NLTK: Uncontrolled recursion in WordNet Synset hypernym walkers (max_depth/min_depth/hypernym_paths/hypernym_distances) causes DoS",
+  "details": "## Summary\n\nFour hypernym-walking methods on the WordNet `Synset` class in `nltk/corpus/reader/wordnet.py` (`max_depth`, `min_depth`, `hypernym_paths`, and `hypernym_distances`) traverse the hypernym pointer graph by direct recursion with no visited-node set and no depth cap. WordNet `data.\u003cpos\u003e` file content is untrusted corpus input in NLTK, the same trust boundary the project already treats as attacker-controlled across its corpus-content hardening work. When the parsed hypernym graph contains a cycle, or a chain deeper than the interpreter recursion limit, these methods recurse without bound and raise an uncaught `RecursionError`, aborting the traversal and any worker that does not catch it. No special privileges are needed; the victim only has to load an attacker-supplied corpus and call any of several shipped public methods that reach these walkers.\n\n## Root Cause\n\n`Synset.max_depth` computes `1 + max(h.max_depth() for h in hypernyms)` and only assigns its `_max_depth` memo after that recursive expression fully returns. Because Python evaluates the right-hand side completely before binding the left-hand side, the memo is never set on a node that is still on the recursion stack, so a cyclic graph re-enters the same not-yet-memoized node indefinitely. `min_depth`, `hypernym_paths`, and `hypernym_distances` follow the same recursive descent with no cycle detection. The security invariant that graph traversal over untrusted corpus data must terminate is violated: the pointer offsets parsed from the data file are stored verbatim with no graph-shape validation, so the attacker controls the graph topology. The sibling walkers in the same class (`closure`, `tree`, `_shortest_hypernym_paths`) were hardened with acyclic/visited guards, which shows cyclic hypernym graphs are an in-scope threat that these four methods simply were not converted to handle.\n\n```text\nAffected functions in nltk/corpus/reader/wordnet.py:\n  Synset.max_depth          (nltk/corpus/reader/wordnet.py:550)\n  Synset.min_depth          (nltk/corpus/reader/wordnet.py:564)\n  Synset.hypernym_paths     (nltk/corpus/reader/wordnet.py:666)\n  Synset.hypernym_distances (nltk/corpus/reader/wordnet.py:768)\nUntrusted pointer stored at nltk/corpus/reader/wordnet.py:1694\nRe-entry edge: hypernyms() (:138) -\u003e _related('@') (:1103) -\u003e synset_from_pos_and_offset (:1104)\n```\n\n## Impact\n\nAn attacker who can supply a WordNet `data.\u003cpos\u003e` corpus file that the victim loads (for example a downloaded, mirrored, or user-provided WordNet corpus) can construct a hypernym pointer graph that is cyclic or deeper than the recursion limit. When the application then calls any hypernym-depth or path method, the walker recurses without bound and raises an uncaught `RecursionError`, terminating the current traversal and any request or worker process that does not handle it. Under a raised or removed recursion limit, unbounded recursion can instead exhaust the native stack and abort the process. The impact is availability only; there is no confidentiality or integrity effect. Reachable public entry points include `hypernym_paths` and `hypernym_distances` directly, and `max_depth`/`min_depth` indirectly through `lowest_common_hypernyms`, `wup_similarity`, `path_similarity`, and `lch_similarity`.\n\n## Proof of Concept\n\n`Requires only the nltk package under test on PYTHONPATH; no network or WordNet data download. The reader is instantiated with __new__ to skip unrelated OMW/lexname loading, the same technique NLTK's own recursion-DoS hardening test uses; the parser and the walker under test are unmodified library code.`\n\n1. Build a `WordNetCorpusReader` without its unrelated data-loading side effects.\n2. Parse two synset records whose `@` (hypernym) pointers reference each other, forming a 2-cycle.\n3. Call `Synset.max_depth()` on one of them.\n\n```python\nimport sys\nsys.setrecursionlimit(1500)\nfrom nltk.corpus.reader.wordnet import WordNetCorpusReader\n\nreader = WordNetCorpusReader.__new__(WordNetCorpusReader)\nreader._synset_offset_cache = {\"n\": {}}\nreader._lexnames = [\"adj.all\"]\nreader._lemma_pos_offset_map = {\"w88\": {\"n\": [88]}, \"w99\": {\"n\": [99]}}\n\ndef make(offset, partner):\n    line = f\"{offset:08d} 00 n 01 w{offset} 0 001 @ {partner:08d} n 0000 | gloss\"\n    s = reader._synset_from_pos_and_line(\"n\", line)\n    reader._synset_offset_cache[\"n\"][offset] = s\n    return s\n\na = make(88, 99)\nb = make(99, 88)\nprint(\"hypernym pointers:\", dict(a._pointers))\nprint(\"hypernyms():\", a.hypernyms())\ntry:\n    a.max_depth()\n    print(\"returned normally\")\nexcept RecursionError:\n    print(\"VULNERABLE: max_depth() recursed without bound -\u003e RecursionError\")\n```\n\n```text\nhypernym pointers: {'@': {('n', 99)}}\nhypernyms(): [Synset('w99.n.01')]\nVULNERABLE: max_depth() recursed without bound -\u003e RecursionError\n```\n\n## Attack Chain\n\n1. **Exposure:** The victim application loads a WordNet `data.\u003cpos\u003e` corpus file whose content is attacker-supplied. Corpus file content is untrusted input in NLTK, consistent with the project's existing corpus-content hardening.\n2. **Control:** The attacker fully controls the `@` hypernym pointer offset fields. They are parsed and stored verbatim at `nltk/corpus/reader/wordnet.py:1694` with no graph-shape validation, so the attacker chooses an arbitrary graph topology (a cycle or a chain deeper than the recursion limit).\n3. **Path:** A shipped public method reaches a walker: `hypernym_paths`/`hypernym_distances` directly, or `lowest_common_hypernyms`/`wup_similarity`/`path_similarity`/`lch_similarity` via `max_depth`/`min_depth`. `hypernyms()` (`:138`) resolves the partner synset through `_related('@')` (`:1103`) and `synset_from_pos_and_offset` (`:1104`), which returns the same cached, still-unmemoized object.\n4. **Guard:** The only candidate guard, the `_max_depth`/`_min_depth` memo, is assigned only after the recursive expression returns, so it never protects a node still on the stack. No visited set and no depth cap exist on any of the four methods.\n5. **Primitive:** Unbounded recursion over the attacker-chosen graph.\n6. **Result:** Uncaught `RecursionError` aborts the traversal and any worker that does not catch it; native stack exhaustion and process abort are possible under a raised recursion limit. Availability impact only.\n\n## Bypass Evidence\n\nThe relevant candidate guard is the per-instance depth memo. It does not block the path: Python evaluates `1 + max(h.max_depth() for h in hypernyms)` fully before binding `self._max_depth`, so during recursion the memo check `\"_max_depth\" not in self.__dict__` is still true when the traversal re-enters a node already on the stack. The synset offset cache does not help either; it returns the same object whose memo is still unset, and even a hypothetical fresh object per lookup would also be unmemoized, so termination is unaffected. Attempts to disprove the finding all failed: the claim that the offset cache breaks the cycle is false (same unmemoized object), the claim that no shipped public API reaches the walkers is false (`hypernym_paths`, `hypernym_distances`, `wup_similarity`, `lowest_common_hypernyms` all reach them), and the claim that the reproduction is an artifact of skipping `__init__` is false (only unrelated OMW/lexname loading is skipped; the parser and walker are unmodified). A non-cyclic hypernym chain longer than `sys.getrecursionlimit()` triggers the same failure, so a cycle is not even required. That the maintainers added acyclic/visited guards to the sibling walkers `closure`, `tree`, and `_shortest_hypernym_paths` confirms this is an unhardened gap rather than intended behavior.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (pypi.org/pypi/nltk/json, verified 2026-09-15)`\n- `Fix status: not fixed`\n\nThe four walkers and their missing guards are long-standing WordNet-reader code present in the current published artifact (3.10.3), and no fix has been released. The upper bound `\u003c= 3.10.3` is verified against the exact PyPI-published version. The lower bound is left open because the first affected release was not binary-searched; the vulnerable code predates recent releases.\n\n## Suggested Fix\n\nEnforce bounded, cycle-safe traversal in `max_depth`, `min_depth`, `hypernym_paths`, and `hypernym_distances`. Thread a visited-node set through the recursion (skipping nodes already on the current path) and/or impose an explicit maximum depth, mirroring the acyclic helpers already used by `closure`, `tree`, and `_shortest_hypernym_paths` in the same class. As an interim mitigation, applications that must process untrusted corpora can wrap calls to these methods in a `RecursionError` handler and set a conservative `sys.setrecursionlimit`, though this only converts the crash into a handled error rather than removing the unbounded traversal.\n\n---\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144.\n\nFix commit: 34adf1ee4 \"Bound WordNet hypernym recursion and linearize the lemma-marker regex\".\n\nNo probe. The advisory PoC re-run (two synsets whose @ pointers form a 2-cycle): on the PR head max_depth, min_depth, hypernym_paths and hypernym_distances all raise ValueError; on develop 2fa3f48fe all four raise RecursionError, so develop is still VULNERABLE.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-53pg-5qp8-mhvr/GHSA-53pg-5qp8-mhvr.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-53pg-5qp8-mhvr"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129230"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/34adf1ee425b5c817d2a88c674bac68672e3ab26"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-rh8m-wqhc-qmrf",
+  "modified": "2026-11-20T00:00:04.065535200Z",
+  "published": "2026-11-19T23:53:41Z",
+  "aliases": [
+    "CVE-2026-129222"
+  ],
+  "summary": "Natural Language Toolkit (NLTK): Uncontrolled recursion (crash DoS) in DependencyGraph.tree()/triples()",
+  "details": "### Summary\nDependencyGraph.tree()/triples() walk the parsed dependency structure using plain, unbounded Python recursion — one stack frame per edge in the graph — and never use the class's own cycle detector. A crafted dependency-parse file with a few thousand chained tokens (an entirely ordinary-looking long sentence) crashes the process with an unhandled RecursionError the moment .tree() or .triples() is called — which is NLTK's own documented usage pattern immediately after loading such a file.\n\n### Details\n`DependencyGraph._tree()` (~lines 393-406), `.tree()` (~408-417), and `.triples()` (~419-432) in `nltk/parse/dependencygraph.py` rebuild/walk the graph with `Tree(word, [self._tree(dep) for dep in deps])` and `yield from self.triples(node=dep)` — ordinary recursive calls, one per edge, with no depth check. `contains_cycle()` is defined on the class (~line 447) but is never invoked by any of these three methods.\n\nThis is exactly the CWE-674 pattern the project has already identified and fixed elsewhere: `nltk/tree/tree.py` adds `MAX_TREE_DEPTH = 500` with a comment stating that an arbitrarily deep tree would make every traversal raise RecursionError, and `nltk/test/unit/test_recursion_dos.py` locks in the identical fix for `FeatStructReader`, `LogicParser`, and `ResolutionProver`. But `DependencyGraph` builds its `Tree` objects **programmatically** (`Tree(word, [...])`), which bypasses `MAX_TREE_DEPTH` entirely — that guard only fires inside `Tree.fromstring()`'s bracket-string parser, never in `Tree.__init__`. `DependencyGraph`'s own recursive walk has no depth limit of its own.\n\nAny Malt-TAB/CoNLL(3/4/7/10)-format text — read via `DependencyCorpusReader` (`nltk/corpus/reader/dependency.py`, lines 62-69, backing the public, documented `nltk.corpus.dependency_treebank` and `nltk.corpus.conll2007` corpora) or via the public classmethod `DependencyGraph.load(filename)` (~line 213) / `DependencyGraph(text)` directly — that chains more tokens than Python's default recursion limit (1000) via consecutive head references crashes with an unhandled `RecursionError` the moment `.tree()`/`.triples()` is called. Calling `.tree()` immediately after `parsed_sents()` is not a contrived edge case — it is NLTK's own documented usage pattern (`nltk/test/corpus.doctest`: `print(conll2007.parsed_sents('esp.train')[0].tree())`; `nltk/test/dependency.doctest`: `dg.tree().pprint()`).\n\n**Related observation:** `contains_cycle()` itself has a separate bug that means it wouldn't help even if it were called on this path — it iterates `node[\"deps\"]` as if it were a flat list of neighbor addresses, but `_parse()`/`add_arc()` actually store `deps` as `{relation_label: [addresses]}`; iterating that dict yields relation-label strings, which then fail the `dep not in self.nodes` check and get silently skipped. So `contains_cycle()` returns `False` (a false negative) on real parsed/`add_arc()`-built graphs even when a genuine cycle exists — it only works on the flat-list shape used in its own docstring example. This reinforces that there is no working recursion/cycle safety net on this code path today.\n\n### PoC\nA tiny (few KB) 3-column Malt-TAB file: one root line `w1 ROOT 0` followed by ~2000-3000 lines `wi X i-1`, each chaining a token to the previous one (an entirely ordinary-looking long sentence/coordination structure). Verified directly against current source:\n\n1. Constructing a `DependencyGraph` from a 3000-token linear chain and calling `.tree()` → `RecursionError: maximum recursion depth exceeded`. Confirmed.\n2. Same graph, `.triples()` fully consumed → `RecursionError`. Confirmed.\n3. Full realistic path: wrote the 3000-token chain to a temp file, read it back through an actual `DependencyCorpusReader` (the exact class backing `dependency_treebank`/`conll2007`) via `parsed_sents()`, then called `.tree()` on the result → `RecursionError`, end-to-end through the real public API.\n\n(One honest correction to an earlier draft of this finding: a \"two lines whose head columns reference each other\" file-based cycle does *not* actually reach this crash the way it might seem — in the single-head-per-token Malt-TAB/CoNLL format, a genuine mutual-reference pair can't simultaneously be reachable from the graph's root and form a back-edge, so it either leaves `self.root = None`, or the pair becomes a disconnected island that's silently walked past without crashing. The long-chain vector above is the one that's fully, independently confirmed; a cycle built via direct `add_arc()` graph manipulation does also crash, but that's a narrower trigger than a parsed file.)\n\n### Impact\nAn unauthenticated party who can get a crafted CoNLL/Malt-TAB dependency file processed by a downstream application — a treebank upload, a shared-task submission portal, a user-editable corpus directory, or any code calling `DependencyGraph.load()`/`DependencyGraph()` on user-supplied text — crashes that request/worker/script with no further interaction needed. 100% reliable, trivial to construct.\n\nSuggested fix: apply the same `MAX_TREE_DEPTH`-style depth guard used elsewhere in the codebase to `_tree()`/`tree()`/`triples()`, and fix `contains_cycle()`'s dict-vs-flat-list bug so it can actually be invoked as a real safety net on this path.\n\n\n## Fix status (2026-09-28)\n\nStatus: MERGED on develop (unreleased; v3.10.3 of 2026-08-12 predates the fix).\n\nPR: #3885 \"Bound recursion depth in parsers and traversal helpers\" (ekaf), merged 2026-09-11, merge commit e521ecafc on develop.\n\nFix commit: a74682757 (nltk/parse/dependencygraph.py: _tree, tree and triples stop at MAX_DEPTH=200 with ValueError instead of recursing until RecursionError).\n\nProbe: none of its own; nltk/test/unit/security_probes/ghsa_xfcv_m889_fmqg.py covers tree() and reports FIXED on develop 2fa3f48fe. The advisory PoC re-run on develop 2fa3f48fe (a 3000-token Malt-TAB chain): tree() and list(triples()) both raise ValueError (exceeded MAX_DEPTH=200), no RecursionError.\n\nRelease: none yet; no release tag contains e521ecafc.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-rh8m-wqhc-qmrf/GHSA-rh8m-wqhc-qmrf.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-rh8m-wqhc-qmrf"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129222"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3885"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/a74682757cee8c11128ad277d2f2bd0b8e1884ff"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

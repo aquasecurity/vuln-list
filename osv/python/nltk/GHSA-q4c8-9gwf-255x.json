@@ -1,0 +1,133 @@
+{
+  "id": "GHSA-q4c8-9gwf-255x",
+  "modified": "2026-11-20T00:00:04.080602950Z",
+  "published": "2026-11-19T23:48:39Z",
+  "aliases": [
+    "CVE-2026-129231"
+  ],
+  "summary": "NLTK: Quadratic-time DoS in SeekableUnicodeStreamReader.readline on an unterminated corpus line via per-iteration full-buffer rescan",
+  "details": "## Summary\n\n`SeekableUnicodeStreamReader.readline` in `nltk/data.py` assembles a line by repeatedly reading a block, appending it to a growing `chars` buffer, and recomputing `chars.splitlines(True)` over the entire buffer on every loop iteration. The read block size doubles only until it caps at 8000 characters, so for a single unterminated line of N characters the loop runs about N/8000 iterations and iteration k re-scans roughly 8000*k characters, giving O(N^2) total work. The default `size=None` used on the line-oriented corpus-reader read path means the early break never fires before end of file. An attacker who supplies a corpus file containing one very long line with no newline can force quadratic CPU consumption in the reader's process. This is the same growing-buffer re-scan algorithmic-complexity class the project already treats as advisory-worthy in sibling corpus readers.\n\n## Root Cause\n\nThe `readline` loop violates the expectation that reading a line costs time linear in the line length. On each pass it executes `chars += new_chars; lines = chars.splitlines(True)`, scanning the whole accumulated buffer again rather than only the newly read block. Because `readsize` is capped at 8000 (`nltk/data.py:1997-1998`), the number of iterations grows linearly with the line length while each iteration's scan cost also grows linearly, producing quadratic total cost. The loop exits only on end of file or when `size is not None`; since the line-oriented block readers call `stream.readline()` with no argument, `size` defaults to `None` (`nltk/data.py:1942`) and that early break is unreachable on this path. There is no length cap on the assembled line and no wall-clock backstop, because no regular expression is involved on this path and the `nltk.redos` timeout therefore does not apply.\n\n```text\nAffected function: nltk.data.SeekableUnicodeStreamReader.readline\nLoop with per-iteration full-buffer rescan: nltk/data.py:1968-2000\n  chars += new_chars; lines = chars.splitlines(True)   (nltk/data.py:1977-1978)\n  readsize *= 2 capped at 8000                          (nltk/data.py:1997-1998)\nDefault size=None on the corpus-view path:              nltk/data.py:1942\nReachable via read_line_block/read_whitespace_block/read_wordpunct_block/\n  read_blankline_block in nltk/corpus/reader/util.py, through _open's\n  SeekableUnicodeStreamReader construction.\n```\n\n## Impact\n\nAn attacker who controls the bytes of a corpus file processed by a line-oriented NLTK corpus reader (encoding set, which is the common case) can craft one arbitrarily long unterminated line. Reading that line pins a single CPU core for time quadratic in the line length. The effect is recoverable CPU-availability degradation in the processing worker, not a crash: memory use remains linear and the operation completes once the buffer is exhausted. Because the constant factor is bounded by the 8000-character read cap, a meaningful denial of service requires a large crafted file, which keeps the severity in the low to medium range. The worst credible deployment is an automated document-ingestion service that feeds attacker-supplied uploads into such a reader with no human step; a more typical case where a victim manually loads an attacker-supplied corpus requires user interaction and is lower.\n\n## Proof of Concept\n\n`Requires only the nltk package under test on PYTHONPATH; no network access. Feeds one unterminated line of increasing length through SeekableUnicodeStreamReader.readline (size=None, the corpus-view path) and times each call.`\n\n```python\nimport io, time\nfrom nltk.data import SeekableUnicodeStreamReader\n\ndef measure(n):\n    stream = io.BytesIO(b\"a\" * n)          # one unterminated line, no newline\n    reader = SeekableUnicodeStreamReader(stream, \"utf-8\")\n    t0 = time.perf_counter()\n    line = reader.readline()               # size=None -\u003e corpus-view path\n    dt = time.perf_counter() - t0\n    assert len(line) == n\n    return dt\n\nprev = None\nfor n in (1_000_000, 2_000_000, 4_000_000, 8_000_000):\n    dt = measure(n)\n    ratio = \"-\" if prev is None else f\"{dt/prev:.2f}x\"\n    print(f\"{n:\u003e12,} chars  {dt:8.3f}s  ratio(x2 size)={ratio}\")\n    prev = dt\n```\n\n```text\n   1,000,000 chars     0.058s  ratio(x2 size)=-\n   2,000,000 chars     0.290s  ratio(x2 size)=4.99x\n   4,000,000 chars     1.154s  ratio(x2 size)=3.98x\n   8,000,000 chars     4.694s  ratio(x2 size)=4.07x\n```\n\nThe roughly 4x time increase for each 2x increase in size is the O(N^2) signature; a linear `readline` would grow about 2x per 2x size step.\n\n## Attack Chain\n\n1. **Exposure:** The victim application processes a corpus file whose bytes are attacker-supplied through a line-oriented corpus reader. Corpus file content is untrusted input in NLTK.\n2. **Control:** The attacker controls the file bytes and can emit one arbitrarily long run of characters with no newline. This survives path/open security controls (`_secure_open`/pathsec), which bound file access but not read-loop cost.\n3. **Path:** `StreamBackedCorpusView._open` (`nltk/corpus/reader/util.py:210-214`) constructs a `SeekableUnicodeStreamReader` when an encoding is set; the block readers `read_line_block`, `read_whitespace_block`, `read_wordpunct_block`, and `read_blankline_block` call `stream.readline()` with no size argument.\n4. **Guard:** The only candidate guard, the `if not new_chars or size is not None:` early break at `nltk/data.py:1992`, does not fire because `size` defaults to `None`; the loop runs until end of file. No line-length cap and no wall-clock backstop exist.\n5. **Primitive:** Per-iteration `chars.splitlines(True)` over the whole growing buffer with a capped 8000-character read block, giving quadratic total work.\n6. **Result:** One CPU core is consumed for O(N^2) time on a single `readline` call, degrading availability of the reader's process. Recoverable, no crash.\n\n## Bypass Evidence\n\nThe `size is not None` early break is the only guard that could stop the quadratic loop, and it is disproven: `readline` is defined as `readline(self, size=None)` and the four shipped block readers invoke it with no argument, so `size` is `None` and the break only triggers at end of file. The `nltk.redos` timeout that protects regex-based paths does not apply here because there is no regular expression on the readline loop. The `linebuffer` short-circuit at `nltk/data.py:1955` is not taken for a single unterminated line, since the buffer never accumulates more than one element. Attempts to disprove the finding all failed: the size early break is unreachable on this path, the redos timeout is inapplicable, the linebuffer short-circuit does not engage, the block-size doubling does not make the loop log-linear because it caps at 8000, and the path is reachable from four standard block readers rather than being test-only. The sustained adversarial observation is only that impact is bounded (recoverable CPU degradation needing a large file), which lowers severity but does not overturn the finding. No prior fix exists for this sink; the two published sibling advisories in the same quadratic corpus-reader class target different functions.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: \u003c= 3.10.3`\n- `Latest release checked: 3.10.3 (pypi.org/pypi/nltk/json, verified 2026-09-15)`\n- `Fix status: not fixed`\n\n`SeekableUnicodeStreamReader.readline` and its per-iteration `splitlines` re-scan are long-standing `nltk/data.py` code present in the current published artifact (3.10.3), and no fix has been released. The upper bound `\u003c= 3.10.3` is verified against the exact PyPI-published version. The lower bound is left open because the first affected release was not binary-searched; the vulnerable code predates recent releases.\n\n## Suggested Fix\n\nAvoid rescanning the whole buffer on every iteration. Search only the newly read block for a line terminator (tracking a running offset), or read through the underlying stream's own buffered line reading, so the cost of assembling a line is linear in the line length. Optionally impose a configurable maximum line length and raise or truncate when it is exceeded, so a single pathological line cannot consume unbounded CPU. As an interim mitigation, deployments that ingest untrusted corpora can bound the size of accepted input files or run corpus parsing under a CPU-time limit, though neither removes the quadratic behavior in the reader itself.\n\n---\n\nReported by zx (GitHub: @manus-pi).\n\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nTwo open pull requests carry a fix.\n\nPR: #3895 \"[WIP] Bound algorithmic-DoS and uncontrolled-recursion vectors (CWE-400/407/674/1333)\", open, head b22ebe144. Fix commit: 002bcf714 (SeekableUnicodeStreamReader.readline searches only the freshly decoded span for a line end).\n\nPR: #3753 \"[Do not merge yet] Fix GHSA-8mgp-746c-j5xp: URL-scheme bypass of pathsec.validate_path\", open; head da55cab0e at the time of this note (a develop merge on top of 238f81500, the head on which the verdicts below were measured). Fix commits: cf12a5e6a (readline searches the fresh span via a _LINE_BOUNDARY_RE) and 2acc9bd97 (spans accumulated in a list and joined once).\n\nNo probe of its own; the readline part of the GHSA-j8g8 probe on #3753 reports FIXED on both PR heads (4.1x and 1.6x over a 4x input). The advisory PoC re-run (one unterminated line, 1M vs 4M chars): #3895 head 6.8x, #3753 head 5.3x, develop 2fa3f48fe 15.2x (0.34 s vs 5.20 s), so develop is still VULNERABLE.\n\nRelease: none.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.8",
+        "0.9",
+        "0.9.3",
+        "0.9.4",
+        "0.9.5",
+        "0.9.6",
+        "0.9.7",
+        "0.9.8",
+        "0.9.9",
+        "2.0.1",
+        "2.0.1rc1",
+        "2.0.1rc2-git",
+        "2.0.1rc3",
+        "2.0.1rc4",
+        "2.0.2",
+        "2.0.3",
+        "2.0.4",
+        "2.0.5",
+        "2.0b4",
+        "2.0b5",
+        "2.0b6",
+        "2.0b7",
+        "2.0b8",
+        "2.0b9",
+        "3.0.0",
+        "3.0.0b1",
+        "3.0.0b2",
+        "3.0.1",
+        "3.0.2",
+        "3.0.3",
+        "3.0.4",
+        "3.0.5",
+        "3.1",
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3",
+        "3.2",
+        "3.2.1",
+        "3.2.2",
+        "3.2.3",
+        "3.2.4",
+        "3.2.5",
+        "3.3",
+        "3.4",
+        "3.4.1",
+        "3.4.2",
+        "3.4.3",
+        "3.4.4",
+        "3.4.5",
+        "3.5",
+        "3.5b1",
+        "3.6",
+        "3.6.1",
+        "3.6.2",
+        "3.6.3",
+        "3.6.4",
+        "3.6.5",
+        "3.6.6",
+        "3.6.7",
+        "3.7",
+        "3.8",
+        "3.8.1",
+        "3.9",
+        "3.9.1",
+        "3.9.2",
+        "3.9.3",
+        "3.9.4",
+        "3.9b1"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 3.10.3",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-q4c8-9gwf-255x/GHSA-q4c8-9gwf-255x.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-q4c8-9gwf-255x"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-129231"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3895"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/002bcf714ef8cb8baf94436f4be73e5516914412"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

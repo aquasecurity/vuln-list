@@ -1,0 +1,67 @@
+{
+  "id": "GHSA-c59x-vh6j-3w8v",
+  "modified": "2026-11-20T00:15:05.394249179Z",
+  "published": "2026-11-19T23:58:53Z",
+  "aliases": [
+    "CVE-2026-128136"
+  ],
+  "summary": "NLTK: AllowlistUnpickler does not deny numpy submodule-local file-I/O sinks",
+  "details": "### Summary\n\n`nltk.picklesec.allowlisted_pickle_load` keyed its denylist of dangerous globals by export name, so numpy's file-I/O callables that live in submodules and are not re-exported under `__module__ == \"numpy\"` were never matched. Under the broad `allowed_modules=(\"numpy\", \"scipy\", \"sklearn\")` allowance that `TransitionParser.parse(depgraphs, modelFile)` granted for model files, a crafted protocol 4 pickle could name `numpy.lib._npyio_impl.recfromtxt` (arbitrary file read, result returned to the caller of `allowlisted_pickle_load`) or `numpy.lib.format.open_memmap` (attacker-chosen file create), and the REDUCE opcode invoked them during the load.\n\n### Affected\n\nnltk \u003e= 3.10.0 and \u003c= 3.10.3 (the allowlisting unpickler and the `TransitionParser` model path); numpy must be installed.\n\n### Reproduction\n\nA pickle whose REDUCE names `numpy.lib._npyio_impl.recfromtxt` with a target path, loaded through `allowlisted_pickle_load(data, allowed_modules=(\"numpy\",))`, reads that file on v3.10.3; one naming `numpy.lib.format.open_memmap` with mode `w+` creates a file. Both are refused on develop with `UnpicklingError: global '...' is from a denied module`. The maintainer transcript below shows the before and after runs.\n\n### Impact\n\nFile read and file create on the host that loads an untrusted model through NLTK's allowlisting unpickler. No code execution: this sits below the `TransitionParser` code-execution sibling GHSA-m396-3h67-vpfv, which is why the severity was reassessed to Medium (see the reply below).\n\n_Editorial note (2026-10-10): the report body of this advisory had been overwritten with the text of GHSA-rv69-j573-cm47 (the nested gzip decompression bomb). The summary above was reconstructed by the maintainers from the title, the maintainer reply, the CVSS justification and PR #3757; the original reporter text is not recoverable from the record._\n\n---\n\n## Fix status (2026-09-28)\n\nStatus: MERGED on develop (unreleased; v3.10.3 of 2026-08-12 predates the fix).\n\nPR: #3778 \"Bound decompression entry points in nltk (zip/gzip layers + pathsec.ZipFile + weka), CWE-409\", merged 2026-08-25, merge commit 42d99b7a2 on develop. Fix commits: b6e0cedca (the nested gzip layer of a zip .gz member is bounded) and c6fe98211 (the decompression guards stream instead of buffering whole payloads).\n\nProbe: none. The advisory PoC re-run on develop 2fa3f48fe (256 MiB of zeros gzipped into a STORED zip member declared at about 256 KiB, read through nltk.data.find().open().read()): refused with ValueError \"Refusing to decompress suspected gzip bomb 'corpus/bomb.gz': it expands beyond nltk.data.MAX_UNZIP_RATIO=1000\".\n\nRelease: none yet; no release tag contains b6e0cedca.\n\n\n---\n\n## Maintainer reply (2026-09-28)\n\nStatus: fixed on develop, unreleased.\n\n### Fix verified\n\nThe numpy submodule file I/O sinks named in this report are denied on develop. This is fixed by PR #3757 (\"Harden untrusted-model pickle allowlist (exact globals + numpy.lib denylist)\"), merged into develop on 2026-08-20 as merge commit 628ebd2fa1b81d961edb6eff6b2eddd9d64588ba. The fix commit is a44a7af69bca87e92d9c4a701fcbbe4512e8d450 and the regression tests are in fb8da992b7b2ad082c69d2618ae2ac1c90c6b8b8.\n\nWhat the fix does. In nltk/picklesec.py the denylist no longer keys numpy sinks by export name; it now denies whole module prefixes. `_DENIED_MODULE_PREFIXES` gained `numpy.lib`, `numpy.rec`, `numpy.core.records`, `numpy._core.records`, `numpy.ma.mrecords` and `numpy.compat`, so `numpy.lib.npyio`, `numpy.lib._npyio_impl` and `numpy.lib.format` resolve inside a denied prefix and are refused under both request forms (the submodule module string and any top level re-export). In nltk/parse/transitionparser.py the model load no longer grants a broad `allowed_modules=(\"numpy\",\"scipy\",\"sklearn\")`; it now uses `allowed_modules=()` plus an exact `_MODEL_ALLOWED_GLOBALS` list, and the model read is routed through `pathsec.open`.\n\n### Before and after evidence\n\nReproduced the report's own primitives with a protocol 4 REDUCE payload for `numpy.lib._npyio_impl.recfromtxt` (arbitrary file read) and `numpy.lib.format.open_memmap` (arbitrary file create), loaded through `allowlisted_pickle_load(allowed_modules=(\"numpy\",\"scipy\",\"sklearn\"))`, and also driven through the real `TransitionParser.parse` product path. Judged by whether the sink actually touched a file, not by whether something raised. Interpreter: `env -u PYTHONPATH /usr/local/bin/python3.13`, CPython 3.13.7, numpy 2.4.4, scipy 1.18.1, sklearn 1.9.0.\n\nBefore the fix, on release tag v3.10.3 (303f6e2ba), nltk 3.10.3:\n\n```\n[READ ] recfromtxt sink reached = True   returned [[1, 2, 3], [4, 5, 6]] (file was read)\n[WRITE] open_memmap sink reached = True   attacker chosen path created on disk\n[CTRL ] canonical numpy.load = refused: UnpicklingError (already denylisted in 3.10.3)\n[PROD ] TransitionParser.parse sink reached = True   model load passed the allowlist;\n        AttributeError after load: recarray has no attribute predict_proba (the read ran)\nVERDICT: SINK REACHED (vulnerable)\n```\n\nAfter the fix, on develop (2fa3f48fe):\n\n```\n[READ ] recfromtxt sink reached = False   refused: UnpicklingError: global\n        'numpy.lib._npyio_impl.recfromtxt' is from a denied module\n[WRITE] open_memmap sink reached = False   refused: UnpicklingError: global\n        'numpy.lib.format.open_memmap' is from a denied module; no file created\n[PROD ] TransitionParser.parse sink reached = False   blocked at the allowlist: UnpicklingError\nVERDICT: SINK BLOCKED (fixed)\n```\n\n### Tests\n\nThe regression suite added by the fix passes on develop. `TestNumpySubmoduleFileIOSinks` in `nltk/test/unit/test_pickle_allowlist_security.py`: 31 passed, 1 skipped. The combined suites `test_pickle_allowlist_security.py`, `test_pathsec_sweep_transitionparser.py` and `test_pathsec_sweep_deserialization.py`: 251 passed, 2 skipped.\n\n### Severity reassessment\n\nLowered from High (8.2) to Medium.\n\nNew vector: `CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N` (base 6.1, Medium).\n\nReasoning:\n\n- The reachable primitives are file read (`recfromtxt`, `recfromcsv`) and constrained file create or truncate (`open_memmap` in `w+` mode writes a numpy `.npy` header). The proof of concept does not achieve code execution, so integrity is Low (I:L, no arbitrary content control) and availability is None (A:N). Confidentiality is set High (C:H) as a worst case because a direct `allowlisted_pickle_load` caller receives the read object; note that through `TransitionParser.parse` the read content is consumed internally and is not returned to the attacker.\n- The sink fires only when a victim loads attacker controlled bytes through NLTK's allowlisting unpickler, which is itself a defensive layer, and numpy must be installed. Loading an untrusted model file is a local, operator initiated action, so Attack Vector is Local (AV:L) and User Interaction is Required (UI:R). No privileges are needed to craft the payload (PR:N) and no privilege boundary is crossed (S:U).\n- Calibration against siblings in this repository: GHSA-m396-3h67-vpfv scores the same `TransitionParser` model load path at 7.8 High (AV:L/UI:R, C:H/I:H/A:H) because it reaches remote code execution. A file read and file create only issue on the same path must sit below full code execution, not above it. The previous 8.2 exceeded that code execution sibling and came from AV:N/UI:N, which overstated the delivery of a file as network attack surface. The file I/O and DoS sibling GHSA-7pvm-89gg-6c6h sits at 6.2 Medium, consistent with this Medium rating.\n\n### Release status\n\nNo release tag contains commit a44a7af69 (checked with git tag, contains option), so the fix is on develop and is not in any release yet. The latest release v3.10.3 (2026-08-12) predates the fix commit (2026-08-17).",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "nltk",
+        "purl": "pkg:pypi/nltk"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.10.0"
+            },
+            {
+              "fixed": "3.10.4"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.10.0",
+        "3.10.1",
+        "3.10.2",
+        "3.10.3"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-c59x-vh6j-3w8v/GHSA-c59x-vh6j-3w8v.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/security/advisories/GHSA-c59x-vh6j-3w8v"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-128136"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/pull/3757"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/commit/a44a7af69bca87e92d9c4a701fcbbe4512e8d450"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/nltk/nltk"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/nltk/nltk/releases/tag/v3.10.4"
+    }
+  ]
+}

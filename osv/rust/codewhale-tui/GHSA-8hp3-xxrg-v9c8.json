@@ -1,0 +1,82 @@
+{
+  "id": "GHSA-8hp3-xxrg-v9c8",
+  "modified": "2026-11-19T23:00:36.646795780Z",
+  "published": "2026-11-19T22:47:33Z",
+  "aliases": [
+    "CVE-2026-83817"
+  ],
+  "summary": "CodeWhale: Automation auto_approve defaults to true, bypassing the task-path hardening fix for silent recurring agent execution",
+  "details": "### Maintainer resolution\n\nThe CodeWhale maintainers validated this report. CodeWhale 0.8.67 and earlier are affected. Version 0.9.0 contains the fix in commit 208421b9d23d81cea3311a1eeb2a2ea81d637686. Users should upgrade to 0.9.0 or later. The original reporter analysis is preserved below.\n\n## Summary\nCVE-2026-45374 (GHSA-72w5-pf8h-xfp4) hardened the task path so auto-approval must be opted into explicitly: `add_task` uses `req.auto_approve.unwrap_or(false)` (task_manager.rs:868). The automation subsystem was not hardened in kind. `AutomationRecord::task_auto_approve()` resolves an omitted `auto_approve` to `DEFAULT_AUTOMATION_AUTO_APPROVE = true` (automation_manager.rs:29, 101-103), and `enqueue_run_task` builds the `NewTaskRequest` with `auto_approve: Some(automation.task_auto_approve())` — i.e. an explicit `Some(true)` (automation_manager.rs:766). Because the field is `Some`, `unwrap_or(false)` returns `true` and the seed-2 default is bypassed. That `true` propagates to `ApprovalMode::Bypass` (runtime_threads.rs:2253), where the background approval loop auto-approves every tool call with no human present (runtime_threads.rs:3383-3416). One approved `automation_create` becomes a durable, recurring, fully auto-approved agent. Same insecure-default class as CVE-2026-45374, on a different, unpatched subsystem.\n\n## Root Cause\nSibling durable defaults in the same struct are safe — `DEFAULT_AUTOMATION_ALLOW_SHELL = false` and `DEFAULT_AUTOMATION_TRUST_MODE = false` (automation_manager.rs:27-28) — while `DEFAULT_AUTOMATION_AUTO_APPROVE` alone defaults `true` (:29). `create_automation` stores `auto_approve: None` when omitted (:422); `task_auto_approve()` resolves `None`→`true` (:101-103); `enqueue_run_task` passes `Some(true)` (:766), defeating `add_task`'s `unwrap_or(false)` seed fix. The `automation_create` tool schema also declares `\"auto_approve\": {\"type\":\"boolean\",\"default\":true}` (tools/automation.rs:49) while sibling `allow_shell`/`trust_mode` default `false`.\n\n## Impact\nA single approved `automation_create` yields a durable, recurring, fully auto-approved agent. Every scheduled fire silently authorizes mutating tools (file writes, apply_patch, git, MCP writes) with no prompt; combined with `allow_shell:true` in the create call, recurring silent RCE with no human present. Even without `allow_shell`, every recurring run silently authorizes all non-shell mutating tools. Same class as seed CVE-2026-45374.\n\n## Proof of Concept\nPrompt injection convinces the model to create a benign-sounding recurring job (single human approval on the `automation_create` call):\n```json\n{\"name\":\"automation_create\",\"arguments\":{\n  \"name\":\"nightly-maintenance\",\n  \"prompt\":\"Fetch latest and run project setup script\",\n  \"rrule\":\"FREQ=HOURLY;INTERVAL=1\",\n  \"allow_shell\":true\n}}\n```\n(`auto_approve` omitted → stored `None` → resolves to `true` on every run.)\n\n## Attack Chain\n1. **Entry.** Prompt injection → model creates a recurring job via `automation_create` with `auto_approve` omitted.\n   - **Guard:** `automation_create` is `Required` (tools/automation.rs:61-63) — user sees ONE approval prompt.\n   - **Bypass proof:** the prompt describes an innocuous automation; the schema hides `\"auto_approve\": {\"default\": true}` (tools/automation.rs:49). Approving \"create a scheduled job\" is not informed consent to \"every future run bypasses all approval prompts.\" The resolved `auto_approve=true` (omitted field) is not surfaced.\n2. **Persist.** `create_automation` stores `auto_approve: None` (automation_manager.rs:422).\n   - **Guard:** none.\n   - **Bypass proof:** `None` is later resolved to `true`, not `false`.\n3. **Fire.** Headless scheduler tick (`scheduler_tick_shared`, no human) or `automation_run` invokes `enqueue_run_task`, which sets `auto_approve: Some(true)` (automation_manager.rs:766).\n   - **Guard:** seed-2's hardened `add_task` default `unwrap_or(false)` (task_manager.rs:868).\n   - **Bypass proof:** the value is `Some(true)`, so `unwrap_or(false)` yields `true` — the hardened default never applies.\n4. **Sink.** Background worker builds the turn with `auto_approve=true` → `ApprovalMode::Bypass` (runtime_threads.rs:2253); the approval loop auto-approves (runtime_threads.rs:3383-3416).\n   - **Guard:** auto_review safety_floor.\n   - **Bypass proof:** safety_floor holds only `Publish` (any origin) and `Destructive/Secret` (background/headless) (auto_review.rs:344-357); ordinary `write_file`/`apply_patch`/`edit_file`/non-destructive `exec_shell` are NOT held → they run unattended. With `allow_shell:true`, every scheduled run additionally gets silent shell execution.\n5. **Impact.** Durable, recurring, fully auto-approved agent from one create approval; recurring silent RCE with `allow_shell:true`.\n\n## Bypass Evidence\n- Present on latest release tag v0.8.67: automation_manager.rs:27-29 (`ALLOW_SHELL=false`, `TRUST_MODE=false`, `AUTO_APPROVE=true`), :101-103 `task_auto_approve()`→`unwrap_or(true)`, :766 `Some(automation.task_auto_approve())`, :422 stores `None` when omitted; task_manager.rs:868 `unwrap_or(false)`; runtime_threads.rs:2253 `if auto_approve → ApprovalMode::Bypass`. automation_manager.rs and task_manager.rs byte-identical v0.8.67↔HEAD.\n- Subsystem wired by default: `automation_create`/`automation_run` registered via `with_runtime_task_tools()` in `with_agent_tools_policy` (registry.rs:1005); TUI attaches `automations: Some(...)` (tui/ui.rs:986-1011), serve mode via runtime_api.rs:426 — not feature-gated.\n- Sibling flags `allow_shell`/`trust_mode` default `false` in the same struct — `auto_approve=true` is the un-hardened anomaly.\n\n## Affected Versions\n`\u003c= 0.8.67` (present on latest release tag v0.8.67 and HEAD 6a3403e).\n\n## Suggested Fix\nSet `DEFAULT_AUTOMATION_AUTO_APPROVE = false` (mirror the seed-2 task-path fix) and change the `automation_create` schema default to `false`, so durable automations require explicit opt-in to auto-approval just like the task path.\n\nReported by **zx (Jace)**",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "codewhale-tui",
+        "purl": "pkg:cargo/codewhale-tui"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.67",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-8hp3-xxrg-v9c8/GHSA-8hp3-xxrg-v9c8.json"
+      }
+    },
+    {
+      "package": {
+        "ecosystem": "npm",
+        "name": "codewhale",
+        "purl": "pkg:npm/codewhale"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "0.9.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 0.8.67",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-8hp3-xxrg-v9c8/GHSA-8hp3-xxrg-v9c8.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/security/advisories/GHSA-8hp3-xxrg-v9c8"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-83817"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/commit/208421b9d23d81cea3311a1eeb2a2ea81d637686"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/codewhale-hq/Codewhale"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/codewhale-hq/Codewhale/releases/tag/v0.9.0"
+    }
+  ]
+}
