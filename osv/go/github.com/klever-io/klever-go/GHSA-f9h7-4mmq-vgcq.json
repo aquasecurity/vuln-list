@@ -1,0 +1,53 @@
+{
+  "id": "GHSA-f9h7-4mmq-vgcq",
+  "modified": "2026-11-23T21:00:55.870244794Z",
+  "published": "2026-11-23T20:55:35Z",
+  "aliases": [
+    "CVE-2026-58262"
+  ],
+  "summary": "Klever Go counts bitmap padding bits toward BLS quorum, allowing blocks with insufficient signatures",
+  "details": "## Summary\n\nWhen validating an incoming block header, `HeaderSigVerifier.verifyConsensusSize` counts *every* set bit in `PubKeysBitmap` — including bits that correspond to no validator (the padding bits of the final byte, which exist whenever the consensus group size is not a multiple of 8). The subsequent BLS aggregate-signature verification (`blsMultiSigner.Verify`) only checks signature validity for real validator indices and silently ignores those padding bits. As a result, a malicious or compromised block producer can set the padding bits to make the on-bits reach the PBFT quorum while only gathering a smaller number of real validator signature shares, causing a block to be accepted as correctly signed without a genuine two-thirds validator quorum.\n\n## Details\n\nQuorum counter counts padding bits — `core/process/headerCheck/headerSignatureVerify.go:145-183`:\n\n```go\nfunc (hsv *HeaderSigVerifier) verifyConsensusSize(consensusPubKeys []string, header data.HeaderHandler) error {\n\tconsensusSize := len(consensusPubKeys)\n\tbitmap := header.GetPubKeysBitmap()\n\n\texpectedBitmapSize := consensusSize / 8\n\tif consensusSize%8 != 0 {\n\t\texpectedBitmapSize++\n\t}\n\tif len(bitmap) != expectedBitmapSize {\n\t\t...\n\t\treturn ErrWrongSizeBitmap\n\t}\n\n\tnumOfOnesInBitmap := 0\n\tfor index := range bitmap {\n\t\tnumOfOnesInBitmap += bits.OnesCount8(bitmap[index])   // \u003c-- counts ALL bits incl. padding\n\t}\n\n\tminNumRequiredSignatures := consensus.GetPBFTThreshold(consensusSize)\n\t...\n\tif numOfOnesInBitmap \u003e= minNumRequiredSignatures {\n\t\treturn nil\n\t}\n\t...\n\treturn ErrNotEnoughSignatures\n}\n```\n\nThe bitmap-byte-length check above only ensures the byte array is the right *size*; it never requires the padding bits (bits `[consensusSize … expectedBitmapSize*8)`) to be zero. So any combination of padding bits is accepted toward the quorum.\n\n`VerifySignature` (`:92-143`) then builds the verifier from the *real* public keys, sets the aggregate signature, and calls `verifier.Verify(hash, bitmap)`.\n\nThe BLS verifier ignores padding bits — `crypto/signing/multisig/blsMultisig.go:272-297`:\n\n```go\nfunc (bms *blsMultiSigner) Verify(message []byte, bitmap []byte) error {\n\t...\n\tmaxFlags := len(bitmap) * 8\n\tflagsMismatch := maxFlags \u003c len(bms.data.pubKeys)   // only rejects *too few* bytes\n\tif flagsMismatch {\n\t\treturn crypto.ErrBitmapMismatch\n\t}\n\n\tpubKeys := make([]crypto.PublicKey, 0)\n\tfor i := range bms.data.pubKeys {                    // \u003c-- only real validator indices\n\t\terr := bms.isIndexInBitmap(uint16(i), bitmap)\n\t\tif err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tpubKeys = append(pubKeys, bms.data.pubKeys[i])\n\t}\n\n\treturn bms.llSigner.VerifyAggregatedSig(bms.keyGen.Suite(), pubKeys, bms.data.aggSig, message)\n}\n```\n\nBecause the loop only walks `range bms.data.pubKeys`, a bit set at position `i \u003e= len(pubKeys)` is never inspected by `isIndexInBitmap` and is therefore silently dropped from signature verification, even though `verifyConsensusSize` already counted it toward quorum.\n\nPBFT threshold — `core/consensus/consensus.go:5-8` (`consensusSize*2/3 + 1`) and fallback `:10-13` (`consensusSize/2 + 1`).\n\nReachable from received blocks — `core/process/block/interceptedBlocks/interceptedBlock.go:181-201` runs `CheckValidity()` → `VerifySignature` on every header received from peers.\n\n### Worked example (consensus size = 5)\n\n- Required PBFT quorum: `5*2/3 + 1 = 4`.\n- Valid validator bit positions: 0..4. Bits 5, 6, 7 are padding (no validator).\n- Attacker gathers only **one** real signature share (validator 0) and aggregates it.\n- Sets bitmap byte to `0b1110_0001` (`0xE1`): bit 0 (real) + bits 5, 6, 7 (padding).\n- `verifyConsensusSize` sees `bits.OnesCount8(0xE1) = 4` ≥ 4 → passes quorum.\n- `blsMultiSigner.Verify` only validates against validator 0's public key (padding ignored) → passes.\n- The block is accepted with one real signer instead of four.\n\nFor any `consensusSize` not divisible by 8, up to `8 - (consensusSize % 8)` fake \"padding\" signatures can be counted toward quorum. On a 21-member group (one padding bit) the attacker shaves one vote; on smaller/sharded groups with `consensusSize % 8` close to 7 the relative impact is larger.\n\n## PoC\n\nReproduced locally against current `develop` (`085a5d1`) with this test (run under `core/process/headerCheck`, removed after verification):\n\n```go\nfunc TestPOCHeaderSigVerifierCountsPaddingBitsTowardQuorum(t *testing.T) {\n\targs := createHeaderSigVerifierArgs()\n\targs.NodesCoordinator = \u0026cMock.NodesCoordinatorMock{\n\t\tGetValidatorsPublicKeysCalled: func(_ []byte, _ uint64, _ uint32) ([]string, error) {\n\t\t\treturn []string{\"pk0\", \"pk1\", \"pk2\", \"pk3\", \"pk4\"}, nil // consensus size 5 -\u003e need 4\n\t\t},\n\t}\n\tverifyCalled := false\n\targs.MultiSigVerifier = \u0026cMock.BelNevMock{\n\t\tCreateMock: func(pubKeys []string, index uint16) (crypto.MultiSigner, error) {\n\t\t\treturn \u0026cMock.BelNevMock{\n\t\t\t\tVerifyMock: func(msg []byte, bitmap []byte) error {\n\t\t\t\t\tverifyCalled = true          // verifier is reached even though only 1 real signer bit is set\n\t\t\t\t\trequire.Equal(t, []byte{0xe1}, bitmap)\n\t\t\t\t\treturn nil                  // single-signer aggregate verifies OK\n\t\t\t\t},\n\t\t\t}, nil\n\t\t},\n\t}\n\thdrSigVerifier, _ := headerCheck.NewHeaderSigVerifier(args)\n\theader := \u0026block.Block{\n\t\tHeader:        \u0026block.BlockHeader{PrevRandSeed: []byte(\"seed\")},\n\t\tPubKeysBitmap: []byte{0xe1}, // bit0 (real) + padding bits 5,6,7 =\u003e counted as 4/5 quorum\n\t\tSignature:     []byte(\"aggregate-of-only-real-bit-0\"),\n\t}\n\terr := hdrSigVerifier.VerifySignature(header)\n\trequire.NoError(t, err)   // \u003c-- accepted with 1 real signature instead of the required 4\n\trequire.True(t, verifyCalled)\n}\n```\n\nRun: `go test ./core/process/headerCheck -run TestPOCHeaderSigVerifierCountsPaddingBitsTowardQuorum -count=1` → `ok`. The test asserts the current code accepts the header; a corrected implementation must return an error because only one real signer bit is set.\n\n## Impact\n\nThis is an improper-verification / consensus-integrity vulnerability. A block proposer who can produce a valid leader signature plus a single valid aggregate BLS signature share can still satisfy the block-level quorum check by populating the padding bits of `PubKeysBitmap`. This weakens the PBFT two-thirds assumption: blocks can be accepted with fewer honest validator signatures than the protocol requires, enabling acceptance of attacker-favored blocks under collusion/compromise below the intended threshold and undermining finality guarantees. Any node that imports/intercepts headers (`interceptedBlock.CheckValidity`) is affected. Note the attacker still needs at least one valid consensus-group signature share and a valid leader signature, hence `PR:L` / `AC:H`.\n\n## Suggested fix\n\nIn `verifyConsensusSize`, count only bits whose index `\u003c consensusSize` and additionally reject any non-zero bit in the padding region of the final bitmap byte (i.e. mask the last byte with `(1 \u003c\u003c (consensusSize % 8)) - 1` before counting, and fail if the original last byte has bits set above that mask). Mirror the same padding-bit rejection in `blsMultiSigner.Verify` so the verifier fails closed rather than silently ignoring unknown bits.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Go",
+        "name": "github.com/klever-io/klever-go",
+        "purl": "pkg:golang/github.com/klever-io/klever-go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "1.7.20"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/11/GHSA-f9h7-4mmq-vgcq/GHSA-f9h7-4mmq-vgcq.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/security/advisories/GHSA-f9h7-4mmq-vgcq"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-58262"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/klever-io/klever-go/commit/a11cb28e495e608d8034dbe83a91e89d0c68e0f7"
+    },
+    {
+      "type": "PACKAGE",
+      "url": "https://github.com/klever-io/klever-go"
+    }
+  ]
+}
